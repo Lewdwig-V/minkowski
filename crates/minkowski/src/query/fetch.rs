@@ -1,0 +1,263 @@
+use std::marker::PhantomData;
+use fixedbitset::FixedBitSet;
+
+use crate::component::{Component, ComponentRegistry};
+use crate::entity::Entity;
+use crate::storage::archetype::Archetype;
+
+/// Send + Sync wrapper for raw pointers used in query fetches.
+pub struct ThinSlicePtr<T> {
+    ptr: *mut T,
+    _marker: PhantomData<T>,
+}
+
+unsafe impl<T: Send> Send for ThinSlicePtr<T> {}
+unsafe impl<T: Sync> Sync for ThinSlicePtr<T> {}
+
+impl<T> ThinSlicePtr<T> {
+    pub unsafe fn new(ptr: *mut T) -> Self {
+        Self { ptr, _marker: PhantomData }
+    }
+}
+
+/// # Safety
+/// Implementors must guarantee that `init_fetch` returns valid state for the
+/// archetype, and `fetch` returns valid items for any row < archetype.len().
+pub unsafe trait WorldQuery {
+    type Item<'w>;
+    type Fetch<'w>: Send + Sync;
+
+    /// Returns a FixedBitSet with bits set for each required ComponentId.
+    /// Archetypes missing any required component are skipped during query matching.
+    fn required_ids(registry: &ComponentRegistry) -> FixedBitSet;
+
+    /// Initialize fetch state for the given archetype.
+    fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> Self::Fetch<'w>;
+
+    /// Fetch the item at the given row.
+    /// # Safety: row must be < archetype.len(), caller ensures no aliasing violations.
+    unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w>;
+}
+
+// --- &T ---
+unsafe impl<T: Component> WorldQuery for &T {
+    type Item<'w> = &'w T;
+    type Fetch<'w> = ThinSlicePtr<T>;
+
+    fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
+        let mut bits = FixedBitSet::new();
+        if let Some(id) = registry.id::<T>() {
+            bits.grow(id + 1);
+            bits.insert(id);
+        }
+        bits
+    }
+
+    fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> ThinSlicePtr<T> {
+        let id = registry.id::<T>().expect("component not registered");
+        let col_idx = archetype.component_index[&id];
+        unsafe { ThinSlicePtr::new(archetype.columns[col_idx].get_ptr(0) as *mut T) }
+    }
+
+    unsafe fn fetch<'w>(fetch: &ThinSlicePtr<T>, row: usize) -> &'w T {
+        &*fetch.ptr.add(row)
+    }
+}
+
+// --- &mut T ---
+unsafe impl<T: Component> WorldQuery for &mut T {
+    type Item<'w> = &'w mut T;
+    type Fetch<'w> = ThinSlicePtr<T>;
+
+    fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
+        <&T>::required_ids(registry)
+    }
+
+    fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> ThinSlicePtr<T> {
+        <&T>::init_fetch(archetype, registry)
+    }
+
+    unsafe fn fetch<'w>(fetch: &ThinSlicePtr<T>, row: usize) -> &'w mut T {
+        &mut *fetch.ptr.add(row)
+    }
+}
+
+// --- Entity ---
+unsafe impl WorldQuery for Entity {
+    type Item<'w> = Entity;
+    type Fetch<'w> = ThinSlicePtr<Entity>;
+
+    fn required_ids(_registry: &ComponentRegistry) -> FixedBitSet {
+        FixedBitSet::new()
+    }
+
+    fn init_fetch<'w>(archetype: &'w Archetype, _registry: &ComponentRegistry) -> ThinSlicePtr<Entity> {
+        unsafe { ThinSlicePtr::new(archetype.entities.as_ptr() as *mut Entity) }
+    }
+
+    unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
+        *fetch.ptr.add(row)
+    }
+}
+
+// --- Option<&T> ---
+unsafe impl<T: Component> WorldQuery for Option<&T> {
+    type Item<'w> = Option<&'w T>;
+    type Fetch<'w> = Option<ThinSlicePtr<T>>;
+
+    fn required_ids(_registry: &ComponentRegistry) -> FixedBitSet {
+        FixedBitSet::new() // optional — does not filter archetypes
+    }
+
+    fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> Option<ThinSlicePtr<T>> {
+        let id = registry.id::<T>()?;
+        let col_idx = archetype.component_index.get(&id)?;
+        Some(unsafe { ThinSlicePtr::new(archetype.columns[*col_idx].get_ptr(0) as *mut T) })
+    }
+
+    unsafe fn fetch<'w>(fetch: &Option<ThinSlicePtr<T>>, row: usize) -> Option<&'w T> {
+        fetch.as_ref().map(|f| &*f.ptr.add(row))
+    }
+}
+
+// --- Tuple impls ---
+macro_rules! impl_world_query_tuple {
+    ($($name:ident),*) => {
+        #[allow(non_snake_case)]
+        unsafe impl<$($name: WorldQuery),*> WorldQuery for ($($name,)*) {
+            type Item<'w> = ($($name::Item<'w>,)*);
+            type Fetch<'w> = ($($name::Fetch<'w>,)*);
+
+            fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
+                let mut bits = FixedBitSet::new();
+                $(
+                    let sub = $name::required_ids(registry);
+                    bits.grow(sub.len());
+                    bits.union_with(&sub);
+                )*
+                bits
+            }
+
+            fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> Self::Fetch<'w> {
+                ($($name::init_fetch(archetype, registry),)*)
+            }
+
+            unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
+                let ($($name,)*) = fetch;
+                ($(<$name as WorldQuery>::fetch($name, row),)*)
+            }
+        }
+    };
+}
+
+impl_world_query_tuple!(A);
+impl_world_query_tuple!(A, B);
+impl_world_query_tuple!(A, B, C);
+impl_world_query_tuple!(A, B, C, D);
+impl_world_query_tuple!(A, B, C, D, E);
+impl_world_query_tuple!(A, B, C, D, E, F);
+impl_world_query_tuple!(A, B, C, D, E, F, G);
+impl_world_query_tuple!(A, B, C, D, E, F, G, H);
+impl_world_query_tuple!(A, B, C, D, E, F, G, H, I);
+impl_world_query_tuple!(A, B, C, D, E, F, G, H, I, J);
+impl_world_query_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_world_query_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::ComponentRegistry;
+    use crate::entity::Entity;
+    use crate::storage::archetype::{Archetype, ArchetypeId};
+
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    struct Pos { x: f32, y: f32 }
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    struct Vel { dx: f32, dy: f32 }
+
+    fn make_archetype_with_data(
+        reg: &ComponentRegistry,
+        ids: &[crate::component::ComponentId],
+    ) -> Archetype {
+        Archetype::new(ArchetypeId(0), ids, reg)
+    }
+
+    #[test]
+    fn fetch_ref() {
+        let mut reg = ComponentRegistry::new();
+        let pos_id = reg.register::<Pos>();
+        let mut arch = make_archetype_with_data(&reg, &[pos_id]);
+
+        let mut pos = Pos { x: 1.0, y: 2.0 };
+        unsafe {
+            let col = arch.component_index[&pos_id];
+            arch.columns[col].push(&mut pos as *mut Pos as *mut u8);
+            std::mem::forget(pos);
+        }
+        arch.entities.push(Entity::new(0, 0));
+
+        let fetch = <&Pos>::init_fetch(&arch, &reg);
+        let item: &Pos = unsafe { <&Pos>::fetch(&fetch, 0) };
+        assert_eq!(item, &Pos { x: 1.0, y: 2.0 });
+    }
+
+    #[test]
+    fn fetch_mut() {
+        let mut reg = ComponentRegistry::new();
+        let pos_id = reg.register::<Pos>();
+        let mut arch = make_archetype_with_data(&reg, &[pos_id]);
+
+        let mut pos = Pos { x: 1.0, y: 2.0 };
+        unsafe {
+            let col = arch.component_index[&pos_id];
+            arch.columns[col].push(&mut pos as *mut Pos as *mut u8);
+            std::mem::forget(pos);
+        }
+        arch.entities.push(Entity::new(0, 0));
+
+        let fetch = <&mut Pos>::init_fetch(&arch, &reg);
+        unsafe {
+            let item: &mut Pos = <&mut Pos>::fetch(&fetch, 0);
+            item.x = 10.0;
+        }
+        unsafe {
+            let ptr = arch.columns[0].get_ptr(0) as *const Pos;
+            assert_eq!((*ptr).x, 10.0);
+        }
+    }
+
+    #[test]
+    fn fetch_entity() {
+        let mut reg = ComponentRegistry::new();
+        let pos_id = reg.register::<Pos>();
+        let mut arch = make_archetype_with_data(&reg, &[pos_id]);
+
+        let entity = Entity::new(42, 7);
+        let mut pos = Pos { x: 0.0, y: 0.0 };
+        unsafe {
+            arch.columns[0].push(&mut pos as *mut Pos as *mut u8);
+            std::mem::forget(pos);
+        }
+        arch.entities.push(entity);
+
+        let fetch = Entity::init_fetch(&arch, &reg);
+        let item = unsafe { Entity::fetch(&fetch, 0) };
+        assert_eq!(item, entity);
+    }
+
+    #[test]
+    fn required_ids_for_ref() {
+        let mut reg = ComponentRegistry::new();
+        reg.register::<Pos>();
+        let bits = <&Pos>::required_ids(&reg);
+        assert!(bits.contains(0));
+    }
+
+    #[test]
+    fn required_ids_for_option_is_empty() {
+        let mut reg = ComponentRegistry::new();
+        reg.register::<Pos>();
+        let bits = <Option<&Pos>>::required_ids(&reg);
+        assert_eq!(bits.len(), 0);
+    }
+}

@@ -1,0 +1,394 @@
+use std::alloc::{self, Layout};
+use std::ptr::NonNull;
+
+/// Type-erased growable array. Stores raw bytes with a known `Layout`.
+/// Used as the column storage inside archetypes.
+pub(crate) struct BlobVec {
+    item_layout: Layout,
+    drop_fn: Option<unsafe fn(*mut u8)>,
+    data: NonNull<u8>,
+    len: usize,
+    capacity: usize,
+}
+
+// Safety: BlobVec stores Component data which requires Send + Sync.
+unsafe impl Send for BlobVec {}
+unsafe impl Sync for BlobVec {}
+
+impl BlobVec {
+    /// Creates a new `BlobVec` for items with the given layout and optional drop function.
+    pub fn new(item_layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>, capacity: usize) -> Self {
+        let (data, capacity) = if item_layout.size() == 0 {
+            (NonNull::dangling(), usize::MAX)
+        } else if capacity == 0 {
+            (NonNull::dangling(), 0)
+        } else {
+            let layout = Layout::from_size_align(
+                item_layout.size() * capacity,
+                item_layout.align(),
+            )
+            .expect("invalid layout");
+            let ptr = unsafe { alloc::alloc(layout) };
+            let data = NonNull::new(ptr)
+                .unwrap_or_else(|| alloc::handle_alloc_error(layout));
+            (data, capacity)
+        };
+        Self { item_layout, drop_fn, data, len: 0, capacity }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Pushes a value by copying `item_layout.size()` bytes from `ptr`.
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid, initialized value matching this BlobVec's layout.
+    /// Caller is responsible for not double-dropping the source value.
+    pub unsafe fn push(&mut self, ptr: *mut u8) {
+        if self.len == self.capacity {
+            self.grow();
+        }
+        let dst = self.ptr_at(self.len);
+        let size = self.item_layout.size();
+        if size > 0 {
+            std::ptr::copy_nonoverlapping(ptr, dst, size);
+        }
+        self.len += 1;
+    }
+
+    /// Returns a raw pointer to the element at `row`.
+    ///
+    /// # Safety
+    /// `row` must be in bounds (`row < len`).
+    #[inline]
+    pub unsafe fn get_ptr(&self, row: usize) -> *mut u8 {
+        debug_assert!(row < self.len);
+        self.ptr_at(row)
+    }
+
+    /// Removes the element at `row` by swapping it with the last element,
+    /// then dropping the removed element.
+    ///
+    /// # Safety
+    /// `row` must be in bounds (`row < len`).
+    pub unsafe fn swap_remove(&mut self, row: usize) {
+        debug_assert!(row < self.len);
+        let last = self.len - 1;
+        let size = self.item_layout.size();
+        if row != last && size > 0 {
+            let row_ptr = self.ptr_at(row);
+            if let Some(drop_fn) = self.drop_fn {
+                drop_fn(row_ptr);
+            }
+            let last_ptr = self.ptr_at(last);
+            std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size);
+        } else if let Some(drop_fn) = self.drop_fn {
+            drop_fn(self.ptr_at(row));
+        }
+        self.len -= 1;
+    }
+
+    /// Removes the element at `row` by swapping it with the last element.
+    /// The removed element is written to `ptr` instead of being dropped.
+    ///
+    /// # Safety
+    /// `row` must be in bounds. `ptr` must be valid for writes of `item_layout.size()` bytes.
+    pub unsafe fn swap_remove_unchecked(&mut self, row: usize, ptr: *mut u8) {
+        debug_assert!(row < self.len);
+        let last = self.len - 1;
+        let size = self.item_layout.size();
+        let row_ptr = self.ptr_at(row);
+        if size > 0 {
+            // Copy removed element to output
+            std::ptr::copy_nonoverlapping(row_ptr, ptr, size);
+            // Move last into the gap (if not same row)
+            if row != last {
+                let last_ptr = self.ptr_at(last);
+                std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size);
+            }
+        }
+        self.len -= 1;
+    }
+
+    /// Removes the element at `row` by swapping with the last element.
+    /// Neither drops the removed element nor copies it out.
+    /// Used during archetype migration where data is moved via get_ptr + push.
+    ///
+    /// # Safety
+    /// `row` must be in bounds. Caller must have already moved/copied the data.
+    pub unsafe fn swap_remove_no_drop(&mut self, row: usize) {
+        debug_assert!(row < self.len);
+        let last = self.len - 1;
+        let size = self.item_layout.size();
+        if row != last && size > 0 {
+            let row_ptr = self.ptr_at(row);
+            let last_ptr = self.ptr_at(last);
+            std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size);
+        }
+        self.len -= 1;
+    }
+
+    #[inline]
+    fn ptr_at(&self, index: usize) -> *mut u8 {
+        if self.item_layout.size() == 0 {
+            NonNull::dangling().as_ptr()
+        } else {
+            unsafe { self.data.as_ptr().add(index * self.item_layout.size()) }
+        }
+    }
+
+    fn grow(&mut self) {
+        let size = self.item_layout.size();
+        if size == 0 {
+            return;
+        }
+        let new_capacity = if self.capacity == 0 { 4 } else { self.capacity * 2 };
+        let new_layout = Layout::from_size_align(
+            size.checked_mul(new_capacity).expect("capacity overflow"),
+            self.item_layout.align(),
+        )
+        .expect("invalid layout");
+
+        let new_data = if self.capacity == 0 {
+            unsafe { alloc::alloc(new_layout) }
+        } else {
+            let old_layout = Layout::from_size_align(
+                size * self.capacity,
+                self.item_layout.align(),
+            )
+            .unwrap();
+            unsafe { alloc::realloc(self.data.as_ptr(), old_layout, new_layout.size()) }
+        };
+
+        self.data = NonNull::new(new_data)
+            .unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
+        self.capacity = new_capacity;
+    }
+}
+
+impl Drop for BlobVec {
+    fn drop(&mut self) {
+        if let Some(drop_fn) = self.drop_fn {
+            for i in 0..self.len {
+                unsafe { drop_fn(self.ptr_at(i)); }
+            }
+        }
+        let size = self.item_layout.size();
+        if size > 0 && self.capacity > 0 {
+            let layout = Layout::from_size_align(
+                size * self.capacity,
+                self.item_layout.align(),
+            )
+            .unwrap();
+            unsafe { alloc::dealloc(self.data.as_ptr(), layout); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::alloc::Layout;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ── helpers ──────────────────────────────────────────────
+
+    /// Push a typed value into a BlobVec, forgetting the original.
+    unsafe fn push_val<T>(bv: &mut BlobVec, mut val: T) {
+        let ptr = &mut val as *mut T as *mut u8;
+        bv.push(ptr);
+        std::mem::forget(val);
+    }
+
+    /// Read a typed value from a BlobVec row.
+    unsafe fn read_val<T: Copy>(bv: &BlobVec, row: usize) -> T {
+        let ptr = bv.get_ptr(row) as *const T;
+        *ptr
+    }
+
+    unsafe fn drop_ptr<T>(ptr: *mut u8) {
+        std::ptr::drop_in_place(ptr as *mut T);
+    }
+
+    fn bv_for<T>() -> BlobVec {
+        let drop_fn = if std::mem::needs_drop::<T>() {
+            Some(drop_ptr::<T> as unsafe fn(*mut u8))
+        } else {
+            None
+        };
+        BlobVec::new(Layout::new::<T>(), drop_fn, 0)
+    }
+
+    // ── tests ───────────────────────────────────────────────
+
+    #[test]
+    fn new_is_empty() {
+        let bv = BlobVec::new(Layout::new::<u32>(), None, 0);
+        assert_eq!(bv.len(), 0);
+        assert!(bv.is_empty());
+    }
+
+    #[test]
+    fn push_increments_len() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 42u32);
+        }
+        assert_eq!(bv.len(), 1);
+        assert!(!bv.is_empty());
+    }
+
+    #[test]
+    fn push_and_read_back() {
+        let mut bv = bv_for::<u64>();
+        unsafe {
+            push_val(&mut bv, 100u64);
+            push_val(&mut bv, 200u64);
+            push_val(&mut bv, 300u64);
+            assert_eq!(read_val::<u64>(&bv, 0), 100);
+            assert_eq!(read_val::<u64>(&bv, 1), 200);
+            assert_eq!(read_val::<u64>(&bv, 2), 300);
+        }
+    }
+
+    #[test]
+    fn push_triggers_growth() {
+        let mut bv = bv_for::<u32>();
+        // Push enough to force multiple reallocations
+        for i in 0u32..256 {
+            unsafe { push_val(&mut bv, i); }
+        }
+        assert_eq!(bv.len(), 256);
+        unsafe {
+            for i in 0u32..256 {
+                assert_eq!(read_val::<u32>(&bv, i as usize), i);
+            }
+        }
+    }
+
+    #[test]
+    fn swap_remove_last_element() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 10u32);
+            bv.swap_remove(0);
+        }
+        assert_eq!(bv.len(), 0);
+    }
+
+    #[test]
+    fn swap_remove_swaps_with_last() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 10u32);
+            push_val(&mut bv, 20u32);
+            push_val(&mut bv, 30u32);
+            // Remove row 0 — last element (30) moves to row 0
+            bv.swap_remove(0);
+        }
+        assert_eq!(bv.len(), 2);
+        unsafe {
+            assert_eq!(read_val::<u32>(&bv, 0), 30);
+            assert_eq!(read_val::<u32>(&bv, 1), 20);
+        }
+    }
+
+    #[test]
+    fn swap_remove_unchecked_returns_removed() {
+        let mut bv = bv_for::<u64>();
+        unsafe {
+            push_val(&mut bv, 111u64);
+            push_val(&mut bv, 222u64);
+            let mut out: u64 = 0;
+            bv.swap_remove_unchecked(0, &mut out as *mut u64 as *mut u8);
+            assert_eq!(out, 111);
+            assert_eq!(bv.len(), 1);
+            assert_eq!(read_val::<u64>(&bv, 0), 222);
+        }
+    }
+
+    #[test]
+    fn drop_calls_drop_fn_for_all_elements() {
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        struct Tracked(u32);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let mut bv = bv_for::<Tracked>();
+            unsafe {
+                push_val(&mut bv, Tracked(1));
+                push_val(&mut bv, Tracked(2));
+                push_val(&mut bv, Tracked(3));
+            }
+            // bv drops here
+        }
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn swap_remove_drops_removed_element() {
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        struct Tracked(u32);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let mut bv = bv_for::<Tracked>();
+            unsafe {
+                push_val(&mut bv, Tracked(1));
+                push_val(&mut bv, Tracked(2));
+                bv.swap_remove(0);
+            }
+            // 1 drop from swap_remove
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1);
+            // bv drops here — 1 more (the remaining Tracked(2))
+        }
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn zst_push_and_len() {
+        // Zero-sized types should track length but not allocate
+        let mut bv = BlobVec::new(Layout::new::<()>(), None, 0);
+        unsafe {
+            let mut unit = ();
+            bv.push(&mut unit as *mut () as *mut u8);
+            bv.push(&mut unit as *mut () as *mut u8);
+        }
+        assert_eq!(bv.len(), 2);
+    }
+
+    #[test]
+    fn initial_capacity() {
+        let mut bv = BlobVec::new(Layout::new::<u32>(), None, 16);
+        // Should not reallocate for the first 16 pushes
+        for i in 0u32..16 {
+            unsafe { push_val(&mut bv, i); }
+        }
+        assert_eq!(bv.len(), 16);
+        unsafe {
+            assert_eq!(read_val::<u32>(&bv, 0), 0);
+            assert_eq!(read_val::<u32>(&bv, 15), 15);
+        }
+    }
+}
