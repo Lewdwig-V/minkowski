@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use rayon::prelude::*;
 use super::fetch::WorldQuery;
 
 /// Iterator over entities matching a query.
@@ -16,6 +17,20 @@ impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
             current_arch: 0,
             current_row: 0,
             _marker: PhantomData,
+        }
+    }
+
+    /// Execute `f` for each matched entity in parallel using rayon.
+    /// Parallelizes across rows within each archetype.
+    pub fn par_for_each<F>(self, f: F)
+    where
+        F: Fn(Q::Item<'_>) + Send + Sync,
+    {
+        for (fetch, len) in &self.fetches {
+            (0..*len).into_par_iter().for_each(|row| {
+                let item = unsafe { Q::fetch(fetch, row) };
+                f(item);
+            });
         }
     }
 }
@@ -127,5 +142,39 @@ mod tests {
 
         let xs: Vec<f32> = world.query::<&Pos>().map(|p| p.x).collect();
         assert_eq!(xs, vec![11.0, 22.0]);
+    }
+
+    #[test]
+    fn par_for_each_updates_all() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let mut world = World::new();
+        for i in 0..1000u32 {
+            world.spawn((Pos { x: i as f32, y: 0.0 },));
+        }
+
+        let sum = AtomicU32::new(0);
+        world.query::<&Pos>().par_for_each(|pos| {
+            sum.fetch_add(pos.x as u32, Ordering::Relaxed);
+        });
+        // Sum of 0..1000 = 999 * 1000 / 2 = 499500
+        assert_eq!(sum.load(Ordering::SeqCst), 499500);
+    }
+
+    #[test]
+    fn par_for_each_mutation() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Pos { x: i as f32, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
+        }
+
+        world.query::<(&mut Pos, &Vel)>().par_for_each(|(pos, vel)| {
+            pos.x += vel.dx;
+        });
+
+        let xs: Vec<f32> = world.query::<&Pos>().map(|p| p.x).collect();
+        for (i, x) in xs.iter().enumerate() {
+            assert_eq!(*x, i as f32 + 1.0);
+        }
     }
 }
