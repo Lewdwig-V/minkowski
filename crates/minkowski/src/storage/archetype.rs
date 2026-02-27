@@ -1,13 +1,14 @@
-use std::collections::HashMap;
 use fixedbitset::FixedBitSet;
+use std::collections::HashMap;
 
+use super::blob_vec::BlobVec;
 use crate::component::{ComponentId, ComponentRegistry};
 use crate::entity::Entity;
-use super::blob_vec::BlobVec;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ArchetypeId(pub usize);
 
+#[allow(dead_code)]
 pub(crate) struct Archetype {
     pub id: ArchetypeId,
     /// Bitset of which ComponentIds this archetype contains.
@@ -77,6 +78,7 @@ impl Archetypes {
         }
     }
 
+    #[allow(dead_code)]
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -106,10 +108,16 @@ mod tests {
     use crate::entity::Entity;
 
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Pos { x: f32, y: f32 }
+    struct Pos {
+        x: f32,
+        y: f32,
+    }
 
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Vel { dx: f32, dy: f32 }
+    struct Vel {
+        dx: f32,
+        dy: f32,
+    }
 
     fn setup_registry() -> ComponentRegistry {
         ComponentRegistry::new()
@@ -141,7 +149,7 @@ mod tests {
         unsafe {
             let col = arch.component_index[&pos_id];
             arch.columns[col].push(&mut pos as *mut Pos as *mut u8);
-            std::mem::forget(pos);
+            let _ = pos;
             arch.entities.push(entity);
         }
         assert_eq!(arch.len(), 1);

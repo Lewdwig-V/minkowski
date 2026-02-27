@@ -10,13 +10,17 @@ pub(crate) struct SparseStorage {
     storages: HashMap<ComponentId, Box<dyn Any + Send + Sync>>,
 }
 
+#[allow(dead_code)]
 impl SparseStorage {
     pub fn new() -> Self {
-        Self { storages: HashMap::new() }
+        Self {
+            storages: HashMap::new(),
+        }
     }
 
     pub fn insert<T: Component>(&mut self, comp_id: ComponentId, entity: Entity, value: T) {
-        let map = self.storages
+        let map = self
+            .storages
             .entry(comp_id)
             .or_insert_with(|| Box::new(HashMap::<Entity, T>::new()))
             .downcast_mut::<HashMap<Entity, T>>()
@@ -25,19 +29,26 @@ impl SparseStorage {
     }
 
     pub fn get<T: Component>(&self, comp_id: ComponentId, entity: Entity) -> Option<&T> {
-        self.storages.get(&comp_id)?
+        self.storages
+            .get(&comp_id)?
             .downcast_ref::<HashMap<Entity, T>>()?
             .get(&entity)
     }
 
-    pub fn get_mut<T: Component>(&mut self, comp_id: ComponentId, entity: Entity) -> Option<&mut T> {
-        self.storages.get_mut(&comp_id)?
+    pub fn get_mut<T: Component>(
+        &mut self,
+        comp_id: ComponentId,
+        entity: Entity,
+    ) -> Option<&mut T> {
+        self.storages
+            .get_mut(&comp_id)?
             .downcast_mut::<HashMap<Entity, T>>()?
             .get_mut(&entity)
     }
 
     pub fn remove<T: Component>(&mut self, comp_id: ComponentId, entity: Entity) -> Option<T> {
-        self.storages.get_mut(&comp_id)?
+        self.storages
+            .get_mut(&comp_id)?
             .downcast_mut::<HashMap<Entity, T>>()?
             .remove(&entity)
     }

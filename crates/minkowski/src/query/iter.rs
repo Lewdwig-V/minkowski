@@ -1,6 +1,6 @@
-use std::marker::PhantomData;
-use rayon::prelude::*;
 use super::fetch::WorldQuery;
+use rayon::prelude::*;
+use std::marker::PhantomData;
 
 /// Iterator over entities matching a query.
 pub struct QueryIter<'w, Q: WorldQuery> {
@@ -66,16 +66,19 @@ impl<'w, Q: WorldQuery> Iterator for QueryIter<'w, Q> {
 
 #[cfg(test)]
 mod tests {
-    use crate::world::World;
     use crate::entity::Entity;
+    use crate::world::World;
 
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Pos { x: f32, y: f32 }
+    struct Pos {
+        x: f32,
+        y: f32,
+    }
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Vel { dx: f32, dy: f32 }
-    #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Health(u32);
-
+    struct Vel {
+        dx: f32,
+        dy: f32,
+    }
     #[test]
     fn iterate_single_archetype() {
         let mut world = World::new();
@@ -83,9 +86,7 @@ mod tests {
         world.spawn((Pos { x: 2.0, y: 0.0 },));
         world.spawn((Pos { x: 3.0, y: 0.0 },));
 
-        let positions: Vec<f32> = world.query::<&Pos>()
-            .map(|p| p.x)
-            .collect();
+        let positions: Vec<f32> = world.query::<&Pos>().map(|p| p.x).collect();
         assert_eq!(positions, vec![1.0, 2.0, 3.0]);
     }
 
@@ -117,9 +118,7 @@ mod tests {
         let e1 = world.spawn((Pos { x: 1.0, y: 0.0 },));
         let e2 = world.spawn((Pos { x: 2.0, y: 0.0 },));
 
-        let entities: Vec<Entity> = world.query::<(Entity, &Pos)>()
-            .map(|(e, _)| e)
-            .collect();
+        let entities: Vec<Entity> = world.query::<(Entity, &Pos)>().map(|(e, _)| e).collect();
         assert_eq!(entities, vec![e1, e2]);
     }
 
@@ -150,7 +149,10 @@ mod tests {
 
         let mut world = World::new();
         for i in 0..1000u32 {
-            world.spawn((Pos { x: i as f32, y: 0.0 },));
+            world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },));
         }
 
         let sum = AtomicU32::new(0);
@@ -165,12 +167,20 @@ mod tests {
     fn par_for_each_mutation() {
         let mut world = World::new();
         for i in 0..100u32 {
-            world.spawn((Pos { x: i as f32, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
+            world.spawn((
+                Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+                Vel { dx: 1.0, dy: 0.0 },
+            ));
         }
 
-        world.query::<(&mut Pos, &Vel)>().par_for_each(|(pos, vel)| {
-            pos.x += vel.dx;
-        });
+        world
+            .query::<(&mut Pos, &Vel)>()
+            .par_for_each(|(pos, vel)| {
+                pos.x += vel.dx;
+            });
 
         let xs: Vec<f32> = world.query::<&Pos>().map(|p| p.x).collect();
         for (i, x) in xs.iter().enumerate() {

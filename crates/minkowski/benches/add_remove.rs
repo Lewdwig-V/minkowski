@@ -1,7 +1,14 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
-#[derive(Clone, Copy)] struct Position { x: f32, y: f32 }
-#[derive(Clone, Copy)] struct Health(f32);
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct Position {
+    x: f32,
+    y: f32,
+}
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct Health(f32);
 
 fn add_remove_minkowski(c: &mut Criterion) {
     c.bench_function("minkowski/add_remove_1k", |b| {
@@ -9,7 +16,12 @@ fn add_remove_minkowski(c: &mut Criterion) {
             || {
                 let mut world = minkowski::World::new();
                 let entities: Vec<_> = (0..1000)
-                    .map(|i| world.spawn((Position { x: i as f32, y: 0.0 },)))
+                    .map(|i| {
+                        world.spawn((Position {
+                            x: i as f32,
+                            y: 0.0,
+                        },))
+                    })
                     .collect();
                 (world, entities)
             },
@@ -32,7 +44,12 @@ fn add_remove_hecs(c: &mut Criterion) {
             || {
                 let mut world = hecs::World::new();
                 let entities: Vec<_> = (0..1000)
-                    .map(|i| world.spawn((Position { x: i as f32, y: 0.0 },)))
+                    .map(|i| {
+                        world.spawn((Position {
+                            x: i as f32,
+                            y: 0.0,
+                        },))
+                    })
                     .collect();
                 (world, entities)
             },
