@@ -248,10 +248,21 @@ fn main() {
                 spawn_boid(&mut world, &params);
             }
         }
-        // Step 7: Stats — TODO
-
-        let _ = (frame, frame_start, &snapshot);
+        // Step 7: Stats
+        if frame % CHURN_INTERVAL == 0 || frame == FRAME_COUNT - 1 {
+            let entity_count = world.query::<&Position>().count();
+            let mut speed_sum = 0.0f32;
+            for vel in world.query::<&Velocity>() {
+                speed_sum += vel.0.length();
+            }
+            let avg_vel = if entity_count > 0 { speed_sum / entity_count as f32 } else { 0.0 };
+            let dt_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "frame {:04} | entities: {:>5} | avg_vel: {:.2} | dt: {:.1}ms",
+                frame, entity_count, avg_vel, dt_ms,
+            );
+        }
     }
 
-    println!("boids: {} frames complete", FRAME_COUNT);
+    println!("Done.");
 }
