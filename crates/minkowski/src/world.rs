@@ -5,6 +5,7 @@ use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
+use crate::table::TableCache;
 
 fn get_pair_mut(v: &mut [Archetype], a: usize, b: usize) -> (&mut Archetype, &mut Archetype) {
     assert_ne!(a, b, "cannot get mutable references to the same archetype");
@@ -29,6 +30,7 @@ pub struct World {
     pub(crate) components: ComponentRegistry,
     pub(crate) sparse: SparseStorage,
     pub(crate) entity_locations: Vec<Option<EntityLocation>>,
+    pub(crate) table_cache: TableCache,
 }
 
 impl World {
@@ -39,6 +41,7 @@ impl World {
             components: ComponentRegistry::new(),
             sparse: SparseStorage::new(),
             entity_locations: Vec::new(),
+            table_cache: TableCache::new(),
         }
     }
 
@@ -161,6 +164,54 @@ impl World {
             })
             .collect();
         QueryIter::new(fetches)
+    }
+
+    /// Resolve column pointers for a table's archetype.
+    fn resolve_table_ptrs<T: crate::table::Table>(
+        &mut self,
+    ) -> (Vec<(*mut u8, usize)>, usize) {
+        let desc = self
+            .table_cache
+            .get_or_create::<T>(&mut self.components, &mut self.archetypes);
+        let arch_id = desc.archetype_id;
+        let col_indices = desc.col_indices.clone();
+        let item_sizes = desc.item_sizes.clone();
+
+        let archetype = &self.archetypes.archetypes[arch_id.0];
+        if archetype.is_empty() {
+            return (vec![], 0);
+        }
+
+        let col_ptrs: Vec<(*mut u8, usize)> = col_indices
+            .iter()
+            .zip(item_sizes.iter())
+            .map(|(&col_idx, &size)| unsafe { (archetype.columns[col_idx].get_ptr(0), size) })
+            .collect();
+
+        (col_ptrs, archetype.len())
+    }
+
+    /// Iterate all rows of a table's archetype with raw column pointers.
+    /// Skips archetype matching — goes directly to the table's cached archetype.
+    pub fn query_table_raw<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
+        let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
+        crate::table::TableIter::new(col_ptrs, len)
+    }
+
+    /// Iterate all rows with typed immutable field access.
+    pub fn query_table<T: crate::table::Table>(
+        &mut self,
+    ) -> crate::table::TableTypedIter<'_, T::Ref<'_>> {
+        let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
+        crate::table::TableTypedIter::new(col_ptrs, len)
+    }
+
+    /// Iterate all rows with typed mutable field access.
+    pub fn query_table_mut<T: crate::table::Table>(
+        &mut self,
+    ) -> crate::table::TableTypedIter<'_, T::Mut<'_>> {
+        let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
+        crate::table::TableTypedIter::new(col_ptrs, len)
     }
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {

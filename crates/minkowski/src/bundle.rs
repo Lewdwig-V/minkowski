@@ -126,7 +126,7 @@ mod tests {
         assert_eq!(written.len(), 2);
         let a_id = reg.id::<A>().unwrap();
         let a_entry = written.iter().find(|(id, _)| *id == a_id).unwrap();
-        let a_val: A = unsafe { std::ptr::read(a_entry.1.as_ptr() as *const A) };
+        let a_val: A = unsafe { std::ptr::read_unaligned(a_entry.1.as_ptr() as *const A) };
         assert_eq!(a_val, A(42));
     }
 }

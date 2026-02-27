@@ -103,6 +103,119 @@ cargo bench            # benchmarks
 
 Requires Rust 2021 edition. Dependencies: `rayon`, `fixedbitset`.
 
+## Architecture
+
+### Storage
+
+- **Column-oriented archetype storage** — each archetype is a collection of independently addressable `BlobVec` columns, not interleaved allocations. Enables per-column features (indexes, change ticks, compression) without touching archetype logic.
+- **Dense vs. sparse split** — components that benefit from contiguous iteration live in archetypes. Marker tags and rarely-queried components live in sparse maps (`HashMap<Entity, T>`) and don't contribute to archetype identity. Prevents archetype fragmentation.
+- **Entity IDs** — generational index `(u32 index, u32 generation)` packed into `u64`.
+
+### Compile-Time Schema Registry
+
+Proc macros define "tables" — known component bundles with fixed schemas:
+
+```rust
+#[derive(Table)]
+struct Transform {
+    position: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+}
+```
+
+A table is a pre-registered archetype with statically-known column offsets. Queries against known tables compile to direct pointer arithmetic, bypassing the archetype graph entirely.
+
+### Query Engine
+
+Two-tier query system:
+
+- **Static queries** — against known tables, skip archetype graph traversal, iterate as `&[T]` with zero indirection.
+- **Dynamic queries** — arbitrary component combinations, walk the archetype graph with cached `QueryState` (re-evaluated only when new archetypes appear).
+
+Matching uses **bitsets** — one per archetype, `(archetype_bits & query_bits) == query_bits`. Handles negation, optionals, and union queries with bitwise ops. Scales to hundreds of archetypes in microseconds.
+
+Query planning uses a simple plan tree:
+
+| Node | Purpose |
+|------|---------|
+| `Scan` | Iterate all rows in an archetype |
+| `IndexScan` | B-tree range lookup on an indexed column |
+| `Filter` | Row-level predicate evaluation |
+| `Merge` | Concatenate results from multiple archetypes |
+
+Plans are cached per-query. The planner runs rarely (query creation, new archetype events); the hot path is pointer chasing through pre-resolved column arrays.
+
+### Indexes
+
+Optional per-column B-tree or hash indexes:
+
+```rust
+#[derive(Table)]
+struct Player {
+    #[index(btree)]
+    score: u64,
+    #[index(hash)]
+    name: String,
+}
+```
+
+Enables O(log n) lookups by column value — essential for the database side, absent from pure-game ECS.
+
+### Mutation
+
+- **Deferred via command buffers** — structural changes (add/remove component, spawn/despawn) are batched and applied at sync points. Amortizes archetype migration cost and avoids iterator invalidation.
+- **Lazy archetype migration** — if a newly added component doesn't affect any active query, store it in sparse storage and defer the archetype move until actually needed.
+- **Change detection** — per-column tick tracking (`Changed<T>`, `Added<T>`). Entire archetypes skipped when unchanged since last query evaluation.
+
+### Persistence
+
+Log-structured persistence, modeled after SpacetimeDB / Redis AOF+RDB:
+
+- **Commit log (WAL)** — source of truth on disk. Every mutation serialized and appended sequentially. Append-only, no random IO.
+- **Snapshots** — periodic serialization of full world state. Recovery = load latest snapshot + replay subsequent log entries.
+- **Not mmap** — direct memory-mapped archetype storage creates crash consistency, migration, and TLB pressure problems.
+
+All mutations route through a `ChangeSet` abstraction, which is the natural serialization boundary for log entries.
+
+### Serialization
+
+| Layer | Format | Rationale |
+|-------|--------|-----------|
+| In-process systems | None | Typed references directly into archetype storage. Hot path never serializes. |
+| Commit log & client sync | bincode (v1) | Compact, fast, serde-native. No schema in payload — both sides share Rust type definitions. |
+| Snapshots (future) | rkyv | Zero-copy deserialization. Archived layout matches `BlobVec` layout, so snapshot load = mmap + pointer setup. |
+
+Serialization is behind a `WireFormat` trait for swappability. bincode has no schema evolution story — acceptable during development (wipe on schema change), needs a migration strategy before shipping persistent data.
+
+### Replication & Sync
+
+Falls out naturally from the commit log:
+
+- **Read replicas** — ship log entries to a second process, replay into its own world.
+- **Client sync** — send filtered log entries (only entities the client can see). Client maintains a local ECS mirror.
+- **Time-travel debugging** — replay log to tick N and stop.
+
+## Build Roadmap
+
+1. `BlobVec` — type-erased aligned column storage
+2. `Archetype` — collection of `BlobVec` columns keyed by `ComponentId`
+3. `World` — entity allocator + archetype storage + archetype graph edges
+4. `Query<(A, B, ...)>` — tuple trait impls with bitset matching
+5. `#[derive(Table)]` — proc macro for compile-time schema registration
+6. `ChangeSet` — mutation abstraction (enables command buffers, persistence, replication)
+7. Commit log + snapshot persistence
+8. Indexes (B-tree, hash)
+9. Transaction isolation / MVCC
+10. rkyv zero-copy snapshots
+
+## Design Principles
+
+- **Archetypes are an optimization, not a data model.** SpacetimeDB proves you can get excellent performance with fixed schemas and indexes. The archetype system is the tax for runtime flexibility — make it optional.
+- **Two-tier everything.** Static (compile-time known) paths for database-like use, dynamic paths for game-like use. Same underlying storage, different access patterns.
+- **Persistence is a log, not a flush.** Never serialize the world on every write. Append to a log, snapshot periodically.
+- **Query planning is cheap because it barely runs.** Cache aggressively, re-evaluate incrementally.
+
 ## License
 
 This project is licensed under the [Mozilla Public License 2.0](https://www.mozilla.org/en-US/MPL/2.0/).

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 fixedbitset = "0.5"
 rayon = "1"
+minkowski-derive = { path = "../minkowski-derive" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

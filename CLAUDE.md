@@ -16,7 +16,11 @@ cargo bench -p minkowski               # All criterion benchmarks
 cargo bench -p minkowski -- spawn      # Single benchmark
 
 cargo run -p minkowski --example boids --release   # Boids simulation (5K entities, 1K frames)
+
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib  # UB check
 ```
+
+Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows; `-Zmiri-ignore-leaks` because rayon's thread pool intentionally outlives main.
 
 Pre-commit hooks run `cargo fmt` and `cargo clippy -D warnings` on commit, `cargo test` on push.
 
