@@ -162,8 +162,62 @@ fn main() {
             .map(|(e, p, v)| (e, p.0, v.0))
             .collect();
 
-        // Step 3: Force accumulation (parallel) — TODO
-        // Step 4: Apply forces — TODO
+        // Step 3: Force accumulation (parallel)
+        let forces: Vec<(Entity, Vec2)> = {
+            use rayon::prelude::*;
+            snapshot.par_iter().map(|&(entity, pos, vel)| {
+                let mut sep = Vec2::ZERO;
+                let mut ali = Vec2::ZERO;
+                let mut coh = Vec2::ZERO;
+                let mut sep_count = 0u32;
+                let mut ali_count = 0u32;
+                let mut coh_count = 0u32;
+
+                for &(_other_e, other_pos, other_vel) in &snapshot {
+                    let diff = other_pos - pos;
+                    let dist_sq = diff.length_sq();
+                    if dist_sq < 1e-6 { continue; }
+
+                    let dist = dist_sq.sqrt();
+
+                    if dist < params.separation_radius {
+                        sep = sep - diff.normalized() * (1.0 / dist);
+                        sep_count += 1;
+                    }
+                    if dist < params.alignment_radius {
+                        ali = ali + other_vel;
+                        ali_count += 1;
+                    }
+                    if dist < params.cohesion_radius {
+                        coh = coh + other_pos;
+                        coh_count += 1;
+                    }
+                }
+
+                let mut force = Vec2::ZERO;
+                if sep_count > 0 {
+                    force += sep / sep_count as f32 * params.separation_weight;
+                }
+                if ali_count > 0 {
+                    let desired = ali / ali_count as f32 - vel;
+                    force += desired * params.alignment_weight;
+                }
+                if coh_count > 0 {
+                    let center = coh / coh_count as f32;
+                    let desired = center - pos;
+                    force += desired * params.cohesion_weight;
+                }
+
+                (entity, force.clamped(params.max_force))
+            }).collect()
+        };
+
+        // Step 4: Apply forces
+        for &(entity, force) in &forces {
+            if let Some(acc) = world.get_mut::<Acceleration>(entity) {
+                acc.0 = acc.0 + force;
+            }
+        }
 
         // Step 5: Integration
         for (vel, acc) in world.query::<(&mut Velocity, &Acceleration)>() {
