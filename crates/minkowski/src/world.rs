@@ -5,6 +5,7 @@ use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
+use crate::table::TableCache;
 
 fn get_pair_mut(v: &mut [Archetype], a: usize, b: usize) -> (&mut Archetype, &mut Archetype) {
     assert_ne!(a, b, "cannot get mutable references to the same archetype");
@@ -29,6 +30,7 @@ pub struct World {
     pub(crate) components: ComponentRegistry,
     pub(crate) sparse: SparseStorage,
     pub(crate) entity_locations: Vec<Option<EntityLocation>>,
+    pub(crate) table_cache: TableCache,
 }
 
 impl World {
@@ -39,6 +41,7 @@ impl World {
             components: ComponentRegistry::new(),
             sparse: SparseStorage::new(),
             entity_locations: Vec::new(),
+            table_cache: TableCache::new(),
         }
     }
 

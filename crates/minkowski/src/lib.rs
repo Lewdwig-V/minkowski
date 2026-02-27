@@ -8,6 +8,7 @@ pub mod component;
 pub mod entity;
 pub mod query;
 pub mod storage;
+pub mod table;
 pub mod world;
 
 pub use command::CommandBuffer;
