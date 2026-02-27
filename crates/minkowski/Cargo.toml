@@ -10,6 +10,7 @@ rayon = "1"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 hecs = "0.10"
+fastrand = "2"
 
 [[bench]]
 name = "spawn"

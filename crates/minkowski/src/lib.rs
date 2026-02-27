@@ -8,4 +8,4 @@ pub mod bundle;
 
 pub use entity::Entity;
 pub use world::World;
-// pub use command::CommandBuffer;
+pub use command::CommandBuffer;
