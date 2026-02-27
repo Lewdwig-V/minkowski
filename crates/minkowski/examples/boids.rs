@@ -115,6 +115,72 @@ impl Default for BoidParams {
     }
 }
 
+// ── Constants ───────────────────────────────────────────────────────
+
+const ENTITY_COUNT: usize = 5_000;
+const FRAME_COUNT: usize = 1_000;
+const CHURN_INTERVAL: usize = 100;
+const CHURN_COUNT: usize = 50;
+const DT: f32 = 0.016;
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn spawn_boid(world: &mut World, params: &BoidParams) -> Entity {
+    let x = fastrand::f32() * params.world_size;
+    let y = fastrand::f32() * params.world_size;
+    let angle = fastrand::f32() * std::f32::consts::TAU;
+    let speed = fastrand::f32() * params.max_speed;
+    world.spawn((
+        Position(Vec2::new(x, y)),
+        Velocity(Vec2::new(angle.cos() * speed, angle.sin() * speed)),
+        Acceleration(Vec2::ZERO),
+    ))
+}
+
+// ── Main ────────────────────────────────────────────────────────────
+
 fn main() {
-    println!("boids: types defined, simulation not yet implemented");
+    let params = BoidParams::default();
+    let mut world = World::new();
+
+    // Spawn initial boids
+    for _ in 0..ENTITY_COUNT {
+        spawn_boid(&mut world, &params);
+    }
+
+    for frame in 0..FRAME_COUNT {
+        let frame_start = Instant::now();
+
+        // Step 1: Zero accelerations
+        for acc in world.query::<&mut Acceleration>() {
+            acc.0 = Vec2::ZERO;
+        }
+
+        // Step 2: Snapshot for neighbor queries
+        let snapshot: Vec<(Entity, Vec2, Vec2)> = world
+            .query::<(Entity, &Position, &Velocity)>()
+            .map(|(e, p, v)| (e, p.0, v.0))
+            .collect();
+
+        // Step 3: Force accumulation (parallel) — TODO
+        // Step 4: Apply forces — TODO
+
+        // Step 5: Integration
+        for (vel, acc) in world.query::<(&mut Velocity, &Acceleration)>() {
+            vel.0 = vel.0 + acc.0 * DT;
+            vel.0 = vel.0.clamped(params.max_speed);
+        }
+        for (pos, vel) in world.query::<(&mut Position, &Velocity)>() {
+            pos.0 = pos.0 + vel.0 * DT;
+            pos.0.x = pos.0.x.rem_euclid(params.world_size);
+            pos.0.y = pos.0.y.rem_euclid(params.world_size);
+        }
+
+        // Step 6: Spawn/despawn churn — TODO
+        // Step 7: Stats — TODO
+
+        let _ = (frame, frame_start, &snapshot);
+    }
+
+    println!("boids: {} frames complete", FRAME_COUNT);
 }
