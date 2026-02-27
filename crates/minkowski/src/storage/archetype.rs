@@ -1,1 +1,189 @@
-// TODO: implement
+use std::collections::HashMap;
+use fixedbitset::FixedBitSet;
+
+use crate::component::{ComponentId, ComponentRegistry};
+use crate::entity::Entity;
+use super::blob_vec::BlobVec;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ArchetypeId(pub usize);
+
+pub(crate) struct Archetype {
+    pub id: ArchetypeId,
+    /// Bitset of which ComponentIds this archetype contains.
+    pub component_ids: FixedBitSet,
+    /// Sorted list of ComponentIds (canonical key for archetype lookup).
+    pub sorted_ids: Vec<ComponentId>,
+    /// One BlobVec per component, in sorted_ids order.
+    pub columns: Vec<BlobVec>,
+    /// ComponentId -> index into columns.
+    pub component_index: HashMap<ComponentId, usize>,
+    /// Row -> Entity mapping.
+    pub entities: Vec<Entity>,
+}
+
+impl Archetype {
+    pub fn new(
+        id: ArchetypeId,
+        sorted_component_ids: &[ComponentId],
+        registry: &ComponentRegistry,
+    ) -> Self {
+        let max_id = sorted_component_ids.iter().copied().max().unwrap_or(0);
+        let mut bitset = FixedBitSet::with_capacity(max_id + 1);
+        let mut columns = Vec::with_capacity(sorted_component_ids.len());
+        let mut component_index = HashMap::new();
+
+        for (col_idx, &comp_id) in sorted_component_ids.iter().enumerate() {
+            bitset.insert(comp_id);
+            let info = registry.info(comp_id);
+            columns.push(BlobVec::new(info.layout, info.drop_fn, 0));
+            component_index.insert(comp_id, col_idx);
+        }
+
+        Self {
+            id,
+            component_ids: bitset,
+            sorted_ids: sorted_component_ids.to_vec(),
+            columns,
+            component_index,
+            entities: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entities.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+    }
+}
+
+/// Collection of archetypes with lookup by component set.
+pub(crate) struct Archetypes {
+    pub archetypes: Vec<Archetype>,
+    by_components: HashMap<Vec<ComponentId>, ArchetypeId>,
+    generation: u64,
+}
+
+impl Archetypes {
+    pub fn new() -> Self {
+        Self {
+            archetypes: Vec::new(),
+            by_components: HashMap::new(),
+            generation: 0,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Find or create an archetype for the given sorted component ID set.
+    pub fn get_or_create(
+        &mut self,
+        sorted_ids: &[ComponentId],
+        registry: &ComponentRegistry,
+    ) -> ArchetypeId {
+        if let Some(&id) = self.by_components.get(sorted_ids) {
+            return id;
+        }
+        let id = ArchetypeId(self.archetypes.len());
+        let archetype = Archetype::new(id, sorted_ids, registry);
+        self.archetypes.push(archetype);
+        self.by_components.insert(sorted_ids.to_vec(), id);
+        self.generation += 1;
+        id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::ComponentRegistry;
+    use crate::entity::Entity;
+
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    struct Pos { x: f32, y: f32 }
+
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    struct Vel { dx: f32, dy: f32 }
+
+    fn setup_registry() -> ComponentRegistry {
+        ComponentRegistry::new()
+    }
+
+    #[test]
+    fn archetype_creation() {
+        let mut reg = setup_registry();
+        let pos_id = reg.register::<Pos>();
+        let vel_id = reg.register::<Vel>();
+        let mut ids = vec![pos_id, vel_id];
+        ids.sort();
+        let arch = Archetype::new(ArchetypeId(0), &ids, &reg);
+        assert!(arch.component_ids.contains(pos_id));
+        assert!(arch.component_ids.contains(vel_id));
+        assert_eq!(arch.len(), 0);
+    }
+
+    #[test]
+    fn push_and_read_row() {
+        let mut reg = setup_registry();
+        let pos_id = reg.register::<Pos>();
+        let mut ids = vec![pos_id];
+        ids.sort();
+        let mut arch = Archetype::new(ArchetypeId(0), &ids, &reg);
+
+        let entity = Entity::new(0, 0);
+        let mut pos = Pos { x: 1.0, y: 2.0 };
+        unsafe {
+            let col = arch.component_index[&pos_id];
+            arch.columns[col].push(&mut pos as *mut Pos as *mut u8);
+            std::mem::forget(pos);
+            arch.entities.push(entity);
+        }
+        assert_eq!(arch.len(), 1);
+
+        unsafe {
+            let col = arch.component_index[&pos_id];
+            let ptr = arch.columns[col].get_ptr(0) as *const Pos;
+            assert_eq!(*ptr, Pos { x: 1.0, y: 2.0 });
+        }
+    }
+
+    #[test]
+    fn archetypes_get_or_create() {
+        let mut reg = setup_registry();
+        let pos_id = reg.register::<Pos>();
+        let vel_id = reg.register::<Vel>();
+
+        let mut archetypes = Archetypes::new();
+
+        let mut ids = vec![pos_id, vel_id];
+        ids.sort();
+        let a1 = archetypes.get_or_create(&ids, &reg);
+        let a2 = archetypes.get_or_create(&ids, &reg);
+        assert_eq!(a1, a2); // idempotent
+
+        let ids2 = vec![pos_id];
+        let a3 = archetypes.get_or_create(&ids2, &reg);
+        assert_ne!(a1, a3); // different component set = different archetype
+    }
+
+    #[test]
+    fn archetypes_generation_bumps_on_create() {
+        let mut reg = setup_registry();
+        let pos_id = reg.register::<Pos>();
+        let mut archetypes = Archetypes::new();
+
+        let gen_before = archetypes.generation();
+        archetypes.get_or_create(&[pos_id], &reg);
+        assert!(archetypes.generation() > gen_before);
+
+        let gen_before = archetypes.generation();
+        archetypes.get_or_create(&[pos_id], &reg); // same, no new archetype
+        assert_eq!(archetypes.generation(), gen_before);
+    }
+}
