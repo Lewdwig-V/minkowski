@@ -166,6 +166,35 @@ impl World {
         QueryIter::new(fetches)
     }
 
+    /// Iterate all rows of a table's archetype with raw column pointers.
+    /// Skips archetype matching — goes directly to the table's cached archetype.
+    pub fn query_table<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
+        let desc = self
+            .table_cache
+            .get_or_create::<T>(&mut self.components, &mut self.archetypes);
+        let arch_id = desc.archetype_id;
+        let col_indices = desc.col_indices.clone();
+        let item_sizes = desc.item_sizes.clone();
+
+        let archetype = &self.archetypes.archetypes[arch_id.0];
+        if archetype.is_empty() {
+            return crate::table::TableIter::new(vec![], 0);
+        }
+
+        let col_ptrs: Vec<(*mut u8, usize)> = col_indices
+            .iter()
+            .zip(item_sizes.iter())
+            .map(|(&col_idx, &size)| unsafe { (archetype.columns[col_idx].get_ptr(0), size) })
+            .collect();
+
+        crate::table::TableIter::new(col_ptrs, archetype.len())
+    }
+
+    /// Mutable variant of `query_table`. Mutability enforced by `&mut self`.
+    pub fn query_table_mut<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
+        self.query_table::<T>()
+    }
+
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
         assert!(self.is_alive(entity), "entity is not alive");
         let index = entity.index() as usize;

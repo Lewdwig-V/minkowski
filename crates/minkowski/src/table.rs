@@ -86,6 +86,54 @@ impl TableCache {
     }
 }
 
+/// Iterator over rows of a table's archetype, yielding raw column pointers per field.
+pub struct TableIter<'w> {
+    /// One entry per field: (column_start_ptr, item_size).
+    col_ptrs: Vec<(*mut u8, usize)>,
+    len: usize,
+    current_row: usize,
+    _marker: std::marker::PhantomData<&'w ()>,
+}
+
+// Safety: column pointers come from BlobVec which stores Send+Sync component data.
+unsafe impl Send for TableIter<'_> {}
+unsafe impl Sync for TableIter<'_> {}
+
+impl<'w> TableIter<'w> {
+    pub(crate) fn new(col_ptrs: Vec<(*mut u8, usize)>, len: usize) -> Self {
+        Self {
+            col_ptrs,
+            len,
+            current_row: 0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'w> Iterator for TableIter<'w> {
+    /// Yields a Vec of raw pointers, one per field in field order, pointing to the current row.
+    type Item = Vec<*mut u8>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_row >= self.len {
+            return None;
+        }
+        let row = self.current_row;
+        self.current_row += 1;
+        Some(
+            self.col_ptrs
+                .iter()
+                .map(|&(ptr, item_size)| unsafe { ptr.add(row * item_size) })
+                .collect(),
+        )
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len - self.current_row;
+        (remaining, Some(remaining))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +218,78 @@ mod tests {
             .get_or_create::<PosVel>(&mut components, &mut archetypes)
             .archetype_id;
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn query_table_yields_correct_data() {
+        let mut world = crate::world::World::new();
+        world.spawn(PosVel {
+            pos: Pos { x: 1.0, y: 2.0 },
+            vel: Vel { dx: 3.0, dy: 4.0 },
+        });
+        world.spawn(PosVel {
+            pos: Pos { x: 5.0, y: 6.0 },
+            vel: Vel { dx: 7.0, dy: 8.0 },
+        });
+
+        let rows: Vec<(Pos, Vel)> = world
+            .query_table::<PosVel>()
+            .map(|ptrs| unsafe {
+                (
+                    std::ptr::read(ptrs[0] as *const Pos),
+                    std::ptr::read(ptrs[1] as *const Vel),
+                )
+            })
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.x, 1.0);
+        assert_eq!(rows[0].1.dx, 3.0);
+        assert_eq!(rows[1].0.x, 5.0);
+    }
+
+    #[test]
+    fn query_table_mut_allows_mutation() {
+        let mut world = crate::world::World::new();
+        let e = world.spawn(PosVel {
+            pos: Pos { x: 1.0, y: 2.0 },
+            vel: Vel { dx: 3.0, dy: 4.0 },
+        });
+
+        for ptrs in world.query_table_mut::<PosVel>() {
+            unsafe {
+                let pos = &mut *(ptrs[0] as *mut Pos);
+                pos.x += 10.0;
+            }
+        }
+
+        assert_eq!(
+            world.get::<Pos>(e),
+            Some(&Pos { x: 11.0, y: 2.0 })
+        );
+    }
+
+    #[test]
+    fn query_table_interop_with_dynamic_query() {
+        let mut world = crate::world::World::new();
+        world.spawn(PosVel {
+            pos: Pos { x: 1.0, y: 2.0 },
+            vel: Vel { dx: 3.0, dy: 4.0 },
+        });
+
+        // Dynamic query finds the same entity
+        let count = world.query::<(&Pos, &Vel)>().count();
+        assert_eq!(count, 1);
+
+        let pos = world.query::<&Pos>().next().unwrap();
+        assert_eq!(pos.x, 1.0);
+    }
+
+    #[test]
+    fn query_table_empty() {
+        let mut world = crate::world::World::new();
+        let count = world.query_table::<PosVel>().count();
+        assert_eq!(count, 0);
     }
 
     #[test]
