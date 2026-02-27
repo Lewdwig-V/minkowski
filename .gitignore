@@ -1,2 +1,17 @@
 /target
 Cargo.lock
+.claude/settings.local.json
+.gitconfig
+.gitmodules
+.idea
+.mcp.json
+.profile
+.ripgreprc
+.vscode
+.zprofile
+.zshrc
+HEAD
+config
+hooks
+objects
+refs

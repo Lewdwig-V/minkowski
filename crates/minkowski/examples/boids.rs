@@ -5,8 +5,8 @@
 //! Exercises: spawn, despawn, multi-component queries, mutation,
 //! parallel iteration, deferred commands, archetype stability under churn.
 
+use minkowski::{CommandBuffer, Entity, World};
 use std::time::Instant;
-use minkowski::{Entity, World, CommandBuffer};
 
 // ── Vec2 ────────────────────────────────────────────────────────────
 
@@ -36,7 +36,10 @@ impl Vec2 {
         if len < 1e-8 {
             Self::ZERO
         } else {
-            Self { x: self.x / len, y: self.y / len }
+            Self {
+                x: self.x / len,
+                y: self.y / len,
+            }
         }
     }
 
@@ -52,26 +55,49 @@ impl Vec2 {
 
 impl std::ops::Add for Vec2 {
     type Output = Self;
-    fn add(self, rhs: Self) -> Self { Self { x: self.x + rhs.x, y: self.y + rhs.y } }
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            x: self.x + rhs.x,
+            y: self.y + rhs.y,
+        }
+    }
 }
 
 impl std::ops::AddAssign for Vec2 {
-    fn add_assign(&mut self, rhs: Self) { self.x += rhs.x; self.y += rhs.y; }
+    fn add_assign(&mut self, rhs: Self) {
+        self.x += rhs.x;
+        self.y += rhs.y;
+    }
 }
 
 impl std::ops::Sub for Vec2 {
     type Output = Self;
-    fn sub(self, rhs: Self) -> Self { Self { x: self.x - rhs.x, y: self.y - rhs.y } }
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+        }
+    }
 }
 
 impl std::ops::Mul<f32> for Vec2 {
     type Output = Self;
-    fn mul(self, rhs: f32) -> Self { Self { x: self.x * rhs, y: self.y * rhs } }
+    fn mul(self, rhs: f32) -> Self {
+        Self {
+            x: self.x * rhs,
+            y: self.y * rhs,
+        }
+    }
 }
 
 impl std::ops::Div<f32> for Vec2 {
     type Output = Self;
-    fn div(self, rhs: f32) -> Self { Self { x: self.x / rhs, y: self.y / rhs } }
+    fn div(self, rhs: f32) -> Self {
+        Self {
+            x: self.x / rhs,
+            y: self.y / rhs,
+        }
+    }
 }
 
 // ── Components ──────────────────────────────────────────────────────
@@ -165,67 +191,72 @@ fn main() {
         // Step 3: Force accumulation (parallel)
         let forces: Vec<(Entity, Vec2)> = {
             use rayon::prelude::*;
-            snapshot.par_iter().map(|&(entity, pos, vel)| {
-                let mut sep = Vec2::ZERO;
-                let mut ali = Vec2::ZERO;
-                let mut coh = Vec2::ZERO;
-                let mut sep_count = 0u32;
-                let mut ali_count = 0u32;
-                let mut coh_count = 0u32;
+            snapshot
+                .par_iter()
+                .map(|&(entity, pos, vel)| {
+                    let mut sep = Vec2::ZERO;
+                    let mut ali = Vec2::ZERO;
+                    let mut coh = Vec2::ZERO;
+                    let mut sep_count = 0u32;
+                    let mut ali_count = 0u32;
+                    let mut coh_count = 0u32;
 
-                for &(_other_e, other_pos, other_vel) in &snapshot {
-                    let diff = other_pos - pos;
-                    let dist_sq = diff.length_sq();
-                    if dist_sq < 1e-6 { continue; }
+                    for &(_other_e, other_pos, other_vel) in &snapshot {
+                        let diff = other_pos - pos;
+                        let dist_sq = diff.length_sq();
+                        if dist_sq < 1e-6 {
+                            continue;
+                        }
 
-                    let dist = dist_sq.sqrt();
+                        let dist = dist_sq.sqrt();
 
-                    if dist < params.separation_radius {
-                        sep = sep - diff.normalized() * (1.0 / dist);
-                        sep_count += 1;
+                        if dist < params.separation_radius {
+                            sep = sep - diff.normalized() * (1.0 / dist);
+                            sep_count += 1;
+                        }
+                        if dist < params.alignment_radius {
+                            ali += other_vel;
+                            ali_count += 1;
+                        }
+                        if dist < params.cohesion_radius {
+                            coh += other_pos;
+                            coh_count += 1;
+                        }
                     }
-                    if dist < params.alignment_radius {
-                        ali = ali + other_vel;
-                        ali_count += 1;
-                    }
-                    if dist < params.cohesion_radius {
-                        coh = coh + other_pos;
-                        coh_count += 1;
-                    }
-                }
 
-                let mut force = Vec2::ZERO;
-                if sep_count > 0 {
-                    force += sep / sep_count as f32 * params.separation_weight;
-                }
-                if ali_count > 0 {
-                    let desired = ali / ali_count as f32 - vel;
-                    force += desired * params.alignment_weight;
-                }
-                if coh_count > 0 {
-                    let center = coh / coh_count as f32;
-                    let desired = center - pos;
-                    force += desired * params.cohesion_weight;
-                }
+                    let mut force = Vec2::ZERO;
+                    if sep_count > 0 {
+                        force += sep / sep_count as f32 * params.separation_weight;
+                    }
+                    if ali_count > 0 {
+                        let desired = ali / ali_count as f32 - vel;
+                        force += desired * params.alignment_weight;
+                    }
+                    if coh_count > 0 {
+                        let center = coh / coh_count as f32;
+                        let desired = center - pos;
+                        force += desired * params.cohesion_weight;
+                    }
 
-                (entity, force.clamped(params.max_force))
-            }).collect()
+                    (entity, force.clamped(params.max_force))
+                })
+                .collect()
         };
 
         // Step 4: Apply forces
         for &(entity, force) in &forces {
             if let Some(acc) = world.get_mut::<Acceleration>(entity) {
-                acc.0 = acc.0 + force;
+                acc.0 += force;
             }
         }
 
         // Step 5: Integration
         for (vel, acc) in world.query::<(&mut Velocity, &Acceleration)>() {
-            vel.0 = vel.0 + acc.0 * DT;
+            vel.0 += acc.0 * DT;
             vel.0 = vel.0.clamped(params.max_speed);
         }
         for (pos, vel) in world.query::<(&mut Position, &Velocity)>() {
-            pos.0 = pos.0 + vel.0 * DT;
+            pos.0 += vel.0 * DT;
             pos.0.x = pos.0.x.rem_euclid(params.world_size);
             pos.0.y = pos.0.y.rem_euclid(params.world_size);
         }
@@ -255,7 +286,11 @@ fn main() {
             for vel in world.query::<&Velocity>() {
                 speed_sum += vel.0.length();
             }
-            let avg_vel = if entity_count > 0 { speed_sum / entity_count as f32 } else { 0.0 };
+            let avg_vel = if entity_count > 0 {
+                speed_sum / entity_count as f32
+            } else {
+                0.0
+            };
             let dt_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
             println!(
                 "frame {:04} | entities: {:>5} | avg_vel: {:.2} | dt: {:.1}ms",

@@ -1,5 +1,5 @@
-use std::alloc::Layout;
 use crate::component::{Component, ComponentId, ComponentRegistry};
+use std::alloc::Layout;
 
 /// A collection of components that can be added to an entity.
 /// Implemented for tuples of Components via macro.
@@ -11,7 +11,11 @@ pub unsafe trait Bundle: Send + Sync + 'static {
     fn component_ids(registry: &mut ComponentRegistry) -> Vec<ComponentId>;
 
     /// Write each component to the callback: (ComponentId, *const u8, Layout).
-    /// Components are consumed — caller takes ownership via the pointer.
+    /// Components are consumed -- caller takes ownership via the pointer.
+    ///
+    /// # Safety
+    /// The caller must ensure that the `func` callback correctly takes ownership
+    /// of the component data at the given pointer and does not double-free it.
     unsafe fn put(
         self,
         registry: &ComponentRegistry,
@@ -93,7 +97,7 @@ mod tests {
         let mut reg = ComponentRegistry::new();
         let ids = <(A, B)>::component_ids(&mut reg);
         assert_eq!(ids.len(), 2);
-        assert!(ids[0] < ids[1] || ids[0] == ids[1]);
+        assert!(ids[0] <= ids[1]);
     }
 
     #[test]
@@ -108,7 +112,7 @@ mod tests {
         let mut reg = ComponentRegistry::new();
         let _ = <(A, B)>::component_ids(&mut reg);
 
-        let bundle = (A(42), B(3.14));
+        let bundle = (A(42), B(3.5));
         let mut written: Vec<(ComponentId, Vec<u8>)> = Vec::new();
 
         unsafe {

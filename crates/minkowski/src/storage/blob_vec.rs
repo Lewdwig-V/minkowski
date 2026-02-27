@@ -15,6 +15,7 @@ pub(crate) struct BlobVec {
 unsafe impl Send for BlobVec {}
 unsafe impl Sync for BlobVec {}
 
+#[allow(dead_code)]
 impl BlobVec {
     /// Creates a new `BlobVec` for items with the given layout and optional drop function.
     pub fn new(item_layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>, capacity: usize) -> Self {
@@ -23,17 +24,20 @@ impl BlobVec {
         } else if capacity == 0 {
             (NonNull::dangling(), 0)
         } else {
-            let layout = Layout::from_size_align(
-                item_layout.size() * capacity,
-                item_layout.align(),
-            )
-            .expect("invalid layout");
+            let layout =
+                Layout::from_size_align(item_layout.size() * capacity, item_layout.align())
+                    .expect("invalid layout");
             let ptr = unsafe { alloc::alloc(layout) };
-            let data = NonNull::new(ptr)
-                .unwrap_or_else(|| alloc::handle_alloc_error(layout));
+            let data = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
             (data, capacity)
         };
-        Self { item_layout, drop_fn, data, len: 0, capacity }
+        Self {
+            item_layout,
+            drop_fn,
+            data,
+            len: 0,
+            capacity,
+        }
     }
 
     #[inline]
@@ -149,7 +153,11 @@ impl BlobVec {
         if size == 0 {
             return;
         }
-        let new_capacity = if self.capacity == 0 { 4 } else { self.capacity * 2 };
+        let new_capacity = if self.capacity == 0 {
+            4
+        } else {
+            self.capacity * 2
+        };
         let new_layout = Layout::from_size_align(
             size.checked_mul(new_capacity).expect("capacity overflow"),
             self.item_layout.align(),
@@ -159,16 +167,12 @@ impl BlobVec {
         let new_data = if self.capacity == 0 {
             unsafe { alloc::alloc(new_layout) }
         } else {
-            let old_layout = Layout::from_size_align(
-                size * self.capacity,
-                self.item_layout.align(),
-            )
-            .unwrap();
+            let old_layout =
+                Layout::from_size_align(size * self.capacity, self.item_layout.align()).unwrap();
             unsafe { alloc::realloc(self.data.as_ptr(), old_layout, new_layout.size()) }
         };
 
-        self.data = NonNull::new(new_data)
-            .unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
+        self.data = NonNull::new(new_data).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
         self.capacity = new_capacity;
     }
 }
@@ -177,17 +181,18 @@ impl Drop for BlobVec {
     fn drop(&mut self) {
         if let Some(drop_fn) = self.drop_fn {
             for i in 0..self.len {
-                unsafe { drop_fn(self.ptr_at(i)); }
+                unsafe {
+                    drop_fn(self.ptr_at(i));
+                }
             }
         }
         let size = self.item_layout.size();
         if size > 0 && self.capacity > 0 {
-            let layout = Layout::from_size_align(
-                size * self.capacity,
-                self.item_layout.align(),
-            )
-            .unwrap();
-            unsafe { alloc::dealloc(self.data.as_ptr(), layout); }
+            let layout =
+                Layout::from_size_align(size * self.capacity, self.item_layout.align()).unwrap();
+            unsafe {
+                alloc::dealloc(self.data.as_ptr(), layout);
+            }
         }
     }
 }
@@ -263,7 +268,9 @@ mod tests {
         let mut bv = bv_for::<u32>();
         // Push enough to force multiple reallocations
         for i in 0u32..256 {
-            unsafe { push_val(&mut bv, i); }
+            unsafe {
+                push_val(&mut bv, i);
+            }
         }
         assert_eq!(bv.len(), 256);
         unsafe {
@@ -319,6 +326,7 @@ mod tests {
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         #[derive(Debug)]
+        #[allow(dead_code)]
         struct Tracked(u32);
         impl Drop for Tracked {
             fn drop(&mut self) {
@@ -344,6 +352,7 @@ mod tests {
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         #[derive(Debug)]
+        #[allow(dead_code)]
         struct Tracked(u32);
         impl Drop for Tracked {
             fn drop(&mut self) {
@@ -383,7 +392,9 @@ mod tests {
         let mut bv = BlobVec::new(Layout::new::<u32>(), None, 16);
         // Should not reallocate for the first 16 pushes
         for i in 0u32..16 {
-            unsafe { push_val(&mut bv, i); }
+            unsafe {
+                push_val(&mut bv, i);
+            }
         }
         assert_eq!(bv.len(), 16);
         unsafe {

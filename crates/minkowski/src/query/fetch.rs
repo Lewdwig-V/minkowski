@@ -1,5 +1,5 @@
-use std::marker::PhantomData;
 use fixedbitset::FixedBitSet;
+use std::marker::PhantomData;
 
 use crate::component::{Component, ComponentRegistry};
 use crate::entity::Entity;
@@ -15,8 +15,13 @@ unsafe impl<T: Send> Send for ThinSlicePtr<T> {}
 unsafe impl<T: Sync> Sync for ThinSlicePtr<T> {}
 
 impl<T> ThinSlicePtr<T> {
+    /// # Safety
+    /// `ptr` must be valid for reads/writes and properly aligned for `T`.
     pub unsafe fn new(ptr: *mut T) -> Self {
-        Self { ptr, _marker: PhantomData }
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -35,7 +40,10 @@ pub unsafe trait WorldQuery {
     fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> Self::Fetch<'w>;
 
     /// Fetch the item at the given row.
-    /// # Safety: row must be < archetype.len(), caller ensures no aliasing violations.
+    ///
+    /// # Safety
+    /// `row` must be less than `archetype.len()`, and the caller must ensure
+    /// no aliasing violations occur.
     unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w>;
 }
 
@@ -53,7 +61,7 @@ unsafe impl<T: Component> WorldQuery for &T {
         bits
     }
 
-    fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> ThinSlicePtr<T> {
+    fn init_fetch(archetype: &Archetype, registry: &ComponentRegistry) -> ThinSlicePtr<T> {
         let id = registry.id::<T>().expect("component not registered");
         let col_idx = archetype.component_index[&id];
         unsafe { ThinSlicePtr::new(archetype.columns[col_idx].get_ptr(0) as *mut T) }
@@ -73,7 +81,7 @@ unsafe impl<T: Component> WorldQuery for &mut T {
         <&T>::required_ids(registry)
     }
 
-    fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> ThinSlicePtr<T> {
+    fn init_fetch(archetype: &Archetype, registry: &ComponentRegistry) -> ThinSlicePtr<T> {
         <&T>::init_fetch(archetype, registry)
     }
 
@@ -91,7 +99,7 @@ unsafe impl WorldQuery for Entity {
         FixedBitSet::new()
     }
 
-    fn init_fetch<'w>(archetype: &'w Archetype, _registry: &ComponentRegistry) -> ThinSlicePtr<Entity> {
+    fn init_fetch(archetype: &Archetype, _registry: &ComponentRegistry) -> ThinSlicePtr<Entity> {
         unsafe { ThinSlicePtr::new(archetype.entities.as_ptr() as *mut Entity) }
     }
 
@@ -109,7 +117,7 @@ unsafe impl<T: Component> WorldQuery for Option<&T> {
         FixedBitSet::new() // optional — does not filter archetypes
     }
 
-    fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> Option<ThinSlicePtr<T>> {
+    fn init_fetch(archetype: &Archetype, registry: &ComponentRegistry) -> Option<ThinSlicePtr<T>> {
         let id = registry.id::<T>()?;
         let col_idx = archetype.component_index.get(&id)?;
         Some(unsafe { ThinSlicePtr::new(archetype.columns[*col_idx].get_ptr(0) as *mut T) })
@@ -171,10 +179,10 @@ mod tests {
     use crate::storage::archetype::{Archetype, ArchetypeId};
 
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Pos { x: f32, y: f32 }
-    #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Vel { dx: f32, dy: f32 }
-
+    struct Pos {
+        x: f32,
+        y: f32,
+    }
     fn make_archetype_with_data(
         reg: &ComponentRegistry,
         ids: &[crate::component::ComponentId],
@@ -192,7 +200,7 @@ mod tests {
         unsafe {
             let col = arch.component_index[&pos_id];
             arch.columns[col].push(&mut pos as *mut Pos as *mut u8);
-            std::mem::forget(pos);
+            let _ = pos;
         }
         arch.entities.push(Entity::new(0, 0));
 
@@ -211,7 +219,7 @@ mod tests {
         unsafe {
             let col = arch.component_index[&pos_id];
             arch.columns[col].push(&mut pos as *mut Pos as *mut u8);
-            std::mem::forget(pos);
+            let _ = pos;
         }
         arch.entities.push(Entity::new(0, 0));
 
@@ -236,7 +244,7 @@ mod tests {
         let mut pos = Pos { x: 0.0, y: 0.0 };
         unsafe {
             arch.columns[0].push(&mut pos as *mut Pos as *mut u8);
-            std::mem::forget(pos);
+            let _ = pos;
         }
         arch.entities.push(entity);
 

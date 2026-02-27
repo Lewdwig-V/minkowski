@@ -1,7 +1,7 @@
+use fixedbitset::FixedBitSet;
 use std::alloc::Layout;
 use std::any::TypeId;
 use std::collections::HashMap;
-use fixedbitset::FixedBitSet;
 
 /// Marker trait for ECS components. Blanket-implemented for all eligible types.
 pub trait Component: 'static + Send + Sync {}
@@ -9,6 +9,7 @@ impl<T: 'static + Send + Sync> Component for T {}
 
 pub type ComponentId = usize;
 
+#[allow(dead_code)]
 pub(crate) struct ComponentInfo {
     pub id: ComponentId,
     pub name: &'static str,
@@ -52,6 +53,7 @@ impl ComponentRegistry {
         id
     }
 
+    #[allow(dead_code)]
     pub fn register_sparse<T: Component>(&mut self) -> ComponentId {
         let id = self.register::<T>();
         self.sparse_set.grow(id + 1);
@@ -80,8 +82,15 @@ impl ComponentRegistry {
 mod tests {
     use super::*;
 
-    struct Position { _x: f32, _y: f32 }
-    struct Velocity { _dx: f32, _dy: f32 }
+    struct Position {
+        _x: f32,
+        _y: f32,
+    }
+    struct Velocity {
+        _dx: f32,
+        _dy: f32,
+    }
+    #[allow(dead_code)]
     struct Health(u32);
 
     #[test]

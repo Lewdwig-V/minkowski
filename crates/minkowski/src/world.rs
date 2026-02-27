@@ -44,7 +44,9 @@ impl World {
 
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
         let component_ids = B::component_ids(&mut self.components);
-        let arch_id = self.archetypes.get_or_create(&component_ids, &self.components);
+        let arch_id = self
+            .archetypes
+            .get_or_create(&component_ids, &self.components);
         let entity = self.entities.alloc();
         let index = entity.index() as usize;
 
@@ -83,7 +85,9 @@ impl World {
         let row = location.row;
 
         for col in &mut archetype.columns {
-            unsafe { col.swap_remove(row); }
+            unsafe {
+                col.swap_remove(row);
+            }
         }
 
         archetype.entities.swap_remove(row);
@@ -146,10 +150,11 @@ impl World {
 
     pub fn query<Q: WorldQuery>(&self) -> QueryIter<'_, Q> {
         let required = Q::required_ids(&self.components);
-        let fetches: Vec<_> = self.archetypes.archetypes.iter()
-            .filter(|arch| {
-                !arch.is_empty() && required.is_subset(&arch.component_ids)
-            })
+        let fetches: Vec<_> = self
+            .archetypes
+            .archetypes
+            .iter()
+            .filter(|arch| !arch.is_empty() && required.is_subset(&arch.component_ids))
             .map(|arch| {
                 let fetch = Q::init_fetch(arch, &self.components);
                 (fetch, arch.len())
@@ -251,7 +256,9 @@ impl World {
         };
 
         // Compute target archetype: source components minus removed component
-        let target_ids: Vec<ComponentId> = src_arch.sorted_ids.iter()
+        let target_ids: Vec<ComponentId> = src_arch
+            .sorted_ids
+            .iter()
             .copied()
             .filter(|&id| id != comp_id)
             .collect();
@@ -263,11 +270,15 @@ impl World {
             let arch = &mut self.archetypes.archetypes[src_arch_id.0];
             // swap_remove_no_drop for the removed component (already read)
             let removed_col = arch.component_index[&comp_id];
-            unsafe { arch.columns[removed_col].swap_remove_no_drop(src_row); }
+            unsafe {
+                arch.columns[removed_col].swap_remove_no_drop(src_row);
+            }
             // swap_remove with drop for remaining columns
             for (&cid, &col_idx) in &arch.component_index {
                 if cid != comp_id {
-                    unsafe { arch.columns[col_idx].swap_remove(src_row); }
+                    unsafe {
+                        arch.columns[col_idx].swap_remove(src_row);
+                    }
                 }
             }
             arch.entities.swap_remove(src_row);
@@ -300,7 +311,9 @@ impl World {
         for (&cid, &src_col) in &src_arch.component_index {
             if cid == comp_id {
                 // Already read — just discard from source
-                unsafe { src_arch.columns[src_col].swap_remove_no_drop(src_row); }
+                unsafe {
+                    src_arch.columns[src_col].swap_remove_no_drop(src_row);
+                }
             } else if let Some(&tgt_col) = target_arch.component_index.get(&cid) {
                 unsafe {
                     let ptr = src_arch.columns[src_col].get_ptr(src_row);
@@ -342,10 +355,16 @@ mod tests {
     use super::*;
 
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Pos { x: f32, y: f32 }
+    struct Pos {
+        x: f32,
+        y: f32,
+    }
 
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Vel { dx: f32, dy: f32 }
+    struct Vel {
+        dx: f32,
+        dy: f32,
+    }
 
     #[test]
     fn spawn_and_get() {

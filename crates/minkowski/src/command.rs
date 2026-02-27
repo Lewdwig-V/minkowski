@@ -6,12 +6,15 @@ use crate::world::World;
 /// Deferred mutation buffer. Records commands during iteration,
 /// applies them all at once to &mut World.
 pub struct CommandBuffer {
+    #[allow(clippy::type_complexity)]
     commands: Vec<Box<dyn FnOnce(&mut World) + Send>>,
 }
 
 impl CommandBuffer {
     pub fn new() -> Self {
-        Self { commands: Vec::new() }
+        Self {
+            commands: Vec::new(),
+        }
     }
 
     pub fn spawn<B: Bundle>(&mut self, bundle: B) {
@@ -61,9 +64,15 @@ mod tests {
     use crate::world::World;
 
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Pos { x: f32, y: f32 }
+    struct Pos {
+        x: f32,
+        y: f32,
+    }
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct Vel { dx: f32, dy: f32 }
+    struct Vel {
+        dx: f32,
+        dy: f32,
+    }
 
     #[test]
     fn command_spawn() {
@@ -115,7 +124,10 @@ mod tests {
     fn commands_during_iteration() {
         let mut world = World::new();
         for i in 0..5 {
-            world.spawn((Pos { x: i as f32, y: 0.0 },));
+            world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },));
         }
 
         let mut cmds = CommandBuffer::new();
