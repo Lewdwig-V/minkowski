@@ -230,7 +230,24 @@ fn main() {
             pos.0.y = pos.0.y.rem_euclid(params.world_size);
         }
 
-        // Step 6: Spawn/despawn churn — TODO
+        // Step 6: Spawn/despawn churn
+        if frame > 0 && frame % CHURN_INTERVAL == 0 {
+            let entities: Vec<Entity> = world.query::<Entity>().collect();
+            let count = entities.len();
+
+            let mut cmds = CommandBuffer::new();
+            for _ in 0..CHURN_COUNT.min(count) {
+                let idx = fastrand::usize(..count);
+                cmds.despawn(entities[idx]);
+            }
+            cmds.apply(&mut world);
+
+            let current = world.query::<&Position>().count();
+            let deficit = ENTITY_COUNT.saturating_sub(current);
+            for _ in 0..deficit {
+                spawn_boid(&mut world, &params);
+            }
+        }
         // Step 7: Stats — TODO
 
         let _ = (frame, frame_start, &snapshot);
