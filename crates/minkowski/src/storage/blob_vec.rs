@@ -117,6 +117,24 @@ impl BlobVec {
         self.len -= 1;
     }
 
+    /// Removes the element at `row` by swapping with the last element.
+    /// Neither drops the removed element nor copies it out.
+    /// Used during archetype migration where data is moved via get_ptr + push.
+    ///
+    /// # Safety
+    /// `row` must be in bounds. Caller must have already moved/copied the data.
+    pub unsafe fn swap_remove_no_drop(&mut self, row: usize) {
+        debug_assert!(row < self.len);
+        let last = self.len - 1;
+        let size = self.item_layout.size();
+        if row != last && size > 0 {
+            let row_ptr = self.ptr_at(row);
+            let last_ptr = self.ptr_at(last);
+            std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size);
+        }
+        self.len -= 1;
+    }
+
     #[inline]
     fn ptr_at(&self, index: usize) -> *mut u8 {
         if self.item_layout.size() == 0 {
