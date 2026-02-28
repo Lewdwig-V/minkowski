@@ -16,3 +16,5 @@ hooks
 objects
 refs
 .claude/
+.bashrc
+.bash_profile
