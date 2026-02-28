@@ -7,6 +7,7 @@
 extern crate self as minkowski;
 
 pub mod bundle;
+pub mod changeset;
 pub mod command;
 pub mod component;
 pub mod entity;
@@ -15,6 +16,7 @@ pub mod storage;
 pub mod table;
 pub mod world;
 
+pub use changeset::EnumChangeSet;
 pub use command::CommandBuffer;
 pub use entity::Entity;
 pub use minkowski_derive::Table;

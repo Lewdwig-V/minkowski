@@ -7,10 +7,15 @@ use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
 use crate::table::TableCache;
 use fixedbitset::FixedBitSet;
+use std::alloc::Layout;
 use std::any::TypeId;
 use std::collections::HashMap;
 
-fn get_pair_mut(v: &mut [Archetype], a: usize, b: usize) -> (&mut Archetype, &mut Archetype) {
+pub(crate) fn get_pair_mut(
+    v: &mut [Archetype],
+    a: usize,
+    b: usize,
+) -> (&mut Archetype, &mut Archetype) {
     assert_ne!(a, b, "cannot get mutable references to the same archetype");
     if a < b {
         let (left, right) = v.split_at_mut(b);
@@ -438,6 +443,34 @@ impl World {
 
         Some(removed)
     }
+
+    /// Read all component data for an entity as raw bytes.
+    /// Returns (ComponentId, *const u8, Layout) per component.
+    /// The pointers are valid until the next structural mutation.
+    #[allow(dead_code)]
+    pub(crate) fn read_all_components(
+        &self,
+        entity: Entity,
+    ) -> Option<Vec<(ComponentId, *const u8, Layout)>> {
+        if !self.entities.is_alive(entity) {
+            return None;
+        }
+        let location = self.entity_locations[entity.index() as usize]?;
+        let archetype = &self.archetypes.archetypes[location.archetype_id.0];
+
+        let components: Vec<_> = archetype
+            .sorted_ids
+            .iter()
+            .map(|&comp_id| {
+                let col_idx = archetype.component_index[&comp_id];
+                let info = self.components.info(comp_id);
+                let ptr = unsafe { archetype.columns[col_idx].get_ptr(location.row) };
+                (comp_id, ptr as *const u8, info.layout)
+            })
+            .collect();
+
+        Some(components)
+    }
 }
 
 impl Default for World {
@@ -618,5 +651,17 @@ mod tests {
         world.insert(e, Vel { dx: 1.0, dy: 0.0 });
         assert_eq!(world.query::<&Pos>().count(), 1);
         assert_eq!(world.query::<(&Pos, &Vel)>().count(), 1);
+    }
+
+    #[test]
+    fn read_entity_components_raw() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+
+        let components = world.read_all_components(e).unwrap();
+        assert_eq!(components.len(), 2);
+        for &(_, _, layout) in &components {
+            assert!(layout.size() > 0);
+        }
     }
 }

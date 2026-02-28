@@ -2,12 +2,22 @@
 
 A column-oriented archetype ECS built from scratch in Rust. Game workloads first, database features later.
 
-## What's here (Phase 1)
+## What's here
 
-The foundational storage layer: type-erased BlobVec columns packed into archetypes, generational entity IDs, parallel query iteration via rayon, and deferred mutation through CommandBuffer.
+The foundational storage layer plus compile-time schema support and cached queries.
+
+**Phase 1** — type-erased BlobVec columns packed into archetypes, generational entity IDs, parallel query iteration via rayon, deferred mutation through CommandBuffer.
+
+**Phase 2** — `#[derive(Table)]` proc macro for compile-time schema declarations with typed row accessors, and transparent query caching with incremental archetype scanning.
 
 ```rust
-use minkowski::{World, Entity, CommandBuffer};
+use minkowski::{World, Entity, CommandBuffer, Table};
+
+#[derive(Table)]
+struct Transform {
+    pos: Position,
+    vel: Velocity,
+}
 
 struct Position { x: f32, y: f32 }
 struct Velocity { dx: f32, dy: f32 }
@@ -17,7 +27,7 @@ let mut world = World::new();
 // Spawn entities into archetypes
 let e = world.spawn((Position { x: 0.0, y: 0.0 }, Velocity { dx: 1.0, dy: 0.0 }));
 
-// Query and mutate
+// Dynamic query (cached — skips archetype scan on repeat calls)
 for (pos, vel) in world.query::<(&mut Position, &Velocity)>() {
     pos.x += vel.dx;
     pos.y += vel.dy;
@@ -27,6 +37,15 @@ for (pos, vel) in world.query::<(&mut Position, &Velocity)>() {
 world.query::<(&mut Position, &Velocity)>().par_for_each(|(pos, vel)| {
     pos.x += vel.dx;
 });
+
+// Table query — typed access, bypasses archetype matching entirely
+world.spawn(Transform {
+    pos: Position { x: 0.0, y: 0.0 },
+    vel: Velocity { dx: 1.0, dy: 0.0 },
+});
+for row in world.query_table::<Transform>() {
+    println!("{}, {}", row.pos.x, row.vel.dx);
+}
 
 // Archetype migration
 world.insert(e, Health(100));   // moves entity to new archetype
@@ -77,12 +96,10 @@ $ cargo bench -p minkowski
 
 Suites: `spawn` (10K entities), `iterate` (10K), `parallel` (100K vs sequential), `add_remove` (1K migration cycles), `fragmented` (20 archetypes).
 
-## What's next (Phase 2+)
+## What's next (Phase 3+)
 
 | Phase | Feature | Why |
 |---|---|---|
-| 2 | `#[derive(Component)]` proc macro | Compile-time schema validation, ergonomic derives |
-| 2 | Query caching with generation tracking | Skip archetype re-scan when nothing changed |
 | 3 | Change detection ticks | Systems only process entities that actually changed |
 | 3 | Automatic system scheduling | Conflict detection, parallel system execution |
 | 4 | Persistence — WAL + snapshots | Durable state via BlobVec memcpy to disk |
@@ -101,7 +118,7 @@ cargo test             # all tests
 cargo bench            # benchmarks
 ```
 
-Requires Rust 2021 edition. Dependencies: `rayon`, `fixedbitset`.
+Requires Rust 2021 edition. Dependencies: `rayon`, `fixedbitset`, `minkowski-derive`.
 
 ## Architecture
 
@@ -131,7 +148,7 @@ A table is a pre-registered archetype with statically-known column offsets. Quer
 Two-tier query system:
 
 - **Static queries** — against known tables, skip archetype graph traversal, iterate as `&[T]` with zero indirection.
-- **Dynamic queries** — arbitrary component combinations, walk the archetype graph with cached `QueryState` (re-evaluated only when new archetypes appear).
+- **Dynamic queries** — arbitrary component combinations, matched archetypes cached per query type in `QueryCacheEntry` (incrementally updated only when new archetypes appear).
 
 Matching uses **bitsets** — one per archetype, `(archetype_bits & query_bits) == query_bits`. Handles negation, optionals, and union queries with bitwise ops. Scales to hundreds of archetypes in microseconds.
 
