@@ -27,7 +27,6 @@ pub(crate) struct EntityLocation {
     pub row: usize,
 }
 
-#[allow(dead_code)]
 pub(crate) struct QueryCacheEntry {
     /// Archetypes whose component_ids are a superset of the query's required_ids.
     matched_ids: Vec<ArchetypeId>,
@@ -44,7 +43,6 @@ pub struct World {
     pub(crate) sparse: SparseStorage,
     pub(crate) entity_locations: Vec<Option<EntityLocation>>,
     pub(crate) table_cache: TableCache,
-    #[allow(dead_code)]
     pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
 }
 
@@ -167,18 +165,51 @@ impl World {
         }
     }
 
-    pub fn query<Q: WorldQuery>(&mut self) -> QueryIter<'_, Q> {
-        let required = Q::required_ids(&self.components);
-        let fetches: Vec<_> = self
-            .archetypes
-            .archetypes
+    pub fn query<Q: WorldQuery + 'static>(&mut self) -> QueryIter<'_, Q> {
+        let type_id = TypeId::of::<Q>();
+        let total = self.archetypes.archetypes.len();
+
+        let entry = self
+            .query_cache
+            .entry(type_id)
+            .or_insert_with(|| QueryCacheEntry {
+                matched_ids: Vec::new(),
+                required: Q::required_ids(&self.components),
+                last_archetype_count: 0,
+            });
+
+        // Refresh required bitset in case new components were registered since
+        // the cache entry was created. If the bitset changed, rescan from scratch.
+        let fresh_required = Q::required_ids(&self.components);
+        if fresh_required != entry.required {
+            entry.required = fresh_required;
+            entry.matched_ids.clear();
+            entry.last_archetype_count = 0;
+        }
+
+        // Incremental scan: only check archetypes added since last cache update
+        if entry.last_archetype_count < total {
+            for arch in &self.archetypes.archetypes[entry.last_archetype_count..total] {
+                if entry.required.is_subset(&arch.component_ids) {
+                    entry.matched_ids.push(arch.id);
+                }
+            }
+            entry.last_archetype_count = total;
+        }
+
+        // Build fetches from cached archetype list, filtering empties at iteration time
+        let fetches: Vec<_> = entry
+            .matched_ids
             .iter()
-            .filter(|arch| !arch.is_empty() && required.is_subset(&arch.component_ids))
-            .map(|arch| {
-                let fetch = Q::init_fetch(arch, &self.components);
-                (fetch, arch.len())
+            .filter_map(|&aid| {
+                let arch = &self.archetypes.archetypes[aid.0];
+                if arch.is_empty() {
+                    return None;
+                }
+                Some((Q::init_fetch(arch, &self.components), arch.len()))
             })
             .collect();
+
         QueryIter::new(fetches)
     }
 

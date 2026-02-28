@@ -65,6 +65,12 @@ impl ComponentRegistry {
         self.by_type.get(&TypeId::of::<T>()).copied()
     }
 
+    /// Returns the number of registered components.
+    /// Also serves as the next `ComponentId` that will be assigned.
+    pub fn len(&self) -> usize {
+        self.infos.len()
+    }
+
     pub fn info(&self, id: ComponentId) -> &ComponentInfo {
         &self.infos[id]
     }
