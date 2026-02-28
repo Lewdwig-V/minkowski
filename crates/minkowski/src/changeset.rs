@@ -1,7 +1,7 @@
 use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 
-use crate::component::ComponentId;
+use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::world::{get_pair_mut, EntityLocation, World};
 
@@ -176,6 +176,26 @@ impl EnumChangeSet {
             entity,
             component_id,
         });
+    }
+}
+
+// ── Typed safe helpers ─────────────────────────────────────────
+
+impl EnumChangeSet {
+    /// Record inserting a component on an entity. Auto-registers the
+    /// component type. Safe wrapper over `record_insert`.
+    pub fn insert<T: Component>(&mut self, world: &mut World, entity: Entity, value: T) {
+        let comp_id = world.register_component::<T>();
+        let layout = Layout::new::<T>();
+        let value = std::mem::ManuallyDrop::new(value);
+        self.record_insert(entity, comp_id, &*value as *const T as *const u8, layout);
+    }
+
+    /// Record removing a component from an entity. Auto-registers the
+    /// component type.
+    pub fn remove<T: Component>(&mut self, world: &mut World, entity: Entity) {
+        let comp_id = world.register_component::<T>();
+        self.record_remove(entity, comp_id);
     }
 }
 
@@ -730,5 +750,51 @@ mod tests {
 
         let _ = forward_again.apply(&mut world);
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
+    }
+
+    // ── typed helper tests ────────────────────────────────────────
+
+    #[test]
+    fn typed_insert_and_apply() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert::<Vel>(&mut world, e, Vel { dx: 3.0, dy: 4.0 });
+
+        let _reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn typed_insert_overwrite_and_reverse() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert::<Pos>(&mut world, e, Pos { x: 99.0, y: 99.0 });
+
+        let reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 99.0, y: 99.0 }));
+
+        let _ = reverse.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn typed_remove_and_reverse() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+
+        let mut cs = EnumChangeSet::new();
+        cs.remove::<Vel>(&mut world, e);
+
+        let reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), None);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+
+        let _ = reverse.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
 }
