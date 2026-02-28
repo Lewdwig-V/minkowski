@@ -524,4 +524,68 @@ mod tests {
         assert_eq!(world.get::<Pos>(e2), Some(&Pos { x: 2.0, y: 0.0 }));
         assert_eq!(world.get::<Pos>(e3), Some(&Pos { x: 3.0, y: 0.0 }));
     }
+
+    #[test]
+    fn query_cache_populated_on_first_call() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        let count1 = world.query::<&Pos>().count();
+        let count2 = world.query::<&Pos>().count();
+        assert_eq!(count1, 1);
+        assert_eq!(count2, 1);
+    }
+
+    #[test]
+    fn query_cache_incremental_after_new_archetype() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.query::<&Pos>().count(), 1);
+
+        world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
+        assert_eq!(world.query::<&Pos>().count(), 2);
+    }
+
+    #[test]
+    fn query_cache_filters_empty_archetypes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.query::<&Pos>().count(), 1);
+
+        world.despawn(e);
+        assert_eq!(world.query::<&Pos>().count(), 0);
+    }
+
+    #[test]
+    fn query_cache_independent_per_query_type() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
+
+        assert_eq!(world.query::<&Pos>().count(), 2);
+        assert_eq!(world.query::<(&Pos, &Vel)>().count(), 1);
+    }
+
+    #[test]
+    fn query_cache_unrelated_archetype_no_false_match() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.query::<&Vel>().count(), 0);
+
+        world.spawn((Vel { dx: 1.0, dy: 0.0 },));
+        assert_eq!(world.query::<&Pos>().count(), 1);
+        assert_eq!(world.query::<&Vel>().count(), 1);
+    }
+
+    #[test]
+    fn query_cache_after_migration() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.query::<&Pos>().count(), 1);
+        assert_eq!(world.query::<(&Pos, &Vel)>().count(), 0);
+
+        world.insert(e, Vel { dx: 1.0, dy: 0.0 });
+        assert_eq!(world.query::<&Pos>().count(), 1);
+        assert_eq!(world.query::<(&Pos, &Vel)>().count(), 1);
+    }
 }
