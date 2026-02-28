@@ -180,9 +180,9 @@ impl World {
 
         let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
         let col_idx = *archetype.component_index.get(&comp_id)?;
-        archetype.columns[col_idx].mark_changed(self.current_tick);
         unsafe {
-            let ptr = archetype.columns[col_idx].get_ptr(location.row) as *mut T;
+            let ptr =
+                archetype.columns[col_idx].get_ptr_mut(location.row, self.current_tick) as *mut T;
             Some(&mut *ptr)
         }
     }
@@ -292,7 +292,10 @@ impl World {
 
     /// Iterate all rows of a table's archetype with raw column pointers.
     /// Skips archetype matching — goes directly to the table's cached archetype.
+    ///
+    /// Marks all columns changed (raw pointers allow arbitrary writes).
     pub fn query_table_raw<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
+        self.mark_table_columns_changed::<T>();
         let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
         crate::table::TableIter::new(col_ptrs, len)
     }
@@ -306,11 +309,26 @@ impl World {
     }
 
     /// Iterate all rows with typed mutable field access.
+    ///
+    /// Marks all columns changed for change detection.
     pub fn query_table_mut<T: crate::table::Table>(
         &mut self,
     ) -> crate::table::TableTypedIter<'_, T::Mut<'_>> {
+        self.mark_table_columns_changed::<T>();
         let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
         crate::table::TableTypedIter::new(col_ptrs, len)
+    }
+
+    /// Mark all columns in a table's archetype as changed at the current tick.
+    fn mark_table_columns_changed<T: crate::table::Table>(&mut self) {
+        let desc = self
+            .table_cache
+            .get_or_create::<T>(&mut self.components, &mut self.archetypes);
+        let arch_id = desc.archetype_id;
+        let archetype = &mut self.archetypes.archetypes[arch_id.0];
+        for col in &mut archetype.columns {
+            col.mark_changed(self.current_tick);
+        }
     }
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
@@ -325,11 +343,11 @@ impl World {
             if src_arch.component_ids.contains(comp_id) {
                 let col_idx = src_arch.component_index[&comp_id];
                 unsafe {
-                    let ptr = src_arch.columns[col_idx].get_ptr(location.row) as *mut T;
+                    let ptr = src_arch.columns[col_idx].get_ptr_mut(location.row, self.current_tick)
+                        as *mut T;
                     std::ptr::drop_in_place(ptr);
                     std::ptr::write(ptr, component);
                 }
-                src_arch.columns[col_idx].mark_changed(self.current_tick);
                 return;
             }
         }
@@ -814,6 +832,101 @@ mod tests {
         let _ = world.query::<&mut Pos>().count();
 
         // Now Changed<Pos> should detect the mutation
+        assert_eq!(world.query::<(Changed<Pos>,)>().count(), 1);
+    }
+
+    #[test]
+    fn query_table_mut_marks_columns_changed() {
+        use crate::table::{Table, TableRow};
+
+        // Manual table impl for testing (matches the PosVel in table::tests)
+        struct PosVelTable {
+            pos: Pos,
+            vel: Vel,
+        }
+        unsafe impl crate::bundle::Bundle for PosVelTable {
+            fn component_ids(
+                registry: &mut crate::component::ComponentRegistry,
+            ) -> Vec<crate::component::ComponentId> {
+                let mut ids = vec![registry.register::<Pos>(), registry.register::<Vel>()];
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            }
+            unsafe fn put(
+                self,
+                registry: &crate::component::ComponentRegistry,
+                func: &mut dyn FnMut(crate::component::ComponentId, *const u8, std::alloc::Layout),
+            ) {
+                let pos = std::mem::ManuallyDrop::new(self.pos);
+                func(
+                    registry.id::<Pos>().unwrap(),
+                    &*pos as *const Pos as *const u8,
+                    std::alloc::Layout::new::<Pos>(),
+                );
+                let vel = std::mem::ManuallyDrop::new(self.vel);
+                func(
+                    registry.id::<Vel>().unwrap(),
+                    &*vel as *const Vel as *const u8,
+                    std::alloc::Layout::new::<Vel>(),
+                );
+            }
+        }
+        struct PosVelMut<'w> {
+            pos: &'w mut Pos,
+            #[allow(dead_code)]
+            vel: &'w mut Vel,
+        }
+        struct PosVelRef<'w> {
+            #[allow(dead_code)]
+            pos: &'w Pos,
+            #[allow(dead_code)]
+            vel: &'w Vel,
+        }
+        unsafe impl<'w> TableRow<'w> for PosVelMut<'w> {
+            unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
+                Self {
+                    pos: &mut *(col_ptrs[0].0.add(row * col_ptrs[0].1) as *mut Pos),
+                    vel: &mut *(col_ptrs[1].0.add(row * col_ptrs[1].1) as *mut Vel),
+                }
+            }
+        }
+        unsafe impl<'w> TableRow<'w> for PosVelRef<'w> {
+            unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
+                Self {
+                    pos: &*(col_ptrs[0].0.add(row * col_ptrs[0].1) as *const Pos),
+                    vel: &*(col_ptrs[1].0.add(row * col_ptrs[1].1) as *const Vel),
+                }
+            }
+        }
+        unsafe impl Table for PosVelTable {
+            const FIELD_COUNT: usize = 2;
+            type Ref<'w> = PosVelRef<'w>;
+            type Mut<'w> = PosVelMut<'w>;
+            fn register(
+                registry: &mut crate::component::ComponentRegistry,
+            ) -> Vec<crate::component::ComponentId> {
+                vec![registry.register::<Pos>(), registry.register::<Vel>()]
+            }
+        }
+
+        let mut world = World::new();
+        world.tick();
+        world.spawn(PosVelTable {
+            pos: Pos { x: 1.0, y: 2.0 },
+            vel: Vel { dx: 3.0, dy: 4.0 },
+        });
+
+        // Consume initial change
+        let _ = world.query::<(Changed<Pos>,)>().count();
+
+        // Mutate via query_table_mut
+        world.tick();
+        for row in world.query_table_mut::<PosVelTable>() {
+            row.pos.x += 10.0;
+        }
+
+        // Changed<Pos> must detect the mutation from the table path
         assert_eq!(world.query::<(Changed<Pos>,)>().count(), 1);
     }
 }

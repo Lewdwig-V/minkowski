@@ -295,23 +295,20 @@ fn changeset_insert_raw(
         // Entity already has this component — overwrite in-place.
         let col_idx = src_arch.component_index[&comp_id];
 
-        // Capture old value for reverse.
+        // Capture old value for reverse (read path — no tick).
         let old_ptr = unsafe { src_arch.columns[col_idx].get_ptr(location.row) };
         reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
 
-        // Overwrite with new data.
+        // Overwrite with new data (write path — marks column changed).
+        let src_arch = &mut world.archetypes.archetypes[location.archetype_id.0];
         unsafe {
-            // For types with drop, drop the old value first.
+            let dst = src_arch.columns[col_idx].get_ptr_mut(location.row, world.current_tick);
             let info = world.components.info(comp_id);
             if let Some(drop_fn) = info.drop_fn {
-                drop_fn(old_ptr);
+                drop_fn(dst);
             }
-            std::ptr::copy_nonoverlapping(data_ptr, old_ptr, layout.size());
+            std::ptr::copy_nonoverlapping(data_ptr, dst, layout.size());
         }
-
-        // Mark the written column as changed.
-        let src_arch = &mut world.archetypes.archetypes[location.archetype_id.0];
-        src_arch.columns[col_idx].mark_changed(world.current_tick);
     } else {
         // Entity does not have this component — reverse is Remove.
         reverse.record_remove(entity, comp_id);

@@ -88,13 +88,25 @@ impl BlobVec {
         self.len += 1;
     }
 
-    /// Returns a raw pointer to the element at `row`.
+    /// Returns a raw pointer to the element at `row` (read path).
     ///
     /// # Safety
     /// `row` must be in bounds (`row < len`).
     #[inline]
     pub unsafe fn get_ptr(&self, row: usize) -> *mut u8 {
         debug_assert!(row < self.len);
+        self.ptr_at(row)
+    }
+
+    /// Returns a raw pointer to the element at `row` and marks the column
+    /// changed at the given tick (write path).
+    ///
+    /// # Safety
+    /// `row` must be in bounds (`row < len`).
+    #[inline]
+    pub unsafe fn get_ptr_mut(&mut self, row: usize, tick: Tick) -> *mut u8 {
+        debug_assert!(row < self.len);
+        self.changed_tick = tick;
         self.ptr_at(row)
     }
 
