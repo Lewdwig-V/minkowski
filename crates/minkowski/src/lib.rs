@@ -14,7 +14,7 @@ pub mod entity;
 pub mod query;
 pub mod storage;
 pub mod table;
-pub mod tick;
+pub(crate) mod tick;
 pub mod world;
 
 pub use changeset::EnumChangeSet;
@@ -22,5 +22,4 @@ pub use command::CommandBuffer;
 pub use entity::Entity;
 pub use minkowski_derive::Table;
 pub use query::fetch::Changed;
-pub use tick::Tick;
 pub use world::World;

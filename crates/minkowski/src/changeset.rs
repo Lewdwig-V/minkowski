@@ -210,16 +210,16 @@ impl EnumChangeSet {
                         world.entity_locations.resize(index + 1, None);
                     }
 
+                    let tick = world.next_tick();
                     let archetype = &mut world.archetypes.archetypes[arch_id.0];
                     for &(comp_id, offset, layout) in components {
                         let src = self.arena.get(offset);
                         let col = archetype.component_index[&comp_id];
                         unsafe {
-                            // push takes *mut u8 but only reads from it
                             archetype.columns[col].push(src as *mut u8);
                         }
-                        archetype.columns[col].mark_changed(world.current_tick);
-                        let _ = layout; // layout stored for reverse, not needed here
+                        archetype.columns[col].mark_changed(tick);
+                        let _ = layout;
                     }
                     let row = archetype.entities.len();
                     archetype.entities.push(*entity);
@@ -300,9 +300,10 @@ fn changeset_insert_raw(
         reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
 
         // Overwrite with new data (write path — marks column changed).
+        let tick = world.next_tick();
         let src_arch = &mut world.archetypes.archetypes[location.archetype_id.0];
         unsafe {
-            let dst = src_arch.columns[col_idx].get_ptr_mut(location.row, world.current_tick);
+            let dst = src_arch.columns[col_idx].get_ptr_mut(location.row, tick);
             let info = world.components.info(comp_id);
             if let Some(drop_fn) = info.drop_fn {
                 drop_fn(dst);
@@ -324,6 +325,7 @@ fn changeset_insert_raw(
         let target_arch_id = world
             .archetypes
             .get_or_create(&target_ids, &world.components);
+        let tick = world.next_tick();
 
         let (src_arch, target_arch) = get_pair_mut(
             &mut world.archetypes.archetypes,
@@ -350,7 +352,7 @@ fn changeset_insert_raw(
 
         // Mark all target columns as changed.
         for col in &mut target_arch.columns {
-            col.mark_changed(world.current_tick);
+            col.mark_changed(tick);
         }
 
         // Move entity tracking.

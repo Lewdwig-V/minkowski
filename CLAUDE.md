@@ -69,9 +69,9 @@ Build with `-C target-cpu=native` (configured in `.cargo/config.toml`) to enable
 
 ### Change Detection
 
-Each BlobVec column stores a `changed_tick: Tick` — the world tick at which it was last mutably accessed. `World::tick()` advances the global counter. Every mutable access path (spawn, get_mut, insert, query `&mut T`) sets `changed_tick = current_tick` on the affected columns. Marking is pessimistic (on mutable access, not actual write) but zero-cost at the write site.
+Each BlobVec column stores a `changed_tick: Tick` — the tick at which it was last mutably accessed. The tick is a monotonic u64 counter that auto-advances on every mutation and query — there is no user-facing `World::tick()`. Every mutable access path (spawn, get_mut, insert, query `&mut T`, query_table_mut, query_table_raw, changeset apply) advances the tick and marks affected columns. Marking is pessimistic (on mutable access, not actual write) but zero-cost at the write site.
 
-`Changed<T>` is a `WorldQuery` filter that skips entire archetypes whose column tick is older than the query's `last_read_tick` (stored per query type in `QueryCacheEntry`). `Tick` is a u32 newtype with wrapping-aware `is_newer_than` comparison to handle overflow correctly.
+`Changed<T>` is a `WorldQuery` filter that skips entire archetypes whose column tick is older than the query's `last_read_tick` (stored per query type in `QueryCacheEntry`). `Changed<T>` means "since the last time this query observed this column" — it has no concept of frames or simulation time. `Tick` is `pub(crate)` — not exposed to users.
 
 ### Deferred Mutation
 
@@ -81,7 +81,7 @@ Each BlobVec column stores a `changed_tick: Tick` — the world tick at which it
 
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Tick`, `Changed`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `ComponentRegistry`, `EntityAllocator`, `QueryCacheEntry`).
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `ComponentRegistry`, `EntityAllocator`, `QueryCacheEntry`, `Tick`).
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.

@@ -1,27 +1,29 @@
-/// Monotonic tick counter with wrapping-aware comparison.
+/// Monotonic event counter for change detection.
 ///
-/// Used for change detection: each BlobVec column stores the tick at which
-/// it was last mutably accessed. Queries compare column ticks against their
-/// last-read tick to skip unchanged archetypes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Tick(u32);
+/// Each BlobVec column stores the tick at which it was last mutably accessed.
+/// Queries compare column ticks against their last-read tick to skip unchanged
+/// archetypes. The tick is an implementation detail of the storage engine —
+/// it is not a frame counter, simulation clock, or user-facing concept.
+///
+/// u64 gives ~584,000 years at 1M events/second. No wrapping needed.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub(crate) struct Tick(u64);
 
 impl Tick {
-    pub fn new(value: u32) -> Self {
+    #[cfg(test)]
+    pub fn new(value: u64) -> Self {
         Self(value)
     }
 
-    /// Wrapping-aware comparison. Returns true if `self` is more recent than `other`.
-    ///
-    /// Handles overflow: treats any tick within `u32::MAX / 2` distance as "recent".
+    /// Returns true if `self` is strictly more recent than `other`.
     pub fn is_newer_than(self, other: Tick) -> bool {
-        let diff = self.0.wrapping_sub(other.0);
-        diff > 0 && diff < u32::MAX / 2
+        self.0 > other.0
     }
 
-    /// Advance the tick by one (wrapping).
-    pub fn advance(&mut self) {
-        self.0 = self.0.wrapping_add(1);
+    /// Advance the tick by one. Returns the new tick value.
+    pub fn advance(&mut self) -> Tick {
+        self.0 += 1;
+        *self
     }
 }
 
@@ -37,7 +39,8 @@ mod tests {
     #[test]
     fn advance_increments() {
         let mut t = Tick::new(0);
-        t.advance();
+        let new = t.advance();
+        assert_eq!(new, Tick::new(1));
         assert_eq!(t, Tick::new(1));
     }
 
@@ -56,17 +59,12 @@ mod tests {
     }
 
     #[test]
-    fn newer_than_wrapping() {
-        let old = Tick::new(u32::MAX - 5);
-        let new = Tick::new(3);
-        assert!(new.is_newer_than(old));
-        assert!(!old.is_newer_than(new));
-    }
-
-    #[test]
-    fn advance_wraps() {
-        let mut t = Tick::new(u32::MAX);
-        t.advance();
-        assert_eq!(t, Tick::new(0));
+    fn ordering() {
+        let a = Tick::new(1);
+        let b = Tick::new(2);
+        let c = Tick::new(2);
+        assert!(a < b);
+        assert_eq!(b, c);
+        assert!(b > a);
     }
 }
