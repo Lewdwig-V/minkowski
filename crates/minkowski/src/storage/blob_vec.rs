@@ -17,6 +17,15 @@ unsafe impl Sync for BlobVec {}
 
 #[allow(dead_code)]
 impl BlobVec {
+    /// Minimum allocation alignment for all BlobVec columns.
+    /// 64 bytes = cache line on x86-64 and Apple Silicon.
+    const MIN_COLUMN_ALIGN: usize = 64;
+
+    /// Compute the allocation alignment for a BlobVec column.
+    fn alloc_align(item: &Layout) -> usize {
+        item.align().max(Self::MIN_COLUMN_ALIGN)
+    }
+
     /// Creates a new `BlobVec` for items with the given layout and optional drop function.
     pub fn new(item_layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>, capacity: usize) -> Self {
         let (data, capacity) = if item_layout.size() == 0 {
@@ -24,9 +33,11 @@ impl BlobVec {
         } else if capacity == 0 {
             (NonNull::dangling(), 0)
         } else {
-            let layout =
-                Layout::from_size_align(item_layout.size() * capacity, item_layout.align())
-                    .expect("invalid layout");
+            let layout = Layout::from_size_align(
+                item_layout.size() * capacity,
+                Self::alloc_align(&item_layout),
+            )
+            .expect("invalid layout");
             let ptr = unsafe { alloc::alloc(layout) };
             let data = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
             (data, capacity)
@@ -160,7 +171,7 @@ impl BlobVec {
         };
         let new_layout = Layout::from_size_align(
             size.checked_mul(new_capacity).expect("capacity overflow"),
-            self.item_layout.align(),
+            Self::alloc_align(&self.item_layout),
         )
         .expect("invalid layout");
 
@@ -168,7 +179,8 @@ impl BlobVec {
             unsafe { alloc::alloc(new_layout) }
         } else {
             let old_layout =
-                Layout::from_size_align(size * self.capacity, self.item_layout.align()).unwrap();
+                Layout::from_size_align(size * self.capacity, Self::alloc_align(&self.item_layout))
+                    .unwrap();
             unsafe { alloc::realloc(self.data.as_ptr(), old_layout, new_layout.size()) }
         };
 
@@ -189,7 +201,8 @@ impl Drop for BlobVec {
         let size = self.item_layout.size();
         if size > 0 && self.capacity > 0 {
             let layout =
-                Layout::from_size_align(size * self.capacity, self.item_layout.align()).unwrap();
+                Layout::from_size_align(size * self.capacity, Self::alloc_align(&self.item_layout))
+                    .unwrap();
             unsafe {
                 alloc::dealloc(self.data.as_ptr(), layout);
             }
@@ -385,6 +398,24 @@ mod tests {
             bv.push(&mut unit as *mut () as *mut u8);
         }
         assert_eq!(bv.len(), 2);
+    }
+
+    #[test]
+    fn column_base_is_64_byte_aligned() {
+        for &(size, align) in &[(4, 4), (8, 8), (1, 1), (12, 4), (32, 16)] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            let mut bv = BlobVec::new(layout, None, 8);
+            unsafe {
+                let mut val = vec![0u8; size];
+                bv.push(val.as_mut_ptr());
+            }
+            let base = unsafe { bv.get_ptr(0) } as usize;
+            assert_eq!(
+                base % 64,
+                0,
+                "BlobVec base not 64-byte aligned for size={size}, align={align}, base={base:#x}"
+            );
+        }
     }
 
     #[test]
