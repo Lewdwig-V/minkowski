@@ -1,13 +1,14 @@
-//! Game of Life with undo — exercises Changed<T>, get_mut, and undo/replay.
+//! Game of Life with undo — exercises Changed<T>, EnumChangeSet, and undo/replay.
 //!
 //! Run: cargo run -p minkowski --example life --release
 //!
 //! Features exercised:
 //! - `Changed<CellState>` for detecting which cells mutated each generation
-//! - `get_mut` for per-entity state updates via grid index
-//! - Undo stack for time-travel (rewind + deterministic replay)
+//! - `EnumChangeSet::insert` for recording typed mutations with automatic undo
+//! - `get_mut` for per-entity neighbor count updates
+//! - Reversible changesets for time-travel (rewind + deterministic replay)
 
-use minkowski::{Changed, Entity, World};
+use minkowski::{Changed, Entity, EnumChangeSet, World};
 use std::time::Instant;
 
 // ── Components ──────────────────────────────────────────────────────
@@ -25,9 +26,6 @@ const HEIGHT: usize = 64;
 const CELL_COUNT: usize = WIDTH * HEIGHT;
 const GENERATIONS: usize = 500;
 const REWIND_GENS: usize = 50;
-
-/// An undo entry: (grid_index, old_state).
-type UndoEntry = (usize, bool);
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -88,10 +86,8 @@ fn write_neighbor_counts(world: &mut World, grid: &[Entity], counts: &[u8]) {
     }
 }
 
-/// Apply Conway rules: returns Vec of (grid_index, old_state) for undo,
-/// plus the new states to apply.
-fn apply_rules(states: &[bool], counts: &[u8]) -> (Vec<UndoEntry>, Vec<UndoEntry>) {
-    let mut undo = Vec::new();
+/// Apply Conway rules: returns (grid_index, new_state) for each cell that changed.
+fn apply_rules(states: &[bool], counts: &[u8]) -> Vec<(usize, bool)> {
     let mut updates = Vec::new();
     for i in 0..CELL_COUNT {
         let alive = states[i];
@@ -103,20 +99,20 @@ fn apply_rules(states: &[bool], counts: &[u8]) -> (Vec<UndoEntry>, Vec<UndoEntry
             (false, _) => false,
         };
         if new_alive != alive {
-            undo.push((i, alive)); // record old state for undo
             updates.push((i, new_alive));
         }
     }
-    (undo, updates)
+    updates
 }
 
-/// Apply state updates to the world.
-fn apply_updates(world: &mut World, grid: &[Entity], updates: &[(usize, bool)]) {
+/// Build an EnumChangeSet from cell state updates and apply it.
+/// Returns the reverse changeset for undo.
+fn apply_updates(world: &mut World, grid: &[Entity], updates: &[(usize, bool)]) -> EnumChangeSet {
+    let mut cs = EnumChangeSet::new();
     for &(i, new_state) in updates {
-        if let Some(cs) = world.get_mut::<CellState>(grid[i]) {
-            cs.0 = new_state;
-        }
+        cs.insert::<CellState>(world, grid[i], CellState(new_state));
     }
+    cs.apply(world)
 }
 
 /// Count alive cells from the world.
@@ -154,7 +150,7 @@ fn main() {
     println!();
 
     // ── Generation loop ─────────────────────────────────────────────
-    let mut undo_stack: Vec<Vec<(usize, bool)>> = Vec::with_capacity(GENERATIONS);
+    let mut undo_stack: Vec<EnumChangeSet> = Vec::with_capacity(GENERATIONS);
 
     for gen in 0..GENERATIONS {
         let frame_start = Instant::now();
@@ -164,17 +160,17 @@ fn main() {
         let counts = count_neighbors(&states);
         write_neighbor_counts(&mut world, &grid, &counts);
 
-        // Apply Conway rules
-        let (undo, updates) = apply_rules(&states, &counts);
+        // Apply Conway rules via EnumChangeSet — automatic undo capture
+        let updates = apply_rules(&states, &counts);
         let change_count = updates.len();
-        apply_updates(&mut world, &grid, &updates);
+        let reverse = apply_updates(&mut world, &grid, &updates);
 
         // Exercise Changed<CellState> — archetype-level, so if any changed,
         // the query returns all cells in that archetype.
         let _changed_count = world.query::<(Changed<CellState>,)>().count();
 
-        // Push undo record
-        undo_stack.push(undo);
+        // Push reverse changeset for undo
+        undo_stack.push(reverse);
 
         // Print stats every 50 generations
         if gen % 50 == 0 || gen == GENERATIONS - 1 {
@@ -203,13 +199,9 @@ fn main() {
     println!("Rewinding {} generations...", REWIND_GENS);
 
     for i in 0..REWIND_GENS {
-        let undo = undo_stack.pop().expect("undo stack underflow");
-        // Restore old states (undo entries contain old_state)
-        for &(grid_idx, old_state) in &undo {
-            if let Some(cs) = world.get_mut::<CellState>(grid[grid_idx]) {
-                cs.0 = old_state;
-            }
-        }
+        let reverse = undo_stack.pop().expect("undo stack underflow");
+        // Apply the reverse changeset — restores previous cell states automatically
+        let _ = reverse.apply(&mut world);
         if i % 10 == 0 {
             println!(
                 "  rewind step {:>2} | alive: {:>4}",
@@ -235,8 +227,8 @@ fn main() {
         let counts = count_neighbors(&states);
         write_neighbor_counts(&mut world, &grid, &counts);
 
-        let (_undo, updates) = apply_rules(&states, &counts);
-        apply_updates(&mut world, &grid, &updates);
+        let updates = apply_rules(&states, &counts);
+        let _ = apply_updates(&mut world, &grid, &updates);
 
         if i % 10 == 0 {
             println!(

@@ -19,6 +19,7 @@ pub mod world;
 
 pub use changeset::EnumChangeSet;
 pub use command::CommandBuffer;
+pub use component::ComponentId;
 pub use entity::Entity;
 pub use minkowski_derive::Table;
 pub use query::fetch::Changed;

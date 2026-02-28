@@ -78,11 +78,11 @@ Each BlobVec column stores a `changed_tick: Tick` — the tick at which it was l
 
 `CommandBuffer` stores `Vec<Box<dyn FnOnce(&mut World) + Send>>`. Used during query iteration when structural changes (spawn/despawn/insert/remove) must be deferred. Applied via `cmds.apply(&mut world)`.
 
-`EnumChangeSet` is the data-driven alternative: mutations are recorded as a `Vec<Mutation>` enum with component bytes in a contiguous `Arena`. `apply()` returns a reverse `EnumChangeSet` for rollback — applying the reverse undoes the original changes. Useful for persistence (WAL serialization) and transactions.
+`EnumChangeSet` is the data-driven alternative: mutations are recorded as a `Vec<Mutation>` enum with component bytes in a contiguous `Arena`. `apply()` returns a reverse `EnumChangeSet` for rollback — applying the reverse undoes the original changes. Useful for persistence (WAL serialization) and transactions. Typed safe helpers (`insert<T>`, `remove<T>`, `spawn_bundle<B>`) wrap the raw `record_*` methods — they auto-register component types and handle `ManuallyDrop` internally. The raw methods remain for power users who already have a `ComponentId`.
 
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `ComponentRegistry`, `EntityAllocator`, `QueryCacheEntry`, `Tick`).
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `ComponentRegistry`, `EntityAllocator`, `QueryCacheEntry`, `Tick`).
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.

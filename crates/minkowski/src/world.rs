@@ -75,6 +75,18 @@ impl World {
         self.current_tick.advance()
     }
 
+    /// Look up the ComponentId for a type. Returns None if the type has
+    /// never been spawned or registered.
+    pub fn component_id<T: Component>(&self) -> Option<ComponentId> {
+        self.components.id::<T>()
+    }
+
+    /// Register a component type, returning its ComponentId. Idempotent —
+    /// returns the existing id if already registered.
+    pub fn register_component<T: Component>(&mut self) -> ComponentId {
+        self.components.register::<T>()
+    }
+
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
         let component_ids = B::component_ids(&mut self.components);
         let arch_id = self
@@ -945,5 +957,26 @@ mod tests {
 
         // Changed<Pos> must detect the mutation from the table path
         assert_eq!(world.query::<(Changed<Pos>,)>().count(), 1);
+    }
+
+    #[test]
+    fn component_id_returns_none_for_unregistered() {
+        let world = World::new();
+        assert_eq!(world.component_id::<Pos>(), None);
+    }
+
+    #[test]
+    fn register_component_returns_id_and_subsequent_lookup_works() {
+        let mut world = World::new();
+        let id = world.register_component::<Pos>();
+        assert_eq!(world.component_id::<Pos>(), Some(id));
+    }
+
+    #[test]
+    fn register_component_is_idempotent() {
+        let mut world = World::new();
+        let a = world.register_component::<Pos>();
+        let b = world.register_component::<Pos>();
+        assert_eq!(a, b);
     }
 }
