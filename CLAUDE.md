@@ -58,6 +58,14 @@ Each unique set of component types gets an **Archetype** — a struct containing
 
 `World::query()` maintains a `HashMap<TypeId, QueryCacheEntry>` that caches matched archetype IDs per query type. On repeat calls with no new archetypes, the archetype scan is skipped entirely. When new archetypes are created (spawn/insert/remove can trigger this), only the new ones are scanned incrementally. Empty archetypes are filtered at iteration time, not cache time. `query()` takes `&mut self` for cache mutation.
 
+### Column Alignment & Vectorization
+
+BlobVec columns are allocated with 64-byte alignment (cache line). `QueryIter::for_each_chunk` yields typed `&[T]` / `&mut [T]` slices per archetype — LLVM can auto-vectorize loops over these slices.
+
+Component types that are 16-byte-aligned (e.g., `#[repr(align(16))]` or naturally `[f32; 4]`) vectorize better than odd-sized ones. The engine guarantees 64-byte column alignment; component layout determines whether LLVM can pack operations.
+
+Build with `-C target-cpu=native` (configured in `.cargo/config.toml`) to enable platform-specific SIMD instructions.
+
 ### Deferred Mutation
 
 `CommandBuffer` stores `Vec<Box<dyn FnOnce(&mut World) + Send>>`. Used during query iteration when structural changes (spawn/despawn/insert/remove) must be deferred. Applied via `cmds.apply(&mut world)`.

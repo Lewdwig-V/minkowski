@@ -175,13 +175,21 @@ impl BlobVec {
         )
         .expect("invalid layout");
 
-        let new_data = if self.capacity == 0 {
-            unsafe { alloc::alloc(new_layout) }
-        } else {
-            let old_layout =
-                Layout::from_size_align(size * self.capacity, Self::alloc_align(&self.item_layout))
-                    .unwrap();
-            unsafe { alloc::realloc(self.data.as_ptr(), old_layout, new_layout.size()) }
+        // Always use alloc + copy + dealloc instead of realloc.
+        // realloc may not preserve alignment > max_align_t (typically 16 bytes),
+        // and we require 64-byte alignment for cache line / SIMD guarantees.
+        let new_data = unsafe {
+            let new_ptr = alloc::alloc(new_layout);
+            if self.capacity > 0 {
+                std::ptr::copy_nonoverlapping(self.data.as_ptr(), new_ptr, size * self.len);
+                let old_layout = Layout::from_size_align(
+                    size * self.capacity,
+                    Self::alloc_align(&self.item_layout),
+                )
+                .unwrap();
+                alloc::dealloc(self.data.as_ptr(), old_layout);
+            }
+            new_ptr
         };
 
         self.data = NonNull::new(new_data).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
