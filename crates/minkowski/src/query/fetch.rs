@@ -31,6 +31,7 @@ impl<T> ThinSlicePtr<T> {
 pub unsafe trait WorldQuery {
     type Item<'w>;
     type Fetch<'w>: Send + Sync;
+    type Slice<'w>;
 
     /// Returns a FixedBitSet with bits set for each required ComponentId.
     /// Archetypes missing any required component are skipped during query matching.
@@ -45,12 +46,19 @@ pub unsafe trait WorldQuery {
     /// `row` must be less than `archetype.len()`, and the caller must ensure
     /// no aliasing violations occur.
     unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w>;
+
+    /// Construct a typed slice over the entire column for this archetype.
+    ///
+    /// # Safety
+    /// `len` must equal the archetype length. Caller must ensure no aliasing violations.
+    unsafe fn as_slice<'w>(fetch: &Self::Fetch<'w>, len: usize) -> Self::Slice<'w>;
 }
 
 // --- &T ---
 unsafe impl<T: Component> WorldQuery for &T {
     type Item<'w> = &'w T;
     type Fetch<'w> = ThinSlicePtr<T>;
+    type Slice<'w> = &'w [T];
 
     fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
         let mut bits = FixedBitSet::new();
@@ -74,12 +82,17 @@ unsafe impl<T: Component> WorldQuery for &T {
     unsafe fn fetch<'w>(fetch: &ThinSlicePtr<T>, row: usize) -> &'w T {
         &*fetch.ptr.add(row)
     }
+
+    unsafe fn as_slice<'w>(fetch: &ThinSlicePtr<T>, len: usize) -> &'w [T] {
+        std::slice::from_raw_parts(fetch.ptr as *const T, len)
+    }
 }
 
 // --- &mut T ---
 unsafe impl<T: Component> WorldQuery for &mut T {
     type Item<'w> = &'w mut T;
     type Fetch<'w> = ThinSlicePtr<T>;
+    type Slice<'w> = &'w mut [T];
 
     fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
         <&T>::required_ids(registry)
@@ -92,12 +105,17 @@ unsafe impl<T: Component> WorldQuery for &mut T {
     unsafe fn fetch<'w>(fetch: &ThinSlicePtr<T>, row: usize) -> &'w mut T {
         &mut *fetch.ptr.add(row)
     }
+
+    unsafe fn as_slice<'w>(fetch: &ThinSlicePtr<T>, len: usize) -> &'w mut [T] {
+        std::slice::from_raw_parts_mut(fetch.ptr, len)
+    }
 }
 
 // --- Entity ---
 unsafe impl WorldQuery for Entity {
     type Item<'w> = Entity;
     type Fetch<'w> = ThinSlicePtr<Entity>;
+    type Slice<'w> = &'w [Entity];
 
     fn required_ids(_registry: &ComponentRegistry) -> FixedBitSet {
         FixedBitSet::new()
@@ -110,12 +128,17 @@ unsafe impl WorldQuery for Entity {
     unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
         *fetch.ptr.add(row)
     }
+
+    unsafe fn as_slice<'w>(fetch: &Self::Fetch<'w>, len: usize) -> &'w [Entity] {
+        std::slice::from_raw_parts(fetch.ptr as *const Entity, len)
+    }
 }
 
 // --- Option<&T> ---
 unsafe impl<T: Component> WorldQuery for Option<&T> {
     type Item<'w> = Option<&'w T>;
     type Fetch<'w> = Option<ThinSlicePtr<T>>;
+    type Slice<'w> = Option<&'w [T]>;
 
     fn required_ids(_registry: &ComponentRegistry) -> FixedBitSet {
         FixedBitSet::new() // optional — does not filter archetypes
@@ -130,6 +153,12 @@ unsafe impl<T: Component> WorldQuery for Option<&T> {
     unsafe fn fetch<'w>(fetch: &Option<ThinSlicePtr<T>>, row: usize) -> Option<&'w T> {
         fetch.as_ref().map(|f| &*f.ptr.add(row))
     }
+
+    unsafe fn as_slice<'w>(fetch: &Option<ThinSlicePtr<T>>, len: usize) -> Option<&'w [T]> {
+        fetch
+            .as_ref()
+            .map(|f| std::slice::from_raw_parts(f.ptr as *const T, len))
+    }
 }
 
 // --- Tuple impls ---
@@ -139,6 +168,7 @@ macro_rules! impl_world_query_tuple {
         unsafe impl<$($name: WorldQuery),*> WorldQuery for ($($name,)*) {
             type Item<'w> = ($($name::Item<'w>,)*);
             type Fetch<'w> = ($($name::Fetch<'w>,)*);
+            type Slice<'w> = ($($name::Slice<'w>,)*);
 
             fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
                 let mut bits = FixedBitSet::new();
@@ -157,6 +187,11 @@ macro_rules! impl_world_query_tuple {
             unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
                 let ($($name,)*) = fetch;
                 ($(<$name as WorldQuery>::fetch($name, row),)*)
+            }
+
+            unsafe fn as_slice<'w>(fetch: &Self::Fetch<'w>, len: usize) -> Self::Slice<'w> {
+                let ($($name,)*) = fetch;
+                ($(<$name as WorldQuery>::as_slice($name, len),)*)
             }
         }
     };
