@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo test -p minkowski --lib          # Unit tests (105 tests, fast)
+cargo test -p minkowski --lib          # Unit tests (118 tests, fast)
 cargo test -p minkowski                # All tests including doc tests
 cargo test -p minkowski -- entity      # Run tests matching a filter
 
@@ -17,10 +17,11 @@ cargo bench -p minkowski -- spawn      # Single benchmark
 
 cargo run -p minkowski --example boids --release   # Boids simulation (5K entities, 1K frames)
 
-MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib  # UB check
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
 ```
 
-Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows; `-Zmiri-ignore-leaks` because rayon's thread pool intentionally outlives main.
+Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows; `-Zmiri-ignore-leaks` only for the two `par_for_each` tests because rayon's thread pool intentionally outlives main. All other tests run without leak suppression to catch real leaks.
 
 Pre-commit hooks run `cargo fmt` and `cargo clippy -D warnings` on commit, `cargo test` on push.
 
