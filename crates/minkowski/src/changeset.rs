@@ -218,6 +218,7 @@ impl EnumChangeSet {
                             // push takes *mut u8 but only reads from it
                             archetype.columns[col].push(src as *mut u8);
                         }
+                        archetype.columns[col].mark_changed(world.current_tick);
                         let _ = layout; // layout stored for reverse, not needed here
                     }
                     let row = archetype.entities.len();
@@ -307,6 +308,10 @@ fn changeset_insert_raw(
             }
             std::ptr::copy_nonoverlapping(data_ptr, old_ptr, layout.size());
         }
+
+        // Mark the written column as changed.
+        let src_arch = &mut world.archetypes.archetypes[location.archetype_id.0];
+        src_arch.columns[col_idx].mark_changed(world.current_tick);
     } else {
         // Entity does not have this component — reverse is Remove.
         reverse.record_remove(entity, comp_id);
@@ -344,6 +349,11 @@ fn changeset_insert_raw(
         let tgt_col = target_arch.component_index[&comp_id];
         unsafe {
             target_arch.columns[tgt_col].push(data_ptr as *mut u8);
+        }
+
+        // Mark all target columns as changed.
+        for col in &mut target_arch.columns {
+            col.mark_changed(world.current_tick);
         }
 
         // Move entity tracking.
