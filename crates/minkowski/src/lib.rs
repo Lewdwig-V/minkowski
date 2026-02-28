@@ -7,6 +7,7 @@
 extern crate self as minkowski;
 
 pub mod bundle;
+pub mod changeset;
 pub mod command;
 pub mod component;
 pub mod entity;
