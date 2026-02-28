@@ -4,6 +4,32 @@
 //!
 //! Exercises: spawn, despawn, multi-component queries, mutation,
 //! parallel iteration, deferred commands, archetype stability under churn.
+//!
+//! # Vectorization
+//!
+//! The integration loops (Steps 1 and 5) are designed to auto-vectorize.
+//! LLVM generates branchless AVX-512 masked ops for the position/velocity
+//! updates. Every link in this chain is required — remove any one and the
+//! loop falls back to scalar:
+//!
+//! 1. **64-byte aligned columns** — BlobVec allocates with cache-line alignment.
+//!    Without this, LLVM may not emit aligned loads or may add peel loops.
+//! 2. **`for_each_chunk` yields `&[T]`/`&mut [T]` slices** — LLVM needs to see
+//!    a contiguous slice with a known length to engage its loop vectorizer.
+//!    Per-element `fetch(ptr, row)` across a trait boundary is opaque.
+//! 3. **Index loop `for i in 0..len`** — iterating by index over the slice
+//!    gives LLVM the simple induction variable it needs. Iterator adaptors
+//!    can obscure the access pattern.
+//! 4. **No opaque function calls in the loop body** — `rem_euclid` compiles
+//!    to `fmodf` (scalar libm), which is an optimization barrier. The
+//!    branchless conditional subtract wraps identically for bounded velocity
+//!    and is fully inlineable.
+//! 5. **`-C target-cpu=native`** (in `.cargo/config.toml`) — without this,
+//!    rustc targets a baseline x86-64 that lacks AVX2/AVX-512.
+//!
+//! Verify with: `objdump -d -M intel target/release/examples/boids | grep vmulps`
+//! You should see packed float ops (vaddps, vmulps, vblendmps), not scalar
+//! (vaddss, vmulss).
 
 use minkowski::{CommandBuffer, Entity, World};
 use std::time::Instant;
