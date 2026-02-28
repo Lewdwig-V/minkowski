@@ -2,6 +2,7 @@ use std::alloc::Layout;
 
 use crate::component::ComponentId;
 use crate::entity::Entity;
+use crate::world::{get_pair_mut, EntityLocation, World};
 
 /// Contiguous byte arena for component data. Mutations store integer offsets
 /// into this arena, avoiding per-mutation heap allocation.
@@ -138,6 +139,300 @@ impl Default for EnumChangeSet {
     }
 }
 
+impl EnumChangeSet {
+    /// Apply every mutation in this changeset to `world`, returning a reverse
+    /// changeset that undoes the changes when applied.
+    pub fn apply(self, world: &mut World) -> EnumChangeSet {
+        let mut reverse = EnumChangeSet::new();
+
+        for mutation in &self.mutations {
+            match mutation {
+                Mutation::Spawn { entity, components } => {
+                    // --- Apply: push raw component data into the right archetype ---
+                    let sorted_ids: Vec<ComponentId> = {
+                        let mut ids: Vec<_> = components.iter().map(|&(id, _, _)| id).collect();
+                        ids.sort_unstable();
+                        ids.dedup();
+                        ids
+                    };
+                    let arch_id = world
+                        .archetypes
+                        .get_or_create(&sorted_ids, &world.components);
+                    let index = entity.index() as usize;
+
+                    if index >= world.entity_locations.len() {
+                        world.entity_locations.resize(index + 1, None);
+                    }
+
+                    let archetype = &mut world.archetypes.archetypes[arch_id.0];
+                    for &(comp_id, offset, layout) in components {
+                        let src = self.arena.get(offset);
+                        let col = archetype.component_index[&comp_id];
+                        unsafe {
+                            // push takes *mut u8 but only reads from it
+                            archetype.columns[col].push(src as *mut u8);
+                        }
+                        let _ = layout; // layout stored for reverse, not needed here
+                    }
+                    let row = archetype.entities.len();
+                    archetype.entities.push(*entity);
+
+                    world.entity_locations[index] = Some(EntityLocation {
+                        archetype_id: arch_id,
+                        row,
+                    });
+
+                    // --- Reverse: despawn this entity ---
+                    reverse.record_despawn(*entity);
+                }
+
+                Mutation::Despawn { entity } => {
+                    // --- Capture: read all components before despawning ---
+                    let comp_data = world.read_all_components(*entity).unwrap_or_default();
+                    let captured: Vec<(ComponentId, *const u8, Layout)> = comp_data;
+
+                    // Record spawn as reverse (copies bytes into reverse arena)
+                    reverse.record_spawn(*entity, &captured);
+
+                    // --- Apply ---
+                    world.despawn(*entity);
+                }
+
+                Mutation::Insert {
+                    entity,
+                    component_id,
+                    offset,
+                    layout,
+                } => {
+                    let data_ptr = self.arena.get(*offset);
+                    changeset_insert_raw(
+                        world,
+                        &mut reverse,
+                        *entity,
+                        *component_id,
+                        data_ptr,
+                        *layout,
+                    );
+                }
+
+                Mutation::Remove {
+                    entity,
+                    component_id,
+                } => {
+                    changeset_remove_raw(world, &mut reverse, *entity, *component_id);
+                }
+            }
+        }
+
+        reverse
+    }
+}
+
+/// Raw insert: either overwrites an existing component in-place (capturing old
+/// value for reverse), or performs archetype migration to add a new component.
+fn changeset_insert_raw(
+    world: &mut World,
+    reverse: &mut EnumChangeSet,
+    entity: Entity,
+    comp_id: ComponentId,
+    data_ptr: *const u8,
+    layout: Layout,
+) {
+    assert!(world.is_alive(entity), "entity is not alive");
+    let index = entity.index() as usize;
+    let location = world.entity_locations[index].unwrap();
+
+    let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
+
+    if src_arch.component_ids.contains(comp_id) {
+        // Entity already has this component — overwrite in-place.
+        let col_idx = src_arch.component_index[&comp_id];
+
+        // Capture old value for reverse.
+        let old_ptr = unsafe { src_arch.columns[col_idx].get_ptr(location.row) };
+        reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
+
+        // Overwrite with new data.
+        unsafe {
+            // For types with drop, drop the old value first.
+            let info = world.components.info(comp_id);
+            if let Some(drop_fn) = info.drop_fn {
+                drop_fn(old_ptr);
+            }
+            std::ptr::copy_nonoverlapping(data_ptr, old_ptr, layout.size());
+        }
+    } else {
+        // Entity does not have this component — reverse is Remove.
+        reverse.record_remove(entity, comp_id);
+
+        // Archetype migration: source components + new component.
+        let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
+        let mut target_ids = src_arch.sorted_ids.clone();
+        target_ids.push(comp_id);
+        target_ids.sort_unstable();
+        let src_arch_id = location.archetype_id;
+        let src_row = location.row;
+
+        let target_arch_id = world
+            .archetypes
+            .get_or_create(&target_ids, &world.components);
+
+        let (src_arch, target_arch) = get_pair_mut(
+            &mut world.archetypes.archetypes,
+            src_arch_id.0,
+            target_arch_id.0,
+        );
+
+        // Move shared columns from source to target.
+        for (&cid, &src_col) in &src_arch.component_index {
+            if let Some(&tgt_col) = target_arch.component_index.get(&cid) {
+                unsafe {
+                    let ptr = src_arch.columns[src_col].get_ptr(src_row);
+                    target_arch.columns[tgt_col].push(ptr);
+                    src_arch.columns[src_col].swap_remove_no_drop(src_row);
+                }
+            }
+        }
+
+        // Write the new component into target.
+        let tgt_col = target_arch.component_index[&comp_id];
+        unsafe {
+            target_arch.columns[tgt_col].push(data_ptr as *mut u8);
+        }
+
+        // Move entity tracking.
+        target_arch.entities.push(entity);
+        let target_row = target_arch.entities.len() - 1;
+        src_arch.entities.swap_remove(src_row);
+
+        // Update swapped entity's location in source.
+        if src_row < src_arch.entities.len() {
+            let swapped = src_arch.entities[src_row];
+            world.entity_locations[swapped.index() as usize] = Some(EntityLocation {
+                archetype_id: src_arch_id,
+                row: src_row,
+            });
+        }
+
+        world.entity_locations[index] = Some(EntityLocation {
+            archetype_id: target_arch_id,
+            row: target_row,
+        });
+    }
+}
+
+/// Raw remove: performs archetype migration to remove a component, capturing its
+/// old value for the reverse changeset.
+fn changeset_remove_raw(
+    world: &mut World,
+    reverse: &mut EnumChangeSet,
+    entity: Entity,
+    comp_id: ComponentId,
+) {
+    assert!(world.is_alive(entity), "entity is not alive");
+    let index = entity.index() as usize;
+    let location = world.entity_locations[index].unwrap();
+    let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
+
+    if !src_arch.component_ids.contains(comp_id) {
+        return; // Component not present — nothing to do.
+    }
+
+    // Capture old value for reverse (Insert).
+    let info = world.components.info(comp_id);
+    let layout = info.layout;
+    let col_idx = src_arch.component_index[&comp_id];
+    let old_ptr = unsafe { src_arch.columns[col_idx].get_ptr(location.row) };
+    reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
+
+    // Compute target archetype: source components minus this one.
+    let target_ids: Vec<ComponentId> = src_arch
+        .sorted_ids
+        .iter()
+        .copied()
+        .filter(|&id| id != comp_id)
+        .collect();
+    let src_arch_id = location.archetype_id;
+    let src_row = location.row;
+
+    if target_ids.is_empty() {
+        // Entity has no components left — move to empty archetype.
+        let arch = &mut world.archetypes.archetypes[src_arch_id.0];
+        // swap_remove_no_drop for the removed component (data already captured)
+        let removed_col = arch.component_index[&comp_id];
+        unsafe {
+            arch.columns[removed_col].swap_remove_no_drop(src_row);
+        }
+        // swap_remove with drop for remaining columns
+        for (&cid, &col_idx_inner) in &arch.component_index {
+            if cid != comp_id {
+                unsafe {
+                    arch.columns[col_idx_inner].swap_remove(src_row);
+                }
+            }
+        }
+        arch.entities.swap_remove(src_row);
+        if src_row < arch.entities.len() {
+            let swapped = arch.entities[src_row];
+            world.entity_locations[swapped.index() as usize] = Some(EntityLocation {
+                archetype_id: src_arch_id,
+                row: src_row,
+            });
+        }
+        let empty_arch_id = world.archetypes.get_or_create(&[], &world.components);
+        let empty_arch = &mut world.archetypes.archetypes[empty_arch_id.0];
+        empty_arch.entities.push(entity);
+        world.entity_locations[index] = Some(EntityLocation {
+            archetype_id: empty_arch_id,
+            row: empty_arch.entities.len() - 1,
+        });
+        return;
+    }
+
+    let target_arch_id = world
+        .archetypes
+        .get_or_create(&target_ids, &world.components);
+
+    let (src_arch, target_arch) = get_pair_mut(
+        &mut world.archetypes.archetypes,
+        src_arch_id.0,
+        target_arch_id.0,
+    );
+
+    // Move shared columns (skip removed component).
+    for (&cid, &src_col) in &src_arch.component_index {
+        if cid == comp_id {
+            // Already captured — just discard from source.
+            unsafe {
+                src_arch.columns[src_col].swap_remove_no_drop(src_row);
+            }
+        } else if let Some(&tgt_col) = target_arch.component_index.get(&cid) {
+            unsafe {
+                let ptr = src_arch.columns[src_col].get_ptr(src_row);
+                target_arch.columns[tgt_col].push(ptr);
+                src_arch.columns[src_col].swap_remove_no_drop(src_row);
+            }
+        }
+    }
+
+    target_arch.entities.push(entity);
+    let target_row = target_arch.entities.len() - 1;
+    src_arch.entities.swap_remove(src_row);
+
+    if src_row < src_arch.entities.len() {
+        let swapped = src_arch.entities[src_row];
+        world.entity_locations[swapped.index() as usize] = Some(EntityLocation {
+            archetype_id: src_arch_id,
+            row: src_row,
+        });
+    }
+
+    world.entity_locations[index] = Some(EntityLocation {
+        archetype_id: target_arch_id,
+        row: target_row,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +512,168 @@ mod tests {
         } else {
             panic!("expected Spawn mutation");
         }
+    }
+
+    // ── apply + reverse tests ──────────────────────────────────
+
+    use crate::world::World;
+
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    struct Pos {
+        x: f32,
+        y: f32,
+    }
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    struct Vel {
+        dx: f32,
+        dy: f32,
+    }
+
+    #[test]
+    fn apply_spawn_and_reverse_despawns() {
+        let mut world = World::new();
+        let entity = world.entities.alloc();
+        let pos_id = world.components.register::<Pos>();
+        let vel_id = world.components.register::<Vel>();
+
+        let pos = Pos { x: 1.0, y: 2.0 };
+        let vel = Vel { dx: 3.0, dy: 4.0 };
+        let mut cs = EnumChangeSet::new();
+        cs.record_spawn(
+            entity,
+            &[
+                (
+                    pos_id,
+                    &pos as *const Pos as *const u8,
+                    Layout::new::<Pos>(),
+                ),
+                (
+                    vel_id,
+                    &vel as *const Vel as *const u8,
+                    Layout::new::<Vel>(),
+                ),
+            ],
+        );
+
+        let reverse = cs.apply(&mut world);
+        assert!(world.is_alive(entity));
+        assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
+
+        // Reverse should despawn
+        let _ = reverse.apply(&mut world);
+        assert!(!world.is_alive(entity));
+    }
+
+    #[test]
+    fn apply_despawn_and_reverse_respawns() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 5.0, y: 6.0 }, Vel { dx: 7.0, dy: 8.0 }));
+
+        let mut cs = EnumChangeSet::new();
+        cs.record_despawn(e);
+        let reverse = cs.apply(&mut world);
+        assert!(!world.is_alive(e));
+
+        // Reverse should respawn — creates new entity with same data
+        let _ = reverse.apply(&mut world);
+        let count = world.query::<(&Pos, &Vel)>().count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn apply_insert_new_and_reverse_removes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let vel_id = world.components.register::<Vel>();
+
+        let vel = Vel { dx: 3.0, dy: 4.0 };
+        let mut cs = EnumChangeSet::new();
+        cs.record_insert(
+            e,
+            vel_id,
+            &vel as *const Vel as *const u8,
+            Layout::new::<Vel>(),
+        );
+
+        let reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
+
+        let _ = reverse.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), None);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn apply_insert_overwrite_and_reverse_restores() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let pos_id = world.components.register::<Pos>();
+
+        let new_pos = Pos { x: 99.0, y: 99.0 };
+        let mut cs = EnumChangeSet::new();
+        cs.record_insert(
+            e,
+            pos_id,
+            &new_pos as *const Pos as *const u8,
+            Layout::new::<Pos>(),
+        );
+
+        let reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 99.0, y: 99.0 }));
+
+        let _ = reverse.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn apply_remove_and_reverse_reinserts() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+        let vel_id = world.components.register::<Vel>();
+
+        let mut cs = EnumChangeSet::new();
+        cs.record_remove(e, vel_id);
+
+        let reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), None);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+
+        let _ = reverse.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
+    }
+
+    #[test]
+    fn apply_empty_changeset() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let cs = EnumChangeSet::new();
+        let reverse = cs.apply(&mut world);
+        assert!(reverse.is_empty());
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn round_trip_forward_reverse_forward() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let vel_id = world.components.register::<Vel>();
+
+        let vel = Vel { dx: 10.0, dy: 20.0 };
+        let mut cs = EnumChangeSet::new();
+        cs.record_insert(
+            e,
+            vel_id,
+            &vel as *const Vel as *const u8,
+            Layout::new::<Vel>(),
+        );
+
+        let reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
+
+        let forward_again = reverse.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), None);
+
+        let _ = forward_again.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
     }
 }
