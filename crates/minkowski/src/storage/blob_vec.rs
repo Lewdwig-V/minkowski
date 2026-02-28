@@ -1,6 +1,8 @@
 use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 
+use crate::tick::Tick;
+
 /// Type-erased growable array. Stores raw bytes with a known `Layout`.
 /// Used as the column storage inside archetypes.
 pub(crate) struct BlobVec {
@@ -9,6 +11,7 @@ pub(crate) struct BlobVec {
     data: NonNull<u8>,
     len: usize,
     capacity: usize,
+    pub(crate) changed_tick: Tick,
 }
 
 // Safety: BlobVec stores Component data which requires Send + Sync.
@@ -24,6 +27,12 @@ impl BlobVec {
     /// Compute the allocation alignment for a BlobVec column.
     fn alloc_align(item: &Layout) -> usize {
         item.align().max(Self::MIN_COLUMN_ALIGN)
+    }
+
+    /// Mark this column as changed at the given tick.
+    #[inline]
+    pub(crate) fn mark_changed(&mut self, tick: Tick) {
+        self.changed_tick = tick;
     }
 
     /// Creates a new `BlobVec` for items with the given layout and optional drop function.
@@ -48,6 +57,7 @@ impl BlobVec {
             data,
             len: 0,
             capacity,
+            changed_tick: Tick::default(),
         }
     }
 
@@ -80,11 +90,36 @@ impl BlobVec {
 
     /// Returns a raw pointer to the element at `row`.
     ///
+    /// # Change detection invariant
+    /// This returns `*mut u8` for internal mechanics (migration, reverse capture)
+    /// but **does not mark the column changed**. Writing through this pointer
+    /// bypasses change detection — `Changed<T>` queries will miss the mutation.
+    ///
+    /// For mutable access that respects change detection, use [`get_ptr_mut`]
+    /// or ensure the caller marks the column via [`mark_changed`] or the
+    /// entry-point methods (`query_table_mut`, `World::query` for `&mut T`).
+    ///
     /// # Safety
     /// `row` must be in bounds (`row < len`).
     #[inline]
     pub unsafe fn get_ptr(&self, row: usize) -> *mut u8 {
         debug_assert!(row < self.len);
+        self.ptr_at(row)
+    }
+
+    /// Returns a raw pointer to the element at `row` and marks the column
+    /// changed at the given tick.
+    ///
+    /// This is the correct write-path accessor — use this (or ensure the
+    /// caller marks via entry-point methods) for any mutation that should
+    /// be visible to `Changed<T>` queries.
+    ///
+    /// # Safety
+    /// `row` must be in bounds (`row < len`).
+    #[inline]
+    pub unsafe fn get_ptr_mut(&mut self, row: usize, tick: Tick) -> *mut u8 {
+        debug_assert!(row < self.len);
+        self.changed_tick = tick;
         self.ptr_at(row)
     }
 
@@ -447,5 +482,14 @@ mod tests {
             assert_eq!(read_val::<u32>(&bv, 0), 0);
             assert_eq!(read_val::<u32>(&bv, 15), 15);
         }
+    }
+
+    #[test]
+    fn changed_tick_default_and_mark() {
+        use crate::tick::Tick;
+        let mut bv = bv_for::<u32>();
+        assert_eq!(bv.changed_tick, Tick::default());
+        bv.mark_changed(Tick::new(42));
+        assert_eq!(bv.changed_tick, Tick::new(42));
     }
 }

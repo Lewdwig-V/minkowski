@@ -52,6 +52,22 @@ pub unsafe trait WorldQuery {
     /// # Safety
     /// `len` must equal the archetype length. Caller must ensure no aliasing violations.
     unsafe fn as_slice<'w>(fetch: &Self::Fetch<'w>, len: usize) -> Self::Slice<'w>;
+
+    /// Returns ComponentIds that this query accesses mutably.
+    /// Used by change detection to mark columns as changed before iteration.
+    fn mutable_ids(_registry: &ComponentRegistry) -> FixedBitSet {
+        FixedBitSet::new()
+    }
+
+    /// Archetype-level filter. Returns false to skip this archetype entirely.
+    /// Used by Changed<T> to skip archetypes whose column tick is stale.
+    fn matches_filters(
+        _archetype: &Archetype,
+        _registry: &ComponentRegistry,
+        _last_read_tick: crate::tick::Tick,
+    ) -> bool {
+        true
+    }
 }
 
 // --- &T ---
@@ -95,6 +111,10 @@ unsafe impl<T: Component> WorldQuery for &mut T {
     type Slice<'w> = &'w mut [T];
 
     fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
+        <&T>::required_ids(registry)
+    }
+
+    fn mutable_ids(registry: &ComponentRegistry) -> FixedBitSet {
         <&T>::required_ids(registry)
     }
 
@@ -161,6 +181,46 @@ unsafe impl<T: Component> WorldQuery for Option<&T> {
     }
 }
 
+// --- Changed<T> ---
+
+/// Query filter that skips archetypes where component T hasn't changed
+/// since the query's last read tick.
+pub struct Changed<T: Component>(std::marker::PhantomData<T>);
+
+unsafe impl<T: Component> WorldQuery for Changed<T> {
+    type Item<'w> = ();
+    type Fetch<'w> = ();
+    type Slice<'w> = ();
+
+    fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
+        <&T>::required_ids(registry)
+    }
+
+    fn init_fetch(_archetype: &Archetype, _registry: &ComponentRegistry) {}
+
+    unsafe fn fetch<'w>(_fetch: &Self::Fetch<'w>, _row: usize) -> Self::Item<'w> {}
+
+    unsafe fn as_slice<'w>(_fetch: &Self::Fetch<'w>, _len: usize) -> Self::Slice<'w> {}
+
+    fn matches_filters(
+        archetype: &Archetype,
+        registry: &ComponentRegistry,
+        last_read_tick: crate::tick::Tick,
+    ) -> bool {
+        let comp_id = match registry.id::<T>() {
+            Some(id) => id,
+            None => return false,
+        };
+        let col_idx = match archetype.component_index.get(&comp_id) {
+            Some(&idx) => idx,
+            None => return false,
+        };
+        archetype.columns[col_idx]
+            .changed_tick
+            .is_newer_than(last_read_tick)
+    }
+}
+
 // --- Tuple impls ---
 macro_rules! impl_world_query_tuple {
     ($($name:ident),*) => {
@@ -178,6 +238,24 @@ macro_rules! impl_world_query_tuple {
                     bits.union_with(&sub);
                 )*
                 bits
+            }
+
+            fn mutable_ids(registry: &ComponentRegistry) -> FixedBitSet {
+                let mut bits = FixedBitSet::new();
+                $(
+                    let sub = $name::mutable_ids(registry);
+                    bits.grow(sub.len());
+                    bits.union_with(&sub);
+                )*
+                bits
+            }
+
+            fn matches_filters(
+                archetype: &Archetype,
+                registry: &ComponentRegistry,
+                last_read_tick: crate::tick::Tick,
+            ) -> bool {
+                $($name::matches_filters(archetype, registry, last_read_tick))&&*
             }
 
             fn init_fetch<'w>(archetype: &'w Archetype, registry: &ComponentRegistry) -> Self::Fetch<'w> {

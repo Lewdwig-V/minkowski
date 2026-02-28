@@ -4,14 +4,16 @@ A column-oriented archetype ECS built from scratch in Rust. Game workloads first
 
 ## What's here
 
-The foundational storage layer plus compile-time schema support and cached queries.
+The foundational storage layer, compile-time schema support, cached queries, SIMD-friendly iteration, and change detection.
 
 **Phase 1** — type-erased BlobVec columns packed into archetypes, generational entity IDs, parallel query iteration via rayon, deferred mutation through CommandBuffer.
 
-**Phase 2** — `#[derive(Table)]` proc macro for compile-time schema declarations with typed row accessors, and transparent query caching with incremental archetype scanning.
+**Phase 2** — `#[derive(Table)]` proc macro for compile-time schema declarations with typed row accessors, transparent query caching with incremental archetype scanning, data-driven `EnumChangeSet` with reversible apply for rollback, 64-byte aligned columns with `for_each_chunk` yielding typed slices for SIMD auto-vectorization.
+
+**Phase 3** — per-column change detection ticks with `Changed<T>` query filter. Queries skip entire archetypes whose data hasn't been mutably accessed since the last read.
 
 ```rust
-use minkowski::{World, Entity, CommandBuffer, Table};
+use minkowski::{World, Entity, CommandBuffer, Table, Changed};
 
 #[derive(Table)]
 struct Transform {
@@ -38,6 +40,14 @@ world.query::<(&mut Position, &Velocity)>().par_for_each(|(pos, vel)| {
     pos.x += vel.dx;
 });
 
+// Chunk iteration — yields &[T]/&mut [T] slices for SIMD auto-vectorization
+world.query::<(&mut Position, &Velocity)>()
+    .for_each_chunk(|(positions, velocities)| {
+        for i in 0..positions.len() {
+            positions[i].x += velocities[i].dx;
+        }
+    });
+
 // Table query — typed access, bypasses archetype matching entirely
 world.spawn(Transform {
     pos: Position { x: 0.0, y: 0.0 },
@@ -50,6 +60,12 @@ for row in world.query_table::<Transform>() {
 // Archetype migration
 world.insert(e, Health(100));   // moves entity to new archetype
 world.remove::<Health>(e);      // moves it back
+
+// Change detection — skip unchanged archetypes
+world.tick(); // advance the world tick (once per frame)
+for pos in world.query::<(&mut Position, Changed<Velocity>)>() {
+    // only runs for entities whose Velocity column was mutably accessed
+}
 
 // Deferred mutation during iteration
 let mut cmds = CommandBuffer::new();
@@ -71,20 +87,20 @@ Each unique combination of component types gets an **archetype** — a struct of
 
 ### Boids example
 
-A flocking simulation that exercises every ECS code path — spawn, despawn, multi-component queries, mutation, parallel iteration, deferred commands, and archetype stability under entity churn.
+A flocking simulation that exercises every ECS code path — spawn, despawn, multi-component queries, mutation, parallel iteration, chunk-based SIMD iteration, deferred commands, and archetype stability under entity churn.
 
 ```
 $ cargo run -p minkowski --example boids --release
 
-frame 0000 | entities:  5000 | avg_vel: 1.99 | dt: 9.9ms
-frame 0100 | entities:  5000 | avg_vel: 1.94 | dt: 7.2ms
-frame 0200 | entities:  5000 | avg_vel: 1.89 | dt: 7.8ms
+frame 0000 | entities:  5000 | avg_vel: 2.00 | dt: 6.5ms
+frame 0100 | entities:  5000 | avg_vel: 1.93 | dt: 3.7ms
+frame 0200 | entities:  5000 | avg_vel: 1.87 | dt: 2.3ms
 ...
-frame 0999 | entities:  5000 | avg_vel: 1.89 | dt: 7.4ms
+frame 0999 | entities:  5000 | avg_vel: 1.80 | dt: 3.0ms
 Done.
 ```
 
-5,000 boids with brute-force N² neighbor search (separation, alignment, cohesion), parallel force computation, and random spawn/despawn churn every 100 frames.
+5,000 boids with uniform spatial grid neighbor search (O(N·k) instead of O(N²)), parallel force computation, vectorized integration via `for_each_chunk`, and random spawn/despawn churn every 100 frames. Integration loops compile to branchless AVX-512 masked ops with `-C target-cpu=native`.
 
 ### Benchmarks
 
@@ -100,14 +116,14 @@ Suites: `spawn` (10K entities), `iterate` (10K), `parallel` (100K vs sequential)
 
 | Phase | Feature | Why |
 |---|---|---|
-| 3 | Change detection ticks | Systems only process entities that actually changed |
+| 3 | Secondary index hooks | Observer API for user-defined spatial indices (grids, BVH, k-d trees) that update on component change |
 | 3 | Automatic system scheduling | Conflict detection, parallel system execution |
 | 4 | Persistence — WAL + snapshots | Durable state via BlobVec memcpy to disk |
 | 4 | Transaction semantics | Atomic multi-entity mutations with rollback |
 | 5 | Query planning (Volcano model) | Optimize complex queries across indexes |
 | 5 | B-tree / hash indexes | Fast range and equality lookups on component fields |
 
-The architecture is designed so each phase layers on without rewriting the previous one. BlobVec's type-erased byte storage is already memcpy-friendly for snapshots. CommandBuffer's closure queue generalizes to ChangeSets for transactions.
+The architecture is designed so each phase layers on without rewriting the previous one. BlobVec's type-erased byte storage is already memcpy-friendly for snapshots. `EnumChangeSet` already provides the mutation abstraction for persistence and rollback.
 
 ## Building
 
@@ -215,12 +231,12 @@ Falls out naturally from the commit log:
 
 ## Build Roadmap
 
-1. `BlobVec` — type-erased aligned column storage
-2. `Archetype` — collection of `BlobVec` columns keyed by `ComponentId`
-3. `World` — entity allocator + archetype storage + archetype graph edges
-4. `Query<(A, B, ...)>` — tuple trait impls with bitset matching
-5. `#[derive(Table)]` — proc macro for compile-time schema registration
-6. `ChangeSet` — mutation abstraction (enables command buffers, persistence, replication)
+1. ~~`BlobVec` — type-erased aligned column storage~~
+2. ~~`Archetype` — collection of `BlobVec` columns keyed by `ComponentId`~~
+3. ~~`World` — entity allocator + archetype storage + archetype graph edges~~
+4. ~~`Query<(A, B, ...)>` — tuple trait impls with bitset matching~~
+5. ~~`#[derive(Table)]` — proc macro for compile-time schema registration~~
+6. ~~`ChangeSet` — mutation abstraction (enables command buffers, persistence, replication)~~
 7. Commit log + snapshot persistence
 8. Indexes (B-tree, hash)
 9. Transaction isolation / MVCC

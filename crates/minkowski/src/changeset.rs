@@ -210,15 +210,16 @@ impl EnumChangeSet {
                         world.entity_locations.resize(index + 1, None);
                     }
 
+                    let tick = world.next_tick();
                     let archetype = &mut world.archetypes.archetypes[arch_id.0];
                     for &(comp_id, offset, layout) in components {
                         let src = self.arena.get(offset);
                         let col = archetype.component_index[&comp_id];
                         unsafe {
-                            // push takes *mut u8 but only reads from it
                             archetype.columns[col].push(src as *mut u8);
                         }
-                        let _ = layout; // layout stored for reverse, not needed here
+                        archetype.columns[col].mark_changed(tick);
+                        let _ = layout;
                     }
                     let row = archetype.entities.len();
                     archetype.entities.push(*entity);
@@ -294,18 +295,20 @@ fn changeset_insert_raw(
         // Entity already has this component — overwrite in-place.
         let col_idx = src_arch.component_index[&comp_id];
 
-        // Capture old value for reverse.
+        // Capture old value for reverse (read path — no tick).
         let old_ptr = unsafe { src_arch.columns[col_idx].get_ptr(location.row) };
         reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
 
-        // Overwrite with new data.
+        // Overwrite with new data (write path — marks column changed).
+        let tick = world.next_tick();
+        let src_arch = &mut world.archetypes.archetypes[location.archetype_id.0];
         unsafe {
-            // For types with drop, drop the old value first.
+            let dst = src_arch.columns[col_idx].get_ptr_mut(location.row, tick);
             let info = world.components.info(comp_id);
             if let Some(drop_fn) = info.drop_fn {
-                drop_fn(old_ptr);
+                drop_fn(dst);
             }
-            std::ptr::copy_nonoverlapping(data_ptr, old_ptr, layout.size());
+            std::ptr::copy_nonoverlapping(data_ptr, dst, layout.size());
         }
     } else {
         // Entity does not have this component — reverse is Remove.
@@ -322,6 +325,7 @@ fn changeset_insert_raw(
         let target_arch_id = world
             .archetypes
             .get_or_create(&target_ids, &world.components);
+        let tick = world.next_tick();
 
         let (src_arch, target_arch) = get_pair_mut(
             &mut world.archetypes.archetypes,
@@ -344,6 +348,11 @@ fn changeset_insert_raw(
         let tgt_col = target_arch.component_index[&comp_id];
         unsafe {
             target_arch.columns[tgt_col].push(data_ptr as *mut u8);
+        }
+
+        // Mark all target columns as changed.
+        for col in &mut target_arch.columns {
+            col.mark_changed(tick);
         }
 
         // Move entity tracking.
