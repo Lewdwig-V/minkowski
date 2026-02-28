@@ -40,6 +40,8 @@ pub(crate) struct QueryCacheEntry {
     required: FixedBitSet,
     /// Number of archetypes when cache was last updated.
     last_archetype_count: usize,
+    /// Tick at which this query last read data (used by Changed<T> filter).
+    last_read_tick: Tick,
 }
 
 pub struct World {
@@ -196,6 +198,7 @@ impl World {
                 matched_ids: Vec::new(),
                 required: Q::required_ids(&self.components),
                 last_archetype_count: 0,
+                last_read_tick: Tick::default(),
             });
 
         // Refresh required bitset in case new components were registered since
@@ -205,6 +208,7 @@ impl World {
             entry.required = fresh_required;
             entry.matched_ids.clear();
             entry.last_archetype_count = 0;
+            entry.last_read_tick = Tick::default();
         }
 
         // Incremental scan: only check archetypes added since last cache update
@@ -217,16 +221,46 @@ impl World {
             entry.last_archetype_count = total;
         }
 
-        // Build fetches from cached archetype list, filtering empties at iteration time
-        let fetches: Vec<_> = entry
-            .matched_ids
-            .iter()
-            .filter_map(|&aid| {
+        // Extract what we need from the cache entry, dropping the borrow
+        let matched_ids = entry.matched_ids.clone();
+        let last_read_tick = entry.last_read_tick;
+
+        // Compute which component IDs this query mutates
+        let mutable = Q::mutable_ids(&self.components);
+
+        // Pass 1: filter archetypes and mark mutable columns (requires &mut self)
+        let mut filtered_ids = Vec::new();
+        for &aid in &matched_ids {
+            let arch = &self.archetypes.archetypes[aid.0];
+            if arch.is_empty() {
+                continue;
+            }
+            if !Q::matches_filters(arch, &self.components, last_read_tick) {
+                continue;
+            }
+            filtered_ids.push(aid);
+        }
+        for &aid in &filtered_ids {
+            for comp_id in mutable.ones() {
                 let arch = &self.archetypes.archetypes[aid.0];
-                if arch.is_empty() {
-                    return None;
+                if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                    self.archetypes.archetypes[aid.0].columns[col_idx]
+                        .mark_changed(self.current_tick);
                 }
-                Some((Q::init_fetch(arch, &self.components), arch.len()))
+            }
+        }
+
+        // Update last_read_tick on the cache entry
+        if let Some(entry) = self.query_cache.get_mut(&type_id) {
+            entry.last_read_tick = self.current_tick;
+        }
+
+        // Pass 2: build fetches (only immutable borrows of archetypes from here)
+        let fetches: Vec<_> = filtered_ids
+            .iter()
+            .map(|&aid| {
+                let arch = &self.archetypes.archetypes[aid.0];
+                (Q::init_fetch(arch, &self.components), arch.len())
             })
             .collect();
 
@@ -712,5 +746,74 @@ mod tests {
         let comp_id = world.components.id::<Pos>().unwrap();
         let col_idx = arch.component_index[&comp_id];
         assert_eq!(arch.columns[col_idx].changed_tick, Tick::new(1));
+    }
+
+    use crate::query::fetch::Changed;
+
+    #[test]
+    fn changed_filter_skips_stale_archetype() {
+        let mut world = World::new();
+        world.tick(); // tick 1
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        // Column changed_tick = 1, query last_read_tick starts at 0
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 1);
+
+        // Query again without changes -- last_read_tick now 1, column still 1
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn changed_filter_detects_get_mut() {
+        let mut world = World::new();
+        world.tick();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Consume the initial change
+        let _ = world.query::<(Changed<Pos>,)>().count();
+
+        // No changes -- should skip
+        world.tick();
+        assert_eq!(world.query::<(Changed<Pos>,)>().count(), 0);
+
+        // Mutate via get_mut
+        world.tick();
+        let _ = world.get_mut::<Pos>(e);
+        assert_eq!(world.query::<(Changed<Pos>,)>().count(), 1);
+    }
+
+    #[test]
+    fn changed_filter_mixed_query() {
+        let mut world = World::new();
+        world.tick();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
+
+        // Consume initial change
+        let _ = world.query::<(&Pos, Changed<Vel>)>().count();
+
+        // Mutate only Pos, not Vel
+        world.tick();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Changed<Vel> should skip -- Vel column not touched
+        assert_eq!(world.query::<(&Pos, Changed<Vel>)>().count(), 0);
+    }
+
+    #[test]
+    fn query_mut_marks_column_changed() {
+        let mut world = World::new();
+        world.tick();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Consume initial change
+        let _ = world.query::<(Changed<Pos>,)>().count();
+
+        // Query with &mut Pos -- should mark column changed
+        world.tick();
+        let _ = world.query::<&mut Pos>().count();
+
+        // Now Changed<Pos> should detect the mutation
+        assert_eq!(world.query::<(Changed<Pos>,)>().count(), 1);
     }
 }
