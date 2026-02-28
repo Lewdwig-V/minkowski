@@ -54,10 +54,14 @@ unsafe impl<T: Component> WorldQuery for &T {
 
     fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
         let mut bits = FixedBitSet::new();
-        if let Some(id) = registry.id::<T>() {
-            bits.grow(id + 1);
-            bits.insert(id);
-        }
+        let id = match registry.id::<T>() {
+            Some(id) => id,
+            // Component not yet registered — use a sentinel bit that no
+            // archetype can contain, so the subset check correctly fails.
+            None => registry.len(),
+        };
+        bits.grow(id + 1);
+        bits.insert(id);
         bits
     }
 
