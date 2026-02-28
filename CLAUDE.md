@@ -16,6 +16,7 @@ cargo bench -p minkowski               # All criterion benchmarks
 cargo bench -p minkowski -- spawn      # Single benchmark
 
 cargo run -p minkowski --example boids --release   # Boids simulation (5K entities, 1K frames)
+cargo run -p minkowski --example life --release    # Game of Life with undo (64x64 grid, 500 gens)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests

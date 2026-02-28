@@ -62,9 +62,9 @@ world.insert(e, Health(100));   // moves entity to new archetype
 world.remove::<Health>(e);      // moves it back
 
 // Change detection — skip unchanged archetypes
-world.tick(); // advance the world tick (once per frame)
+// Tick auto-advances on every mutation/query; no manual world.tick() call needed.
 for pos in world.query::<(&mut Position, Changed<Velocity>)>() {
-    // only runs for entities whose Velocity column was mutably accessed
+    // only runs for entities whose Velocity column was mutably accessed since last query
 }
 
 // Deferred mutation during iteration
@@ -102,6 +102,31 @@ Done.
 
 5,000 boids with uniform spatial grid neighbor search (O(N·k) instead of O(N²)), parallel force computation, vectorized integration via `for_each_chunk`, and random spawn/despawn churn every 100 frames. Integration loops compile to branchless AVX-512 masked ops with `-C target-cpu=native`.
 
+### Game of Life example
+
+A 64×64 Conway's Game of Life that exercises the features boids doesn't cover — `Changed<T>`, `get_mut`, and a per-entity undo stack for time-travel replay.
+
+```
+$ cargo run -p minkowski --example life --release
+
+Game of Life: 64x64 grid, 4096 cells, 500 generations
+Initial alive: 1843
+
+gen    0 | alive: 1843 | changes:  892 | dt: 0.18ms
+gen   50 | alive:  842 | changes:  198 | dt: 0.11ms
+gen  100 | alive:  782 | changes:  172 | dt: 0.09ms
+...
+gen  499 | alive:  751 | changes:  148 | dt: 0.08ms
+
+Rewinding 50 generations...
+  rewind step  0 | alive:  751
+  rewind step 10 | alive:  763
+...
+Verification passed: alive counts match.
+```
+
+`Changed<CellState>` skips the entire archetype when no cell state mutated — iteration cost drops to nearly zero for stable generations. The undo stack records `(grid_index, old_state)` pairs per generation; rewinding restores exact prior states, and replay reproduces the same trajectory deterministically.
+
 ### Benchmarks
 
 Criterion benchmarks compare against [hecs](https://crates.io/crates/hecs):
@@ -112,12 +137,14 @@ $ cargo bench -p minkowski
 
 Suites: `spawn` (10K entities), `iterate` (10K), `parallel` (100K vs sequential), `add_remove` (1K migration cycles), `fragmented` (20 archetypes).
 
-## What's next (Phase 3+)
+## What's next
+
+**Phase 3 — done:** per-column change detection ticks, `Changed<T>` query filter, undo/replay via `EnumChangeSet`.
 
 | Phase | Feature | Why |
 |---|---|---|
-| 3 | Secondary index hooks | Observer API for user-defined spatial indices (grids, BVH, k-d trees) that update on component change |
-| 3 | Automatic system scheduling | Conflict detection, parallel system execution |
+| 4 | Secondary index hooks | Observer API for user-defined spatial indices (grids, BVH, k-d trees) that update on component change |
+| 4 | Automatic system scheduling | Conflict detection, parallel system execution |
 | 4 | Persistence — WAL + snapshots | Durable state via BlobVec memcpy to disk |
 | 4 | Transaction semantics | Atomic multi-entity mutations with rollback |
 | 5 | Query planning (Volcano model) | Optimize complex queries across indexes |
@@ -168,16 +195,14 @@ Two-tier query system:
 
 Matching uses **bitsets** — one per archetype, `(archetype_bits & query_bits) == query_bits`. Handles negation, optionals, and union queries with bitwise ops. Scales to hundreds of archetypes in microseconds.
 
-Query planning uses a simple plan tree:
+The current hot path is pointer-chasing through pre-resolved column arrays cached per-query type. When indexes land (Phase 5), query planning will layer on top:
 
 | Node | Purpose |
 |------|---------|
-| `Scan` | Iterate all rows in an archetype |
-| `IndexScan` | B-tree range lookup on an indexed column |
-| `Filter` | Row-level predicate evaluation |
-| `Merge` | Concatenate results from multiple archetypes |
-
-Plans are cached per-query. The planner runs rarely (query creation, new archetype events); the hot path is pointer chasing through pre-resolved column arrays.
+| `Scan` | Iterate all rows in an archetype (current) |
+| `IndexScan` | B-tree range lookup on an indexed column (planned) |
+| `Filter` | Row-level predicate evaluation (planned) |
+| `Merge` | Concatenate results from multiple archetypes (planned) |
 
 ### Indexes
 
@@ -199,7 +224,7 @@ Enables O(log n) lookups by column value — essential for the database side, ab
 
 - **Deferred via command buffers** — structural changes (add/remove component, spawn/despawn) are batched and applied at sync points. Amortizes archetype migration cost and avoids iterator invalidation.
 - **Lazy archetype migration** — if a newly added component doesn't affect any active query, store it in sparse storage and defer the archetype move until actually needed.
-- **Change detection** — per-column tick tracking (`Changed<T>`, `Added<T>`). Entire archetypes skipped when unchanged since last query evaluation.
+- **Change detection** — per-column tick tracking (`Changed<T>`). Entire archetypes skipped when unchanged since last query evaluation.
 
 ### Persistence
 
@@ -237,10 +262,11 @@ Falls out naturally from the commit log:
 4. ~~`Query<(A, B, ...)>` — tuple trait impls with bitset matching~~
 5. ~~`#[derive(Table)]` — proc macro for compile-time schema registration~~
 6. ~~`ChangeSet` — mutation abstraction (enables command buffers, persistence, replication)~~
-7. Commit log + snapshot persistence
-8. Indexes (B-tree, hash)
-9. Transaction isolation / MVCC
-10. rkyv zero-copy snapshots
+7. ~~`Changed<T>` — per-column tick tracking, archetype-level change detection~~
+8. Commit log + snapshot persistence
+9. Indexes (B-tree, hash)
+10. Transaction isolation / MVCC
+11. rkyv zero-copy snapshots
 
 ## Design Principles
 
