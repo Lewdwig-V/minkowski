@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn iterate_empty() {
-        let world = World::new();
+        let mut world = World::new();
         let count = world.query::<&Pos>().count();
         assert_eq!(count, 0);
     }

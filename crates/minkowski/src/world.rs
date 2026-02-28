@@ -6,6 +6,9 @@ use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
 use crate::table::TableCache;
+use fixedbitset::FixedBitSet;
+use std::any::TypeId;
+use std::collections::HashMap;
 
 fn get_pair_mut(v: &mut [Archetype], a: usize, b: usize) -> (&mut Archetype, &mut Archetype) {
     assert_ne!(a, b, "cannot get mutable references to the same archetype");
@@ -24,6 +27,15 @@ pub(crate) struct EntityLocation {
     pub row: usize,
 }
 
+pub(crate) struct QueryCacheEntry {
+    /// Archetypes whose component_ids are a superset of the query's required_ids.
+    matched_ids: Vec<ArchetypeId>,
+    /// Precomputed required component bitset for incremental scans.
+    required: FixedBitSet,
+    /// Number of archetypes when cache was last updated.
+    last_archetype_count: usize,
+}
+
 pub struct World {
     pub(crate) entities: EntityAllocator,
     pub(crate) archetypes: Archetypes,
@@ -31,6 +43,7 @@ pub struct World {
     pub(crate) sparse: SparseStorage,
     pub(crate) entity_locations: Vec<Option<EntityLocation>>,
     pub(crate) table_cache: TableCache,
+    pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
 }
 
 impl World {
@@ -42,6 +55,7 @@ impl World {
             sparse: SparseStorage::new(),
             entity_locations: Vec::new(),
             table_cache: TableCache::new(),
+            query_cache: HashMap::new(),
         }
     }
 
@@ -151,25 +165,56 @@ impl World {
         }
     }
 
-    pub fn query<Q: WorldQuery>(&self) -> QueryIter<'_, Q> {
-        let required = Q::required_ids(&self.components);
-        let fetches: Vec<_> = self
-            .archetypes
-            .archetypes
+    pub fn query<Q: WorldQuery + 'static>(&mut self) -> QueryIter<'_, Q> {
+        let type_id = TypeId::of::<Q>();
+        let total = self.archetypes.archetypes.len();
+
+        let entry = self
+            .query_cache
+            .entry(type_id)
+            .or_insert_with(|| QueryCacheEntry {
+                matched_ids: Vec::new(),
+                required: Q::required_ids(&self.components),
+                last_archetype_count: 0,
+            });
+
+        // Refresh required bitset in case new components were registered since
+        // the cache entry was created. If the bitset changed, rescan from scratch.
+        let fresh_required = Q::required_ids(&self.components);
+        if fresh_required != entry.required {
+            entry.required = fresh_required;
+            entry.matched_ids.clear();
+            entry.last_archetype_count = 0;
+        }
+
+        // Incremental scan: only check archetypes added since last cache update
+        if entry.last_archetype_count < total {
+            for arch in &self.archetypes.archetypes[entry.last_archetype_count..total] {
+                if entry.required.is_subset(&arch.component_ids) {
+                    entry.matched_ids.push(arch.id);
+                }
+            }
+            entry.last_archetype_count = total;
+        }
+
+        // Build fetches from cached archetype list, filtering empties at iteration time
+        let fetches: Vec<_> = entry
+            .matched_ids
             .iter()
-            .filter(|arch| !arch.is_empty() && required.is_subset(&arch.component_ids))
-            .map(|arch| {
-                let fetch = Q::init_fetch(arch, &self.components);
-                (fetch, arch.len())
+            .filter_map(|&aid| {
+                let arch = &self.archetypes.archetypes[aid.0];
+                if arch.is_empty() {
+                    return None;
+                }
+                Some((Q::init_fetch(arch, &self.components), arch.len()))
             })
             .collect();
+
         QueryIter::new(fetches)
     }
 
     /// Resolve column pointers for a table's archetype.
-    fn resolve_table_ptrs<T: crate::table::Table>(
-        &mut self,
-    ) -> (Vec<(*mut u8, usize)>, usize) {
+    fn resolve_table_ptrs<T: crate::table::Table>(&mut self) -> (Vec<(*mut u8, usize)>, usize) {
         let desc = self
             .table_cache
             .get_or_create::<T>(&mut self.components, &mut self.archetypes);
@@ -509,5 +554,69 @@ mod tests {
         assert_eq!(world.get::<Vel>(e1), Some(&Vel { dx: 1.0, dy: 0.0 }));
         assert_eq!(world.get::<Pos>(e2), Some(&Pos { x: 2.0, y: 0.0 }));
         assert_eq!(world.get::<Pos>(e3), Some(&Pos { x: 3.0, y: 0.0 }));
+    }
+
+    #[test]
+    fn query_cache_populated_on_first_call() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        let count1 = world.query::<&Pos>().count();
+        let count2 = world.query::<&Pos>().count();
+        assert_eq!(count1, 1);
+        assert_eq!(count2, 1);
+    }
+
+    #[test]
+    fn query_cache_incremental_after_new_archetype() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.query::<&Pos>().count(), 1);
+
+        world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
+        assert_eq!(world.query::<&Pos>().count(), 2);
+    }
+
+    #[test]
+    fn query_cache_filters_empty_archetypes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.query::<&Pos>().count(), 1);
+
+        world.despawn(e);
+        assert_eq!(world.query::<&Pos>().count(), 0);
+    }
+
+    #[test]
+    fn query_cache_independent_per_query_type() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
+
+        assert_eq!(world.query::<&Pos>().count(), 2);
+        assert_eq!(world.query::<(&Pos, &Vel)>().count(), 1);
+    }
+
+    #[test]
+    fn query_cache_unrelated_archetype_no_false_match() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.query::<&Vel>().count(), 0);
+
+        world.spawn((Vel { dx: 1.0, dy: 0.0 },));
+        assert_eq!(world.query::<&Pos>().count(), 1);
+        assert_eq!(world.query::<&Vel>().count(), 1);
+    }
+
+    #[test]
+    fn query_cache_after_migration() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.query::<&Pos>().count(), 1);
+        assert_eq!(world.query::<(&Pos, &Vel)>().count(), 0);
+
+        world.insert(e, Vel { dx: 1.0, dy: 0.0 });
+        assert_eq!(world.query::<&Pos>().count(), 1);
+        assert_eq!(world.query::<(&Pos, &Vel)>().count(), 1);
     }
 }

@@ -352,10 +352,7 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            world.get::<Pos>(e),
-            Some(&Pos { x: 11.0, y: 2.0 })
-        );
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 11.0, y: 2.0 }));
     }
 
     #[test]
@@ -489,10 +486,7 @@ mod tests {
             row.pos.x += 10.0;
         }
 
-        assert_eq!(
-            world.get::<Pos>(e),
-            Some(&Pos { x: 11.0, y: 2.0 })
-        );
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 11.0, y: 2.0 }));
     }
 
     #[test]
@@ -521,10 +515,7 @@ mod tests {
             row.pos.x += 100.0;
         }
 
-        assert_eq!(
-            world.get::<Pos>(e),
-            Some(&Pos { x: 101.0, y: 2.0 })
-        );
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 101.0, y: 2.0 }));
     }
 
     // --- Edge cases ---
@@ -573,10 +564,7 @@ mod tests {
             });
         }
 
-        let sum: f32 = world
-            .query_table::<Transform>()
-            .map(|row| row.pos.x)
-            .sum();
+        let sum: f32 = world.query_table::<Transform>().map(|row| row.pos.x).sum();
         // Sum of 0..1000 = 999*1000/2 = 499500
         assert_eq!(sum, 499500.0);
     }
