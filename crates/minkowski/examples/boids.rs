@@ -229,7 +229,19 @@ fn main() {
             .map(|(e, p, v)| (e, p.0, v.0))
             .collect();
 
-        // Step 3: Force accumulation (parallel)
+        // Step 3: Build spatial grid + force accumulation (parallel)
+        let cell_size = params.cohesion_radius; // largest interaction radius
+        let grid_w = (params.world_size / cell_size).ceil() as usize;
+
+        // Build grid: each cell contains snapshot indices of boids in that cell
+        let mut grid: Vec<Vec<usize>> = vec![vec![]; grid_w * grid_w];
+        for (i, &(_, pos, _)) in snapshot.iter().enumerate() {
+            let cx = ((pos.x / cell_size) as usize).min(grid_w - 1);
+            let cy = ((pos.y / cell_size) as usize).min(grid_w - 1);
+            grid[cy * grid_w + cx].push(i);
+        }
+
+        // Force accumulation — iterate only 3x3 neighbor cells per boid
         let forces: Vec<(Entity, Vec2)> = {
             use rayon::prelude::*;
             snapshot
@@ -242,26 +254,39 @@ fn main() {
                     let mut ali_count = 0u32;
                     let mut coh_count = 0u32;
 
-                    for &(_other_e, other_pos, other_vel) in &snapshot {
-                        let diff = other_pos - pos;
-                        let dist_sq = diff.length_sq();
-                        if dist_sq < 1e-6 {
-                            continue;
-                        }
+                    let cx = ((pos.x / cell_size) as usize).min(grid_w - 1);
+                    let cy = ((pos.y / cell_size) as usize).min(grid_w - 1);
 
-                        let dist = dist_sq.sqrt();
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let nx = (cx as i32 + dx).rem_euclid(grid_w as i32) as usize;
+                            let ny = (cy as i32 + dy).rem_euclid(grid_w as i32) as usize;
+                            for &j in &grid[ny * grid_w + nx] {
+                                let (_, other_pos, other_vel) = snapshot[j];
+                                let diff = Vec2::new(
+                                    wrapped_diff(other_pos.x, pos.x, params.world_size),
+                                    wrapped_diff(other_pos.y, pos.y, params.world_size),
+                                );
+                                let dist_sq = diff.length_sq();
+                                if dist_sq < 1e-6 {
+                                    continue;
+                                }
 
-                        if dist < params.separation_radius {
-                            sep = sep - diff.normalized() * (1.0 / dist);
-                            sep_count += 1;
-                        }
-                        if dist < params.alignment_radius {
-                            ali += other_vel;
-                            ali_count += 1;
-                        }
-                        if dist < params.cohesion_radius {
-                            coh += other_pos;
-                            coh_count += 1;
+                                let dist = dist_sq.sqrt();
+
+                                if dist < params.separation_radius {
+                                    sep = sep - diff.normalized() * (1.0 / dist);
+                                    sep_count += 1;
+                                }
+                                if dist < params.alignment_radius {
+                                    ali += other_vel;
+                                    ali_count += 1;
+                                }
+                                if dist < params.cohesion_radius {
+                                    coh += other_pos;
+                                    coh_count += 1;
+                                }
+                            }
                         }
                     }
 
@@ -275,7 +300,10 @@ fn main() {
                     }
                     if coh_count > 0 {
                         let center = coh / coh_count as f32;
-                        let desired = center - pos;
+                        let desired = Vec2::new(
+                            wrapped_diff(center.x, pos.x, params.world_size),
+                            wrapped_diff(center.y, pos.y, params.world_size),
+                        );
                         force += desired * params.cohesion_weight;
                     }
 
