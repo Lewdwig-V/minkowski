@@ -5,6 +5,10 @@
 //! Exercises: spawn, despawn, multi-component queries, mutation,
 //! parallel iteration, deferred commands, archetype stability under churn.
 //!
+//! The N² neighbor search is replaced by a uniform spatial grid — each boid
+//! checks only a 3×3 cell neighborhood, reducing inner loop iterations from
+//! ~5,000 to ~450 and improving cache locality.
+//!
 //! # Vectorization
 //!
 //! The integration loops (Steps 1 and 5) are designed to auto-vectorize.
