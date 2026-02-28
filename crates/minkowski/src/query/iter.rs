@@ -20,6 +20,21 @@ impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
         }
     }
 
+    /// Iterate archetypes, yielding typed column slices per archetype.
+    /// Each invocation of `f` receives all matched rows in one archetype
+    /// as contiguous slices — enabling SIMD auto-vectorization.
+    pub fn for_each_chunk<F>(self, mut f: F)
+    where
+        F: FnMut(Q::Slice<'w>),
+    {
+        for (fetch, len) in &self.fetches {
+            if *len > 0 {
+                let slices = unsafe { Q::as_slice(fetch, *len) };
+                f(slices);
+            }
+        }
+    }
+
     /// Execute `f` for each matched entity in parallel using rayon.
     /// Parallelizes across rows within each archetype.
     pub fn par_for_each<F>(self, f: F)
@@ -141,6 +156,71 @@ mod tests {
 
         let xs: Vec<f32> = world.query::<&Pos>().map(|p| p.x).collect();
         assert_eq!(xs, vec![11.0, 22.0]);
+    }
+
+    #[test]
+    fn for_each_chunk_yields_correct_data() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        world.spawn((Pos { x: 2.0, y: 0.0 },));
+        world.spawn((Pos { x: 3.0, y: 0.0 },));
+
+        let mut total = 0.0f32;
+        world.query::<&Pos>().for_each_chunk(|positions| {
+            for p in positions {
+                total += p.x;
+            }
+        });
+        assert_eq!(total, 6.0);
+    }
+
+    #[test]
+    fn for_each_chunk_mutation() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { dx: 10.0, dy: 0.0 }));
+        world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { dx: 20.0, dy: 0.0 }));
+
+        world
+            .query::<(&mut Pos, &Vel)>()
+            .for_each_chunk(|(positions, velocities)| {
+                for i in 0..positions.len() {
+                    positions[i].x += velocities[i].dx;
+                }
+            });
+
+        let xs: Vec<f32> = world.query::<&Pos>().map(|p| p.x).collect();
+        assert_eq!(xs, vec![11.0, 22.0]);
+    }
+
+    #[test]
+    fn for_each_chunk_skips_empty() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        world.despawn(e);
+
+        let mut chunk_count = 0;
+        world.query::<&Pos>().for_each_chunk(|_| {
+            chunk_count += 1;
+        });
+        assert_eq!(chunk_count, 0);
+    }
+
+    #[test]
+    fn for_each_chunk_multiple_archetypes() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
+
+        let mut chunk_count = 0;
+        let mut total = 0.0f32;
+        world.query::<&Pos>().for_each_chunk(|positions| {
+            chunk_count += 1;
+            for p in positions {
+                total += p.x;
+            }
+        });
+        assert_eq!(chunk_count, 2);
+        assert_eq!(total, 3.0);
     }
 
     #[test]
