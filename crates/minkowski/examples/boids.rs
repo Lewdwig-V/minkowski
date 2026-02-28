@@ -287,7 +287,7 @@ fn main() {
                                     ali_count += 1;
                                 }
                                 if dist < params.cohesion_radius {
-                                    coh += other_pos;
+                                    coh += diff;
                                     coh_count += 1;
                                 }
                             }
@@ -303,11 +303,9 @@ fn main() {
                         force += desired * params.alignment_weight;
                     }
                     if coh_count > 0 {
-                        let center = coh / coh_count as f32;
-                        let desired = Vec2::new(
-                            wrapped_diff(center.x, pos.x, params.world_size),
-                            wrapped_diff(center.y, pos.y, params.world_size),
-                        );
+                        // coh is the sum of wrapped offsets from pos to each neighbor,
+                        // so the mean offset is directly the desired cohesion direction.
+                        let desired = coh / coh_count as f32;
                         force += desired * params.cohesion_weight;
                     }
 
