@@ -26,6 +26,19 @@ Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates S
 
 Pre-commit hooks run `cargo fmt` and `cargo clippy -D warnings` on commit, `cargo test` on push.
 
+## CI
+
+GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every PR and push to main:
+
+| Job | Toolchain | Command | `needs` |
+|---|---|---|---|
+| fmt | stable | `cargo fmt --all -- --check` | — |
+| clippy | stable | `cargo clippy --workspace --all-targets -- -D warnings` | fmt |
+| test | stable | `cargo test -p minkowski` | clippy |
+| miri | nightly | Two-step Miri run (see Build & Test Commands) | test |
+
+Sequential chain: fmt failure skips all downstream jobs. The `miri` job is the required status check for branch protection (implicitly requires all upstream jobs).
+
 ## Architecture
 
 Minkowski is a **column-oriented archetype ECS**. Two crates: `minkowski` (core) and `minkowski-derive` (`#[derive(Table)]` proc macro).
