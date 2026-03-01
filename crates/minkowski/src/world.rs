@@ -8,9 +8,11 @@ use crate::storage::sparse::SparseStorage;
 use crate::table::TableCache;
 use crate::tick::Tick;
 use fixedbitset::FixedBitSet;
+use parking_lot::Mutex;
 use std::alloc::Layout;
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub(crate) fn get_pair_mut(
     v: &mut [Archetype],
@@ -44,6 +46,17 @@ pub(crate) struct QueryCacheEntry {
     last_read_tick: Tick,
 }
 
+/// Shared queue for entity IDs orphaned by aborted transactions.
+/// World owns the canonical instance; strategies clone the Arc handle.
+#[derive(Clone)]
+pub(crate) struct OrphanQueue(pub(crate) Arc<Mutex<Vec<Entity>>>);
+
+impl OrphanQueue {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Vec::new())))
+    }
+}
+
 pub struct World {
     pub(crate) entities: EntityAllocator,
     pub(crate) archetypes: Archetypes,
@@ -53,6 +66,7 @@ pub struct World {
     pub(crate) table_cache: TableCache,
     pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
     pub(crate) current_tick: Tick,
+    pub(crate) orphan_queue: OrphanQueue,
 }
 
 impl World {
@@ -66,6 +80,7 @@ impl World {
             table_cache: TableCache::new(),
             query_cache: HashMap::new(),
             current_tick: Tick::default(),
+            orphan_queue: OrphanQueue::new(),
         }
     }
 
@@ -73,6 +88,22 @@ impl World {
     /// Called automatically on every mutation and query — not user-facing.
     pub(crate) fn next_tick(&mut self) -> Tick {
         self.current_tick.advance()
+    }
+
+    /// Drain orphaned entity IDs from aborted transactions.
+    /// Called automatically at the top of every &mut self entry point.
+    fn drain_orphans(&mut self) {
+        let mut queue = self.orphan_queue.0.lock();
+        for entity in queue.drain(..) {
+            self.entities.dealloc(entity);
+        }
+    }
+
+    /// Clone the orphan queue handle. Strategies capture this at construction
+    /// so that transaction Drop can push orphaned entity IDs without &mut World.
+    #[allow(dead_code)]
+    pub(crate) fn orphan_queue(&self) -> OrphanQueue {
+        self.orphan_queue.clone()
     }
 
     /// Look up the ComponentId for a type. Returns None if the type has
@@ -84,12 +115,14 @@ impl World {
     /// Register a component type, returning its ComponentId. Idempotent —
     /// returns the existing id if already registered.
     pub fn register_component<T: Component>(&mut self) -> ComponentId {
+        self.drain_orphans();
         self.components.register::<T>()
     }
 
     /// Allocate a fresh entity ID without placing it in any archetype.
     /// Use this to obtain an unplaced handle for `EnumChangeSet::spawn_bundle`.
     pub fn alloc_entity(&mut self) -> Entity {
+        self.drain_orphans();
         let entity = self.entities.alloc();
         let index = entity.index() as usize;
         if index >= self.entity_locations.len() {
@@ -104,6 +137,7 @@ impl World {
     /// Used by transaction abort to clean up entity IDs that were allocated
     /// via `alloc_entity()` but never placed (changeset was discarded).
     pub(crate) fn dealloc_entity(&mut self, entity: Entity) {
+        self.drain_orphans();
         self.entities.dealloc(entity);
     }
 
@@ -115,6 +149,7 @@ impl World {
     }
 
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
+        self.drain_orphans();
         let component_ids = B::component_ids(&mut self.components);
         let arch_id = self
             .archetypes
@@ -148,6 +183,7 @@ impl World {
     }
 
     pub fn despawn(&mut self, entity: Entity) -> bool {
+        self.drain_orphans();
         if !self.entities.is_alive(entity) {
             return false;
         }
@@ -206,6 +242,7 @@ impl World {
     }
 
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
+        self.drain_orphans();
         if !self.entities.is_alive(entity) {
             return None;
         }
@@ -226,6 +263,7 @@ impl World {
     }
 
     pub fn query<Q: WorldQuery + 'static>(&mut self) -> QueryIter<'_, Q> {
+        self.drain_orphans();
         let type_id = TypeId::of::<Q>();
         let total = self.archetypes.archetypes.len();
 
@@ -337,6 +375,7 @@ impl World {
     ///
     /// Marks all columns changed (raw pointers allow arbitrary writes).
     pub fn query_table_raw<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
+        self.drain_orphans();
         self.mark_table_columns_changed::<T>();
         let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
         crate::table::TableIter::new(col_ptrs, len)
@@ -375,6 +414,7 @@ impl World {
     }
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
+        self.drain_orphans();
         assert!(self.is_alive(entity), "entity is not alive");
         let index = entity.index() as usize;
         let location = self.entity_locations[index].unwrap();
@@ -457,6 +497,7 @@ impl World {
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
+        self.drain_orphans();
         if !self.is_alive(entity) {
             return None;
         }
