@@ -116,22 +116,15 @@ impl SequentialTx {
 /// Best for read-heavy workloads where conflicts are rare.
 pub struct Optimistic {
     next_tx_id: AtomicU64,
-    /// Entity IDs from aborted transactions awaiting generation-bump + recycle.
-    pending_release: Mutex<Vec<Entity>>,
+    orphan_queue: crate::world::OrphanQueue,
 }
 
 impl Optimistic {
-    pub fn new() -> Self {
+    pub fn new(world: &World) -> Self {
         Self {
             next_tx_id: AtomicU64::new(1),
-            pending_release: Mutex::new(Vec::new()),
+            orphan_queue: world.orphan_queue(),
         }
-    }
-}
-
-impl Default for Optimistic {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -139,10 +132,6 @@ impl TransactionStrategy for Optimistic {
     type Tx<'s> = OptimisticTx<'s>;
 
     fn begin<'s>(&'s self, world: &mut World, access: &Access) -> OptimisticTx<'s> {
-        // Drain pending releases from previous aborted transactions.
-        for entity in self.pending_release.lock().drain(..) {
-            world.dealloc_entity(entity);
-        }
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         let mut accessed = access.reads().clone();
         accessed.union_with(access.writes());
@@ -169,7 +158,7 @@ impl TransactionStrategy for Optimistic {
 /// that existed when the transaction started.
 ///
 /// Drop without commit releases spawned entity IDs back to the allocator
-/// via the strategy's pending release queue — no entity IDs ever leak.
+/// via the World's orphan queue — no entity IDs ever leak.
 pub struct OptimisticTx<'s> {
     /// Unique transaction identifier (monotonic per strategy).
     pub tx_id: TxId,
@@ -228,10 +217,9 @@ impl<'s> OptimisticTx<'s> {
 impl<'s> Drop for OptimisticTx<'s> {
     fn drop(&mut self) {
         if !self.spawned_entities.is_empty() {
-            // Push to strategy's pending release queue — generation bump
-            // happens at next begin() when &mut World is available.
             self.strategy
-                .pending_release
+                .orphan_queue
+                .0
                 .lock()
                 .extend(self.spawned_entities.drain(..));
         }
@@ -247,30 +235,23 @@ impl<'s> Drop for OptimisticTx<'s> {
 /// Owns the `ColumnLockTable` via `Mutex` — multiple transactions can
 /// coexist from the same strategy instance. The mutex is only locked
 /// during begin/commit/drop (all sequential phases), never contended
-/// during the parallel read phase. Created via `Pessimistic::new()`.
+/// during the parallel read phase. Created via `Pessimistic::new(&world)`.
 ///
 /// Best for write-heavy workloads or expensive computations where
 /// optimistic retry would waste work.
 pub struct Pessimistic {
     lock_table: Mutex<ColumnLockTable>,
     next_tx_id: AtomicU64,
-    /// Entity IDs from aborted transactions awaiting generation-bump + recycle.
-    pending_release: Mutex<Vec<Entity>>,
+    orphan_queue: crate::world::OrphanQueue,
 }
 
 impl Pessimistic {
-    pub fn new() -> Self {
+    pub fn new(world: &World) -> Self {
         Self {
             lock_table: Mutex::new(ColumnLockTable::new()),
             next_tx_id: AtomicU64::new(1),
-            pending_release: Mutex::new(Vec::new()),
+            orphan_queue: world.orphan_queue(),
         }
-    }
-}
-
-impl Default for Pessimistic {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -278,10 +259,6 @@ impl TransactionStrategy for Pessimistic {
     type Tx<'s> = PessimisticTx<'s>;
 
     fn begin<'s>(&'s self, world: &mut World, access: &Access) -> PessimisticTx<'s> {
-        // Drain pending releases from previous aborted transactions.
-        for entity in self.pending_release.lock().drain(..) {
-            world.dealloc_entity(entity);
-        }
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         let lock_result = self.lock_table.lock().acquire(
             &world.archetypes.archetypes,
@@ -380,10 +357,11 @@ impl<'s> Drop for PessimisticTx<'s> {
         if let Some(locks) = self.locks.take() {
             self.strategy.lock_table.lock().release(locks);
         }
-        // Release spawned entity IDs to pending queue
+        // Release spawned entity IDs to orphan queue
         if !self.spawned_entities.is_empty() {
             self.strategy
-                .pending_release
+                .orphan_queue
+                .0
                 .lock()
                 .extend(self.spawned_entities.drain(..));
         }
