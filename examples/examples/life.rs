@@ -1,14 +1,15 @@
-//! Game of Life with undo — exercises Changed<T>, EnumChangeSet, and undo/replay.
+//! Game of Life with undo — exercises `#[derive(Table)]`, Changed<T>, EnumChangeSet, and undo/replay.
 //!
 //! Run: cargo run -p minkowski --example life --release
 //!
 //! Features exercised:
+//! - `#[derive(Table)]` for typed row access that skips archetype matching
+//! - `query_table` / `query_table_mut` for bulk reads and writes over the cell grid
 //! - `Changed<CellState>` for detecting which cells mutated each generation
 //! - `EnumChangeSet::insert` for recording typed mutations with automatic undo
-//! - `get_mut` for per-entity neighbor count updates
 //! - Reversible changesets for time-travel (rewind + deterministic replay)
 
-use minkowski::{Changed, Entity, EnumChangeSet, World};
+use minkowski::{Changed, Entity, EnumChangeSet, Table, World};
 use std::time::Instant;
 
 // ── Components ──────────────────────────────────────────────────────
@@ -18,6 +19,12 @@ struct CellState(bool);
 
 #[derive(Clone, Copy)]
 struct NeighborCount(u8);
+
+#[derive(Clone, Copy, Table)]
+struct Cell {
+    state: CellState,
+    neighbors: NeighborCount,
+}
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -53,10 +60,9 @@ fn neighbor_indices(x: usize, y: usize) -> [usize; 8] {
 }
 
 /// Snapshot all cell states into a local Vec<bool> to avoid aliasing.
-fn snapshot_states(world: &World, grid: &[Entity]) -> Vec<bool> {
-    grid.iter()
-        .map(|&e| world.get::<CellState>(e).unwrap().0)
-        .collect()
+/// Uses `query_table` for typed row access without archetype matching.
+fn snapshot_states(world: &mut World) -> Vec<bool> {
+    world.query_table::<Cell>().map(|row| row.state.0).collect()
 }
 
 /// Count alive neighbors for every cell using a state snapshot.
@@ -77,12 +83,12 @@ fn count_neighbors(states: &[bool]) -> Vec<u8> {
     counts
 }
 
-/// Write neighbor counts into the world via get_mut.
-fn write_neighbor_counts(world: &mut World, grid: &[Entity], counts: &[u8]) {
-    for (i, &count) in counts.iter().enumerate() {
-        if let Some(nc) = world.get_mut::<NeighborCount>(grid[i]) {
-            nc.0 = count;
-        }
+/// Write neighbor counts into the world via `query_table_mut`.
+/// Marks all Cell columns changed (including CellState) — this is the
+/// column-level granularity trade-off of the table mutation path.
+fn write_neighbor_counts(world: &mut World, counts: &[u8]) {
+    for (row, &count) in world.query_table_mut::<Cell>().zip(counts.iter()) {
+        row.neighbors.0 = count;
     }
 }
 
@@ -115,10 +121,11 @@ fn apply_updates(world: &mut World, grid: &[Entity], updates: &[(usize, bool)]) 
     cs.apply(world)
 }
 
-/// Count alive cells from the world.
-fn alive_count(world: &World, grid: &[Entity]) -> usize {
-    grid.iter()
-        .filter(|&&e| world.get::<CellState>(e).unwrap().0)
+/// Count alive cells from the world via `query_table`.
+fn alive_count(world: &mut World) -> usize {
+    world
+        .query_table::<Cell>()
+        .filter(|row| row.state.0)
         .count()
 }
 
@@ -131,22 +138,25 @@ fn main() {
     let mut grid = Vec::with_capacity(CELL_COUNT);
     for _ in 0..CELL_COUNT {
         let alive = fastrand::f32() < 0.45;
-        let e = world.spawn((CellState(alive), NeighborCount(0)));
+        let e = world.spawn(Cell {
+            state: CellState(alive),
+            neighbors: NeighborCount(0),
+        });
         grid.push(e);
     }
 
     // Initial neighbor count
     {
-        let states = snapshot_states(&world, &grid);
+        let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
-        write_neighbor_counts(&mut world, &grid, &counts);
+        write_neighbor_counts(&mut world, &counts);
     }
 
     println!(
         "Game of Life: {}x{} grid, {} cells, {} generations",
         WIDTH, HEIGHT, CELL_COUNT, GENERATIONS
     );
-    println!("Initial alive: {}", alive_count(&world, &grid));
+    println!("Initial alive: {}", alive_count(&mut world));
     println!();
 
     // ── Generation loop ─────────────────────────────────────────────
@@ -156,9 +166,9 @@ fn main() {
         let frame_start = Instant::now();
 
         // Snapshot states, recount neighbors
-        let states = snapshot_states(&world, &grid);
+        let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
-        write_neighbor_counts(&mut world, &grid, &counts);
+        write_neighbor_counts(&mut world, &counts);
 
         // Apply Conway rules via EnumChangeSet — automatic undo capture
         let updates = apply_rules(&states, &counts);
@@ -178,7 +188,7 @@ fn main() {
             println!(
                 "gen {:>4} | alive: {:>4} | changes: {:>4} | dt: {:.2}ms",
                 gen,
-                alive_count(&world, &grid),
+                alive_count(&mut world),
                 change_count,
                 dt_ms,
             );
@@ -186,7 +196,7 @@ fn main() {
     }
 
     // Record alive count at gen 499 (before rewind)
-    let pre_rewind_alive = alive_count(&world, &grid);
+    let pre_rewind_alive = alive_count(&mut world);
     println!();
     println!(
         "Pre-rewind alive count (gen {}): {}",
@@ -206,12 +216,12 @@ fn main() {
             println!(
                 "  rewind step {:>2} | alive: {:>4}",
                 i,
-                alive_count(&world, &grid)
+                alive_count(&mut world)
             );
         }
     }
 
-    let rewound_alive = alive_count(&world, &grid);
+    let rewound_alive = alive_count(&mut world);
     println!(
         "Rewound to gen {} | alive: {}",
         GENERATIONS - 1 - REWIND_GENS,
@@ -223,9 +233,9 @@ fn main() {
     println!("Replaying {} generations...", REWIND_GENS);
 
     for i in 0..REWIND_GENS {
-        let states = snapshot_states(&world, &grid);
+        let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
-        write_neighbor_counts(&mut world, &grid, &counts);
+        write_neighbor_counts(&mut world, &counts);
 
         let updates = apply_rules(&states, &counts);
         let _ = apply_updates(&mut world, &grid, &updates);
@@ -234,12 +244,12 @@ fn main() {
             println!(
                 "  replay step {:>2} | alive: {:>4}",
                 i,
-                alive_count(&world, &grid)
+                alive_count(&mut world)
             );
         }
     }
 
-    let post_replay_alive = alive_count(&world, &grid);
+    let post_replay_alive = alive_count(&mut world);
     println!();
     println!("Post-replay alive count: {}", post_replay_alive);
     println!("Pre-rewind alive count:  {}", pre_rewind_alive);
