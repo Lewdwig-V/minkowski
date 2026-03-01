@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use fixedbitset::FixedBitSet;
 use parking_lot::Mutex;
 
@@ -9,6 +11,9 @@ use crate::lock_table::{ColumnLockSet, ColumnLockTable};
 use crate::query::fetch::{ReadOnlyWorldQuery, WorldQuery};
 use crate::query::iter::QueryIter;
 use crate::world::World;
+
+/// Unique transaction identifier, monotonically increasing per strategy.
+pub type TxId = u64;
 
 /// Conflict information returned when a transaction commit fails.
 pub struct Conflict {
@@ -109,20 +114,41 @@ impl SequentialTx {
 /// At commit, validates that no read column was modified since begin.
 ///
 /// Best for read-heavy workloads where conflicts are rare.
-pub struct Optimistic;
+pub struct Optimistic {
+    next_tx_id: AtomicU64,
+}
+
+impl Optimistic {
+    pub fn new() -> Self {
+        Self {
+            next_tx_id: AtomicU64::new(1),
+        }
+    }
+}
+
+impl Default for Optimistic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TransactionStrategy for Optimistic {
     type Tx<'s> = OptimisticTx;
 
     fn begin(&self, world: &mut World, access: &Access) -> OptimisticTx {
+        let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         // Snapshot ticks for ALL accessed columns (reads + writes).
         // If another transaction modifies a column we read OR write,
         // our computed values may be stale (read-modify-write pattern).
         let mut accessed = access.reads().clone();
         accessed.union_with(access.writes());
         let read_ticks = world.snapshot_column_ticks(&accessed);
+        // Pre-resolve archetype count — transactions see a frozen archetype set.
+        let archetype_count = world.archetypes.archetypes.len();
         OptimisticTx {
+            tx_id,
             read_ticks,
+            archetype_count,
             changeset: EnumChangeSet::new(),
         }
     }
@@ -134,20 +160,27 @@ impl TransactionStrategy for Optimistic {
 /// as parameters. Reads use `World::query_raw` (shared-ref, no tick/cache
 /// mutation). Writes buffer into an `EnumChangeSet`.
 ///
+/// Archetype set is frozen at begin time — queries only see archetypes
+/// that existed when the transaction started.
+///
 /// Drop without commit discards the buffered changeset (abort).
 pub struct OptimisticTx {
+    /// Unique transaction identifier (monotonic per strategy).
+    pub tx_id: TxId,
     read_ticks: Vec<(usize, crate::component::ComponentId, crate::tick::Tick)>,
+    archetype_count: usize,
     changeset: EnumChangeSet,
 }
 
 impl OptimisticTx {
     /// Read through the transaction via shared World reference.
     /// No tick advancement, no cache mutation. Safe for concurrent reads.
+    /// Only sees archetypes that existed at begin time.
     ///
     /// Requires `ReadOnlyWorldQuery` — `&mut T` queries are rejected at
     /// compile time. Writes go through `insert`/`remove`/`spawn` instead.
     pub fn query<'a, Q: ReadOnlyWorldQuery + 'static>(&self, world: &'a World) -> QueryIter<'a, Q> {
-        world.query_raw::<Q>()
+        world.query_raw::<Q>(self.archetype_count)
     }
 
     pub fn insert<T: Component>(&mut self, world: &mut World, entity: Entity, value: T) {
@@ -192,12 +225,14 @@ impl OptimisticTx {
 /// optimistic retry would waste work.
 pub struct Pessimistic {
     lock_table: Mutex<ColumnLockTable>,
+    next_tx_id: AtomicU64,
 }
 
 impl Pessimistic {
     pub fn new() -> Self {
         Self {
             lock_table: Mutex::new(ColumnLockTable::new()),
+            next_tx_id: AtomicU64::new(1),
         }
     }
 }
@@ -212,15 +247,19 @@ impl TransactionStrategy for Pessimistic {
     type Tx<'s> = PessimisticTx<'s>;
 
     fn begin<'s>(&'s self, world: &mut World, access: &Access) -> PessimisticTx<'s> {
+        let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         let lock_result = self.lock_table.lock().acquire(
             &world.archetypes.archetypes,
             access.reads(),
             access.writes(),
         );
         let locks = lock_result.ok();
+        let archetype_count = world.archetypes.archetypes.len();
         PessimisticTx {
+            tx_id,
             strategy: self,
             locks,
+            archetype_count,
             changeset: EnumChangeSet::new(),
         }
     }
@@ -234,18 +273,22 @@ impl TransactionStrategy for Pessimistic {
 ///
 /// Drop without commit releases locks and discards the changeset (abort).
 pub struct PessimisticTx<'s> {
+    /// Unique transaction identifier (monotonic per strategy).
+    pub tx_id: TxId,
     strategy: &'s Pessimistic,
     locks: Option<ColumnLockSet>,
+    archetype_count: usize,
     changeset: EnumChangeSet,
 }
 
 impl<'s> PessimisticTx<'s> {
     /// Read through the transaction via shared World reference.
+    /// Only sees archetypes that existed at begin time.
     ///
     /// Requires `ReadOnlyWorldQuery` — `&mut T` queries are rejected at
     /// compile time. Writes go through `insert`/`remove`/`spawn` instead.
     pub fn query<'a, Q: ReadOnlyWorldQuery + 'static>(&self, world: &'a World) -> QueryIter<'a, Q> {
-        world.query_raw::<Q>()
+        world.query_raw::<Q>(self.archetype_count)
     }
 
     pub fn insert<T: Component>(&mut self, world: &mut World, entity: Entity, value: T) {
@@ -366,7 +409,7 @@ mod tests {
         let e = world.spawn((Pos(1.0), Vel(2.0)));
         let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
 
-        let strategy = Optimistic;
+        let strategy = Optimistic::new();
         let mut tx = strategy.begin(&mut world, &access);
         let count = tx.query::<(&Pos,)>(&world).count();
         assert_eq!(count, 1);
@@ -380,7 +423,7 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let strategy = Optimistic;
+        let strategy = Optimistic::new();
         let mut tx = strategy.begin(&mut world, &access);
         tx.insert::<Pos>(&mut world, e, Pos(99.0));
         // query_raw sees old value (write is buffered in changeset)
@@ -397,7 +440,7 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let strategy = Optimistic;
+        let strategy = Optimistic::new();
         {
             let mut tx = strategy.begin(&mut world, &access);
             tx.insert::<Pos>(&mut world, e, Pos(99.0));
@@ -431,7 +474,7 @@ mod tests {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let strategy = Optimistic;
+        let strategy = Optimistic::new();
         let mut tx = strategy.begin(&mut world, &access);
         let e = tx.spawn(&mut world, (Pos(42.0),));
         assert!(tx.commit(&mut world).is_ok());

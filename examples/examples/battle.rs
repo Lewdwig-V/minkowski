@@ -145,7 +145,7 @@ fn run_frame_optimistic(
     let frame_start = Instant::now();
 
     // 1. Begin phase (sequential -- needs &mut World).
-    let strategy = Optimistic;
+    let strategy = Optimistic::new();
     let mut tx_combat = strategy.begin(world, combat_access);
     let mut tx_healing = strategy.begin(world, healing_access);
 

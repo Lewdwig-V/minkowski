@@ -627,17 +627,18 @@ impl World {
     /// advancement, no column marking. Safe for concurrent reads from
     /// multiple threads.
     ///
-    /// Scans all archetypes against the query's required component bitset.
-    /// Skips empty archetypes. Does not apply Changed<T> filters (transactions
-    /// have their own tick-based conflict model).
+    /// Scans archetypes (up to `archetype_count`) against the query's required
+    /// component bitset. Skips empty archetypes. Does not apply Changed<T> filters
+    /// (transactions have their own tick-based conflict model).
+    ///
+    /// `archetype_count` freezes the archetype set to what existed at begin time.
     #[allow(dead_code)]
     pub(crate) fn query_raw<Q: crate::query::fetch::ReadOnlyWorldQuery + 'static>(
         &self,
+        archetype_count: usize,
     ) -> QueryIter<'_, Q> {
         let required = Q::required_ids(&self.components);
-        let fetches: Vec<_> = self
-            .archetypes
-            .archetypes
+        let fetches: Vec<_> = self.archetypes.archetypes[..archetype_count]
             .iter()
             .filter(|arch| !arch.is_empty() && required.is_subset(&arch.component_ids))
             .map(|arch| (Q::init_fetch(arch, &self.components), arch.len()))
@@ -1129,7 +1130,8 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
 
         // query_raw takes &self — no tick advancement, no cache mutation
-        let count = world.query_raw::<(&Pos,)>().count();
+        let n = world.archetypes.archetypes.len();
+        let count = world.query_raw::<(&Pos,)>(n).count();
         assert_eq!(count, 1);
     }
 
@@ -1137,9 +1139,10 @@ mod tests {
     fn query_raw_skips_empty_archetypes() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let n = world.archetypes.archetypes.len();
         world.despawn(e);
 
-        let count = world.query_raw::<(&Pos,)>().count();
+        let count = world.query_raw::<(&Pos,)>(n).count();
         assert_eq!(count, 0);
     }
 
@@ -1148,8 +1151,9 @@ mod tests {
         let mut world = World::new();
         world.spawn((Pos { x: 0.0, y: 0.0 },));
         world.spawn((Pos { x: 1.0, y: 1.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        let n = world.archetypes.archetypes.len();
         // Both archetypes contain Pos
-        let count = world.query_raw::<(&Pos,)>().count();
+        let count = world.query_raw::<(&Pos,)>(n).count();
         assert_eq!(count, 2);
     }
 }
