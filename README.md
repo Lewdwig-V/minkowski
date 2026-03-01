@@ -154,6 +154,41 @@ Done.
 
 2,000 bodies with O(N log N) Barnes-Hut force approximation via quadtree, parallel force computation via rayon, vectorized symplectic Euler integration via `for_each_chunk`, and random spawn/despawn churn to exercise generational validation of stale index entries.
 
+### Scheduler example
+
+A minimal conflict analysis demo showing how a framework author would use `Access` to detect data races between systems.
+
+```
+$ cargo run -p minkowski-examples --example scheduler --release
+
+Conflict matrix:
+
+       movement <-> gravity        CONFLICT
+       movement <-> health_regen   independent
+       movement <-> apply_damage   independent
+       movement <-> log_positions  CONFLICT
+       movement <-> log_health     independent
+        gravity <-> health_regen   independent
+        gravity <-> apply_damage   independent
+        gravity <-> log_positions  independent
+        gravity <-> log_health     independent
+   health_regen <-> apply_damage   CONFLICT
+   health_regen <-> log_positions  independent
+   health_regen <-> log_health     CONFLICT
+   apply_damage <-> log_positions  independent
+   apply_damage <-> log_health     CONFLICT
+  log_positions <-> log_health     independent
+
+Batch assignment (3 batches):
+  batch 0: [movement, health_regen]
+  batch 1: [gravity, apply_damage, log_positions]
+  batch 2: [log_health]
+...
+Done.
+```
+
+Six systems demonstrate every conflict case: write/write (`health_regen` vs `apply_damage`), read/write (`log_positions` vs `movement`), disjoint writes that parallelize (`movement` + `health_regen`), and read-only systems that batch with non-overlapping writers. The greedy batcher assigns systems to 3 batches — within each batch, systems touch disjoint components and could run in parallel.
+
 ### Benchmarks
 
 Criterion benchmarks compare against [hecs](https://crates.io/crates/hecs):
@@ -166,11 +201,10 @@ Suites: `spawn` (10K entities), `iterate` (10K), `parallel` (100K vs sequential)
 
 ## What's next
 
-**Phase 4 — done:** `SpatialIndex` lifecycle trait, Barnes-Hut N-body example, boids grid refactored through the trait.
+**Phase 4 — done:** `SpatialIndex` lifecycle trait, Barnes-Hut N-body example, boids grid refactored through the trait. `Access` struct for query conflict detection, scheduler example.
 
 | Phase | Feature | Why |
 |---|---|---|
-| 4 | Automatic system scheduling | Conflict detection, parallel system execution |
 | 4 | Persistence — WAL + snapshots | Durable state via BlobVec memcpy to disk |
 | 4 | Transaction semantics | Atomic multi-entity mutations with rollback |
 | 5 | Query planning (Volcano model) | Optimize complex queries across indexes |

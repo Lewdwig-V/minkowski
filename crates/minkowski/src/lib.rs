@@ -7,6 +7,7 @@
 // to resolve when used inside this crate's own tests.
 extern crate self as minkowski;
 
+pub mod access;
 pub mod bundle;
 pub mod changeset;
 pub mod command;
@@ -19,6 +20,7 @@ pub mod table;
 pub(crate) mod tick;
 pub mod world;
 
+pub use access::Access;
 pub use changeset::EnumChangeSet;
 pub use command::CommandBuffer;
 pub use component::ComponentId;
