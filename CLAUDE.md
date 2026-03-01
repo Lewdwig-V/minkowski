@@ -17,6 +17,7 @@ cargo bench -p minkowski -- spawn      # Single benchmark
 
 cargo run -p minkowski --example boids --release   # Boids simulation (5K entities, 1K frames)
 cargo run -p minkowski --example life --release    # Game of Life with undo (64x64 grid, 500 gens)
+cargo run -p minkowski --example nbody --release   # Barnes-Hut N-body (2K entities, 1K frames)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -93,9 +94,13 @@ Each BlobVec column stores a `changed_tick: Tick` — the tick at which it was l
 
 `EnumChangeSet` is the data-driven alternative: mutations are recorded as a `Vec<Mutation>` enum with component bytes in a contiguous `Arena`. `apply()` returns a reverse `EnumChangeSet` for rollback — applying the reverse undoes the original changes. Useful for persistence (WAL serialization) and transactions. Typed safe helpers (`insert<T>`, `remove<T>`, `spawn_bundle<B>`) wrap the raw `record_*` methods — they auto-register component types and handle `ManuallyDrop` internally. The raw methods remain for power users who already have a `ComponentId`.
 
+### Secondary Indexes
+
+`SpatialIndex` is a lifecycle trait for user-owned spatial data structures (grids, quadtrees, BVH, k-d trees). Indexes are fully external to World — they compose from existing query primitives. The trait has two methods: `rebuild` (required, full reconstruction) and `update` (optional, defaults to rebuild — override for incremental updates via `Changed<T>`). Despawned entities are handled via generational validation: stale entries are skipped at query time when `world.is_alive()` returns false, and cleaned up on the next rebuild.
+
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `ComponentRegistry`, `EntityAllocator`, `QueryCacheEntry`, `Tick`).
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `ComponentRegistry`, `EntityAllocator`, `QueryCacheEntry`, `Tick`).
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
