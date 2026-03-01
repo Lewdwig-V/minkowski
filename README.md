@@ -13,7 +13,7 @@ The foundational storage layer, compile-time schema support, cached queries, SIM
 **Phase 3** — per-column change detection ticks with `Changed<T>` query filter. Queries skip entire archetypes whose data hasn't been mutably accessed since the last read.
 
 ```rust
-use minkowski::{World, Entity, CommandBuffer, Table, Changed};
+use minkowski::{World, Entity, CommandBuffer, EnumChangeSet, Table, Changed};
 
 #[derive(Table)]
 struct Transform {
@@ -75,6 +75,13 @@ for (entity, pos) in world.query::<(Entity, &Position)>() {
     }
 }
 cmds.apply(&mut world);
+
+// Data-driven mutations with automatic undo
+let mut cs = EnumChangeSet::new();
+cs.insert::<Velocity>(&mut world, e, Velocity { dx: 5.0, dy: 0.0 });
+cs.remove::<Health>(&mut world, e);
+let reverse = cs.apply(&mut world);  // apply and capture reverse
+let _ = reverse.apply(&mut world);   // undo — restores previous state
 ```
 
 ### Storage design
@@ -104,7 +111,7 @@ Done.
 
 ### Game of Life example
 
-A 64×64 Conway's Game of Life that exercises the features boids doesn't cover — `Changed<T>`, `get_mut`, and a per-entity undo stack for time-travel replay.
+A 64×64 Conway's Game of Life that exercises the features boids doesn't cover — `Changed<T>`, `EnumChangeSet` typed API for reversible mutations, and time-travel via undo/replay.
 
 ```
 $ cargo run -p minkowski --example life --release
@@ -125,7 +132,7 @@ Rewinding 50 generations...
 Verification passed: alive counts match.
 ```
 
-`Changed<CellState>` skips the entire archetype when no cell state mutated — iteration cost drops to nearly zero for stable generations. The undo stack records `(grid_index, old_state)` pairs per generation; rewinding restores exact prior states, and replay reproduces the same trajectory deterministically.
+`Changed<CellState>` skips the entire archetype when no cell state mutated — iteration cost drops to nearly zero for stable generations. Each generation builds an `EnumChangeSet` via `cs.insert::<CellState>()`, and `apply()` returns the reverse changeset automatically. Rewinding is just `reverse.apply(&mut world)` — no manual state tracking needed.
 
 ### Benchmarks
 
@@ -223,6 +230,7 @@ Enables O(log n) lookups by column value — essential for the database side, ab
 ### Mutation
 
 - **Deferred via command buffers** — structural changes (add/remove component, spawn/despawn) are batched and applied at sync points. Amortizes archetype migration cost and avoids iterator invalidation.
+- **Data-driven changesets** — `EnumChangeSet` records mutations as an enum vec with component bytes in a contiguous arena. `apply()` returns a reverse changeset for rollback. Typed helpers (`insert<T>`, `remove<T>`, `spawn_bundle<B>`) handle raw pointers and component registration internally.
 - **Lazy archetype migration** — if a newly added component doesn't affect any active query, store it in sparse storage and defer the archetype move until actually needed.
 - **Change detection** — per-column tick tracking (`Changed<T>`). Entire archetypes skipped when unchanged since last query evaluation.
 
