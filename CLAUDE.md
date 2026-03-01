@@ -20,6 +20,7 @@ cargo run -p minkowski-examples --example life --release    # Game of Life with 
 cargo run -p minkowski-examples --example nbody --release   # Barnes-Hut N-body (2K entities, 1K frames)
 cargo run -p minkowski-examples --example scheduler --release   # Access conflict detection demo (6 systems, 10 frames)
 cargo run -p minkowski-examples --example transaction --release   # Transaction strategies demo (3 strategies, 100 entities)
+cargo run -p minkowski-examples --example battle --release   # Multi-threaded battle with tunable conflict rates (500 entities, 100 frames)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -108,11 +109,11 @@ This is a building block for framework-level schedulers. Minkowski provides the 
 
 ### Transaction Semantics
 
-`TransactionStrategy` is a trait with one method: `begin(world, access) -> Tx`. The associated type `Tx` is strategy-specific — each strategy defines its own transaction struct with `query()`, `insert()`, `spawn()`, and `commit()` methods. Drop without commit = abort (RAII).
+`TransactionStrategy` is a trait with one method: `begin(&mut self, world, access) -> Tx`. The Tx does NOT hold `&mut World` — methods take `world` as a parameter. This split-phase design enables concurrent reads: `tx.query(&world)` uses `World::query_raw(&self)` (shared-ref, no ticks/cache), while `tx.commit(&mut world)` validates and applies atomically.
 
-Three built-in strategies: `Sequential` (zero-cost passthrough — all ops delegate directly to World, commit always succeeds), `Optimistic` (live reads, buffered writes into `EnumChangeSet`, tick-based validation at commit — `Err(Conflict)` if any read column was modified since begin), `Pessimistic` (cooperative per-column locks acquired at begin, buffered writes, commit always succeeds — locks released on drop).
+Three built-in strategies: `Sequential` (zero-cost passthrough — all ops delegate directly to World, commit always succeeds), `Optimistic` (live reads via `query_raw`, buffered writes into `EnumChangeSet`, tick-based validation at commit — `Err(Conflict)` if any accessed column was modified since begin), `Pessimistic` (cooperative per-column locks acquired at begin, buffered writes, commit always succeeds — locks released on drop).
 
-Lock granularity is per-column `(ArchetypeId, ComponentId)`. `ColumnLockTable` is `pub(crate)` on World, initialized empty, zero cost if unused. Not MVCC — no version chains. Optimistic uses existing `changed_tick` infrastructure for validation.
+Lock granularity is per-column `(ArchetypeId, ComponentId)`. `ColumnLockTable` is owned by `Pessimistic` strategy (not World — it's concurrency policy, not storage). Not MVCC — no version chains. Optimistic uses existing `changed_tick` infrastructure for validation. `World::query_raw(&self)` is the shared-ref read path — scans archetypes without touching cache or ticks.
 
 ## Key Conventions
 

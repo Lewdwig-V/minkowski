@@ -222,7 +222,37 @@ Transaction strategies — 100 entities with (Pos, Vel, Health)
 Done.
 ```
 
-The caller decides the transaction boundary and the concurrency strategy. Sequential has zero overhead — the compiler inlines everything. Optimistic validates read-set ticks at commit. Pessimistic acquires per-column cooperative locks at begin.
+The caller decides the transaction boundary and the concurrency strategy. Sequential has zero overhead — the compiler inlines everything. Optimistic validates read-set ticks at commit. Pessimistic acquires per-column cooperative locks at begin. Tx types don't hold `&mut World` — methods take world as a parameter, enabling split-phase execution with concurrent reads via `rayon`.
+
+### Battle example
+
+A multi-threaded arena battle that stress-tests transaction strategies under tunable conflict pressure. 500 entities across 2 teams, with combat and healing systems running as parallel transactions via `rayon::join`.
+
+```
+$ cargo run -p minkowski-examples --example battle --release
+
+Battle simulation: 500 entities (250 per team), 100 frames
+
+=== Low conflict mode (disjoint targets) ===
+
+Optimistic:
+  commits: 200 | conflicts: 0 | avg frame: 0.19ms
+
+Pessimistic:
+  commits: 200 | conflicts: 0 | avg frame: 0.17ms
+
+=== High conflict mode (overlapping targets) ===
+
+Optimistic:
+  commits: 100 | conflicts: 100 | avg frame: 0.16ms
+
+Pessimistic:
+  commits: 200 | conflicts: 0 | avg frame: 0.17ms
+
+Done.
+```
+
+In low-conflict mode (disjoint entity targets), both strategies perform identically — zero conflicts. In high-conflict mode (overlapping targets), optimistic transactions see 100 conflicts (one per frame for the second-to-commit system), while pessimistic guarantees all 200 commits succeed via cooperative column locks.
 
 ### Benchmarks
 
