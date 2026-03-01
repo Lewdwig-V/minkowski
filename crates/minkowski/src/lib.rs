@@ -18,6 +18,7 @@ pub mod query;
 pub mod storage;
 pub mod table;
 pub(crate) mod tick;
+pub mod transaction;
 pub mod world;
 
 pub use access::Access;
@@ -28,4 +29,5 @@ pub use entity::Entity;
 pub use index::SpatialIndex;
 pub use minkowski_derive::Table;
 pub use query::fetch::Changed;
+pub use transaction::{Conflict, Sequential, SequentialTx, TransactionStrategy};
 pub use world::World;
