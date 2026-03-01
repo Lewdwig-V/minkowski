@@ -582,6 +582,46 @@ impl World {
 
         Some(components)
     }
+
+    /// Snapshot the `changed_tick` of every column matching the given component
+    /// bitset. Returns a Vec of (ArchetypeId index, ComponentId, Tick) triples.
+    /// Used by OptimisticTx for read-set validation.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_column_ticks(
+        &self,
+        component_ids: &FixedBitSet,
+    ) -> Vec<(usize, ComponentId, crate::tick::Tick)> {
+        let mut ticks = Vec::new();
+        for arch in &self.archetypes.archetypes {
+            for comp_id in component_ids.ones() {
+                if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                    ticks.push((arch.id.0, comp_id, arch.columns[col_idx].changed_tick));
+                }
+            }
+        }
+        ticks
+    }
+
+    /// Check if any column in the snapshot has been modified since the
+    /// recorded tick. Returns a FixedBitSet of conflicting ComponentIds.
+    #[allow(dead_code)]
+    pub(crate) fn check_column_conflicts(
+        &self,
+        snapshot: &[(usize, ComponentId, crate::tick::Tick)],
+    ) -> FixedBitSet {
+        let mut conflicts = FixedBitSet::new();
+        for &(arch_idx, comp_id, begin_tick) in snapshot {
+            if let Some(arch) = self.archetypes.archetypes.get(arch_idx) {
+                if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                    if arch.columns[col_idx].changed_tick.is_newer_than(begin_tick) {
+                        conflicts.grow(comp_id + 1);
+                        conflicts.insert(comp_id);
+                    }
+                }
+            }
+        }
+        conflicts
+    }
 }
 
 impl Default for World {
@@ -1015,5 +1055,49 @@ mod tests {
         assert_eq!(world.get::<Pos>(e), None);
         assert_eq!(world.get_mut::<Pos>(e), None);
         assert!(!world.despawn(e));
+    }
+
+    #[test]
+    fn snapshot_column_ticks_captures_current_state() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let mut bits = FixedBitSet::with_capacity(pos_id + 1);
+        bits.insert(pos_id);
+        let snap = world.snapshot_column_ticks(&bits);
+        assert!(!snap.is_empty());
+    }
+
+    #[test]
+    fn check_column_conflicts_detects_mutation() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let mut bits = FixedBitSet::with_capacity(pos_id + 1);
+        bits.insert(pos_id);
+
+        let snap = world.snapshot_column_ticks(&bits);
+
+        // Mutate through query — advances tick
+        for pos in world.query::<(&mut Pos,)>() {
+            pos.0.x = 99.0;
+        }
+
+        let conflicts = world.check_column_conflicts(&snap);
+        assert!(conflicts.contains(pos_id));
+    }
+
+    #[test]
+    fn check_column_conflicts_clean_when_unchanged() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let mut bits = FixedBitSet::with_capacity(pos_id + 1);
+        bits.insert(pos_id);
+
+        let snap = world.snapshot_column_ticks(&bits);
+        // No mutation
+        let conflicts = world.check_column_conflicts(&snap);
+        assert!(!conflicts.contains(pos_id));
     }
 }
