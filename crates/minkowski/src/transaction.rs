@@ -1,4 +1,5 @@
 use fixedbitset::FixedBitSet;
+use parking_lot::Mutex;
 
 use crate::access::Access;
 use crate::changeset::EnumChangeSet;
@@ -40,8 +41,9 @@ pub trait TransactionStrategy {
     /// by Pessimistic for lock acquisition.
     ///
     /// World is borrowed transiently for setup. The returned Tx does not
-    /// hold a World reference.
-    fn begin<'s>(&'s mut self, world: &mut World, access: &Access) -> Self::Tx<'s>;
+    /// hold a World reference. Takes `&self` (not `&mut self`) so multiple
+    /// transactions can coexist from the same strategy instance.
+    fn begin<'s>(&'s self, world: &mut World, access: &Access) -> Self::Tx<'s>;
 }
 
 // ── Sequential ──────────────────────────────────────────────────────
@@ -55,7 +57,7 @@ pub struct Sequential;
 impl TransactionStrategy for Sequential {
     type Tx<'s> = SequentialTx;
 
-    fn begin(&mut self, _world: &mut World, _access: &Access) -> SequentialTx {
+    fn begin(&self, _world: &mut World, _access: &Access) -> SequentialTx {
         SequentialTx
     }
 }
@@ -112,7 +114,7 @@ pub struct Optimistic;
 impl TransactionStrategy for Optimistic {
     type Tx<'s> = OptimisticTx;
 
-    fn begin(&mut self, world: &mut World, access: &Access) -> OptimisticTx {
+    fn begin(&self, world: &mut World, access: &Access) -> OptimisticTx {
         // Snapshot ticks for ALL accessed columns (reads + writes).
         // If another transaction modifies a column we read OR write,
         // our computed values may be stale (read-modify-write pattern).
@@ -181,19 +183,21 @@ impl OptimisticTx {
 /// at begin. Reads and writes are guaranteed conflict-free. Commit
 /// always succeeds.
 ///
-/// Owns the `ColumnLockTable` — the lock table is concurrency policy,
-/// not storage infrastructure. Created via `Pessimistic::new()`.
+/// Owns the `ColumnLockTable` via `Mutex` — multiple transactions can
+/// coexist from the same strategy instance. The mutex is only locked
+/// during begin/commit/drop (all sequential phases), never contended
+/// during the parallel read phase. Created via `Pessimistic::new()`.
 ///
 /// Best for write-heavy workloads or expensive computations where
 /// optimistic retry would waste work.
 pub struct Pessimistic {
-    lock_table: ColumnLockTable,
+    lock_table: Mutex<ColumnLockTable>,
 }
 
 impl Pessimistic {
     pub fn new() -> Self {
         Self {
-            lock_table: ColumnLockTable::new(),
+            lock_table: Mutex::new(ColumnLockTable::new()),
         }
     }
 }
@@ -207,18 +211,16 @@ impl Default for Pessimistic {
 impl TransactionStrategy for Pessimistic {
     type Tx<'s> = PessimisticTx<'s>;
 
-    fn begin<'s>(&'s mut self, world: &mut World, access: &Access) -> PessimisticTx<'s> {
-        let locks = self
-            .lock_table
-            .acquire(
-                &world.archetypes.archetypes,
-                access.reads(),
-                access.writes(),
-            )
-            .expect("pessimistic begin: lock acquisition failed (held by another transaction)");
+    fn begin<'s>(&'s self, world: &mut World, access: &Access) -> PessimisticTx<'s> {
+        let lock_result = self.lock_table.lock().acquire(
+            &world.archetypes.archetypes,
+            access.reads(),
+            access.writes(),
+        );
+        let locks = lock_result.ok();
         PessimisticTx {
             strategy: self,
-            locks: Some(locks),
+            locks,
             changeset: EnumChangeSet::new(),
         }
     }
@@ -226,12 +228,13 @@ impl TransactionStrategy for Pessimistic {
 
 /// Transaction object for the [`Pessimistic`] strategy.
 ///
-/// Holds a reference to the Pessimistic strategy for lock release on drop.
+/// Holds a shared reference to the Pessimistic strategy for lock release
+/// on drop. Multiple transactions can coexist from the same strategy.
 /// Does not hold a World reference — methods take `&World` or `&mut World`.
 ///
 /// Drop without commit releases locks and discards the changeset (abort).
 pub struct PessimisticTx<'s> {
-    strategy: &'s mut Pessimistic,
+    strategy: &'s Pessimistic,
     locks: Option<ColumnLockSet>,
     changeset: EnumChangeSet,
 }
@@ -259,12 +262,26 @@ impl<'s> PessimisticTx<'s> {
         entity
     }
 
-    /// Commit the transaction. Always succeeds (locks guarantee isolation).
+    /// Returns true if locks were successfully acquired at begin time.
+    /// If false, commit will return Err(Conflict) — the caller should
+    /// fall back to sequential execution for conflicting systems.
+    pub fn has_locks(&self) -> bool {
+        self.locks.is_some()
+    }
+
+    /// Commit the transaction. Succeeds if locks were acquired at begin
+    /// time (guaranteed for non-conflicting access patterns). Returns
+    /// Err(Conflict) if locks were not acquired.
     pub fn commit(mut self, world: &mut World) -> Result<EnumChangeSet, Conflict> {
+        if self.locks.is_none() {
+            return Err(Conflict {
+                component_ids: FixedBitSet::new(),
+            });
+        }
         let changeset = std::mem::take(&mut self.changeset);
         let reverse = changeset.apply(world);
         if let Some(locks) = self.locks.take() {
-            self.strategy.lock_table.release(locks);
+            self.strategy.lock_table.lock().release(locks);
         }
         Ok(reverse)
     }
@@ -273,7 +290,7 @@ impl<'s> PessimisticTx<'s> {
 impl<'s> Drop for PessimisticTx<'s> {
     fn drop(&mut self) {
         if let Some(locks) = self.locks.take() {
-            self.strategy.lock_table.release(locks);
+            self.strategy.lock_table.lock().release(locks);
         }
     }
 }
@@ -298,7 +315,7 @@ mod tests {
         world.spawn((Pos(1.0), Vel(2.0)));
         let access = Access::of::<(&Pos, &Vel)>(&mut world);
 
-        let mut strategy = Sequential;
+        let strategy = Sequential;
         let tx = strategy.begin(&mut world, &access);
         let count = tx.query::<(&Pos,)>(&mut world).count();
         assert_eq!(count, 1);
@@ -310,7 +327,7 @@ mod tests {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let mut strategy = Sequential;
+        let strategy = Sequential;
         let mut tx = strategy.begin(&mut world, &access);
         tx.spawn(&mut world, (Pos(42.0),));
         let count = tx.query::<(&Pos,)>(&mut world).count();
@@ -323,7 +340,7 @@ mod tests {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let mut strategy = Sequential;
+        let strategy = Sequential;
         let mut tx = strategy.begin(&mut world, &access);
         tx.spawn(&mut world, (Pos(1.0),));
         assert!(tx.commit(&mut world).is_ok());
@@ -333,7 +350,7 @@ mod tests {
     fn sequential_drop_is_noop() {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
-        let mut strategy = Sequential;
+        let strategy = Sequential;
         {
             let mut tx = strategy.begin(&mut world, &access);
             tx.spawn(&mut world, (Pos(1.0),));
@@ -349,7 +366,7 @@ mod tests {
         let e = world.spawn((Pos(1.0), Vel(2.0)));
         let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
 
-        let mut strategy = Optimistic;
+        let strategy = Optimistic;
         let mut tx = strategy.begin(&mut world, &access);
         let count = tx.query::<(&Pos,)>(&world).count();
         assert_eq!(count, 1);
@@ -363,7 +380,7 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let mut strategy = Optimistic;
+        let strategy = Optimistic;
         let mut tx = strategy.begin(&mut world, &access);
         tx.insert::<Pos>(&mut world, e, Pos(99.0));
         // query_raw sees old value (write is buffered in changeset)
@@ -380,7 +397,7 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let mut strategy = Optimistic;
+        let strategy = Optimistic;
         {
             let mut tx = strategy.begin(&mut world, &access);
             tx.insert::<Pos>(&mut world, e, Pos(99.0));
@@ -414,7 +431,7 @@ mod tests {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let mut strategy = Optimistic;
+        let strategy = Optimistic;
         let mut tx = strategy.begin(&mut world, &access);
         let e = tx.spawn(&mut world, (Pos(42.0),));
         assert!(tx.commit(&mut world).is_ok());
@@ -429,7 +446,7 @@ mod tests {
         let e = world.spawn((Pos(1.0), Vel(2.0)));
         let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
 
-        let mut strategy = Pessimistic::new();
+        let strategy = Pessimistic::new();
         let mut tx = strategy.begin(&mut world, &access);
         let _ = tx.query::<(&Pos,)>(&world).count();
         tx.insert::<Vel>(&mut world, e, Vel(99.0));
@@ -442,7 +459,7 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let mut strategy = Pessimistic::new();
+        let strategy = Pessimistic::new();
         let mut tx = strategy.begin(&mut world, &access);
         tx.insert::<Pos>(&mut world, e, Pos(42.0));
         let pos = tx.query::<(&Pos,)>(&world).next().unwrap();
@@ -458,7 +475,7 @@ mod tests {
         world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let mut strategy = Pessimistic::new();
+        let strategy = Pessimistic::new();
         {
             let _tx = strategy.begin(&mut world, &access);
         }
@@ -471,7 +488,7 @@ mod tests {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let mut strategy = Pessimistic::new();
+        let strategy = Pessimistic::new();
         let mut tx = strategy.begin(&mut world, &access);
         let e = tx.spawn(&mut world, (Pos(77.0),));
         let _ = tx.commit(&mut world);

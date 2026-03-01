@@ -82,7 +82,7 @@ fn movement_system(tx: &mut SequentialTx, world: &mut World) {
 
 fn run_sequential(world: &mut World) {
     let access = Access::of::<(&mut Pos, &Vel)>(world);
-    let mut strategy = Sequential;
+    let strategy = Sequential;
 
     for _ in 0..10 {
         let mut tx = strategy.begin(world, &access);
@@ -115,7 +115,7 @@ fn health_decay_optimistic(tx: &mut OptimisticTx, world: &mut World, entities: &
 
 fn run_optimistic_clean(world: &mut World, entities: &[Entity]) {
     let access = Access::of::<(&Health, &mut Health)>(world);
-    let mut strategy = Optimistic;
+    let strategy = Optimistic;
 
     for _ in 0..10 {
         let mut tx = strategy.begin(world, &access);
@@ -135,7 +135,7 @@ fn run_optimistic_conflict(world: &mut World) {
     // Declare access: reads Pos, writes Health.
     // The optimistic strategy snapshots read-column ticks at begin.
     let access = Access::of::<(&Pos, &mut Health)>(world);
-    let mut strategy = Optimistic;
+    let strategy = Optimistic;
 
     let tx = strategy.begin(world, &access);
 
@@ -175,7 +175,7 @@ fn health_decay_pessimistic(tx: &mut PessimisticTx<'_>, world: &mut World, entit
 
 fn run_pessimistic(world: &mut World, entities: &[Entity]) {
     let access = Access::of::<(&Health, &mut Health)>(world);
-    let mut strategy = Pessimistic::new();
+    let strategy = Pessimistic::new();
 
     for _ in 0..10 {
         let mut tx = strategy.begin(world, &access);

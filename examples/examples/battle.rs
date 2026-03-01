@@ -145,10 +145,9 @@ fn run_frame_optimistic(
     let frame_start = Instant::now();
 
     // 1. Begin phase (sequential -- needs &mut World).
-    let mut strategy_combat = Optimistic;
-    let mut strategy_healing = Optimistic;
-    let mut tx_combat = strategy_combat.begin(world, combat_access);
-    let mut tx_healing = strategy_healing.begin(world, healing_access);
+    let strategy = Optimistic;
+    let mut tx_combat = strategy.begin(world, combat_access);
+    let mut tx_healing = strategy.begin(world, healing_access);
 
     // 2. Parallel read phase.
     //    tx.query(&self, &World) takes shared refs -- safe for concurrent reads.
@@ -222,16 +221,71 @@ fn run_frame_pessimistic(
 ) {
     let frame_start = Instant::now();
 
-    // Each "system" gets its own Pessimistic strategy instance so two
-    // PessimisticTx<'s> can coexist (each borrows a different strategy).
-    let mut strategy_combat = Pessimistic::new();
-    let mut strategy_healing = Pessimistic::new();
+    // Single strategy instance — both transactions share the same lock table,
+    // so conflicting locks are correctly detected across concurrent systems.
+    let strategy = Pessimistic::new();
 
     // 1. Begin phase (sequential).
-    let mut tx_combat = strategy_combat.begin(world, combat_access);
-    let mut tx_healing = strategy_healing.begin(world, healing_access);
+    let mut tx_combat = strategy.begin(world, combat_access);
+    let mut tx_healing = strategy.begin(world, healing_access);
 
-    // 2. Parallel read phase.
+    // If the second tx couldn't acquire locks (write-write conflict on same
+    // columns), fall back to sequential execution: commit combat first, then
+    // re-begin healing with locks now available.
+    if !tx_healing.has_locks() {
+        stats.conflicts += 1;
+        // Run combat to completion
+        let entities: Vec<(Entity, u8, u32)> = tx_combat
+            .query::<(Entity, &Team, &Health)>(world)
+            .map(|(e, t, h)| (e, t.0, h.0))
+            .collect();
+        let combat_results = compute_combat(&entities, mode);
+        match mode {
+            ConflictMode::Low => {
+                for &(entity, dmg) in &combat_results {
+                    tx_combat.insert::<Damage>(world, entity, Damage(dmg));
+                }
+            }
+            ConflictMode::High => {
+                for &(entity, new_hp) in &combat_results {
+                    tx_combat.insert::<Health>(world, entity, Health(new_hp));
+                }
+            }
+        }
+        let _ = tx_combat.commit(world);
+        stats.commits += 1;
+        drop(tx_healing); // release (no locks to release)
+
+        // Re-begin healing — locks now available
+        let mut tx_healing = strategy.begin(world, healing_access);
+        let entities: Vec<(Entity, u8, u32)> = tx_healing
+            .query::<(Entity, &Team, &Health)>(world)
+            .map(|(e, t, h)| (e, t.0, h.0))
+            .collect();
+        let healing_results = compute_healing(&entities, mode);
+        match mode {
+            ConflictMode::Low => {
+                for &(entity, heal) in &healing_results {
+                    tx_healing.insert::<Healing>(world, entity, Healing(heal));
+                }
+            }
+            ConflictMode::High => {
+                for &(entity, new_hp) in &healing_results {
+                    tx_healing.insert::<Health>(world, entity, Health(new_hp));
+                }
+            }
+        }
+        let _ = tx_healing.commit(world);
+        stats.commits += 1;
+        if mode == ConflictMode::Low {
+            apply_effects(world);
+        }
+        stats.total_time += frame_start.elapsed();
+        stats.frames += 1;
+        return;
+    }
+
+    // 2. Parallel read phase — both txs have locks, safe to read concurrently.
     let (combat_results, healing_results) = rayon::join(
         || {
             let entities: Vec<(Entity, u8, u32)> = tx_combat
@@ -269,7 +323,7 @@ fn run_frame_pessimistic(
         }
     }
 
-    // 4. Commit phase -- pessimistic always succeeds.
+    // 4. Commit phase — locks guarantee success.
     let _ = tx_combat.commit(world);
     stats.commits += 1;
     let _ = tx_healing.commit(world);
