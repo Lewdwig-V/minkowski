@@ -189,6 +189,41 @@ Done.
 
 Six systems demonstrate every conflict case: write/write (`health_regen` vs `apply_damage`), read/write (`log_positions` vs `movement`), disjoint writes that parallelize (`movement` + `health_regen`), and read-only systems that batch with non-overlapping writers. The greedy batcher assigns systems to 3 batches — within each batch, systems touch disjoint components and could run in parallel.
 
+### Transaction example
+
+Demonstrates all three `TransactionStrategy` implementations on the same workload — Sequential (zero-cost), Optimistic (tick validation), and Pessimistic (cooperative locks).
+
+```
+$ cargo run -p minkowski-examples --example transaction --release
+
+Transaction strategies — 100 entities with (Pos, Vel, Health)
+
+1. Sequential (zero-cost passthrough)
+   Movement system: writes Pos, reads Vel
+  after 10 steps: avg pos = (59.5, 5.0)
+  commit result:  Ok (always succeeds, zero overhead)
+
+2. Optimistic (clean commit)
+   Health decay system: reads Health, buffers writes, validates at commit
+  after 10 steps: avg health = 70
+  commit result:  Ok (no conflicts detected)
+
+3. Optimistic (conflict demonstration)
+   Declared access: reads Pos, writes Health
+   But mutates Pos through live query — tick advances past snapshot
+  commit result:  Err(Conflict) — read column was modified
+  buffered writes discarded (transaction aborted)
+
+4. Pessimistic (guaranteed commit)
+   Same health decay, but with cooperative column locks
+  after 10 steps: avg health = 40
+  commit result:  Ok (locks guarantee success)
+
+Done.
+```
+
+The caller decides the transaction boundary and the concurrency strategy. Sequential has zero overhead — the compiler inlines everything. Optimistic validates read-set ticks at commit. Pessimistic acquires per-column cooperative locks at begin.
+
 ### Benchmarks
 
 Criterion benchmarks compare against [hecs](https://crates.io/crates/hecs):
@@ -201,12 +236,11 @@ Suites: `spawn` (10K entities), `iterate` (10K), `parallel` (100K vs sequential)
 
 ## What's next
 
-**Phase 4 — done:** `SpatialIndex` lifecycle trait, Barnes-Hut N-body example, boids grid refactored through the trait. `Access` struct for query conflict detection, scheduler example.
+**Phase 4 — done:** `SpatialIndex` lifecycle trait, Barnes-Hut N-body example, boids grid refactored through the trait. `Access` struct for query conflict detection, scheduler example. `TransactionStrategy` trait with Sequential/Optimistic/Pessimistic implementations, transaction example.
 
 | Phase | Feature | Why |
 |---|---|---|
 | 4 | Persistence — WAL + snapshots | Durable state via BlobVec memcpy to disk |
-| 4 | Transaction semantics | Atomic multi-entity mutations with rollback |
 | 5 | Query planning (Volcano model) | Optimize complex queries across indexes |
 | 5 | B-tree / hash indexes | Fast range and equality lookups on component fields |
 

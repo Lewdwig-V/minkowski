@@ -19,6 +19,7 @@ cargo run -p minkowski-examples --example boids --release   # Boids simulation (
 cargo run -p minkowski-examples --example life --release    # Game of Life with undo + derive(Table) (64x64 grid, 500 gens)
 cargo run -p minkowski-examples --example nbody --release   # Barnes-Hut N-body (2K entities, 1K frames)
 cargo run -p minkowski-examples --example scheduler --release   # Access conflict detection demo (6 systems, 10 frames)
+cargo run -p minkowski-examples --example transaction --release   # Transaction strategies demo (3 strategies, 100 entities)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -105,9 +106,17 @@ Each BlobVec column stores a `changed_tick: Tick` — the tick at which it was l
 
 This is a building block for framework-level schedulers. Minkowski provides the access metadata; scheduling policy (dependency graphs, topological sort, parallel execution) is the framework's responsibility.
 
+### Transaction Semantics
+
+`TransactionStrategy` is a trait with one method: `begin(world, access) -> Tx`. The associated type `Tx` is strategy-specific — each strategy defines its own transaction struct with `query()`, `insert()`, `spawn()`, and `commit()` methods. Drop without commit = abort (RAII).
+
+Three built-in strategies: `Sequential` (zero-cost passthrough — all ops delegate directly to World, commit always succeeds), `Optimistic` (live reads, buffered writes into `EnumChangeSet`, tick-based validation at commit — `Err(Conflict)` if any read column was modified since begin), `Pessimistic` (cooperative per-column locks acquired at begin, buffered writes, commit always succeeds — locks released on drop).
+
+Lock granularity is per-column `(ArchetypeId, ComponentId)`. `ColumnLockTable` is `pub(crate)` on World, initialized empty, zero cost if unused. Not MVCC — no version chains. Optimistic uses existing `changed_tick` infrastructure for validation.
+
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`, `Access`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`, `Access`, `TransactionStrategy`, `Sequential`, `Optimistic`, `Pessimistic`, `Conflict`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
