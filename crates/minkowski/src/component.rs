@@ -17,14 +17,15 @@ pub(crate) struct ComponentInfo {
     pub drop_fn: Option<unsafe fn(*mut u8)>,
 }
 
-pub(crate) struct ComponentRegistry {
+#[doc(hidden)]
+pub struct ComponentRegistry {
     by_type: HashMap<TypeId, ComponentId>,
     infos: Vec<ComponentInfo>,
     sparse_set: FixedBitSet,
 }
 
 impl ComponentRegistry {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             by_type: HashMap::new(),
             infos: Vec::new(),
@@ -54,7 +55,7 @@ impl ComponentRegistry {
     }
 
     #[allow(dead_code)]
-    pub fn register_sparse<T: Component>(&mut self) -> ComponentId {
+    pub(crate) fn register_sparse<T: Component>(&mut self) -> ComponentId {
         let id = self.register::<T>();
         self.sparse_set.grow(id + 1);
         self.sparse_set.insert(id);
@@ -67,15 +68,15 @@ impl ComponentRegistry {
 
     /// Returns the number of registered components.
     /// Also serves as the next `ComponentId` that will be assigned.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.infos.len()
     }
 
-    pub fn info(&self, id: ComponentId) -> &ComponentInfo {
+    pub(crate) fn info(&self, id: ComponentId) -> &ComponentInfo {
         &self.infos[id]
     }
 
-    pub fn is_sparse(&self, id: ComponentId) -> bool {
+    pub(crate) fn is_sparse(&self, id: ComponentId) -> bool {
         self.sparse_set.contains(id)
     }
 

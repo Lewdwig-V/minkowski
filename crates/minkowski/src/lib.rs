@@ -1,5 +1,6 @@
-// WorldQuery and Bundle are pub traits that reference pub(crate) types in their signatures.
-// Proper fix is to make the public API facade consistent; suppress for now.
+// WorldQuery is a pub trait that references pub(crate) types (Archetype, Tick)
+// in its signatures. Users never implement WorldQuery — they compose existing
+// impls via tuples. Suppress until a proper public API facade is built.
 #![allow(private_interfaces)]
 
 // Allow the derive macro's generated code (which references `::minkowski::*`)
