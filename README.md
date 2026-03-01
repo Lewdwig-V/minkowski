@@ -12,6 +12,8 @@ The foundational storage layer, compile-time schema support, cached queries, SIM
 
 **Phase 3** — per-column change detection ticks with `Changed<T>` query filter. Queries skip entire archetypes whose data hasn't been mutably accessed since the last read.
 
+**Phase 4** — `SpatialIndex` lifecycle trait for user-owned secondary indexes (spatial grids, quadtrees, BVH, k-d trees). Indexes are external to World, compose from query primitives, and handle despawns via generational validation.
+
 ```rust
 use minkowski::{World, Entity, CommandBuffer, EnumChangeSet, Table, Changed};
 
@@ -134,6 +136,24 @@ Verification passed: alive counts match.
 
 `Changed<CellState>` skips the entire archetype when no cell state mutated — iteration cost drops to nearly zero for stable generations. Each generation builds an `EnumChangeSet` via `cs.insert::<CellState>()`, and `apply()` returns the reverse changeset automatically. Rewinding is just `reverse.apply(&mut world)` — no manual state tracking needed.
 
+### N-body example
+
+A Barnes-Hut gravity simulation that exercises the `SpatialIndex` trait with a quadtree — a fundamentally different spatial structure from the uniform grid used in boids.
+
+```
+$ cargo run -p minkowski --example nbody --release
+
+N-body: 2000 entities, 1000 frames, theta=0.50
+frame 0000 | entities:  2000 | dt: 4.2ms
+frame 0200 | entities:  2000 | dt: 2.8ms
+frame 0400 | entities:  2000 | dt: 2.5ms
+...
+frame 0999 | entities:  2000 | dt: 2.3ms
+Done.
+```
+
+2,000 bodies with O(N log N) Barnes-Hut force approximation via quadtree, parallel force computation via rayon, vectorized symplectic Euler integration via `for_each_chunk`, and random spawn/despawn churn to exercise generational validation of stale index entries.
+
 ### Benchmarks
 
 Criterion benchmarks compare against [hecs](https://crates.io/crates/hecs):
@@ -146,11 +166,10 @@ Suites: `spawn` (10K entities), `iterate` (10K), `parallel` (100K vs sequential)
 
 ## What's next
 
-**Phase 3 — done:** per-column change detection ticks, `Changed<T>` query filter, undo/replay via `EnumChangeSet`.
+**Phase 4 — done:** `SpatialIndex` lifecycle trait, Barnes-Hut N-body example, boids grid refactored through the trait.
 
 | Phase | Feature | Why |
 |---|---|---|
-| 4 | Secondary index hooks | Observer API for user-defined spatial indices (grids, BVH, k-d trees) that update on component change |
 | 4 | Automatic system scheduling | Conflict detection, parallel system execution |
 | 4 | Persistence — WAL + snapshots | Durable state via BlobVec memcpy to disk |
 | 4 | Transaction semantics | Atomic multi-entity mutations with rollback |
@@ -271,10 +290,11 @@ Falls out naturally from the commit log:
 5. ~~`#[derive(Table)]` — proc macro for compile-time schema registration~~
 6. ~~`ChangeSet` — mutation abstraction (enables command buffers, persistence, replication)~~
 7. ~~`Changed<T>` — per-column tick tracking, archetype-level change detection~~
-8. Commit log + snapshot persistence
-9. Indexes (B-tree, hash)
-10. Transaction isolation / MVCC
-11. rkyv zero-copy snapshots
+8. ~~Secondary index hooks (`SpatialIndex` trait)~~
+9. Commit log + snapshot persistence
+10. Indexes (B-tree, hash)
+11. Transaction isolation / MVCC
+12. rkyv zero-copy snapshots
 
 ## Design Principles
 
