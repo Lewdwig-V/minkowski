@@ -6,6 +6,31 @@ use crate::world::World;
 /// Implementations use standard query primitives (`world.query()`,
 /// `Changed<T>`) internally. Query methods are defined per concrete
 /// type, not on this trait.
+///
+/// # Design rationale
+///
+/// This trait deliberately excludes several things that were considered:
+///
+/// - **No generic query method.** A grid needs `query_cell()`, a BVH
+///   needs `query_aabb()`, a k-d tree needs `nearest()`. Forcing one
+///   query shape onto all index types would either over-constrain simple
+///   structures or under-serve complex ones.
+/// - **No component type parameters.** An index over `Position` and an
+///   index over `(Position, Velocity)` would be different trait
+///   instantiations, making it impossible to store mixed indexes in a
+///   `Vec<Box<dyn SpatialIndex>>`.
+/// - **No stored `&World` reference.** Indexes compose from the outside:
+///   they receive the world transiently during `rebuild`/`update` and
+///   own their data independently. This avoids lifetime coupling and
+///   lets indexes outlive any particular borrow.
+/// - **No registration on World.** Adding `world.register_index()` would
+///   grow World's API with every index pattern someone invents. Keeping
+///   indexes external means World stays focused on entities and
+///   components.
+///
+/// The result is that structurally different algorithms (uniform grids,
+/// quadtrees, BVH, k-d trees) all implement the same two-method trait
+/// without friction — see the `boids` and `nbody` examples.
 pub trait SpatialIndex {
     /// Reconstruct the index from scratch by scanning all matching entities.
     fn rebuild(&mut self, world: &mut World);
