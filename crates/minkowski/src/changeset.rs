@@ -84,6 +84,15 @@ impl Drop for Arena {
     }
 }
 
+/// Tracks an arena-buffered value that needs its destructor run if the
+/// changeset is dropped without being applied.
+struct DropEntry {
+    /// Byte offset within the arena where the owned value starts.
+    offset: usize,
+    /// Type-erased destructor (`drop_in_place::<T>`).
+    drop_fn: unsafe fn(*mut u8),
+}
+
 /// A single structural mutation recorded in a ChangeSet.
 #[allow(dead_code)]
 pub(crate) enum Mutation {
@@ -109,9 +118,19 @@ pub(crate) enum Mutation {
 
 /// Data-driven mutation buffer. Records structural mutations as an enum vec
 /// with component bytes stored in a contiguous Arena.
+///
+/// Implements `Drop`: if the changeset is discarded without calling `apply()`,
+/// destructors are run for any values whose ownership was transferred in via
+/// typed helpers (`insert`, `spawn_bundle`). Values recorded through the raw
+/// API (`record_insert`, `record_spawn`) are borrowed, not owned, so their
+/// callers remain responsible for cleanup.
 pub struct EnumChangeSet {
     pub(crate) mutations: Vec<Mutation>,
     pub(crate) arena: Arena,
+    /// Drop glue for arena-buffered values whose ownership was transferred
+    /// from the caller via typed helpers. Cleared on `apply()` when ownership
+    /// moves to the world; remaining entries are cleaned up on drop.
+    drop_entries: Vec<DropEntry>,
 }
 
 impl EnumChangeSet {
@@ -119,6 +138,7 @@ impl EnumChangeSet {
         Self {
             mutations: Vec::new(),
             arena: Arena::new(),
+            drop_entries: Vec::new(),
         }
     }
 
@@ -159,14 +179,15 @@ impl EnumChangeSet {
         self.mutations.push(Mutation::Despawn { entity });
     }
 
-    /// Record inserting a component on an entity.
+    /// Record inserting a component on an entity. Returns the arena byte offset
+    /// where the component data was stored.
     pub fn record_insert(
         &mut self,
         entity: Entity,
         component_id: ComponentId,
         data: *const u8,
         layout: Layout,
-    ) {
+    ) -> usize {
         let offset = self.arena.alloc(data, layout);
         self.mutations.push(Mutation::Insert {
             entity,
@@ -174,6 +195,7 @@ impl EnumChangeSet {
             offset,
             layout,
         });
+        offset
     }
 
     /// Record removing a component from an entity.
@@ -190,11 +212,19 @@ impl EnumChangeSet {
 impl EnumChangeSet {
     /// Record inserting a component on an entity. Auto-registers the
     /// component type. Safe wrapper over `record_insert`.
+    ///
+    /// Takes ownership of `value` — the destructor will run either when the
+    /// changeset is applied (ownership transfers to the world) or when the
+    /// changeset is dropped without applying.
     pub fn insert<T: Component>(&mut self, world: &mut World, entity: Entity, value: T) {
         let comp_id = world.register_component::<T>();
+        let drop_fn = world.components.info(comp_id).drop_fn;
         let layout = Layout::new::<T>();
         let value = std::mem::ManuallyDrop::new(value);
-        self.record_insert(entity, comp_id, &*value as *const T as *const u8, layout);
+        let offset = self.record_insert(entity, comp_id, &*value as *const T as *const u8, layout);
+        if let Some(drop_fn) = drop_fn {
+            self.drop_entries.push(DropEntry { offset, drop_fn });
+        }
     }
 
     /// Record removing a component from an entity. Auto-registers the
@@ -225,6 +255,12 @@ impl EnumChangeSet {
                 components.push((comp_id, offset, layout));
             });
         }
+        // Register drop entries for components that need cleanup.
+        for &(comp_id, offset, _) in &components {
+            if let Some(drop_fn) = world.components.info(comp_id).drop_fn {
+                self.drop_entries.push(DropEntry { offset, drop_fn });
+            }
+        }
         self.mutations.push(Mutation::Spawn { entity, components });
     }
 }
@@ -235,10 +271,29 @@ impl Default for EnumChangeSet {
     }
 }
 
+impl Drop for EnumChangeSet {
+    fn drop(&mut self) {
+        // Run destructors for any arena-buffered values that were never
+        // transferred to the world via apply(). After apply(), drop_entries
+        // is empty so this is a no-op.
+        for entry in &self.drop_entries {
+            unsafe {
+                let ptr = self.arena.get(entry.offset) as *mut u8;
+                (entry.drop_fn)(ptr);
+            }
+        }
+    }
+}
+
 impl EnumChangeSet {
     /// Apply every mutation in this changeset to `world`, returning a reverse
     /// changeset that undoes the changes when applied.
-    pub fn apply(self, world: &mut World) -> EnumChangeSet {
+    pub fn apply(mut self, world: &mut World) -> EnumChangeSet {
+        // Disarm drop entries — ownership transfers to the world during apply.
+        // If apply panics (programming error), arena values may leak rather
+        // than double-drop, which is the safer failure mode.
+        self.drop_entries.clear();
+
         let mut reverse = EnumChangeSet::new();
 
         for mutation in &self.mutations {
@@ -449,12 +504,18 @@ fn changeset_remove_raw(
         return; // Component not present — nothing to do.
     }
 
-    // Capture old value for reverse (Insert).
+    // Capture old value for reverse (Insert). The source column will be
+    // swap_remove_no_drop'd below, so the reverse arena becomes the sole
+    // owner of this value — register a drop entry.
     let info = world.components.info(comp_id);
     let layout = info.layout;
+    let drop_fn = info.drop_fn;
     let col_idx = src_arch.component_index[&comp_id];
     let old_ptr = unsafe { src_arch.columns[col_idx].get_ptr(location.row) };
-    reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
+    let offset = reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
+    if let Some(drop_fn) = drop_fn {
+        reverse.drop_entries.push(DropEntry { offset, drop_fn });
+    }
 
     // Compute target archetype: source components minus this one.
     let target_ids: Vec<ComponentId> = src_arch
@@ -849,5 +910,115 @@ mod tests {
             )],
         );
         let _ = cs.apply(&mut world);
+    }
+
+    // ── Drop safety tests ─────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// A non-Copy component that counts destructor calls.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    struct Tracked(u32);
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn drop_runs_destructor_for_unapplied_insert() {
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.insert::<Tracked>(&mut world, e, Tracked(42));
+            // cs dropped here without apply()
+        }
+
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            1,
+            "destructor should run on changeset drop"
+        );
+    }
+
+    #[test]
+    fn drop_runs_destructor_for_unapplied_spawn_bundle() {
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        let mut world = World::new();
+        let e = world.alloc_entity();
+
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(&mut world, e, (Tracked(42),));
+            // cs dropped here without apply()
+        }
+
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            1,
+            "destructor should run on changeset drop"
+        );
+    }
+
+    #[test]
+    fn apply_does_not_double_drop() {
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.insert::<Tracked>(&mut world, e, Tracked(42));
+            let _reverse = cs.apply(&mut world);
+            // cs dropped after apply — should not double-drop
+        }
+
+        // Value is now owned by the world; no spurious drops from changeset.
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            0,
+            "no drops yet — value owned by world"
+        );
+
+        world.despawn(e);
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            1,
+            "one drop from despawn"
+        );
+    }
+
+    #[test]
+    fn reverse_of_remove_drops_owned_value() {
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Tracked(99)));
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            0,
+            "spawn transfers ownership, no drop"
+        );
+
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.remove::<Tracked>(&mut world, e);
+            let _reverse = cs.apply(&mut world);
+            // _reverse owns the Tracked value (remove used swap_remove_no_drop)
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0, "no drop yet");
+            // reverse dropped here without apply()
+        }
+
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            1,
+            "reverse drop should clean up owned value"
+        );
     }
 }
