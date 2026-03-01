@@ -35,7 +35,7 @@
 //! You should see packed float ops (vaddps, vmulps, vblendmps), not scalar
 //! (vaddss, vmulss).
 
-use minkowski::{CommandBuffer, Entity, World};
+use minkowski::{CommandBuffer, Entity, SpatialIndex, World};
 use std::time::Instant;
 
 // ── Vec2 ────────────────────────────────────────────────────────────
@@ -171,6 +171,59 @@ impl Default for BoidParams {
     }
 }
 
+// ── SpatialGrid ────────────────────────────────────────────────────
+
+struct SpatialGrid {
+    cell_size: f32,
+    grid_w: usize,
+    cells: Vec<Vec<usize>>,
+    pub snapshot: Vec<(Entity, Vec2, Vec2)>,
+}
+
+impl SpatialGrid {
+    fn new(cell_size: f32, world_size: f32) -> Self {
+        let grid_w = (world_size / cell_size).ceil() as usize;
+        Self {
+            cell_size,
+            grid_w,
+            cells: Vec::new(),
+            snapshot: Vec::new(),
+        }
+    }
+
+    fn neighbors(&self, pos: Vec2) -> impl Iterator<Item = &(Entity, Vec2, Vec2)> {
+        let cx = ((pos.x / self.cell_size) as usize).min(self.grid_w - 1);
+        let cy = ((pos.y / self.cell_size) as usize).min(self.grid_w - 1);
+        let grid_w = self.grid_w;
+        (-1i32..=1).flat_map(move |dy| {
+            (-1i32..=1).flat_map(move |dx| {
+                let nx = (cx as i32 + dx).rem_euclid(grid_w as i32) as usize;
+                let ny = (cy as i32 + dy).rem_euclid(grid_w as i32) as usize;
+                // SAFETY: nx < grid_w and ny < grid_w guaranteed by rem_euclid
+                let cell = &self.cells[ny * grid_w + nx];
+                cell.iter().map(|&j| &self.snapshot[j])
+            })
+        })
+    }
+}
+
+impl SpatialIndex for SpatialGrid {
+    fn rebuild(&mut self, world: &mut World) {
+        self.snapshot = world
+            .query::<(Entity, &Position, &Velocity)>()
+            .map(|(e, p, v)| (e, p.0, v.0))
+            .collect();
+
+        self.cells.clear();
+        self.cells.resize(self.grid_w * self.grid_w, Vec::new());
+        for (i, &(_, pos, _)) in self.snapshot.iter().enumerate() {
+            let cx = ((pos.x / self.cell_size) as usize).min(self.grid_w - 1);
+            let cy = ((pos.y / self.cell_size) as usize).min(self.grid_w - 1);
+            self.cells[cy * self.grid_w + cx].push(i);
+        }
+    }
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
 const ENTITY_COUNT: usize = 5_000;
@@ -217,6 +270,8 @@ fn main() {
         spawn_boid(&mut world, &params);
     }
 
+    let mut grid = SpatialGrid::new(params.cohesion_radius, params.world_size);
+
     for frame in 0..FRAME_COUNT {
         let frame_start = Instant::now();
 
@@ -227,28 +282,12 @@ fn main() {
             }
         });
 
-        // Step 2: Snapshot for neighbor queries
-        let snapshot: Vec<(Entity, Vec2, Vec2)> = world
-            .query::<(Entity, &Position, &Velocity)>()
-            .map(|(e, p, v)| (e, p.0, v.0))
-            .collect();
+        // Step 2+3: Rebuild spatial grid + force accumulation (parallel)
+        grid.rebuild(&mut world);
 
-        // Step 3: Build spatial grid + force accumulation (parallel)
-        let cell_size = params.cohesion_radius; // largest interaction radius
-        let grid_w = (params.world_size / cell_size).ceil() as usize;
-
-        // Build grid: each cell contains snapshot indices of boids in that cell
-        let mut grid: Vec<Vec<usize>> = vec![vec![]; grid_w * grid_w];
-        for (i, &(_, pos, _)) in snapshot.iter().enumerate() {
-            let cx = ((pos.x / cell_size) as usize).min(grid_w - 1);
-            let cy = ((pos.y / cell_size) as usize).min(grid_w - 1);
-            grid[cy * grid_w + cx].push(i);
-        }
-
-        // Force accumulation — iterate only 3x3 neighbor cells per boid
         let forces: Vec<(Entity, Vec2)> = {
             use rayon::prelude::*;
-            snapshot
+            grid.snapshot
                 .par_iter()
                 .map(|&(entity, pos, vel)| {
                     let mut sep = Vec2::ZERO;
@@ -258,39 +297,29 @@ fn main() {
                     let mut ali_count = 0u32;
                     let mut coh_count = 0u32;
 
-                    let cx = ((pos.x / cell_size) as usize).min(grid_w - 1);
-                    let cy = ((pos.y / cell_size) as usize).min(grid_w - 1);
+                    for &(_, other_pos, other_vel) in grid.neighbors(pos) {
+                        let diff = Vec2::new(
+                            wrapped_diff(other_pos.x, pos.x, params.world_size),
+                            wrapped_diff(other_pos.y, pos.y, params.world_size),
+                        );
+                        let dist_sq = diff.length_sq();
+                        if dist_sq < 1e-6 {
+                            continue;
+                        }
 
-                    for dy in -1i32..=1 {
-                        for dx in -1i32..=1 {
-                            let nx = (cx as i32 + dx).rem_euclid(grid_w as i32) as usize;
-                            let ny = (cy as i32 + dy).rem_euclid(grid_w as i32) as usize;
-                            for &j in &grid[ny * grid_w + nx] {
-                                let (_, other_pos, other_vel) = snapshot[j];
-                                let diff = Vec2::new(
-                                    wrapped_diff(other_pos.x, pos.x, params.world_size),
-                                    wrapped_diff(other_pos.y, pos.y, params.world_size),
-                                );
-                                let dist_sq = diff.length_sq();
-                                if dist_sq < 1e-6 {
-                                    continue;
-                                }
+                        let dist = dist_sq.sqrt();
 
-                                let dist = dist_sq.sqrt();
-
-                                if dist < params.separation_radius {
-                                    sep = sep - diff.normalized() * (1.0 / dist);
-                                    sep_count += 1;
-                                }
-                                if dist < params.alignment_radius {
-                                    ali += other_vel;
-                                    ali_count += 1;
-                                }
-                                if dist < params.cohesion_radius {
-                                    coh += diff;
-                                    coh_count += 1;
-                                }
-                            }
+                        if dist < params.separation_radius {
+                            sep = sep - diff.normalized() * (1.0 / dist);
+                            sep_count += 1;
+                        }
+                        if dist < params.alignment_radius {
+                            ali += other_vel;
+                            ali_count += 1;
+                        }
+                        if dist < params.cohesion_radius {
+                            coh += diff;
+                            coh_count += 1;
                         }
                     }
 
