@@ -98,6 +98,15 @@ impl World {
         entity
     }
 
+    /// Deallocate an unplaced entity ID. Bumps the generation so the handle
+    /// becomes stale, and returns the index to the free list.
+    ///
+    /// Used by transaction abort to clean up entity IDs that were allocated
+    /// via `alloc_entity()` but never placed (changeset was discarded).
+    pub(crate) fn dealloc_entity(&mut self, entity: Entity) {
+        self.entities.dealloc(entity);
+    }
+
     /// Returns true if the entity has been placed in an archetype (has a row).
     /// Entities from `alloc_entity()` return false until they are spawned.
     pub fn is_placed(&self, entity: Entity) -> bool {

@@ -116,12 +116,15 @@ impl SequentialTx {
 /// Best for read-heavy workloads where conflicts are rare.
 pub struct Optimistic {
     next_tx_id: AtomicU64,
+    /// Entity IDs from aborted transactions awaiting generation-bump + recycle.
+    pending_release: Mutex<Vec<Entity>>,
 }
 
 impl Optimistic {
     pub fn new() -> Self {
         Self {
             next_tx_id: AtomicU64::new(1),
+            pending_release: Mutex::new(Vec::new()),
         }
     }
 }
@@ -133,22 +136,24 @@ impl Default for Optimistic {
 }
 
 impl TransactionStrategy for Optimistic {
-    type Tx<'s> = OptimisticTx;
+    type Tx<'s> = OptimisticTx<'s>;
 
-    fn begin(&self, world: &mut World, access: &Access) -> OptimisticTx {
+    fn begin<'s>(&'s self, world: &mut World, access: &Access) -> OptimisticTx<'s> {
+        // Drain pending releases from previous aborted transactions.
+        for entity in self.pending_release.lock().drain(..) {
+            world.dealloc_entity(entity);
+        }
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
-        // Snapshot ticks for ALL accessed columns (reads + writes).
-        // If another transaction modifies a column we read OR write,
-        // our computed values may be stale (read-modify-write pattern).
         let mut accessed = access.reads().clone();
         accessed.union_with(access.writes());
         let read_ticks = world.snapshot_column_ticks(&accessed);
-        // Pre-resolve archetype count — transactions see a frozen archetype set.
         let archetype_count = world.archetypes.archetypes.len();
         OptimisticTx {
             tx_id,
+            strategy: self,
             read_ticks,
             archetype_count,
+            spawned_entities: Vec::new(),
             changeset: EnumChangeSet::new(),
         }
     }
@@ -163,16 +168,19 @@ impl TransactionStrategy for Optimistic {
 /// Archetype set is frozen at begin time — queries only see archetypes
 /// that existed when the transaction started.
 ///
-/// Drop without commit discards the buffered changeset (abort).
-pub struct OptimisticTx {
+/// Drop without commit releases spawned entity IDs back to the allocator
+/// via the strategy's pending release queue — no entity IDs ever leak.
+pub struct OptimisticTx<'s> {
     /// Unique transaction identifier (monotonic per strategy).
     pub tx_id: TxId,
+    strategy: &'s Optimistic,
     read_ticks: Vec<(usize, crate::component::ComponentId, crate::tick::Tick)>,
     archetype_count: usize,
+    spawned_entities: Vec<Entity>,
     changeset: EnumChangeSet,
 }
 
-impl OptimisticTx {
+impl<'s> OptimisticTx<'s> {
     /// Read through the transaction via shared World reference.
     /// No tick advancement, no cache mutation. Safe for concurrent reads.
     /// Only sees archetypes that existed at begin time.
@@ -193,20 +201,40 @@ impl OptimisticTx {
 
     pub fn spawn<B: crate::bundle::Bundle>(&mut self, world: &mut World, bundle: B) -> Entity {
         let entity = world.alloc_entity();
+        self.spawned_entities.push(entity);
         self.changeset.spawn_bundle(world, entity, bundle);
         entity
     }
 
     /// Validate and commit. Checks that no read column was modified since
-    /// begin. Returns reverse changeset on success, Conflict on failure.
-    pub fn commit(self, world: &mut World) -> Result<EnumChangeSet, Conflict> {
+    /// begin. On conflict, spawned entity IDs are immediately deallocated.
+    pub fn commit(mut self, world: &mut World) -> Result<EnumChangeSet, Conflict> {
         let conflicts = world.check_column_conflicts(&self.read_ticks);
         if !conflicts.is_empty() {
+            for &entity in &self.spawned_entities {
+                world.dealloc_entity(entity);
+            }
+            self.spawned_entities.clear();
             return Err(Conflict {
                 component_ids: conflicts,
             });
         }
-        Ok(self.changeset.apply(world))
+        self.spawned_entities.clear();
+        let changeset = std::mem::take(&mut self.changeset);
+        Ok(changeset.apply(world))
+    }
+}
+
+impl<'s> Drop for OptimisticTx<'s> {
+    fn drop(&mut self) {
+        if !self.spawned_entities.is_empty() {
+            // Push to strategy's pending release queue — generation bump
+            // happens at next begin() when &mut World is available.
+            self.strategy
+                .pending_release
+                .lock()
+                .extend(self.spawned_entities.drain(..));
+        }
     }
 }
 
@@ -226,6 +254,8 @@ impl OptimisticTx {
 pub struct Pessimistic {
     lock_table: Mutex<ColumnLockTable>,
     next_tx_id: AtomicU64,
+    /// Entity IDs from aborted transactions awaiting generation-bump + recycle.
+    pending_release: Mutex<Vec<Entity>>,
 }
 
 impl Pessimistic {
@@ -233,6 +263,7 @@ impl Pessimistic {
         Self {
             lock_table: Mutex::new(ColumnLockTable::new()),
             next_tx_id: AtomicU64::new(1),
+            pending_release: Mutex::new(Vec::new()),
         }
     }
 }
@@ -247,6 +278,10 @@ impl TransactionStrategy for Pessimistic {
     type Tx<'s> = PessimisticTx<'s>;
 
     fn begin<'s>(&'s self, world: &mut World, access: &Access) -> PessimisticTx<'s> {
+        // Drain pending releases from previous aborted transactions.
+        for entity in self.pending_release.lock().drain(..) {
+            world.dealloc_entity(entity);
+        }
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         let lock_result = self.lock_table.lock().acquire(
             &world.archetypes.archetypes,
@@ -260,6 +295,7 @@ impl TransactionStrategy for Pessimistic {
             strategy: self,
             locks,
             archetype_count,
+            spawned_entities: Vec::new(),
             changeset: EnumChangeSet::new(),
         }
     }
@@ -278,6 +314,7 @@ pub struct PessimisticTx<'s> {
     strategy: &'s Pessimistic,
     locks: Option<ColumnLockSet>,
     archetype_count: usize,
+    spawned_entities: Vec<Entity>,
     changeset: EnumChangeSet,
 }
 
@@ -301,6 +338,7 @@ impl<'s> PessimisticTx<'s> {
 
     pub fn spawn<B: crate::bundle::Bundle>(&mut self, world: &mut World, bundle: B) -> Entity {
         let entity = world.alloc_entity();
+        self.spawned_entities.push(entity);
         self.changeset.spawn_bundle(world, entity, bundle);
         entity
     }
@@ -314,13 +352,19 @@ impl<'s> PessimisticTx<'s> {
 
     /// Commit the transaction. Succeeds if locks were acquired at begin
     /// time (guaranteed for non-conflicting access patterns). Returns
-    /// Err(Conflict) if locks were not acquired.
+    /// Err(Conflict) if locks were not acquired — spawned entity IDs
+    /// are immediately deallocated.
     pub fn commit(mut self, world: &mut World) -> Result<EnumChangeSet, Conflict> {
         if self.locks.is_none() {
+            for &entity in &self.spawned_entities {
+                world.dealloc_entity(entity);
+            }
+            self.spawned_entities.clear();
             return Err(Conflict {
                 component_ids: FixedBitSet::new(),
             });
         }
+        self.spawned_entities.clear(); // committed — entities are now placed
         let changeset = std::mem::take(&mut self.changeset);
         let reverse = changeset.apply(world);
         if let Some(locks) = self.locks.take() {
@@ -332,8 +376,16 @@ impl<'s> PessimisticTx<'s> {
 
 impl<'s> Drop for PessimisticTx<'s> {
     fn drop(&mut self) {
+        // Release locks
         if let Some(locks) = self.locks.take() {
             self.strategy.lock_table.lock().release(locks);
+        }
+        // Release spawned entity IDs to pending queue
+        if !self.spawned_entities.is_empty() {
+            self.strategy
+                .pending_release
+                .lock()
+                .extend(self.spawned_entities.drain(..));
         }
     }
 }
@@ -537,5 +589,74 @@ mod tests {
         let _ = tx.commit(&mut world);
         assert!(world.get::<Pos>(e).is_some());
         assert_eq!(world.get::<Pos>(e).unwrap().0, 77.0);
+    }
+
+    // ── Entity ID leak tests ────────────────────────────────────────
+
+    #[test]
+    fn optimistic_drop_releases_spawned_entity_ids() {
+        let mut world = World::new();
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+        let strategy = Optimistic::new();
+
+        let spawned_entity;
+        {
+            let mut tx = strategy.begin(&mut world, &access);
+            spawned_entity = tx.spawn(&mut world, (Pos(1.0),));
+            // drop without commit — entity ID goes to pending release queue
+        }
+
+        // Entity was allocated but never placed
+        assert!(!world.is_placed(spawned_entity));
+
+        // Next begin() drains the pending queue
+        let tx2 = strategy.begin(&mut world, &access);
+        let _ = tx2.commit(&mut world);
+
+        // Entity handle is now stale (generation bumped)
+        assert!(!world.is_alive(spawned_entity));
+    }
+
+    #[test]
+    fn pessimistic_drop_releases_spawned_entity_ids() {
+        let mut world = World::new();
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+        let strategy = Pessimistic::new();
+
+        let spawned_entity;
+        {
+            let mut tx = strategy.begin(&mut world, &access);
+            spawned_entity = tx.spawn(&mut world, (Pos(1.0),));
+            // drop without commit
+        }
+
+        assert!(!world.is_placed(spawned_entity));
+
+        // Next begin() drains
+        let tx2 = strategy.begin(&mut world, &access);
+        let _ = tx2.commit(&mut world);
+
+        assert!(!world.is_alive(spawned_entity));
+    }
+
+    #[test]
+    fn optimistic_conflict_deallocates_spawned_entities() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        let access = Access::of::<(&Pos, &mut Pos)>(&mut world);
+        let strategy = Optimistic::new();
+
+        let mut tx = strategy.begin(&mut world, &access);
+        let spawned = tx.spawn(&mut world, (Pos(99.0),));
+
+        // Mutate a read column to force conflict
+        for pos in world.query::<(&mut Pos,)>() {
+            pos.0 .0 = 42.0;
+        }
+
+        let result = tx.commit(&mut world);
+        assert!(result.is_err());
+        // Spawned entity was deallocated immediately by commit
+        assert!(!world.is_alive(spawned));
     }
 }
