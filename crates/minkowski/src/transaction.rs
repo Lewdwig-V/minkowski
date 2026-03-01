@@ -439,7 +439,7 @@ mod tests {
         let e = world.spawn((Pos(1.0), Vel(2.0)));
         let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
 
-        let strategy = Optimistic::new();
+        let strategy = Optimistic::new(&world);
         let mut tx = strategy.begin(&mut world, &access);
         let count = tx.query::<(&Pos,)>(&world).count();
         assert_eq!(count, 1);
@@ -453,7 +453,7 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let strategy = Optimistic::new();
+        let strategy = Optimistic::new(&world);
         let mut tx = strategy.begin(&mut world, &access);
         tx.insert::<Pos>(&mut world, e, Pos(99.0));
         // query_raw sees old value (write is buffered in changeset)
@@ -470,7 +470,7 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let strategy = Optimistic::new();
+        let strategy = Optimistic::new(&world);
         {
             let mut tx = strategy.begin(&mut world, &access);
             tx.insert::<Pos>(&mut world, e, Pos(99.0));
@@ -504,7 +504,7 @@ mod tests {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let strategy = Optimistic::new();
+        let strategy = Optimistic::new(&world);
         let mut tx = strategy.begin(&mut world, &access);
         let e = tx.spawn(&mut world, (Pos(42.0),));
         assert!(tx.commit(&mut world).is_ok());
@@ -519,7 +519,7 @@ mod tests {
         let e = world.spawn((Pos(1.0), Vel(2.0)));
         let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
 
-        let strategy = Pessimistic::new();
+        let strategy = Pessimistic::new(&world);
         let mut tx = strategy.begin(&mut world, &access);
         let _ = tx.query::<(&Pos,)>(&world).count();
         tx.insert::<Vel>(&mut world, e, Vel(99.0));
@@ -532,7 +532,7 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let strategy = Pessimistic::new();
+        let strategy = Pessimistic::new(&world);
         let mut tx = strategy.begin(&mut world, &access);
         tx.insert::<Pos>(&mut world, e, Pos(42.0));
         let pos = tx.query::<(&Pos,)>(&world).next().unwrap();
@@ -548,7 +548,7 @@ mod tests {
         world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let strategy = Pessimistic::new();
+        let strategy = Pessimistic::new(&world);
         {
             let _tx = strategy.begin(&mut world, &access);
         }
@@ -561,7 +561,7 @@ mod tests {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
-        let strategy = Pessimistic::new();
+        let strategy = Pessimistic::new(&world);
         let mut tx = strategy.begin(&mut world, &access);
         let e = tx.spawn(&mut world, (Pos(77.0),));
         let _ = tx.commit(&mut world);
@@ -575,7 +575,7 @@ mod tests {
     fn optimistic_drop_releases_spawned_entity_ids() {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
-        let strategy = Optimistic::new();
+        let strategy = Optimistic::new(&world);
 
         let spawned_entity;
         {
@@ -587,9 +587,8 @@ mod tests {
         // Entity was allocated but never placed
         assert!(!world.is_placed(spawned_entity));
 
-        // Next begin() drains the pending queue
-        let tx2 = strategy.begin(&mut world, &access);
-        let _ = tx2.commit(&mut world);
+        // Any &mut World method drains the orphan queue
+        world.register_component::<Pos>();
 
         // Entity handle is now stale (generation bumped)
         assert!(!world.is_alive(spawned_entity));
@@ -599,7 +598,7 @@ mod tests {
     fn pessimistic_drop_releases_spawned_entity_ids() {
         let mut world = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world);
-        let strategy = Pessimistic::new();
+        let strategy = Pessimistic::new(&world);
 
         let spawned_entity;
         {
@@ -610,9 +609,8 @@ mod tests {
 
         assert!(!world.is_placed(spawned_entity));
 
-        // Next begin() drains
-        let tx2 = strategy.begin(&mut world, &access);
-        let _ = tx2.commit(&mut world);
+        // Any &mut World method drains the orphan queue
+        world.register_component::<Pos>();
 
         assert!(!world.is_alive(spawned_entity));
     }
@@ -622,7 +620,7 @@ mod tests {
         let mut world = World::new();
         world.spawn((Pos(1.0),));
         let access = Access::of::<(&Pos, &mut Pos)>(&mut world);
-        let strategy = Optimistic::new();
+        let strategy = Optimistic::new(&world);
 
         let mut tx = strategy.begin(&mut world, &access);
         let spawned = tx.spawn(&mut world, (Pos(99.0),));
