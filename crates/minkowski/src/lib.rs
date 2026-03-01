@@ -14,6 +14,7 @@ pub mod command;
 pub mod component;
 pub mod entity;
 pub mod index;
+pub(crate) mod lock_table;
 pub mod query;
 pub mod storage;
 pub mod table;
