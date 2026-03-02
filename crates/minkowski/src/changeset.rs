@@ -72,6 +72,12 @@ impl Arena {
     }
 }
 
+// SAFETY: Arena owns its allocation exclusively. All mutation goes through
+// &mut self (alloc, grow). Shared references (&Arena) only read. Same
+// reasoning as BlobVec's Send + Sync impls.
+unsafe impl Send for Arena {}
+unsafe impl Sync for Arena {}
+
 impl Drop for Arena {
     fn drop(&mut self) {
         if self.capacity > 0 {

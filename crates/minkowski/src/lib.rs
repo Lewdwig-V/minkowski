@@ -14,10 +14,12 @@ pub mod command;
 pub mod component;
 pub mod entity;
 pub mod index;
+pub(crate) mod lock_table;
 pub mod query;
 pub mod storage;
 pub mod table;
 pub(crate) mod tick;
+pub mod transaction;
 pub mod world;
 
 pub use access::Access;
@@ -27,5 +29,9 @@ pub use component::ComponentId;
 pub use entity::Entity;
 pub use index::SpatialIndex;
 pub use minkowski_derive::Table;
-pub use query::fetch::Changed;
+pub use query::fetch::{Changed, ReadOnlyWorldQuery};
+pub use transaction::{
+    Conflict, Optimistic, OptimisticTx, Pessimistic, PessimisticTx, Sequential, SequentialTx,
+    TransactionStrategy,
+};
 pub use world::World;

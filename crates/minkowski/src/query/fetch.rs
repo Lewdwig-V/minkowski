@@ -85,6 +85,30 @@ pub unsafe trait WorldQuery {
     }
 }
 
+/// Marker trait for query types that only produce shared references.
+///
+/// # Safety
+/// Implementors must guarantee that `fetch` and `as_slice` never produce
+/// mutable references. This makes `World::query_raw(&self)` sound — multiple
+/// threads can execute read-only queries concurrently against `&World`.
+///
+/// `&mut T` intentionally does NOT implement this trait. Transaction queries
+/// (`OptimisticTx::query`, `PessimisticTx::query`) require this bound to
+/// prevent aliased mutable references during concurrent read phases.
+pub unsafe trait ReadOnlyWorldQuery: WorldQuery {}
+
+// Safety: &T produces &'w T — shared reference only.
+unsafe impl<T: Component> ReadOnlyWorldQuery for &T {}
+
+// Safety: Entity produces Entity (Copy) — no references at all.
+unsafe impl ReadOnlyWorldQuery for Entity {}
+
+// Safety: Option<&T> produces Option<&'w T> — shared reference only.
+unsafe impl<T: Component> ReadOnlyWorldQuery for Option<&T> {}
+
+// Safety: Changed<T> produces () — no references at all.
+unsafe impl<T: Component> ReadOnlyWorldQuery for Changed<T> {}
+
 // --- &T ---
 unsafe impl<T: Component> WorldQuery for &T {
     type Item<'w> = &'w T;
@@ -326,6 +350,13 @@ macro_rules! impl_world_query_tuple {
     };
 }
 
+macro_rules! impl_read_only_world_query_tuple {
+    ($($name:ident),*) => {
+        // Safety: all elements are ReadOnlyWorldQuery, so the tuple only produces shared refs.
+        unsafe impl<$($name: ReadOnlyWorldQuery),*> ReadOnlyWorldQuery for ($($name,)*) {}
+    };
+}
+
 impl_world_query_tuple!(A);
 impl_world_query_tuple!(A, B);
 impl_world_query_tuple!(A, B, C);
@@ -338,6 +369,19 @@ impl_world_query_tuple!(A, B, C, D, E, F, G, H, I);
 impl_world_query_tuple!(A, B, C, D, E, F, G, H, I, J);
 impl_world_query_tuple!(A, B, C, D, E, F, G, H, I, J, K);
 impl_world_query_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+
+impl_read_only_world_query_tuple!(A);
+impl_read_only_world_query_tuple!(A, B);
+impl_read_only_world_query_tuple!(A, B, C);
+impl_read_only_world_query_tuple!(A, B, C, D);
+impl_read_only_world_query_tuple!(A, B, C, D, E);
+impl_read_only_world_query_tuple!(A, B, C, D, E, F);
+impl_read_only_world_query_tuple!(A, B, C, D, E, F, G);
+impl_read_only_world_query_tuple!(A, B, C, D, E, F, G, H);
+impl_read_only_world_query_tuple!(A, B, C, D, E, F, G, H, I);
+impl_read_only_world_query_tuple!(A, B, C, D, E, F, G, H, I, J);
+impl_read_only_world_query_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_read_only_world_query_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
 
 #[cfg(test)]
 mod tests {

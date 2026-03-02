@@ -8,9 +8,26 @@ use crate::storage::sparse::SparseStorage;
 use crate::table::TableCache;
 use crate::tick::Tick;
 use fixedbitset::FixedBitSet;
+use parking_lot::Mutex;
 use std::alloc::Layout;
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// Unique identity for a World instance. Strategies capture this at
+/// construction and assert it matches in begin/commit to prevent
+/// cross-world corruption.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WorldId(u64);
+
+static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
+
+impl WorldId {
+    fn next() -> Self {
+        Self(NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 pub(crate) fn get_pair_mut(
     v: &mut [Archetype],
@@ -44,7 +61,19 @@ pub(crate) struct QueryCacheEntry {
     last_read_tick: Tick,
 }
 
+/// Shared queue for entity IDs orphaned by aborted transactions.
+/// World owns the canonical instance; strategies clone the Arc handle.
+#[derive(Clone)]
+pub(crate) struct OrphanQueue(pub(crate) Arc<Mutex<Vec<Entity>>>);
+
+impl OrphanQueue {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Vec::new())))
+    }
+}
+
 pub struct World {
+    pub(crate) id: WorldId,
     pub(crate) entities: EntityAllocator,
     pub(crate) archetypes: Archetypes,
     pub(crate) components: ComponentRegistry,
@@ -53,11 +82,13 @@ pub struct World {
     pub(crate) table_cache: TableCache,
     pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
     pub(crate) current_tick: Tick,
+    pub(crate) orphan_queue: OrphanQueue,
 }
 
 impl World {
     pub fn new() -> Self {
         Self {
+            id: WorldId::next(),
             entities: EntityAllocator::new(),
             archetypes: Archetypes::new(),
             components: ComponentRegistry::new(),
@@ -66,6 +97,7 @@ impl World {
             table_cache: TableCache::new(),
             query_cache: HashMap::new(),
             current_tick: Tick::default(),
+            orphan_queue: OrphanQueue::new(),
         }
     }
 
@@ -73,6 +105,27 @@ impl World {
     /// Called automatically on every mutation and query — not user-facing.
     pub(crate) fn next_tick(&mut self) -> Tick {
         self.current_tick.advance()
+    }
+
+    /// Drain orphaned entity IDs from aborted transactions.
+    /// Called automatically at the top of every &mut self entry point.
+    fn drain_orphans(&mut self) {
+        let mut queue = self.orphan_queue.0.lock();
+        for entity in queue.drain(..) {
+            self.entities.dealloc(entity);
+        }
+    }
+
+    /// Clone the orphan queue handle. Strategies capture this at construction
+    /// so that transaction Drop can push orphaned entity IDs without &mut World.
+    pub(crate) fn orphan_queue(&self) -> OrphanQueue {
+        self.orphan_queue.clone()
+    }
+
+    /// Return this World's unique identity. Strategies capture this at
+    /// construction and assert it matches in begin/commit.
+    pub(crate) fn world_id(&self) -> WorldId {
+        self.id
     }
 
     /// Look up the ComponentId for a type. Returns None if the type has
@@ -84,18 +137,30 @@ impl World {
     /// Register a component type, returning its ComponentId. Idempotent —
     /// returns the existing id if already registered.
     pub fn register_component<T: Component>(&mut self) -> ComponentId {
+        self.drain_orphans();
         self.components.register::<T>()
     }
 
     /// Allocate a fresh entity ID without placing it in any archetype.
     /// Use this to obtain an unplaced handle for `EnumChangeSet::spawn_bundle`.
     pub fn alloc_entity(&mut self) -> Entity {
+        self.drain_orphans();
         let entity = self.entities.alloc();
         let index = entity.index() as usize;
         if index >= self.entity_locations.len() {
             self.entity_locations.resize(index + 1, None);
         }
         entity
+    }
+
+    /// Deallocate an unplaced entity ID. Bumps the generation so the handle
+    /// becomes stale, and returns the index to the free list.
+    ///
+    /// Used by transaction abort to clean up entity IDs that were allocated
+    /// via `alloc_entity()` but never placed (changeset was discarded).
+    pub(crate) fn dealloc_entity(&mut self, entity: Entity) {
+        self.drain_orphans();
+        self.entities.dealloc(entity);
     }
 
     /// Returns true if the entity has been placed in an archetype (has a row).
@@ -106,6 +171,7 @@ impl World {
     }
 
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
+        self.drain_orphans();
         let component_ids = B::component_ids(&mut self.components);
         let arch_id = self
             .archetypes
@@ -139,6 +205,7 @@ impl World {
     }
 
     pub fn despawn(&mut self, entity: Entity) -> bool {
+        self.drain_orphans();
         if !self.entities.is_alive(entity) {
             return false;
         }
@@ -197,6 +264,7 @@ impl World {
     }
 
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
+        self.drain_orphans();
         if !self.entities.is_alive(entity) {
             return None;
         }
@@ -217,6 +285,7 @@ impl World {
     }
 
     pub fn query<Q: WorldQuery + 'static>(&mut self) -> QueryIter<'_, Q> {
+        self.drain_orphans();
         let type_id = TypeId::of::<Q>();
         let total = self.archetypes.archetypes.len();
 
@@ -328,6 +397,7 @@ impl World {
     ///
     /// Marks all columns changed (raw pointers allow arbitrary writes).
     pub fn query_table_raw<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
+        self.drain_orphans();
         self.mark_table_columns_changed::<T>();
         let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
         crate::table::TableIter::new(col_ptrs, len)
@@ -366,6 +436,7 @@ impl World {
     }
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
+        self.drain_orphans();
         assert!(self.is_alive(entity), "entity is not alive");
         let index = entity.index() as usize;
         let location = self.entity_locations[index].unwrap();
@@ -448,6 +519,7 @@ impl World {
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
+        self.drain_orphans();
         if !self.is_alive(entity) {
             return None;
         }
@@ -581,6 +653,69 @@ impl World {
             .collect();
 
         Some(components)
+    }
+
+    /// Snapshot the `changed_tick` of every column matching the given component
+    /// bitset. Returns a Vec of (ArchetypeId index, ComponentId, Tick) triples.
+    /// Used by OptimisticTx for read-set validation.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_column_ticks(
+        &self,
+        component_ids: &FixedBitSet,
+    ) -> Vec<(usize, ComponentId, crate::tick::Tick)> {
+        let mut ticks = Vec::new();
+        for arch in &self.archetypes.archetypes {
+            for comp_id in component_ids.ones() {
+                if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                    ticks.push((arch.id.0, comp_id, arch.columns[col_idx].changed_tick));
+                }
+            }
+        }
+        ticks
+    }
+
+    /// Check if any column in the snapshot has been modified since the
+    /// recorded tick. Returns a FixedBitSet of conflicting ComponentIds.
+    #[allow(dead_code)]
+    pub(crate) fn check_column_conflicts(
+        &self,
+        snapshot: &[(usize, ComponentId, crate::tick::Tick)],
+    ) -> FixedBitSet {
+        let mut conflicts = FixedBitSet::new();
+        for &(arch_idx, comp_id, begin_tick) in snapshot {
+            if let Some(arch) = self.archetypes.archetypes.get(arch_idx) {
+                if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                    if arch.columns[col_idx].changed_tick.is_newer_than(begin_tick) {
+                        conflicts.grow(comp_id + 1);
+                        conflicts.insert(comp_id);
+                    }
+                }
+            }
+        }
+        conflicts
+    }
+
+    /// Shared-ref query path for transactions. No cache update, no tick
+    /// advancement, no column marking. Safe for concurrent reads from
+    /// multiple threads.
+    ///
+    /// Scans archetypes (up to `archetype_count`) against the query's required
+    /// component bitset. Skips empty archetypes. Does not apply Changed<T> filters
+    /// (transactions have their own tick-based conflict model).
+    ///
+    /// `archetype_count` freezes the archetype set to what existed at begin time.
+    #[allow(dead_code)]
+    pub(crate) fn query_raw<Q: crate::query::fetch::ReadOnlyWorldQuery + 'static>(
+        &self,
+        archetype_count: usize,
+    ) -> QueryIter<'_, Q> {
+        let required = Q::required_ids(&self.components);
+        let fetches: Vec<_> = self.archetypes.archetypes[..archetype_count]
+            .iter()
+            .filter(|arch| !arch.is_empty() && required.is_subset(&arch.component_ids))
+            .map(|arch| (Q::init_fetch(arch, &self.components), arch.len()))
+            .collect();
+        QueryIter::new(fetches)
     }
 }
 
@@ -1015,5 +1150,82 @@ mod tests {
         assert_eq!(world.get::<Pos>(e), None);
         assert_eq!(world.get_mut::<Pos>(e), None);
         assert!(!world.despawn(e));
+    }
+
+    #[test]
+    fn snapshot_column_ticks_captures_current_state() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let mut bits = FixedBitSet::with_capacity(pos_id + 1);
+        bits.insert(pos_id);
+        let snap = world.snapshot_column_ticks(&bits);
+        assert!(!snap.is_empty());
+    }
+
+    #[test]
+    fn check_column_conflicts_detects_mutation() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let mut bits = FixedBitSet::with_capacity(pos_id + 1);
+        bits.insert(pos_id);
+
+        let snap = world.snapshot_column_ticks(&bits);
+
+        // Mutate through query — advances tick
+        for pos in world.query::<(&mut Pos,)>() {
+            pos.0.x = 99.0;
+        }
+
+        let conflicts = world.check_column_conflicts(&snap);
+        assert!(conflicts.contains(pos_id));
+    }
+
+    #[test]
+    fn check_column_conflicts_clean_when_unchanged() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let mut bits = FixedBitSet::with_capacity(pos_id + 1);
+        bits.insert(pos_id);
+
+        let snap = world.snapshot_column_ticks(&bits);
+        // No mutation
+        let conflicts = world.check_column_conflicts(&snap);
+        assert!(!conflicts.contains(pos_id));
+    }
+
+    #[test]
+    fn query_raw_reads_without_mutation() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+
+        // query_raw takes &self — no tick advancement, no cache mutation
+        let n = world.archetypes.archetypes.len();
+        let count = world.query_raw::<(&Pos,)>(n).count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn query_raw_skips_empty_archetypes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let n = world.archetypes.archetypes.len();
+        world.despawn(e);
+
+        let count = world.query_raw::<(&Pos,)>(n).count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn query_raw_matches_multiple_archetypes() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.spawn((Pos { x: 1.0, y: 1.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        let n = world.archetypes.archetypes.len();
+        // Both archetypes contain Pos
+        let count = world.query_raw::<(&Pos,)>(n).count();
+        assert_eq!(count, 2);
     }
 }

@@ -19,6 +19,8 @@ cargo run -p minkowski-examples --example boids --release   # Boids simulation (
 cargo run -p minkowski-examples --example life --release    # Game of Life with undo + derive(Table) (64x64 grid, 500 gens)
 cargo run -p minkowski-examples --example nbody --release   # Barnes-Hut N-body (2K entities, 1K frames)
 cargo run -p minkowski-examples --example scheduler --release   # Access conflict detection demo (6 systems, 10 frames)
+cargo run -p minkowski-examples --example transaction --release   # Transaction strategies demo (3 strategies, 100 entities)
+cargo run -p minkowski-examples --example battle --release   # Multi-threaded battle with tunable conflict rates (500 entities, 100 frames)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -105,9 +107,19 @@ Each BlobVec column stores a `changed_tick: Tick` — the tick at which it was l
 
 This is a building block for framework-level schedulers. Minkowski provides the access metadata; scheduling policy (dependency graphs, topological sort, parallel execution) is the framework's responsibility.
 
+### Transaction Semantics
+
+`TransactionStrategy` is a trait with one method: `begin(&self, world, access) -> Tx`. The Tx does NOT hold `&mut World` — methods take `world` as a parameter. This split-phase design enables concurrent reads: `tx.query(&world)` uses `World::query_raw(&self)` (shared-ref, no ticks/cache), while `tx.commit(&mut world)` validates and applies atomically.
+
+Three built-in strategies: `Sequential` (zero-cost passthrough — all ops delegate directly to World, commit always succeeds), `Optimistic` (live reads via `query_raw`, buffered writes into `EnumChangeSet`, tick-based validation at commit — `Err(Conflict)` if any accessed column was modified since begin), `Pessimistic` (cooperative per-column locks acquired at begin, buffered writes, commit always succeeds — locks released on drop). `Optimistic` and `Pessimistic` are constructed with `::new(&world)` to capture a shared orphan queue handle.
+
+Lock granularity is per-column `(ArchetypeId, ComponentId)`. `ColumnLockTable` is owned by `Pessimistic` strategy (not World — it's concurrency policy, not storage). Not MVCC — no version chains. Optimistic uses existing `changed_tick` infrastructure for validation. `World::query_raw(&self)` is the shared-ref read path — scans archetypes without touching cache or ticks.
+
+**Entity ID lifecycle invariant**: entity IDs allocated during a transaction (`tx.spawn`) are tracked. On successful commit they become placed entities. On abort (drop without commit or conflict), the IDs are pushed to a shared `OrphanQueue` owned by World. World drains this queue automatically at the top of every `&mut self` method — bumping generations and recycling indices. No entity ID ever leaks, regardless of how the transaction ends. No manual drain step required.
+
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`, `Access`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`, `Access`, `TransactionStrategy`, `Sequential`, `Optimistic`, `Pessimistic`, `Conflict`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
@@ -119,6 +131,7 @@ This is a building block for framework-level schedulers. Minkowski provides the 
 | Crate | Purpose |
 |---|---|
 | `fixedbitset` | Archetype component bitmasks for query matching |
+| `parking_lot` | Mutex for `ColumnLockTable`, `OrphanQueue` |
 | `rayon` | `par_for_each` parallel iteration |
 | `minkowski-derive` | `#[derive(Table)]` proc macro (syn/quote/proc-macro2) |
 | `criterion` (dev) | Benchmark harness |

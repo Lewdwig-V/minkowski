@@ -189,6 +189,71 @@ Done.
 
 Six systems demonstrate every conflict case: write/write (`health_regen` vs `apply_damage`), read/write (`log_positions` vs `movement`), disjoint writes that parallelize (`movement` + `health_regen`), and read-only systems that batch with non-overlapping writers. The greedy batcher assigns systems to 3 batches — within each batch, systems touch disjoint components and could run in parallel.
 
+### Transaction example
+
+Demonstrates all three `TransactionStrategy` implementations on the same workload — Sequential (zero-cost), Optimistic (tick validation), and Pessimistic (cooperative locks).
+
+```
+$ cargo run -p minkowski-examples --example transaction --release
+
+Transaction strategies — 100 entities with (Pos, Vel, Health)
+
+1. Sequential (zero-cost passthrough)
+   Movement system: writes Pos, reads Vel
+  after 10 steps: avg pos = (59.5, 5.0)
+  commit result:  Ok (always succeeds, zero overhead)
+
+2. Optimistic (clean commit)
+   Health decay system: reads Health, buffers writes, validates at commit
+  after 10 steps: avg health = 70
+  commit result:  Ok (no conflicts detected)
+
+3. Optimistic (conflict demonstration)
+   Declared access: reads Pos, writes Health
+   But mutates Pos through live query — tick advances past snapshot
+  commit result:  Err(Conflict) — read column was modified
+  buffered writes discarded (transaction aborted)
+
+4. Pessimistic (guaranteed commit)
+   Same health decay, but with cooperative column locks
+  after 10 steps: avg health = 40
+  commit result:  Ok (locks guarantee success)
+
+Done.
+```
+
+The caller decides the transaction boundary and the concurrency strategy. Sequential has zero overhead — the compiler inlines everything. Optimistic validates read-set ticks at commit. Pessimistic acquires per-column cooperative locks at begin. Tx types don't hold `&mut World` — methods take world as a parameter, enabling split-phase execution with concurrent reads via `rayon`.
+
+### Battle example
+
+A multi-threaded arena battle that stress-tests transaction strategies under tunable conflict pressure. 500 entities across 2 teams, with combat and healing systems running as parallel transactions via `rayon::join`.
+
+```
+$ cargo run -p minkowski-examples --example battle --release
+
+Battle simulation: 500 entities (250 per team), 100 frames
+
+=== Low conflict mode (disjoint targets) ===
+
+Optimistic:
+  commits: 200 | conflicts: 0 | avg frame: 0.19ms
+
+Pessimistic:
+  commits: 200 | conflicts: 0 | avg frame: 0.17ms
+
+=== High conflict mode (overlapping targets) ===
+
+Optimistic:
+  commits: 100 | conflicts: 100 | avg frame: 0.16ms
+
+Pessimistic:
+  commits: 200 | conflicts: 0 | avg frame: 0.17ms
+
+Done.
+```
+
+In low-conflict mode (disjoint entity targets), both strategies perform identically — zero conflicts. In high-conflict mode (overlapping targets), optimistic transactions see 100 conflicts (one per frame for the second-to-commit system), while pessimistic guarantees all 200 commits succeed via cooperative column locks.
+
 ### Benchmarks
 
 Criterion benchmarks compare against [hecs](https://crates.io/crates/hecs):
@@ -201,12 +266,11 @@ Suites: `spawn` (10K entities), `iterate` (10K), `parallel` (100K vs sequential)
 
 ## What's next
 
-**Phase 4 — done:** `SpatialIndex` lifecycle trait, Barnes-Hut N-body example, boids grid refactored through the trait. `Access` struct for query conflict detection, scheduler example.
+**Phase 4 — done:** `SpatialIndex` lifecycle trait, Barnes-Hut N-body example, boids grid refactored through the trait. `Access` struct for query conflict detection, scheduler example. `TransactionStrategy` trait with Sequential/Optimistic/Pessimistic implementations, transaction example.
 
 | Phase | Feature | Why |
 |---|---|---|
 | 4 | Persistence — WAL + snapshots | Durable state via BlobVec memcpy to disk |
-| 4 | Transaction semantics | Atomic multi-entity mutations with rollback |
 | 5 | Query planning (Volcano model) | Optimize complex queries across indexes |
 | 5 | B-tree / hash indexes | Fast range and equality lookups on component fields |
 
