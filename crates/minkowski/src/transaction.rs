@@ -82,6 +82,136 @@ pub struct Conflict {
     pub component_ids: FixedBitSet,
 }
 
+// ── TxCleanup + Tx ─────────────────────────────────────────────────
+
+/// Strategy-specific teardown logic invoked when a [`Tx`] is dropped
+/// without committing (abort path). Strategies implement this to release
+/// resources they acquired at begin time (e.g. column locks).
+pub(crate) trait TxCleanup {
+    fn abort(&mut self);
+}
+
+/// No-op cleanup for strategies that have nothing to release on abort.
+#[allow(dead_code)]
+pub(crate) struct NoopCleanup;
+
+impl TxCleanup for NoopCleanup {
+    fn abort(&mut self) {}
+}
+
+/// Unified transaction object. Holds a buffered changeset and tracks
+/// entity IDs allocated during the transaction. Strategy-specific
+/// teardown is delegated to a boxed [`TxCleanup`] implementor.
+///
+/// Does not hold a World reference — methods take `&World` or
+/// `&mut World` as parameters, enabling split-phase execution where
+/// multiple transactions read concurrently and commit sequentially.
+///
+/// Drop without [`mark_committed`](Tx::mark_committed) triggers abort:
+/// the cleanup callback runs and spawned entity IDs are pushed to the
+/// orphan queue for reclamation.
+pub struct Tx<'a> {
+    archetype_count: usize,
+    changeset: EnumChangeSet,
+    allocated: Vec<Entity>,
+    orphan_queue: crate::world::OrphanQueue,
+    cleanup: Box<dyn TxCleanup + 'a>,
+    committed: bool,
+}
+
+impl<'a> Tx<'a> {
+    /// Create a new transaction with the given archetype snapshot size,
+    /// orphan queue handle, and strategy-specific cleanup.
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        archetype_count: usize,
+        orphan_queue: crate::world::OrphanQueue,
+        cleanup: Box<dyn TxCleanup + 'a>,
+    ) -> Self {
+        Self {
+            archetype_count,
+            changeset: EnumChangeSet::new(),
+            allocated: Vec::new(),
+            orphan_queue,
+            cleanup,
+            committed: false,
+        }
+    }
+
+    /// Read through the transaction via shared World reference.
+    /// No tick advancement, no cache mutation. Safe for concurrent reads.
+    /// Only sees archetypes that existed at begin time.
+    ///
+    /// Requires [`ReadOnlyWorldQuery`] — `&mut T` queries are rejected at
+    /// compile time. Writes go through [`write`](Tx::write)/[`remove`](Tx::remove)/[`spawn`](Tx::spawn) instead.
+    pub fn query<'w, Q: ReadOnlyWorldQuery + 'static>(&self, world: &'w World) -> QueryIter<'w, Q> {
+        world.query_raw::<Q>(self.archetype_count)
+    }
+
+    /// Read a single component from an entity via shared World reference.
+    pub fn read<'w, T: Component>(&self, world: &'w World, entity: Entity) -> Option<&'w T> {
+        world.get::<T>(entity)
+    }
+
+    /// Buffer a component write. The mutation is recorded in the internal
+    /// changeset and will be applied when the strategy commits the transaction.
+    pub fn write<T: Component>(&mut self, world: &mut World, entity: Entity, value: T) {
+        self.changeset.insert::<T>(world, entity, value);
+    }
+
+    /// Buffer a component removal. The mutation is recorded in the internal
+    /// changeset and will be applied when the strategy commits the transaction.
+    pub fn remove<T: Component>(&mut self, world: &mut World, entity: Entity) {
+        self.changeset.remove::<T>(world, entity);
+    }
+
+    /// Allocate a new entity and buffer its initial components. The entity ID
+    /// is tracked so it can be reclaimed on abort (drop without commit).
+    pub fn spawn<B: crate::bundle::Bundle>(&mut self, world: &mut World, bundle: B) -> Entity {
+        let entity = world.alloc_entity();
+        self.allocated.push(entity);
+        self.changeset.spawn_bundle(world, entity, bundle);
+        entity
+    }
+
+    /// Track an externally-allocated entity ID for orphan reclamation on abort.
+    #[allow(dead_code)]
+    pub(crate) fn track_allocated(&mut self, entity: Entity) {
+        self.allocated.push(entity);
+    }
+
+    /// Mark this transaction as committed, preventing abort cleanup on drop.
+    /// Clears the allocated entity list (they are now placed).
+    #[allow(dead_code)]
+    pub(crate) fn mark_committed(&mut self) {
+        self.allocated.clear();
+        self.committed = true;
+    }
+
+    /// Borrow the internal changeset.
+    #[allow(dead_code)]
+    pub(crate) fn changeset(&self) -> &EnumChangeSet {
+        &self.changeset
+    }
+
+    /// Take ownership of the internal changeset, leaving an empty one in place.
+    #[allow(dead_code)]
+    pub(crate) fn take_changeset(&mut self) -> EnumChangeSet {
+        std::mem::take(&mut self.changeset)
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.cleanup.abort();
+            if !self.allocated.is_empty() {
+                self.orphan_queue.0.lock().extend(self.allocated.drain(..));
+            }
+        }
+    }
+}
+
 /// Strategy for transaction concurrency control.
 ///
 /// The trait provides `begin()` which returns a strategy-specific transaction
@@ -752,5 +882,75 @@ mod tests {
         let strategy = Optimistic::new(&world_a);
         let tx = strategy.begin(&mut world_a, &access);
         let _ = tx.commit(&mut world_b);
+    }
+
+    // ── Tx (unified) tests ──────────────────────────────────────────
+
+    #[test]
+    fn tx_query_reads_via_query_raw() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0), Vel(2.0)));
+        let archetype_count = world.archetypes.archetypes.len();
+        let orphan_queue = world.orphan_queue();
+
+        let tx = Tx::new(archetype_count, orphan_queue, Box::new(NoopCleanup));
+        let count = tx.query::<(&Pos,)>(&world).count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn tx_write_buffers_in_changeset() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let archetype_count = world.archetypes.archetypes.len();
+        let orphan_queue = world.orphan_queue();
+
+        let mut tx = Tx::new(archetype_count, orphan_queue, Box::new(NoopCleanup));
+        tx.write::<Pos>(&mut world, e, Pos(99.0));
+        // The write is buffered — world still has old value
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 1.0);
+        // Changeset is non-empty
+        assert!(tx.changeset().iter_mutations().count() > 0);
+        tx.mark_committed();
+    }
+
+    #[test]
+    fn tx_drop_pushes_allocated_to_orphan_queue() {
+        let mut world = World::new();
+        let archetype_count = world.archetypes.archetypes.len();
+        let orphan_queue = world.orphan_queue();
+
+        let spawned;
+        {
+            let mut tx = Tx::new(archetype_count, orphan_queue, Box::new(NoopCleanup));
+            spawned = tx.spawn(&mut world, (Pos(1.0),));
+            // drop without mark_committed — entity goes to orphan queue
+        }
+
+        assert!(!world.is_placed(spawned));
+        // Any &mut World method drains the orphan queue
+        world.register_component::<Pos>();
+        assert!(!world.is_alive(spawned));
+    }
+
+    #[test]
+    fn tx_committed_flag_prevents_orphan_push() {
+        let mut world = World::new();
+        let archetype_count = world.archetypes.archetypes.len();
+        let orphan_queue = world.orphan_queue();
+
+        let spawned;
+        {
+            let mut tx = Tx::new(archetype_count, orphan_queue, Box::new(NoopCleanup));
+            spawned = tx.spawn(&mut world, (Pos(1.0),));
+            tx.mark_committed();
+            // drop after mark_committed — entity NOT pushed to orphan queue
+        }
+
+        // Entity was allocated (alloc_entity) so it exists in the allocator.
+        // Since we marked committed, the orphan queue should be empty.
+        // Drain orphans and confirm the entity is still alive.
+        world.register_component::<Vel>();
+        assert!(world.is_alive(spawned));
     }
 }
