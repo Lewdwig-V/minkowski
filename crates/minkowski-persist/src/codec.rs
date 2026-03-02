@@ -209,13 +209,11 @@ impl CodecRegistry {
         (codec.insert_sparse_fn)(world, entity, data)
     }
 
-    /// Register all known component types into the given World.
-    /// This replays the concrete `register_component::<T>()` calls in
-    /// ComponentId order so that the new World gets matching IDs.
-    pub fn register_all(&self, world: &mut World) {
-        let mut entries: Vec<_> = self.codecs.iter().collect();
-        entries.sort_by_key(|(&id, _)| id);
-        for (_, codec) in entries {
+    /// Register a single component type by its ComponentId into the given World.
+    /// Used by snapshot restore to register persisted components (with drop fns)
+    /// while filling non-persisted gaps with raw placeholders.
+    pub fn register_one(&self, id: ComponentId, world: &mut World) {
+        if let Some(codec) = self.codecs.get(&id) {
             (codec.register_fn)(world);
         }
     }

@@ -141,6 +141,18 @@ impl World {
         self.components.register::<T>()
     }
 
+    /// Register a component slot using raw metadata without a concrete type.
+    /// Used during snapshot restore to preserve ComponentId assignments for
+    /// components that exist in the snapshot schema but have no codec.
+    pub fn register_component_raw(
+        &mut self,
+        name: &'static str,
+        layout: std::alloc::Layout,
+    ) -> ComponentId {
+        self.drain_orphans();
+        self.components.register_raw(name, layout)
+    }
+
     /// Allocate a fresh entity ID without placing it in any archetype.
     /// Use this to obtain an unplaced handle for `EnumChangeSet::spawn_bundle`.
     pub fn alloc_entity(&mut self) -> Entity {

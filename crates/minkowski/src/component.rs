@@ -54,6 +54,25 @@ impl ComponentRegistry {
         id
     }
 
+    /// Register a component slot using raw metadata (name + layout) without
+    /// a concrete Rust type. Used during snapshot restore to fill the ID space
+    /// for components that were registered in the original world but don't have
+    /// a codec in the persist crate.
+    ///
+    /// No TypeId is recorded — the slot cannot be looked up via `id::<T>()`.
+    /// No drop function — the persist crate never instantiates these placeholder
+    /// components, so there is nothing to drop.
+    pub fn register_raw(&mut self, name: &'static str, layout: Layout) -> ComponentId {
+        let id = self.infos.len();
+        self.infos.push(ComponentInfo {
+            id,
+            name,
+            layout,
+            drop_fn: None,
+        });
+        id
+    }
+
     #[allow(dead_code)]
     pub(crate) fn register_sparse<T: Component>(&mut self) -> ComponentId {
         let id = self.register::<T>();

@@ -115,15 +115,15 @@ impl<W: WireFormat> Snapshot<W> {
         codecs: &CodecRegistry,
         wal_seq: u64,
     ) -> Result<SnapshotData, SnapshotError> {
-        // Schema — one entry per registered codec
-        let schema: Vec<ComponentSchema> = codecs
-            .registered_ids()
-            .iter()
-            .map(|&id| ComponentSchema {
+        // Schema — one entry per registered component in the world (not just codecs).
+        // This preserves the full ComponentId space so that restore can fill gaps
+        // for non-persisted components, preventing ID shifts.
+        let schema: Vec<ComponentSchema> = (0..world.component_count())
+            .map(|id| ComponentSchema {
                 id,
-                name: codecs.name(id).unwrap_or("unknown").to_string(),
-                size: codecs.layout(id).map(|l| l.size()).unwrap_or(0),
-                align: codecs.layout(id).map(|l| l.align()).unwrap_or(1),
+                name: world.component_name(id).unwrap_or("unknown").to_string(),
+                size: world.component_layout(id).map(|l| l.size()).unwrap_or(0),
+                align: world.component_layout(id).map(|l| l.align()).unwrap_or(1),
             })
             .collect();
 
@@ -209,11 +209,24 @@ impl<W: WireFormat> Snapshot<W> {
     ) -> Result<World, SnapshotError> {
         let mut world = World::new();
 
-        // Register all component types into the new World so that archetype
-        // creation can look up layouts and drop functions by ComponentId.
-        // register_all replays the concrete register_component::<T>() calls
-        // in ID order so the new World gets matching ComponentIds.
-        codecs.register_all(&mut world);
+        // Register all component types from the schema into the new World.
+        // This preserves the full ComponentId space — components with codecs
+        // get their concrete type registered (for drop functions), while
+        // components without codecs get a raw placeholder (name + layout only).
+        // The schema is ordered by ID, so sequential registration produces
+        // matching IDs.
+        for entry in &data.schema {
+            if codecs.has_codec(entry.id) {
+                codecs.register_one(entry.id, &mut world);
+            } else {
+                let layout = std::alloc::Layout::from_size_align(entry.size, entry.align)
+                    .unwrap_or(std::alloc::Layout::new::<()>());
+                // Leak the name string to get 'static — these are component type names
+                // that live for the duration of the program.
+                let name: &'static str = Box::leak(entry.name.clone().into_boxed_str());
+                world.register_component_raw(name, layout);
+            }
+        }
 
         // Restore archetypes via EnumChangeSet
         for arch_data in &data.archetypes {
@@ -544,5 +557,44 @@ mod tests {
         assert_eq!(world2.query::<(&Pos,)>().count(), 1);
         // No sparse data — should be fine
         assert!(world2.sparse_component_ids().is_empty());
+    }
+
+    #[test]
+    fn non_persisted_component_preserves_id_space() {
+        // Regression: if the original world registered a component without a codec,
+        // snapshot restore must fill the gap so that persisted ComponentIds don't shift.
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("gap.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+
+        // Register a non-persisted component first (gets id=0)
+        #[derive(Clone, Copy)]
+        #[allow(dead_code)]
+        struct Hidden(u32);
+        world.register_component::<Hidden>();
+
+        // Then register the persisted component (gets id=1)
+        codecs.register::<Pos>(&mut world);
+        let pos_id = world.component_id::<Pos>().unwrap();
+        assert_eq!(pos_id, 1, "Pos should have id=1 (Hidden took id=0)");
+
+        world.spawn((Pos { x: 42.0, y: 99.0 },));
+
+        let snap = Snapshot::new(Bincode);
+        snap.save(&snap_path, &world, &codecs, 0).unwrap();
+
+        // Load — the restored world must have Pos at id=1, not id=0
+        let (mut world2, _) = snap.load(&snap_path, &codecs).unwrap();
+
+        let restored_pos_id = world2.component_id::<Pos>().unwrap();
+        assert_eq!(
+            restored_pos_id, pos_id,
+            "Pos ComponentId must match after restore (gap filled for Hidden)"
+        );
+
+        let positions: Vec<_> = world2.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert_eq!(positions, vec![(42.0, 99.0)]);
     }
 }
