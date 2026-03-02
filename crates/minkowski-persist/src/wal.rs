@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use minkowski::{Entity, EnumChangeSet, MutationRef, World};
@@ -8,8 +8,15 @@ use crate::codec::{CodecError, CodecRegistry};
 use crate::format::WireFormat;
 use crate::record::SerializedMutation;
 
-/// WAL file format: `[len: u32 LE][payload: len bytes]` repeated.
-/// Each payload is a `WalRecord` serialized through `WireFormat`.
+// WAL file format: `[len: u32 LE][payload: len bytes]` repeated.
+// Each payload is a `WalRecord` serialized through `WireFormat`.
+
+/// Read exactly `buf.len()` bytes from `file` starting at byte offset `pos`.
+fn read_exact_at(file: &File, pos: u64, buf: &mut [u8]) -> io::Result<()> {
+    let mut f = file;
+    f.seek(SeekFrom::Start(pos))?;
+    f.read_exact(buf)
+}
 
 #[derive(Debug)]
 pub enum WalError {
@@ -118,26 +125,37 @@ impl<W: WireFormat> Wal<W> {
     }
 
     /// Replay records starting from (and including) a given sequence number.
+    /// If a torn entry is found, it is truncated and replay stops cleanly.
     pub fn replay_from(
         &mut self,
         from_seq: u64,
         world: &mut World,
         codecs: &CodecRegistry,
     ) -> Result<u64, WalError> {
-        self.file.seek(SeekFrom::Start(0))?;
-        let mut reader = BufReader::new(&self.file);
+        let mut pos: u64 = 0;
         let mut last_seq = if from_seq > 0 { from_seq - 1 } else { 0 };
 
         loop {
+            let record_start = pos;
             let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf) {
+            match read_exact_at(&self.file, record_start, &mut len_buf) {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.file.set_len(record_start)?;
+                    break;
+                }
                 Err(e) => return Err(e.into()),
             }
             let len = u32::from_le_bytes(len_buf) as usize;
             let mut payload = vec![0u8; len];
-            reader.read_exact(&mut payload)?;
+            match read_exact_at(&self.file, record_start + 4, &mut payload) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.file.set_len(record_start)?;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
 
             let record = self
                 .format
@@ -148,6 +166,8 @@ impl<W: WireFormat> Wal<W> {
                 Self::apply_record(&record, world, codecs)?;
                 last_seq = record.seq;
             }
+
+            pos = record_start + 4 + len as u64;
         }
 
         Ok(last_seq)
@@ -281,27 +301,44 @@ impl<W: WireFormat> Wal<W> {
         Ok(())
     }
 
+    /// Scan the WAL file to find the last valid sequence number.
+    /// If a torn entry is found (partial length prefix or incomplete payload),
+    /// the file is truncated to the last valid record boundary.
     fn scan_last_seq(&mut self) -> Result<u64, WalError> {
         self.file.seek(SeekFrom::Start(0))?;
-        let mut reader = BufReader::new(&self.file);
         let mut last_seq = 0u64;
+        let mut valid_end: u64 = 0;
 
         loop {
+            let record_start = valid_end;
             let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf) {
+            match read_exact_at(&self.file, record_start, &mut len_buf) {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // Torn length prefix — truncate to last valid boundary
+                    self.file.set_len(valid_end)?;
+                    break;
+                }
                 Err(e) => return Err(e.into()),
             }
             let len = u32::from_le_bytes(len_buf) as usize;
             let mut payload = vec![0u8; len];
-            reader.read_exact(&mut payload)?;
+            match read_exact_at(&self.file, record_start + 4, &mut payload) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // Torn payload — truncate to start of this record
+                    self.file.set_len(record_start)?;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
 
             let record = self
                 .format
                 .deserialize_record(&payload)
                 .map_err(|e| WalError::Format(e.to_string()))?;
             last_seq = record.seq;
+            valid_end = record_start + 4 + len as u64;
         }
 
         Ok(last_seq)
@@ -408,5 +445,74 @@ mod tests {
         let mut wal = Wal::create(&wal_path, Bincode).unwrap();
         let last = wal.replay(&mut world, &codecs).unwrap();
         assert_eq!(last, 0);
+    }
+
+    #[test]
+    fn torn_entry_truncated_on_open() {
+        // Simulate a crash mid-write: write 2 valid records, then append
+        // a partial third (length prefix but incomplete payload).
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("torn.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Health>(&mut world);
+
+        {
+            let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+        }
+
+        // Append garbage: a valid length prefix claiming 1000 bytes, but only 5 bytes of payload
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            f.write_all(&1000u32.to_le_bytes()).unwrap();
+            f.write_all(&[0u8; 5]).unwrap();
+            f.flush().unwrap();
+        }
+
+        let file_len_before = std::fs::metadata(&wal_path).unwrap().len();
+
+        // open() should detect the torn entry, truncate it, and recover
+        let wal2 = Wal::open(&wal_path, Bincode).unwrap();
+        assert_eq!(
+            wal2.next_seq(),
+            2,
+            "should see 2 valid records, torn entry removed"
+        );
+
+        let file_len_after = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(file_len_after < file_len_before, "file should be truncated");
+    }
+
+    #[test]
+    fn torn_entry_truncated_on_replay() {
+        // Same setup but verify replay also handles torn entries cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("torn_replay.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Health>(&mut world);
+
+        {
+            let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+        }
+
+        // Append torn entry: just a partial length prefix (2 bytes)
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            f.write_all(&[0xFF, 0xFF]).unwrap();
+            f.flush().unwrap();
+        }
+
+        let mut wal2 = Wal::open(&wal_path, Bincode).unwrap();
+        let mut world2 = World::new();
+        let last = wal2.replay(&mut world2, &codecs).unwrap();
+        assert_eq!(last, 0, "should replay the one valid record");
     }
 }
