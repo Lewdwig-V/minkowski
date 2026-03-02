@@ -11,6 +11,9 @@ type SerializeFn = unsafe fn(*const u8, &mut Vec<u8>) -> Result<(), CodecError>;
 /// Type-erased deserialize: reads T from bytes, returns raw memory bytes.
 type DeserializeFn = fn(&[u8]) -> Result<Vec<u8>, CodecError>;
 
+/// Type-erased component registration: registers the concrete type into a World.
+type RegisterFn = fn(&mut World) -> ComponentId;
+
 #[derive(Debug)]
 pub enum CodecError {
     Serialize(String),
@@ -35,6 +38,7 @@ struct ComponentCodec {
     layout: Layout,
     serialize_fn: SerializeFn,
     deserialize_fn: DeserializeFn,
+    register_fn: RegisterFn,
 }
 
 /// Maps ComponentId to serde codecs. Separate from core's ComponentRegistry --
@@ -81,6 +85,8 @@ impl CodecRegistry {
             Ok(buf)
         };
 
+        let register_fn: RegisterFn = |world| world.register_component::<T>();
+
         self.codecs.insert(
             comp_id,
             ComponentCodec {
@@ -88,6 +94,7 @@ impl CodecRegistry {
                 layout,
                 serialize_fn,
                 deserialize_fn,
+                register_fn,
             },
         );
     }
@@ -138,6 +145,17 @@ impl CodecRegistry {
     /// All registered ComponentIds.
     pub fn registered_ids(&self) -> Vec<ComponentId> {
         self.codecs.keys().copied().collect()
+    }
+
+    /// Register all known component types into the given World.
+    /// This replays the concrete `register_component::<T>()` calls in
+    /// ComponentId order so that the new World gets matching IDs.
+    pub fn register_all(&self, world: &mut World) {
+        let mut entries: Vec<_> = self.codecs.iter().collect();
+        entries.sort_by_key(|(&id, _)| id);
+        for (_, codec) in entries {
+            (codec.register_fn)(world);
+        }
     }
 }
 
