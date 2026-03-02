@@ -125,6 +125,15 @@ Lock granularity is per-column `(ArchetypeId, ComponentId)`. `ColumnLockTable` i
 - Every module has `#[cfg(test)] mod tests` with inline tests.
 - `#[allow(dead_code)]` on fields/methods reserved for future phases.
 - **Change detection invariant**: every path that hands out a mutable pointer to column data must either use `BlobVec::get_ptr_mut(row, tick)` (marks the column changed) or mark via the entry-point method (`World::query` for `&mut T`, `query_table_mut`, `query_table_raw`). `BlobVec::get_ptr` is the read path — writing through it silently bypasses `Changed<T>`. If you add a new mutable accessor, it must go through one of these two mechanisms.
+- **Semantic review checklist**: every new primitive that touches concurrency, entity lifecycle, or cross-system state gets a "what can go wrong" review before implementation. The type system catches syntax; these catch design:
+  1. Can this be called with the wrong World?
+  2. Can Drop observe inconsistent state?
+  3. Can two threads reach this through `&self`?
+  4. Does dedup/merge/collapse preserve the strongest invariant?
+  5. What happens if this is abandoned halfway through?
+  6. Can a type bound be violated by a legal generic instantiation?
+- **Transaction safety invariants**: any query path reachable from `&World` must be bounded by `ReadOnlyWorldQuery`. Any shared structure between World and a strategy uses `Arc` with a `WorldId` check at every entry point. Lock privilege in a `ColumnLockSet` can only escalate, never downgrade. Drop is the abort path — if a transaction can allocate engine resources (entity IDs, locks), it must be able to release them from Drop without `&mut World`, which means those resources route through interior-mutable shared handles (`OrphanQueue`, `Mutex<ColumnLockTable>`).
+- **Drop cleanup rule**: if Drop needs to clean up engine state, the cleanup path must be reachable from `&self`. This constrains where state can live. If it's on World, Drop can't reach it. If it's behind `Arc<Mutex<_>>` shared between World and the transaction, Drop can. Every future resource that transactions can allocate — entity IDs, archetype slots, reserved capacity — must follow this pattern or it will leak on abort.
 
 ## Dependencies
 

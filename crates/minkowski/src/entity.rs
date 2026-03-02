@@ -20,12 +20,25 @@ impl Entity {
     pub fn generation(self) -> u32 {
         (self.0 >> 32) as u32
     }
+
+    /// Convert to raw u64 for serialization (preserves generation + index).
+    #[inline]
+    pub fn to_bits(self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct from raw u64. The caller must ensure the bits represent
+    /// a valid entity (correct generation for the target world).
+    #[inline]
+    pub fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
 }
 
 /// Allocates and recycles entity IDs with generational tracking.
 pub(crate) struct EntityAllocator {
-    generations: Vec<u32>,
-    free_list: Vec<u32>,
+    pub(crate) generations: Vec<u32>,
+    pub(crate) free_list: Vec<u32>,
 }
 
 impl EntityAllocator {
@@ -122,5 +135,15 @@ mod tests {
         let e = alloc.alloc();
         assert!(alloc.dealloc(e));
         assert!(!alloc.dealloc(e));
+    }
+
+    #[test]
+    fn entity_to_from_bits_round_trip() {
+        let e = Entity::new(42, 7);
+        let bits = e.to_bits();
+        let e2 = Entity::from_bits(bits);
+        assert_eq!(e, e2);
+        assert_eq!(e2.index(), 42);
+        assert_eq!(e2.generation(), 7);
     }
 }

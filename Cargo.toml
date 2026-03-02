@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/minkowski", "crates/minkowski-derive", "examples"]
+members = ["crates/minkowski", "crates/minkowski-derive", "crates/minkowski-persist", "examples"]

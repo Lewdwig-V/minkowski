@@ -1,0 +1,12 @@
+[package]
+name = "minkowski-persist"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+minkowski = { path = "../minkowski" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[dev-dependencies]
+tempfile = "3"

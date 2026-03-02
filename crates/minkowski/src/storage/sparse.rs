@@ -52,6 +52,23 @@ impl SparseStorage {
             .downcast_mut::<HashMap<Entity, T>>()?
             .remove(&entity)
     }
+
+    /// Returns the ComponentIds that have sparse storage allocated.
+    pub fn component_ids(&self) -> Vec<ComponentId> {
+        self.storages.keys().copied().collect()
+    }
+
+    /// Typed read-only iteration over a sparse component's entries.
+    pub fn iter<T: Component>(
+        &self,
+        comp_id: ComponentId,
+    ) -> Option<impl Iterator<Item = (Entity, &T)>> {
+        let map = self
+            .storages
+            .get(&comp_id)?
+            .downcast_ref::<HashMap<Entity, T>>()?;
+        Some(map.iter().map(|(&e, v)| (e, v)))
+    }
 }
 
 #[cfg(test)]
@@ -85,5 +102,21 @@ mod tests {
         let removed = storage.remove::<Marker>(0, e);
         assert_eq!(removed, Some(Marker(42)));
         assert_eq!(storage.get::<Marker>(0, e), None);
+    }
+
+    #[test]
+    fn sparse_component_ids_and_iter() {
+        let mut storage = SparseStorage::new();
+        let e1 = Entity::new(0, 0);
+        let e2 = Entity::new(1, 0);
+        storage.insert(0, e1, 42u32);
+        storage.insert(0, e2, 99u32);
+
+        let ids = storage.component_ids();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], 0);
+
+        let entries: Vec<_> = storage.iter::<u32>(0).unwrap().collect();
+        assert_eq!(entries.len(), 2);
     }
 }

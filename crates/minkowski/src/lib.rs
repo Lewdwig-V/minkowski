@@ -23,7 +23,7 @@ pub mod transaction;
 pub mod world;
 
 pub use access::Access;
-pub use changeset::EnumChangeSet;
+pub use changeset::{EnumChangeSet, MutationRef};
 pub use command::CommandBuffer;
 pub use component::ComponentId;
 pub use entity::Entity;

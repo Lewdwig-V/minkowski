@@ -1,18 +1,20 @@
 # minkowski
 
-A column-oriented archetype ECS built from scratch in Rust. Game workloads first, database features later.
+A column-oriented database built atop a high-performance Archetype Entity-Component System.
 
-## What's here
+## Overview
 
-The foundational storage layer, compile-time schema support, cached queries, SIMD-friendly iteration, and change detection.
+Minkowski is a column-oriented database engine built on an archetype ECS foundation. It combines the runtime flexibility of entity-component systems with the performance characteristics of analytical databases: cache-friendly columnar storage, SIMD-friendly iteration, and compile-time schema declarations.
 
-**Phase 1** — type-erased BlobVec columns packed into archetypes, generational entity IDs, parallel query iteration via rayon, deferred mutation through CommandBuffer.
+**Core storage** — type-erased `BlobVec` columns packed into archetypes with 64-byte alignment, generational entity IDs, and sparse component opt-in via `HashMap<Entity, T>` to prevent archetype fragmentation.
 
-**Phase 2** — `#[derive(Table)]` proc macro for compile-time schema declarations with typed row accessors, transparent query caching with incremental archetype scanning, data-driven `EnumChangeSet` with reversible apply for rollback, 64-byte aligned columns with `for_each_chunk` yielding typed slices for SIMD auto-vectorization.
+**Query engine** — two-tier design with static table queries (direct pointer arithmetic, zero indirection) and dynamic component queries (bitset matching, incrementally cached). Parallel iteration via rayon, chunk-based `&[T]`/`&mut [T]` slices for auto-vectorization, and `Changed<T>` filters that skip entire archetypes untouched since the last read.
 
-**Phase 3** — per-column change detection ticks with `Changed<T>` query filter. Queries skip entire archetypes whose data hasn't been mutably accessed since the last read.
+**Schema & mutation** — `#[derive(Table)]` proc macro for compile-time schema registration with typed row accessors. `EnumChangeSet` records mutations as data with automatic reverse generation for rollback. `CommandBuffer` for deferred structural changes during iteration.
 
-**Phase 4** — `SpatialIndex` lifecycle trait for user-owned secondary indexes (spatial grids, quadtrees, BVH, k-d trees). Indexes are external to World, compose from query primitives, and handle despawns via generational validation.
+**Concurrency & transactions** — `Access` extracts per-component read/write metadata for conflict detection. Three transaction strategies — Sequential (zero-cost passthrough), Optimistic (tick-based validation), and Pessimistic (cooperative per-column locks) — with split-phase design enabling concurrent reads via `World::query_raw(&self)`.
+
+**Secondary indexes** — `SpatialIndex` lifecycle trait for user-owned spatial structures (grids, quadtrees, BVH). Indexes compose from query primitives and handle entity despawns via generational validation.
 
 ```rust
 use minkowski::{World, Entity, CommandBuffer, EnumChangeSet, Table, Changed};

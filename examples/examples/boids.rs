@@ -131,6 +131,7 @@ impl std::ops::Div<f32> for Vec2 {
 }
 
 // ── Components ──────────────────────────────────────────────────────
+//
 
 #[derive(Clone, Copy)]
 struct Position(Vec2);

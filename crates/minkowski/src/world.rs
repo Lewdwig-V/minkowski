@@ -141,6 +141,18 @@ impl World {
         self.components.register::<T>()
     }
 
+    /// Register a component slot using raw metadata without a concrete type.
+    /// Used during snapshot restore to preserve ComponentId assignments for
+    /// components that exist in the snapshot schema but have no codec.
+    pub fn register_component_raw(
+        &mut self,
+        name: &'static str,
+        layout: std::alloc::Layout,
+    ) -> ComponentId {
+        self.drain_orphans();
+        self.components.register_raw(name, layout)
+    }
+
     /// Allocate a fresh entity ID without placing it in any archetype.
     /// Use this to obtain an unplaced handle for `EnumChangeSet::spawn_bundle`.
     pub fn alloc_entity(&mut self) -> Entity {
@@ -717,6 +729,102 @@ impl World {
             .collect();
         QueryIter::new(fetches)
     }
+
+    // ── Persistence accessors ────────────────────────────────────────
+
+    /// Number of archetypes (for iteration bounds).
+    pub fn archetype_count(&self) -> usize {
+        self.archetypes.archetypes.len()
+    }
+
+    /// Sorted component IDs defining an archetype's schema.
+    pub fn archetype_component_ids(&self, arch_idx: usize) -> &[ComponentId] {
+        &self.archetypes.archetypes[arch_idx].sorted_ids
+    }
+
+    /// Entity handles stored in an archetype (one per row).
+    pub fn archetype_entities(&self, arch_idx: usize) -> &[Entity] {
+        &self.archetypes.archetypes[arch_idx].entities
+    }
+
+    /// Row count for an archetype.
+    pub fn archetype_len(&self, arch_idx: usize) -> usize {
+        self.archetypes.archetypes[arch_idx].len()
+    }
+
+    /// Raw pointer to a component value at a specific row in an archetype column.
+    ///
+    /// # Safety
+    /// The caller must read through the pointer using the correct component type
+    /// and layout. The pointer is valid until the next structural mutation.
+    pub unsafe fn archetype_column_ptr(
+        &self,
+        arch_idx: usize,
+        comp_id: ComponentId,
+        row: usize,
+    ) -> *const u8 {
+        let arch = &self.archetypes.archetypes[arch_idx];
+        let col_idx = arch.component_index[&comp_id];
+        arch.columns[col_idx].get_ptr(row) as *const u8
+    }
+
+    /// Component name (from `std::any::type_name`). Returns None if unregistered.
+    pub fn component_name(&self, id: ComponentId) -> Option<&'static str> {
+        if id < self.components.len() {
+            Some(self.components.info(id).name)
+        } else {
+            None
+        }
+    }
+
+    /// Component memory layout. Returns None if unregistered.
+    pub fn component_layout(&self, id: ComponentId) -> Option<Layout> {
+        if id < self.components.len() {
+            Some(self.components.info(id).layout)
+        } else {
+            None
+        }
+    }
+
+    /// Number of registered component types.
+    pub fn component_count(&self) -> usize {
+        self.components.len()
+    }
+
+    /// Read-only view of entity allocator state for snapshot serialization.
+    /// Returns (generations_slice, free_list_slice).
+    pub fn entity_allocator_state(&self) -> (&[u32], &[u32]) {
+        (&self.entities.generations, &self.entities.free_list)
+    }
+
+    /// Restore entity allocator state from a snapshot.
+    pub fn restore_allocator_state(&mut self, generations: Vec<u32>, free_list: Vec<u32>) {
+        self.drain_orphans();
+        self.entities.generations = generations;
+        self.entities.free_list = free_list;
+        self.entity_locations
+            .resize(self.entities.generations.len(), None);
+    }
+
+    /// Which ComponentIds have sparse storage.
+    pub fn sparse_component_ids(&self) -> Vec<ComponentId> {
+        self.sparse.component_ids()
+    }
+
+    /// Typed read-only iteration over a sparse component.
+    pub fn iter_sparse<T: Component>(
+        &self,
+        comp_id: ComponentId,
+    ) -> Option<impl Iterator<Item = (Entity, &T)>> {
+        self.sparse.iter::<T>(comp_id)
+    }
+
+    /// Insert a sparse component value. Used during snapshot restore.
+    pub fn insert_sparse<T: Component>(&mut self, entity: Entity, value: T) {
+        self.drain_orphans();
+        let comp_id = self.components.register::<T>();
+        self.sparse.insert(comp_id, entity, value);
+    }
 }
 
 impl Default for World {
@@ -1227,5 +1335,45 @@ mod tests {
         // Both archetypes contain Pos
         let count = world.query_raw::<(&Pos,)>(n).count();
         assert_eq!(count, 2);
+    }
+
+    // ── Persistence accessor tests ────────────────────────────────
+
+    #[test]
+    fn archetype_accessors_match_spawned_data() {
+        let mut world = World::new();
+        world.spawn((1.0f32, 2u32));
+        world.spawn((3.0f32, 4u32));
+
+        // At least one non-empty archetype
+        let mut found = false;
+        for idx in 0..world.archetype_count() {
+            if world.archetype_len(idx) > 0 {
+                let comp_ids = world.archetype_component_ids(idx);
+                assert!(!comp_ids.is_empty());
+                let entities = world.archetype_entities(idx);
+                assert_eq!(entities.len(), world.archetype_len(idx));
+                found = true;
+            }
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn entity_allocator_state_readable() {
+        let mut world = World::new();
+        world.spawn((1.0f32,));
+        let (gens, free) = world.entity_allocator_state();
+        assert!(!gens.is_empty());
+        // free list may or may not be empty
+        let _ = free;
+    }
+
+    #[test]
+    fn component_name_and_layout() {
+        let mut world = World::new();
+        let id = world.register_component::<f32>();
+        assert!(world.component_name(id).unwrap().contains("f32"));
+        assert_eq!(world.component_layout(id).unwrap().size(), 4);
     }
 }

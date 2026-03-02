@@ -271,6 +271,69 @@ impl EnumChangeSet {
     }
 }
 
+/// Read-only view of a mutation for serialization. Component data is
+/// borrowed as byte slices from the changeset's Arena.
+pub enum MutationRef<'a> {
+    Spawn {
+        entity: Entity,
+        components: Vec<(ComponentId, &'a [u8])>,
+    },
+    Despawn {
+        entity: Entity,
+    },
+    Insert {
+        entity: Entity,
+        component_id: ComponentId,
+        data: &'a [u8],
+    },
+    Remove {
+        entity: Entity,
+        component_id: ComponentId,
+    },
+}
+
+impl EnumChangeSet {
+    /// Iterate mutations as borrowed views. Component data is returned as
+    /// byte slices from the Arena.
+    pub fn iter_mutations(&self) -> impl Iterator<Item = MutationRef<'_>> + '_ {
+        self.mutations.iter().map(|m| match m {
+            Mutation::Spawn { entity, components } => MutationRef::Spawn {
+                entity: *entity,
+                components: components
+                    .iter()
+                    .map(|(id, offset, layout)| {
+                        let ptr = self.arena.get(*offset);
+                        let bytes = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                        (*id, bytes)
+                    })
+                    .collect(),
+            },
+            Mutation::Despawn { entity } => MutationRef::Despawn { entity: *entity },
+            Mutation::Insert {
+                entity,
+                component_id,
+                offset,
+                layout,
+            } => {
+                let ptr = self.arena.get(*offset);
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                MutationRef::Insert {
+                    entity: *entity,
+                    component_id: *component_id,
+                    data: bytes,
+                }
+            }
+            Mutation::Remove {
+                entity,
+                component_id,
+            } => MutationRef::Remove {
+                entity: *entity,
+                component_id: *component_id,
+            },
+        })
+    }
+}
+
 impl Default for EnumChangeSet {
     fn default() -> Self {
         Self::new()
@@ -689,6 +752,29 @@ mod tests {
             assert_eq!(components.len(), 2);
         } else {
             panic!("expected Spawn mutation");
+        }
+    }
+
+    #[test]
+    fn iter_mutations_returns_correct_views() {
+        use crate::changeset::MutationRef;
+        use crate::world::World;
+
+        let mut world = World::new();
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.insert::<f32>(&mut world, e, 42.0f32);
+        cs.record_despawn(Entity::new(99, 0));
+
+        let views: Vec<_> = cs.iter_mutations().collect();
+        assert_eq!(views.len(), 2);
+        assert!(matches!(views[0], MutationRef::Insert { .. }));
+        assert!(matches!(views[1], MutationRef::Despawn { .. }));
+
+        if let MutationRef::Insert { data, .. } = &views[0] {
+            assert_eq!(data.len(), std::mem::size_of::<f32>());
+            let val = unsafe { *(data.as_ptr() as *const f32) };
+            assert_eq!(val, 42.0);
         }
     }
 
