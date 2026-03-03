@@ -3,13 +3,13 @@
 //! Demonstrates the full persistence lifecycle:
 //! 1. Create a world and spawn entities
 //! 2. Save a snapshot
-//! 3. Apply more mutations via WAL
+//! 3. Apply mutations via durable transactions (WAL-backed)
 //! 4. Recover from snapshot + WAL replay
 //!
 //! Run: cargo run -p minkowski-examples --example persist --release
 
-use minkowski::{EnumChangeSet, World};
-use minkowski_persist::{Bincode, CodecRegistry, Snapshot, Wal};
+use minkowski::{Access, Optimistic, Transact, World};
+use minkowski_persist::{Bincode, CodecRegistry, Durable, Snapshot, Wal};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -51,9 +51,9 @@ fn main() {
         ));
     }
 
-    // -- Phase 2: Snapshot --
-    let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+    // -- Phase 2: Snapshot (before creating Durable, which takes ownership of codecs) --
     let snap = Snapshot::new(Bincode);
+    let wal = Wal::create(&wal_path, Bincode).unwrap();
     let header = snap
         .save(&snap_path, &world, &codecs, wal.next_seq())
         .unwrap();
@@ -62,29 +62,33 @@ fn main() {
         header.entity_count, header.archetype_count, header.wal_seq
     );
 
-    // -- Phase 3: Mutations via WAL --
-    println!("Phase 3: Simulating 10 frames (WAL)...");
-    for frame in 0..10 {
-        let updates: Vec<_> = world
-            .query::<(minkowski::Entity, &Pos, &Vel)>()
-            .map(|(e, p, v)| {
-                (
-                    e,
-                    Pos {
-                        x: p.x + v.dx,
-                        y: p.y + v.dy,
-                    },
-                )
-            })
-            .collect();
+    // -- Phase 3: Durable transactions --
+    println!("Phase 3: Simulating 10 frames (durable transactions)...");
+    let strategy = Optimistic::new(&world);
+    let durable = Durable::new(strategy, wal, codecs);
 
-        let mut cs = EnumChangeSet::new();
-        for (e, new_pos) in &updates {
-            cs.insert::<Pos>(&mut world, *e, *new_pos);
-        }
-        // Append forward changeset to WAL before apply (apply consumes self)
-        wal.append(&cs, &codecs).unwrap();
-        let _reverse = cs.apply(&mut world);
+    let access = Access::of::<(minkowski::Entity, &Pos, &Vel, &mut Pos)>(&mut world);
+    for frame in 0..10 {
+        durable
+            .transact(&mut world, &access, |tx, world| {
+                let updates: Vec<_> = tx
+                    .query::<(minkowski::Entity, &Pos, &Vel)>(world)
+                    .map(|(e, p, v)| {
+                        (
+                            e,
+                            Pos {
+                                x: p.x + v.dx,
+                                y: p.y + v.dy,
+                            },
+                        )
+                    })
+                    .collect();
+
+                for (e, new_pos) in updates {
+                    tx.write::<Pos>(world, e, new_pos);
+                }
+            })
+            .unwrap();
 
         if frame == 0 || frame == 9 {
             let sample = world.query::<(&Pos,)>().next().unwrap();
@@ -94,7 +98,7 @@ fn main() {
             );
         }
     }
-    println!("  WAL has {} records", wal.next_seq());
+    println!("  WAL has {} records", durable.wal_seq());
 
     // -- Phase 4: Recovery --
     println!("Phase 4: Recovering from snapshot + WAL...");
@@ -104,7 +108,8 @@ fn main() {
     load_codecs.register::<Vel>(&mut load_world_tmp);
 
     let (mut recovered, snap_seq) = snap.load(&snap_path, &load_codecs).unwrap();
-    let last_seq = wal
+    let mut replay_wal = Wal::open(&wal_path, Bincode).unwrap();
+    let last_seq = replay_wal
         .replay_from(snap_seq, &mut recovered, &load_codecs)
         .unwrap();
     println!(

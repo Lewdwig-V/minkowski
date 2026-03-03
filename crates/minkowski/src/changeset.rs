@@ -1007,34 +1007,46 @@ mod tests {
     // ── Drop safety tests ─────────────────────────────────────────
 
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-    /// A non-Copy component that counts destructor calls.
+    /// A non-Copy component that counts destructor calls via a shared counter.
+    /// Each test creates its own counter, avoiding races with parallel tests.
     #[derive(Debug)]
-    #[allow(dead_code)]
-    struct Tracked(u32);
+    struct Tracked {
+        #[allow(dead_code)]
+        value: u32,
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl Tracked {
+        fn new(value: u32, counter: &Arc<AtomicUsize>) -> Self {
+            Self {
+                value,
+                counter: counter.clone(),
+            }
+        }
+    }
 
     impl Drop for Tracked {
         fn drop(&mut self) {
-            DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            self.counter.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     #[test]
     fn drop_runs_destructor_for_unapplied_insert() {
-        DROP_COUNT.store(0, Ordering::SeqCst);
+        let drops = Arc::new(AtomicUsize::new(0));
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         {
             let mut cs = EnumChangeSet::new();
-            cs.insert::<Tracked>(&mut world, e, Tracked(42));
+            cs.insert::<Tracked>(&mut world, e, Tracked::new(42, &drops));
             // cs dropped here without apply()
         }
 
         assert_eq!(
-            DROP_COUNT.load(Ordering::SeqCst),
+            drops.load(Ordering::SeqCst),
             1,
             "destructor should run on changeset drop"
         );
@@ -1042,18 +1054,18 @@ mod tests {
 
     #[test]
     fn drop_runs_destructor_for_unapplied_spawn_bundle() {
-        DROP_COUNT.store(0, Ordering::SeqCst);
+        let drops = Arc::new(AtomicUsize::new(0));
         let mut world = World::new();
         let e = world.alloc_entity();
 
         {
             let mut cs = EnumChangeSet::new();
-            cs.spawn_bundle(&mut world, e, (Tracked(42),));
+            cs.spawn_bundle(&mut world, e, (Tracked::new(42, &drops),));
             // cs dropped here without apply()
         }
 
         assert_eq!(
-            DROP_COUNT.load(Ordering::SeqCst),
+            drops.load(Ordering::SeqCst),
             1,
             "destructor should run on changeset drop"
         );
@@ -1061,39 +1073,35 @@ mod tests {
 
     #[test]
     fn apply_does_not_double_drop() {
-        DROP_COUNT.store(0, Ordering::SeqCst);
+        let drops = Arc::new(AtomicUsize::new(0));
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         {
             let mut cs = EnumChangeSet::new();
-            cs.insert::<Tracked>(&mut world, e, Tracked(42));
+            cs.insert::<Tracked>(&mut world, e, Tracked::new(42, &drops));
             let _reverse = cs.apply(&mut world);
             // cs dropped after apply — should not double-drop
         }
 
         // Value is now owned by the world; no spurious drops from changeset.
         assert_eq!(
-            DROP_COUNT.load(Ordering::SeqCst),
+            drops.load(Ordering::SeqCst),
             0,
             "no drops yet — value owned by world"
         );
 
         world.despawn(e);
-        assert_eq!(
-            DROP_COUNT.load(Ordering::SeqCst),
-            1,
-            "one drop from despawn"
-        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "one drop from despawn");
     }
 
     #[test]
     fn reverse_of_remove_drops_owned_value() {
-        DROP_COUNT.store(0, Ordering::SeqCst);
+        let drops = Arc::new(AtomicUsize::new(0));
         let mut world = World::new();
-        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Tracked(99)));
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Tracked::new(99, &drops)));
         assert_eq!(
-            DROP_COUNT.load(Ordering::SeqCst),
+            drops.load(Ordering::SeqCst),
             0,
             "spawn transfers ownership, no drop"
         );
@@ -1103,12 +1111,12 @@ mod tests {
             cs.remove::<Tracked>(&mut world, e);
             let _reverse = cs.apply(&mut world);
             // _reverse owns the Tracked value (remove used swap_remove_no_drop)
-            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0, "no drop yet");
+            assert_eq!(drops.load(Ordering::SeqCst), 0, "no drop yet");
             // reverse dropped here without apply()
         }
 
         assert_eq!(
-            DROP_COUNT.load(Ordering::SeqCst),
+            drops.load(Ordering::SeqCst),
             1,
             "reverse drop should clean up owned value"
         );

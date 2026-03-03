@@ -4,16 +4,16 @@
 //! Run: cargo run -p minkowski-examples --example transaction --release
 //!
 //! Features exercised:
-//! - `TransactionStrategy` trait with three built-in strategies
+//! - `Transact` trait with closure-based `transact()` and building-block `begin()`/`try_commit()`
+//! - `Tx` — unified transaction handle for all strategies
 //! - `SequentialTx` — zero-overhead passthrough, commit always succeeds
-//! - `OptimisticTx` — live reads, buffered writes, tick-based validation at commit
-//! - `PessimisticTx` — cooperative column locks, guaranteed commit success
+//! - `Optimistic` — live reads, buffered writes, tick-based validation at commit
+//! - `Pessimistic` — cooperative column locks, guaranteed commit success
 //! - `Access` — component-level read/write metadata for transaction begin
 //! - `EnumChangeSet` — reverse changeset returned on successful commit
 
 use minkowski::{
-    Access, Entity, Optimistic, OptimisticTx, Pessimistic, PessimisticTx, Sequential, SequentialTx,
-    TransactionStrategy, World,
+    Access, Entity, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, World,
 };
 
 // ── Components ──────────────────────────────────────────────────────
@@ -98,30 +98,28 @@ fn run_sequential(world: &mut World) {
 
 // ── Optimistic (clean commit) ───────────────────────────────────────
 
-fn health_decay_optimistic(tx: &mut OptimisticTx, world: &mut World, entities: &[Entity]) {
-    // Read current health values (live read from World via query_raw)
-    let healths: Vec<(Entity, u32)> = tx
-        .query::<(Entity, &Health)>(world)
-        .map(|(e, hp)| (e, hp.0))
-        .collect();
-
-    // Buffer writes into changeset
-    for (e, hp) in healths {
-        if entities.contains(&e) {
-            tx.insert::<Health>(world, e, Health(hp.saturating_sub(3)));
-        }
-    }
-}
-
 fn run_optimistic_clean(world: &mut World, entities: &[Entity]) {
     let access = Access::of::<(&Health, &mut Health)>(world);
     let strategy = Optimistic::new(world);
 
     for _ in 0..10 {
-        let mut tx = strategy.begin(world, &access);
-        health_decay_optimistic(&mut tx, world, entities);
-        let result = tx.commit(world);
-        assert!(result.is_ok(), "no concurrent modification = clean commit");
+        let entities = entities.to_vec();
+        strategy
+            .transact(world, &access, |tx, world| {
+                // Read current health values (live read from World via query_raw)
+                let healths: Vec<(Entity, u32)> = tx
+                    .query::<(Entity, &Health)>(world)
+                    .map(|(e, hp)| (e, hp.0))
+                    .collect();
+
+                // Buffer writes into changeset
+                for (e, hp) in healths {
+                    if entities.contains(&e) {
+                        tx.write::<Health>(world, e, Health(hp.saturating_sub(3)));
+                    }
+                }
+            })
+            .expect("no concurrent modification = clean commit");
     }
 
     let avg = avg_health(world);
@@ -135,9 +133,11 @@ fn run_optimistic_conflict(world: &mut World) {
     // Declare access: reads Pos, writes Health.
     // The optimistic strategy snapshots read-column ticks at begin.
     let access = Access::of::<(&Pos, &mut Health)>(world);
-    let strategy = Optimistic::new(world);
+    let strategy = Optimistic::with_retries(world, 1);
 
-    let tx = strategy.begin(world, &access);
+    // Use the building-block API so we can manually intervene between begin
+    // and commit to demonstrate conflict detection.
+    let mut tx = strategy.begin(world, &access);
 
     // Mutate the Pos column directly through World (outside the tx).
     // This advances the Pos column tick, invalidating the snapshot.
@@ -145,8 +145,8 @@ fn run_optimistic_conflict(world: &mut World) {
         pos.0.x += 999.0;
     }
 
-    // Commit detects that the Pos column tick advanced past the snapshot.
-    let result = tx.commit(world);
+    // try_commit detects that the Pos column tick advanced past the snapshot.
+    let result = strategy.try_commit(&mut tx, world);
     match result {
         Err(_conflict) => {
             println!("  commit result:  Err(Conflict) — read column was modified");
@@ -160,28 +160,26 @@ fn run_optimistic_conflict(world: &mut World) {
 
 // ── Pessimistic ─────────────────────────────────────────────────────
 
-fn health_decay_pessimistic(tx: &mut PessimisticTx<'_>, world: &mut World, entities: &[Entity]) {
-    let healths: Vec<(Entity, u32)> = tx
-        .query::<(Entity, &Health)>(world)
-        .map(|(e, hp)| (e, hp.0))
-        .collect();
-
-    for (e, hp) in healths {
-        if entities.contains(&e) {
-            tx.insert::<Health>(world, e, Health(hp.saturating_sub(3)));
-        }
-    }
-}
-
 fn run_pessimistic(world: &mut World, entities: &[Entity]) {
     let access = Access::of::<(&Health, &mut Health)>(world);
     let strategy = Pessimistic::new(world);
 
     for _ in 0..10 {
-        let mut tx = strategy.begin(world, &access);
-        health_decay_pessimistic(&mut tx, world, entities);
-        let result = tx.commit(world);
-        assert!(result.is_ok(), "pessimistic commit always succeeds");
+        let entities = entities.to_vec();
+        strategy
+            .transact(world, &access, |tx, world| {
+                let healths: Vec<(Entity, u32)> = tx
+                    .query::<(Entity, &Health)>(world)
+                    .map(|(e, hp)| (e, hp.0))
+                    .collect();
+
+                for (e, hp) in healths {
+                    if entities.contains(&e) {
+                        tx.write::<Health>(world, e, Health(hp.saturating_sub(3)));
+                    }
+                }
+            })
+            .expect("pessimistic commit always succeeds");
     }
 
     let avg = avg_health(world);

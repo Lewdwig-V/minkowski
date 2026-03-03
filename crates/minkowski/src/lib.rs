@@ -30,8 +30,5 @@ pub use entity::Entity;
 pub use index::SpatialIndex;
 pub use minkowski_derive::Table;
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
-pub use transaction::{
-    Conflict, Optimistic, OptimisticTx, Pessimistic, PessimisticTx, Sequential, SequentialTx,
-    TransactionStrategy,
-};
+pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
 pub use world::World;

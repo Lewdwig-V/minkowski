@@ -93,7 +93,7 @@ pub unsafe trait WorldQuery {
 /// threads can execute read-only queries concurrently against `&World`.
 ///
 /// `&mut T` intentionally does NOT implement this trait. Transaction queries
-/// (`OptimisticTx::query`, `PessimisticTx::query`) require this bound to
+/// (`Tx::query`) require this bound to
 /// prevent aliased mutable references during concurrent read phases.
 pub unsafe trait ReadOnlyWorldQuery: WorldQuery {}
 
