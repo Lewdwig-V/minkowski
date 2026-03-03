@@ -493,6 +493,7 @@ pub trait Transact {
         access: &Access,
         mut f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
     ) -> Result<R, Conflict> {
+        let mut last_conflict = None;
         for _ in 0..self.max_retries() {
             let mut tx = self.begin(world, access);
             if !tx.is_ready() {
@@ -507,15 +508,16 @@ pub trait Transact {
                     forward.apply(world);
                     return Ok(value);
                 }
-                Err(_) => {
+                Err(conflict) => {
+                    last_conflict = Some(conflict);
                     drop(tx);
                     continue;
                 }
             }
         }
-        Err(Conflict {
+        Err(last_conflict.unwrap_or_else(|| Conflict {
             component_ids: FixedBitSet::new(),
-        })
+        }))
     }
 
     /// Begin a transaction. Snapshots ticks (optimistic) or acquires
@@ -586,6 +588,7 @@ impl Transact for Pessimistic {
         access: &Access,
         mut f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
     ) -> Result<R, Conflict> {
+        let mut last_conflict = None;
         for attempt in 0..self.max_retries() {
             let mut tx = Transact::begin(self, world, access);
             if !tx.is_ready() {
@@ -602,16 +605,17 @@ impl Transact for Pessimistic {
                     forward.apply(world);
                     return Ok(value);
                 }
-                Err(_) => {
+                Err(conflict) => {
+                    last_conflict = Some(conflict);
                     drop(tx);
                     backoff(attempt);
                     continue;
                 }
             }
         }
-        Err(Conflict {
+        Err(last_conflict.unwrap_or_else(|| Conflict {
             component_ids: FixedBitSet::new(),
-        })
+        }))
     }
 
     fn begin(&self, world: &mut World, access: &Access) -> Tx<'_> {

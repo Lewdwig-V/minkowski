@@ -53,6 +53,7 @@ impl<S: Transact, W: WireFormat> Transact for Durable<S, W> {
         f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
     ) -> Result<R, Conflict> {
         let mut f = f;
+        let mut last_conflict = None;
         for _attempt in 0..self.max_retries() {
             let mut tx = self.begin(world, access);
             if !tx.is_ready() {
@@ -72,12 +73,15 @@ impl<S: Transact, W: WireFormat> Transact for Durable<S, W> {
                     forward.apply(world);
                     return Ok(value);
                 }
-                Err(_) => continue,
+                Err(conflict) => {
+                    last_conflict = Some(conflict);
+                    continue;
+                }
             }
         }
-        Err(Conflict {
+        Err(last_conflict.unwrap_or_else(|| Conflict {
             component_ids: fixedbitset::FixedBitSet::new(),
-        })
+        }))
     }
 }
 
