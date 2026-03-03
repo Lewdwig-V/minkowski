@@ -4,7 +4,8 @@
 //! Run: cargo run -p minkowski-examples --example battle --release
 //!
 //! Features exercised:
-//! - `TransactionStrategy` with `Optimistic` and `Pessimistic` strategies
+//! - `Transact` trait with building-block `begin()`/`try_commit()` API
+//! - `Tx` — unified transaction handle with `query()`, `write()`, `has_locks()`
 //! - `rayon::join` for parallel read phases (concurrent `&World` access)
 //! - Split-phase execution: parallel reads, sequential writes, sequential commit
 //! - Conflict detection under disjoint vs overlapping write-sets
@@ -18,7 +19,7 @@
 //!   the Health column tick, causing the second commit to detect a conflict.
 //!   The conflicted transaction's writes are discarded (optimistic abort).
 
-use minkowski::{Access, Entity, Optimistic, Pessimistic, TransactionStrategy, World};
+use minkowski::{Access, Entity, Optimistic, Pessimistic, Transact, World};
 use std::time::Instant;
 
 // ── Components ──────────────────────────────────────────────────────
@@ -173,18 +174,18 @@ fn run_frame_optimistic(
     match mode {
         ConflictMode::Low => {
             for &(entity, dmg) in &combat_results {
-                tx_combat.insert::<Damage>(world, entity, Damage(dmg));
+                tx_combat.write::<Damage>(world, entity, Damage(dmg));
             }
             for &(entity, heal) in &healing_results {
-                tx_healing.insert::<Healing>(world, entity, Healing(heal));
+                tx_healing.write::<Healing>(world, entity, Healing(heal));
             }
         }
         ConflictMode::High => {
             for &(entity, new_hp) in &combat_results {
-                tx_combat.insert::<Health>(world, entity, Health(new_hp));
+                tx_combat.write::<Health>(world, entity, Health(new_hp));
             }
             for &(entity, new_hp) in &healing_results {
-                tx_healing.insert::<Health>(world, entity, Health(new_hp));
+                tx_healing.write::<Health>(world, entity, Health(new_hp));
             }
         }
     }
@@ -192,13 +193,29 @@ fn run_frame_optimistic(
     // 4. Commit phase (sequential).
     //    In high-conflict mode, the first commit writes Health and advances
     //    the column tick. The second commit's validation sees this and fails.
-    match tx_combat.commit(world) {
-        Ok(_) => stats.commits += 1,
-        Err(_) => stats.conflicts += 1,
+    match strategy.try_commit(&mut tx_combat, world) {
+        Ok(forward) => {
+            tx_combat.mark_committed();
+            drop(tx_combat);
+            forward.apply(world);
+            stats.commits += 1;
+        }
+        Err(_) => {
+            drop(tx_combat);
+            stats.conflicts += 1;
+        }
     }
-    match tx_healing.commit(world) {
-        Ok(_) => stats.commits += 1,
-        Err(_) => stats.conflicts += 1,
+    match strategy.try_commit(&mut tx_healing, world) {
+        Ok(forward) => {
+            tx_healing.mark_committed();
+            drop(tx_healing);
+            forward.apply(world);
+            stats.commits += 1;
+        }
+        Err(_) => {
+            drop(tx_healing);
+            stats.conflicts += 1;
+        }
     }
 
     // 5. Low-conflict mode: merge Damage + Healing into Health.
@@ -243,16 +260,21 @@ fn run_frame_pessimistic(
         match mode {
             ConflictMode::Low => {
                 for &(entity, dmg) in &combat_results {
-                    tx_combat.insert::<Damage>(world, entity, Damage(dmg));
+                    tx_combat.write::<Damage>(world, entity, Damage(dmg));
                 }
             }
             ConflictMode::High => {
                 for &(entity, new_hp) in &combat_results {
-                    tx_combat.insert::<Health>(world, entity, Health(new_hp));
+                    tx_combat.write::<Health>(world, entity, Health(new_hp));
                 }
             }
         }
-        let _ = tx_combat.commit(world);
+        let forward = strategy
+            .try_commit(&mut tx_combat, world)
+            .expect("combat tx holds locks");
+        tx_combat.mark_committed();
+        drop(tx_combat);
+        forward.apply(world);
         stats.commits += 1;
         drop(tx_healing); // release (no locks to release)
 
@@ -266,16 +288,21 @@ fn run_frame_pessimistic(
         match mode {
             ConflictMode::Low => {
                 for &(entity, heal) in &healing_results {
-                    tx_healing.insert::<Healing>(world, entity, Healing(heal));
+                    tx_healing.write::<Healing>(world, entity, Healing(heal));
                 }
             }
             ConflictMode::High => {
                 for &(entity, new_hp) in &healing_results {
-                    tx_healing.insert::<Health>(world, entity, Health(new_hp));
+                    tx_healing.write::<Health>(world, entity, Health(new_hp));
                 }
             }
         }
-        let _ = tx_healing.commit(world);
+        let forward = strategy
+            .try_commit(&mut tx_healing, world)
+            .expect("healing tx holds locks");
+        tx_healing.mark_committed();
+        drop(tx_healing);
+        forward.apply(world);
         stats.commits += 1;
         if mode == ConflictMode::Low {
             apply_effects(world);
@@ -307,26 +334,37 @@ fn run_frame_pessimistic(
     match mode {
         ConflictMode::Low => {
             for &(entity, dmg) in &combat_results {
-                tx_combat.insert::<Damage>(world, entity, Damage(dmg));
+                tx_combat.write::<Damage>(world, entity, Damage(dmg));
             }
             for &(entity, heal) in &healing_results {
-                tx_healing.insert::<Healing>(world, entity, Healing(heal));
+                tx_healing.write::<Healing>(world, entity, Healing(heal));
             }
         }
         ConflictMode::High => {
             for &(entity, new_hp) in &combat_results {
-                tx_combat.insert::<Health>(world, entity, Health(new_hp));
+                tx_combat.write::<Health>(world, entity, Health(new_hp));
             }
             for &(entity, new_hp) in &healing_results {
-                tx_healing.insert::<Health>(world, entity, Health(new_hp));
+                tx_healing.write::<Health>(world, entity, Health(new_hp));
             }
         }
     }
 
     // 4. Commit phase — locks guarantee success.
-    let _ = tx_combat.commit(world);
+    let forward = strategy
+        .try_commit(&mut tx_combat, world)
+        .expect("combat tx holds locks");
+    tx_combat.mark_committed();
+    drop(tx_combat);
+    forward.apply(world);
     stats.commits += 1;
-    let _ = tx_healing.commit(world);
+
+    let forward = strategy
+        .try_commit(&mut tx_healing, world)
+        .expect("healing tx holds locks");
+    tx_healing.mark_committed();
+    drop(tx_healing);
+    forward.apply(world);
     stats.commits += 1;
 
     // 5. Low-conflict mode: merge effects.

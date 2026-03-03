@@ -183,7 +183,7 @@ pub struct Tx<'a> {
     changeset: EnumChangeSet,
     allocated: Vec<Entity>,
     orphan_queue: crate::world::OrphanQueue,
-    cleanup: Box<dyn TxCleanup + 'a>,
+    cleanup: Box<dyn TxCleanup + Send + Sync + 'a>,
     committed: bool,
 }
 
@@ -194,7 +194,7 @@ impl<'a> Tx<'a> {
     pub(crate) fn new(
         archetype_count: usize,
         orphan_queue: crate::world::OrphanQueue,
-        cleanup: Box<dyn TxCleanup + 'a>,
+        cleanup: Box<dyn TxCleanup + Send + Sync + 'a>,
     ) -> Self {
         Self {
             archetype_count,
@@ -242,6 +242,15 @@ impl<'a> Tx<'a> {
         entity
     }
 
+    /// Check whether column locks were acquired at begin time.
+    ///
+    /// Only meaningful for [`Pessimistic`] transactions — returns `true`
+    /// if locks were successfully acquired, `false` otherwise. For
+    /// [`Optimistic`] transactions this always returns `false`.
+    pub fn has_locks(&self) -> bool {
+        self.cleanup.has_locks()
+    }
+
     /// Track an externally-allocated entity ID for orphan reclamation on abort.
     #[allow(dead_code)]
     pub(crate) fn track_allocated(&mut self, entity: Entity) {
@@ -250,8 +259,10 @@ impl<'a> Tx<'a> {
 
     /// Mark this transaction as committed, preventing abort cleanup on drop.
     /// Clears the allocated entity list (they are now placed).
-    #[allow(dead_code)]
-    pub(crate) fn mark_committed(&mut self) {
+    ///
+    /// Call this after a successful [`Transact::try_commit`] when using
+    /// the building-block API, before dropping the `Tx`.
+    pub fn mark_committed(&mut self) {
         self.allocated.clear();
         self.committed = true;
     }
