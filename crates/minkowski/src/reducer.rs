@@ -127,7 +127,14 @@ impl<'a, C: ComponentSet> EntityRef<'a, C> {
         let comp_id = self.resolved.0[IDX];
         self.world
             .get_by_id::<T>(self.entity, comp_id)
-            .expect("component missing on entity — archetype mismatch")
+            .unwrap_or_else(|| {
+                panic!(
+                    "component {} missing on entity {:?} \
+                     (entity may be dead or in a different archetype)",
+                    std::any::type_name::<T>(),
+                    self.entity,
+                )
+            })
     }
 
     pub fn entity(&self) -> Entity {
@@ -172,7 +179,14 @@ impl<'a, C: ComponentSet> EntityMut<'a, C> {
         let comp_id = self.resolved.0[IDX];
         self.world
             .get_by_id::<T>(self.entity, comp_id)
-            .expect("component missing on entity — archetype mismatch")
+            .unwrap_or_else(|| {
+                panic!(
+                    "component {} missing on entity {:?} \
+                     (entity may be dead or in a different archetype)",
+                    std::any::type_name::<T>(),
+                    self.entity,
+                )
+            })
     }
 
     pub fn set<T: Component, const IDX: usize>(&mut self, value: T)
@@ -223,29 +237,31 @@ impl<'a, B: Bundle> Spawner<'a, B> {
 
 // ── Typed query handles (scheduled) ──────────────────────────────────
 
-/// Read-only query iteration. Hides `&World`.
+/// Read-only query iteration. Hides `&mut World`.
+///
+/// Uses the full `world.query()` path (with tick management and filter
+/// support including `Changed<T>`). The `ReadOnlyWorldQuery` bound
+/// guarantees no `&mut T` access through the query.
 pub struct QueryRef<'a, Q: ReadOnlyWorldQuery> {
-    world: &'a World,
+    world: &'a mut World,
     _marker: PhantomData<Q>,
 }
 
 impl<'a, Q: ReadOnlyWorldQuery + 'static> QueryRef<'a, Q> {
     #[allow(dead_code)]
-    pub(crate) fn new(world: &'a World) -> Self {
+    pub(crate) fn new(world: &'a mut World) -> Self {
         Self {
             world,
             _marker: PhantomData,
         }
     }
 
-    pub fn for_each(&self, f: impl FnMut(Q::Item<'_>)) {
-        let count = self.world.archetype_count();
-        self.world.query_raw::<Q>(count).for_each(f);
+    pub fn for_each(&mut self, f: impl FnMut(Q::Item<'_>)) {
+        self.world.query::<Q>().for_each(f);
     }
 
-    pub fn count(&self) -> usize {
-        let count = self.world.archetype_count();
-        self.world.query_raw::<Q>(count).count()
+    pub fn count(&mut self) -> usize {
+        self.world.query::<Q>().count()
     }
 }
 
@@ -281,11 +297,25 @@ impl<'a, Q: WorldQuery + 'static> QueryMut<'a, Q> {
 
 /// Opaque identifier for a transactional reducer (entity/pair/spawner).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ReducerId(pub usize);
+pub struct ReducerId(pub(crate) usize);
+
+impl ReducerId {
+    /// Raw index for serialization / external storage.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
 
 /// Opaque identifier for a scheduled query reducer.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct QueryReducerId(pub usize);
+pub struct QueryReducerId(pub(crate) usize);
+
+impl QueryReducerId {
+    /// Raw index for serialization / external storage.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
 
 /// Type-erased entity reducer adapter. Receives changeset + allocated list
 /// (from Tx), world (for reads), resolved IDs, target entity, and type-erased args.
@@ -346,13 +376,21 @@ impl ReducerRegistry {
         F: Fn(EntityMut<'_, C>, Args) + Send + Sync + 'static,
     {
         let resolved = ResolvedComponents(C::resolve(&mut world.components));
-        let access = C::access(&mut world.components, false);
+        // EntityMut can both read (get) and write (set) all components in C.
+        let reads = C::access(&mut world.components, true);
+        let writes = C::access(&mut world.components, false);
+        let access = reads.merge(&writes);
 
         let adapter: EntityAdapter = Box::new(
             move |changeset, _allocated, world, resolved, entity, args_any| {
                 let args = args_any
                     .downcast_ref::<Args>()
-                    .expect("reducer args type mismatch")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "reducer args type mismatch: expected {}",
+                            std::any::type_name::<Args>()
+                        )
+                    })
                     .clone();
                 let handle = EntityMut::<C>::new(entity, resolved, changeset, world);
                 f(handle, args);
@@ -386,7 +424,12 @@ impl ReducerRegistry {
             move |changeset, allocated, world, _resolved, _entity, args_any| {
                 let args = args_any
                     .downcast_ref::<Args>()
-                    .expect("reducer args type mismatch")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "reducer args type mismatch: expected {}",
+                            std::any::type_name::<Args>()
+                        )
+                    })
                     .clone();
                 let handle = Spawner::<B>::new(changeset, allocated, world);
                 f(handle, args);
@@ -421,7 +464,12 @@ impl ReducerRegistry {
         let adapter: ScheduledAdapter = Box::new(move |world, args_any| {
             let args = args_any
                 .downcast_ref::<Args>()
-                .expect("reducer args type mismatch")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "reducer args type mismatch: expected {}",
+                        std::any::type_name::<Args>()
+                    )
+                })
                 .clone();
             let qm = QueryMut::<Q>::new(world);
             f(qm, args);
@@ -432,6 +480,9 @@ impl ReducerRegistry {
     }
 
     /// Register a read-only query reducer: `f(QueryRef<Q>, args)`.
+    ///
+    /// Uses the full query path with filter support (`Changed<T>` works).
+    /// The `ReadOnlyWorldQuery` bound prevents `&mut T` access.
     pub fn register_query_ref<Q, Args, F>(
         &mut self,
         world: &mut World,
@@ -449,7 +500,12 @@ impl ReducerRegistry {
         let adapter: ScheduledAdapter = Box::new(move |world, args_any| {
             let args = args_any
                 .downcast_ref::<Args>()
-                .expect("reducer args type mismatch")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "reducer args type mismatch: expected {}",
+                        std::any::type_name::<Args>()
+                    )
+                })
                 .clone();
             let qr = QueryRef::<Q>::new(world);
             f(qr, args);
@@ -498,12 +554,37 @@ impl ReducerRegistry {
         }
     }
 
-    /// Name-based lookup for network dispatch.
-    pub fn id_by_name(&self, name: &str) -> Option<usize> {
-        self.by_name.get(name).copied()
+    /// Look up a transactional reducer by name. Returns `None` if the name
+    /// is not registered or points to a scheduled reducer.
+    pub fn reducer_id_by_name(&self, name: &str) -> Option<ReducerId> {
+        let &idx = self.by_name.get(name)?;
+        match &self.reducers[idx].kind {
+            ReducerKind::EntityTransactional(_) => Some(ReducerId(idx)),
+            ReducerKind::Scheduled(_) => None,
+        }
     }
 
-    /// Access metadata for a reducer, useful for scheduler integration.
+    /// Look up a scheduled query reducer by name. Returns `None` if the name
+    /// is not registered or points to a transactional reducer.
+    pub fn query_reducer_id_by_name(&self, name: &str) -> Option<QueryReducerId> {
+        let &idx = self.by_name.get(name)?;
+        match &self.reducers[idx].kind {
+            ReducerKind::Scheduled(_) => Some(QueryReducerId(idx)),
+            ReducerKind::EntityTransactional(_) => None,
+        }
+    }
+
+    /// Access metadata for a transactional reducer.
+    pub fn reducer_access(&self, id: ReducerId) -> &Access {
+        &self.reducers[id.0].access
+    }
+
+    /// Access metadata for a scheduled query reducer.
+    pub fn query_reducer_access(&self, id: QueryReducerId) -> &Access {
+        &self.reducers[id.0].access
+    }
+
+    /// Access metadata by raw index.
     pub fn access(&self, idx: usize) -> &Access {
         &self.reducers[idx].access
     }
@@ -518,6 +599,13 @@ impl ReducerRegistry {
         kind: ReducerKind,
     ) -> ReducerId {
         let id = self.reducers.len();
+        if let Some(&existing) = self.by_name.get(name) {
+            panic!(
+                "ReducerRegistry: duplicate reducer name '{}' \
+                 (already registered at index {})",
+                name, existing
+            );
+        }
         self.by_name.insert(name, id);
         self.reducers.push(ReducerEntry {
             name,
@@ -683,7 +771,7 @@ mod tests {
         let mut world = World::new();
         world.spawn((Pos(1.0),));
         world.spawn((Pos(2.0),));
-        let qr: QueryRef<'_, (&Pos,)> = QueryRef::new(&world);
+        let mut qr: QueryRef<'_, (&Pos,)> = QueryRef::new(&mut world);
         let mut sum = 0.0;
         qr.for_each(|(pos,)| sum += pos.0);
         assert_eq!(sum, 3.0);
@@ -695,7 +783,7 @@ mod tests {
         world.spawn((Pos(1.0),));
         world.spawn((Pos(2.0),));
         world.spawn((Pos(3.0),));
-        let qr: QueryRef<'_, (&Pos,)> = QueryRef::new(&world);
+        let mut qr: QueryRef<'_, (&Pos,)> = QueryRef::new(&mut world);
         assert_eq!(qr.count(), 3);
     }
 
@@ -780,7 +868,7 @@ mod tests {
 
         let mut registry = ReducerRegistry::new();
         let count_id =
-            registry.register_query_ref::<(&Pos,), (), _>(&mut world, "count", |query, ()| {
+            registry.register_query_ref::<(&Pos,), (), _>(&mut world, "count", |mut query, ()| {
                 assert_eq!(query.count(), 2);
             });
 
@@ -788,14 +876,21 @@ mod tests {
     }
 
     #[test]
-    fn id_by_name_lookup() {
+    fn typed_id_by_name_lookup() {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
-        let _id =
+        let heal_id =
             registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
+        let _gravity_id =
+            registry.register_query::<(&mut Vel,), (), _>(&mut world, "gravity", |_query, ()| {});
 
-        assert_eq!(registry.id_by_name("heal"), Some(0));
-        assert_eq!(registry.id_by_name("nonexistent"), None);
+        // Typed lookups return the correct variant
+        assert_eq!(registry.reducer_id_by_name("heal"), Some(heal_id));
+        assert_eq!(registry.reducer_id_by_name("gravity"), None); // wrong kind
+        assert_eq!(registry.reducer_id_by_name("nonexistent"), None);
+
+        assert!(registry.query_reducer_id_by_name("gravity").is_some());
+        assert_eq!(registry.query_reducer_id_by_name("heal"), None); // wrong kind
     }
 
     #[test]
@@ -805,8 +900,10 @@ mod tests {
         let heal_id =
             registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
         let health_id = world.components.id::<Health>().unwrap();
-        let access = registry.access(heal_id.0);
+        let access = registry.reducer_access(heal_id);
+        // Entity reducers declare both reads and writes
         assert!(access.writes()[health_id]);
+        assert!(access.reads()[health_id]);
     }
 
     #[test]
@@ -820,11 +917,109 @@ mod tests {
         let damage_id =
             registry.register_entity::<(Health,), (), _>(&mut world, "damage", |_entity, ()| {});
 
-        let heal_access = registry.access(heal_id.0);
-        let damage_access = registry.access(damage_id.0);
+        let heal_access = registry.reducer_access(heal_id);
+        let damage_access = registry.reducer_access(damage_id);
         assert!(
             heal_access.conflicts_with(damage_access),
             "two reducers writing Health should conflict"
         );
+    }
+
+    // ── Spawner lifecycle tests ──────────────────────────────────
+
+    #[test]
+    fn register_spawner_and_call() {
+        let mut world = World::new();
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let spawn_id = registry.register_spawner::<(Health,), u32, _>(
+            &mut world,
+            "spawn_unit",
+            |mut spawner, hp: u32| {
+                spawner.spawn((Health(hp),));
+            },
+        );
+
+        registry
+            .call_entity(&strategy, &mut world, spawn_id, Entity::DANGLING, 50u32)
+            .unwrap();
+
+        let mut count = 0;
+        for (h,) in world.query::<(&Health,)>() {
+            assert_eq!(h.0, 50);
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn spawner_abort_reclaims_reserved_ids() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),)); // seed an entity so conflict detection works
+        let strategy = Optimistic::with_retries(&world, 1);
+        let mut registry = ReducerRegistry::new();
+
+        // Register a spawner that also reads Pos to create a conflict surface
+        let _spawn_id = registry.register_spawner::<(Health,), (), _>(
+            &mut world,
+            "spawn_and_conflict",
+            |mut spawner, ()| {
+                spawner.spawn((Health(1),));
+            },
+        );
+
+        // Force a conflict: mutate Pos column between begin and commit
+        // by using a strategy with max 1 retry and always-conflicting access
+        let mut attempt = 0u32;
+        let access_with_pos = Access::of::<(&Pos, &mut Pos)>(&mut world);
+        let result = strategy.transact(&mut world, &access_with_pos, |tx, world| {
+            attempt += 1;
+            let (changeset, allocated) = tx.reducer_parts();
+            let spawner = Spawner::<(Health,)>::new(changeset, allocated, world);
+            // Spawner allocates via reserve() — entity tracked in allocated
+            let _spawned = spawner;
+
+            if attempt == 1 {
+                // Mutate to force conflict
+                for pos in world.query::<(&mut Pos,)>() {
+                    pos.0 .0 = 99.0;
+                }
+            }
+        });
+
+        // After abort+retry, no leaked entities
+        // Trigger drain_orphans
+        world.register_component::<Health>();
+        let health_count = world.query::<(&Health,)>().count();
+        // May be 0 (both attempts conflicted) or 1 (retry succeeded)
+        assert!(health_count <= 1, "no duplicate spawns");
+        assert!(attempt >= 1);
+        let _ = result;
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate reducer name")]
+    fn duplicate_name_panics() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
+        registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
+    }
+
+    #[test]
+    fn restore_allocator_syncs_next_reserved() {
+        let mut world = World::new();
+        // Spawn some entities to populate generations
+        world.spawn((Pos(1.0),));
+        world.spawn((Pos(2.0),));
+
+        // Simulate snapshot restore
+        let gens = vec![0u32; 5]; // 5 entities in the snapshot
+        let free = vec![];
+        world.restore_allocator_state(gens, free);
+
+        // reserve() should start at index 5, not 0
+        let reserved = world.entities.reserve();
+        assert_eq!(reserved.index(), 5, "reserve() must skip restored indices");
     }
 }

@@ -71,6 +71,17 @@ impl EntityAllocator {
         Entity::new(index, 0)
     }
 
+    /// Sync the atomic counter to at least `generations.len()`.
+    /// Called after snapshot restore to prevent `reserve()` from
+    /// handing out already-used indices.
+    pub fn sync_reserved(&mut self) {
+        let len = self.generations.len() as u32;
+        let current = *self.next_reserved.get_mut();
+        if current < len {
+            *self.next_reserved.get_mut() = len;
+        }
+    }
+
     /// Backfill the generations vec to cover all reserved indices.
     /// Called automatically by `alloc()`.
     pub fn materialize_reserved(&mut self) {

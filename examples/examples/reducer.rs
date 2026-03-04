@@ -60,7 +60,7 @@ fn main() {
     let logger_id = registry.register_query_ref::<(&Health, &Velocity), (), _>(
         &mut world,
         "logger",
-        |query: QueryRef<'_, (&Health, &Velocity)>, ()| {
+        |mut query: QueryRef<'_, (&Health, &Velocity)>, ()| {
             let count = query.count();
             println!("  [logger] {} entities with Health + Velocity", count);
         },
@@ -128,16 +128,16 @@ fn main() {
 
     // ── 6. Name-based lookup ─────────────────────────────────────────
     println!("\n--- Name-based lookup ---");
-    let idx = registry.id_by_name("heal").unwrap();
-    println!("'heal' -> index {}", idx);
-    let idx = registry.id_by_name("gravity").unwrap();
-    println!("'gravity' -> index {}", idx);
+    let found_heal = registry.reducer_id_by_name("heal").unwrap();
+    println!("'heal' -> {:?}", found_heal);
+    let found_gravity = registry.query_reducer_id_by_name("gravity").unwrap();
+    println!("'gravity' -> {:?}", found_gravity);
 
     // ── 7. Access conflict detection ─────────────────────────────────
     println!("\n--- Access conflict detection ---");
-    let heal_access = registry.access(heal_id.0);
-    let damage_access = registry.access(damage_id.0);
-    let gravity_access = registry.access(gravity_id.0);
+    let heal_access = registry.reducer_access(heal_id);
+    let damage_access = registry.reducer_access(damage_id);
+    let gravity_access = registry.query_reducer_access(gravity_id);
 
     println!(
         "heal vs damage: {}",

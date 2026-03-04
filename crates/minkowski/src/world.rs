@@ -826,6 +826,8 @@ impl World {
         self.drain_orphans();
         self.entities.generations = generations;
         self.entities.free_list = free_list;
+        // Sync the atomic counter so reserve() doesn't hand out already-used indices.
+        self.entities.sync_reserved();
         self.entity_locations
             .resize(self.entities.generations.len(), None);
     }
