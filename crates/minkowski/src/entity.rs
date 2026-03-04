@@ -36,9 +36,18 @@ impl Entity {
 }
 
 /// Allocates and recycles entity IDs with generational tracking.
+///
+/// Supports two allocation modes:
+/// - `alloc(&mut self)`: standard allocation, recycles from free list.
+/// - `reserve(&self)`: lock-free atomic allocation of fresh indices.
+///   Returns Entity with generation 0. Reserved indices are NOT in the
+///   generations vec yet — call `materialize_reserved()` before using
+///   `alloc()` or `is_alive()` on reserved indices.
 pub(crate) struct EntityAllocator {
     pub(crate) generations: Vec<u32>,
     pub(crate) free_list: Vec<u32>,
+    /// Atomic counter for lock-free entity index reservation.
+    next_reserved: std::sync::atomic::AtomicU32,
 }
 
 impl EntityAllocator {
@@ -46,16 +55,41 @@ impl EntityAllocator {
         Self {
             generations: Vec::new(),
             free_list: Vec::new(),
+            next_reserved: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Reserve a fresh entity index atomically (`&self`, no `&mut` needed).
+    /// Returns Entity with generation 0. Reserved entities are NOT in the
+    /// generations vec yet — call `materialize_reserved()` from `&mut self`
+    /// before using `alloc()` or `is_alive()` on reserved indices.
+    #[allow(dead_code)]
+    pub fn reserve(&self) -> Entity {
+        let index = self
+            .next_reserved
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Entity::new(index, 0)
+    }
+
+    /// Backfill the generations vec to cover all reserved indices.
+    /// Called automatically by `alloc()`.
+    pub fn materialize_reserved(&mut self) {
+        let reserved = *self.next_reserved.get_mut();
+        while self.generations.len() < reserved as usize {
+            self.generations.push(0);
         }
     }
 
     pub fn alloc(&mut self) -> Entity {
+        self.materialize_reserved();
         if let Some(index) = self.free_list.pop() {
             let gen = self.generations[index as usize];
             Entity::new(index, gen)
         } else {
             let index = self.generations.len() as u32;
             self.generations.push(0);
+            self.next_reserved
+                .store(index + 1, std::sync::atomic::Ordering::Relaxed);
             Entity::new(index, 0)
         }
     }
@@ -145,5 +179,67 @@ mod tests {
         assert_eq!(e, e2);
         assert_eq!(e2.index(), 42);
         assert_eq!(e2.generation(), 7);
+    }
+
+    // ── Reserve tests ────────────────────────────────────────────
+
+    #[test]
+    fn reserve_basic() {
+        let alloc = EntityAllocator::new();
+        let e1 = alloc.reserve();
+        let e2 = alloc.reserve();
+        assert_eq!(e1.index(), 0);
+        assert_eq!(e1.generation(), 0);
+        assert_eq!(e2.index(), 1);
+        assert_eq!(e2.generation(), 0);
+    }
+
+    #[test]
+    fn reserve_concurrent() {
+        use std::sync::Arc;
+        let alloc = Arc::new(EntityAllocator::new());
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let alloc = alloc.clone();
+                std::thread::spawn(move || (0..100).map(|_| alloc.reserve()).collect::<Vec<_>>())
+            })
+            .collect();
+        let mut all_entities: Vec<Entity> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all_entities.sort_by_key(|e| e.index());
+        all_entities.dedup_by_key(|e| e.index());
+        assert_eq!(all_entities.len(), 400, "no duplicate indices");
+    }
+
+    #[test]
+    fn reserve_then_alloc_no_overlap() {
+        let mut alloc = EntityAllocator::new();
+        let r1 = alloc.reserve();
+        let r2 = alloc.reserve();
+        alloc.materialize_reserved();
+        let a1 = alloc.alloc();
+        assert_eq!(r1.index(), 0);
+        assert_eq!(r2.index(), 1);
+        assert_eq!(a1.index(), 2);
+    }
+
+    #[test]
+    fn alloc_after_reserve_recycles_free_list() {
+        let mut alloc = EntityAllocator::new();
+        // alloc two entities, dealloc one
+        let e0 = alloc.alloc();
+        let _e1 = alloc.alloc();
+        alloc.dealloc(e0);
+
+        // reserve should get a fresh index (not from free list)
+        let r = alloc.reserve();
+        assert_eq!(r.index(), 2);
+
+        // alloc should still recycle from free list
+        let a = alloc.alloc();
+        assert_eq!(a.index(), 0);
+        assert_eq!(a.generation(), 1);
     }
 }

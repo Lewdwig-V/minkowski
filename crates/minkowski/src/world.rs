@@ -110,6 +110,7 @@ impl World {
     /// Drain orphaned entity IDs from aborted transactions.
     /// Called automatically at the top of every &mut self entry point.
     fn drain_orphans(&mut self) {
+        self.entities.materialize_reserved();
         let mut queue = self.orphan_queue.0.lock();
         for entity in queue.drain(..) {
             self.entities.dealloc(entity);
