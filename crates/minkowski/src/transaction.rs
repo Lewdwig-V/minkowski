@@ -298,6 +298,28 @@ impl<'a> Tx<'a> {
         std::mem::take(&mut self.changeset)
     }
 
+    /// Mutable borrow of the internal changeset. Used by typed reducer
+    /// handles that buffer writes directly into the changeset.
+    #[allow(dead_code)]
+    pub(crate) fn changeset_mut(&mut self) -> &mut EnumChangeSet {
+        &mut self.changeset
+    }
+
+    /// Mutable borrow of the allocated entity tracking list. Used by
+    /// Spawner to register entity IDs for orphan reclamation on abort.
+    #[allow(dead_code)]
+    pub(crate) fn allocated_mut(&mut self) -> &mut Vec<Entity> {
+        &mut self.allocated
+    }
+
+    /// Split borrow: returns mutable refs to both changeset and allocated
+    /// list simultaneously. Needed by reducer adapters that construct both
+    /// EntityMut (changeset) and Spawner (allocated) handles.
+    #[allow(dead_code)]
+    pub(crate) fn reducer_parts(&mut self) -> (&mut EnumChangeSet, &mut Vec<Entity>) {
+        (&mut self.changeset, &mut self.allocated)
+    }
+
     // ── Pre-resolved raw methods (pub(crate)) ────────────────────
 
     /// Write a component using a pre-resolved ComponentId.
