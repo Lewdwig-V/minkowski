@@ -104,6 +104,17 @@ impl ComponentRegistry {
     }
 }
 
+/// Type-erased drop glue: calls `drop_in_place::<T>` on a raw pointer.
+/// Used by `EnumChangeSet::insert_raw` and similar pre-resolved paths
+/// that don't have access to `ComponentRegistry`.
+///
+/// # Safety
+/// The pointer must point to a valid, initialized `T`.
+#[allow(dead_code)]
+pub(crate) unsafe fn drop_ptr<T>(ptr: *mut u8) {
+    std::ptr::drop_in_place(ptr as *mut T);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

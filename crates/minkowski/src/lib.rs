@@ -16,6 +16,7 @@ pub mod entity;
 pub mod index;
 pub(crate) mod lock_table;
 pub mod query;
+pub mod reducer;
 pub mod storage;
 pub mod table;
 pub(crate) mod tick;
@@ -30,5 +31,9 @@ pub use entity::Entity;
 pub use index::SpatialIndex;
 pub use minkowski_derive::Table;
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
+pub use reducer::{
+    ComponentSet, Contains, EntityMut, EntityRef, QueryMut, QueryReducerId, QueryRef, ReducerId,
+    ReducerRegistry, Spawner,
+};
 pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
 pub use world::World;

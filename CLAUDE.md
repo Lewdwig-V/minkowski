@@ -22,6 +22,7 @@ cargo run -p minkowski-examples --example scheduler --release   # Access conflic
 cargo run -p minkowski-examples --example transaction --release   # Transaction strategies demo (3 strategies, 100 entities)
 cargo run -p minkowski-examples --example battle --release   # Multi-threaded battle with tunable conflict rates (500 entities, 100 frames)
 cargo run -p minkowski-examples --example persist --release   # Durable transactions: WAL + snapshot save/load/recovery (100 entities, 10 frames)
+cargo run -p minkowski-examples --example reducer --release   # Typed reducer system: entity/query/spawner handles + conflict detection
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -131,9 +132,26 @@ Lock granularity is per-column `(ArchetypeId, ComponentId)`. `ColumnLockTable` i
 
 **Entity ID lifecycle invariant**: entity IDs allocated during a transaction (`tx.spawn`) are tracked. On successful commit they become placed entities. On abort (drop without commit or conflict), the IDs are pushed to a shared `OrphanQueue` owned by World. World drains this queue automatically at the top of every `&mut self` method — bumping generations and recycling indices. No entity ID ever leaks, regardless of how the transaction ends. No manual drain step required.
 
+### Reducer System
+
+Typed reducers narrow what a closure *can* touch so that conflict freedom is provable from the type signature. Two execution models:
+
+| Model | Handle types | Isolation | Conflict detection |
+|---|---|---|---|
+| Transactional | `EntityMut<C>`, `Spawner<B>` | Buffered writes via EnumChangeSet | Runtime (optimistic ticks or pessimistic locks) |
+| Scheduled | `QueryMut<Q>`, `QueryRef<Q>` | Direct `&mut World` (hidden) | Compile-time (Access bitsets) |
+
+**ComponentSet** declares a set of component types with pre-resolved IDs. **Contains<T, INDEX>** uses a const generic index to avoid coherence conflicts with generic tuple impls — the compiler infers INDEX at call sites. Both are macro-generated for tuples 1–12.
+
+**Typed handles** hide World behind a facade exposing exactly the declared operations: `EntityRef<C>` (read-only), `EntityMut<C>` (read + buffered write), `Spawner<B>` (entity creation via `reserve()`), `QueryRef<Q>` (read-only iteration), `QueryMut<Q>` (read-write iteration). EntityMut and Spawner hold `&mut EnumChangeSet` (not `&mut Tx`) for clean borrow splitting — Tx retains lifecycle ownership, handles borrow disjoint fields.
+
+**ReducerRegistry** is external to World (same composition pattern as SpatialIndex). Registration type-erases closures with Access metadata and pre-resolved ComponentIds. Dispatch: `call_entity()` for transactional reducers (runs through `strategy.transact()`), `run()` for scheduled query reducers (direct `&mut World`). `id_by_name()` enables network dispatch. `access()` enables scheduler conflict analysis.
+
+**EntityAllocator::reserve(&self)** provides lock-free entity ID allocation via `AtomicU32` — enables `Spawner` to work inside transactional closures where only `&World` is available.
+
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`, `Access`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`, `Access`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `Spawner`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
@@ -146,6 +164,7 @@ Lock granularity is per-column `(ArchetypeId, ComponentId)`. `ColumnLockTable` i
   4. Does dedup/merge/collapse preserve the strongest invariant?
   5. What happens if this is abandoned halfway through?
   6. Can a type bound be violated by a legal generic instantiation?
+  7. Does the API surface of this handle permit any operation not covered by the Access bitset?
 - **Transaction safety invariants**: any query path reachable from `&World` must be bounded by `ReadOnlyWorldQuery`. Any shared structure between World and a strategy uses `Arc` with a `WorldId` check at every entry point. Lock privilege in a `ColumnLockSet` can only escalate, never downgrade. Drop is the abort path — if a transaction can allocate engine resources (entity IDs, locks), it must be able to release them from Drop without `&mut World`, which means those resources route through interior-mutable shared handles (`OrphanQueue`, `Mutex<ColumnLockTable>`).
 - **Drop cleanup rule**: if Drop needs to clean up engine state, the cleanup path must be reachable from `&self`. This constrains where state can live. If it's on World, Drop can't reach it. If it's behind `Arc<Mutex<_>>` shared between World and the transaction, Drop can. Every future resource that transactions can allocate — entity IDs, archetype slots, reserved capacity — must follow this pattern or it will leak on abort.
 

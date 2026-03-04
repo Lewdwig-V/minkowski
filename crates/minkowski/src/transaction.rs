@@ -66,7 +66,7 @@ use parking_lot::Mutex;
 
 use crate::access::Access;
 use crate::changeset::EnumChangeSet;
-use crate::component::Component;
+use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::lock_table::{ColumnLockSet, ColumnLockTable};
 use crate::query::fetch::{ReadOnlyWorldQuery, WorldQuery};
@@ -296,6 +296,63 @@ impl<'a> Tx<'a> {
     /// Take ownership of the internal changeset, leaving an empty one in place.
     pub fn take_changeset(&mut self) -> EnumChangeSet {
         std::mem::take(&mut self.changeset)
+    }
+
+    /// Mutable borrow of the internal changeset. Used by typed reducer
+    /// handles that buffer writes directly into the changeset.
+    #[allow(dead_code)]
+    pub(crate) fn changeset_mut(&mut self) -> &mut EnumChangeSet {
+        &mut self.changeset
+    }
+
+    /// Mutable borrow of the allocated entity tracking list. Used by
+    /// Spawner to register entity IDs for orphan reclamation on abort.
+    #[allow(dead_code)]
+    pub(crate) fn allocated_mut(&mut self) -> &mut Vec<Entity> {
+        &mut self.allocated
+    }
+
+    /// Split borrow: returns mutable refs to both changeset and allocated
+    /// list simultaneously. Needed by reducer adapters that construct both
+    /// EntityMut (changeset) and Spawner (allocated) handles.
+    #[allow(dead_code)]
+    pub(crate) fn reducer_parts(&mut self) -> (&mut EnumChangeSet, &mut Vec<Entity>) {
+        (&mut self.changeset, &mut self.allocated)
+    }
+
+    // ── Pre-resolved raw methods (pub(crate)) ────────────────────
+
+    /// Write a component using a pre-resolved ComponentId.
+    /// No registration, no `&mut World`.
+    #[allow(dead_code)]
+    pub(crate) fn write_raw<T: Component>(
+        &mut self,
+        entity: Entity,
+        comp_id: ComponentId,
+        value: T,
+    ) {
+        self.changeset.insert_raw(entity, comp_id, value);
+    }
+
+    /// Remove a component using a pre-resolved ComponentId.
+    #[allow(dead_code)]
+    pub(crate) fn remove_raw(&mut self, entity: Entity, comp_id: ComponentId) {
+        self.changeset.record_remove(entity, comp_id);
+    }
+
+    /// Spawn an entity with a bundle using pre-resolved ComponentIds.
+    /// Atomically reserves an entity ID via `EntityAllocator::reserve()`.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_raw<B: crate::bundle::Bundle>(
+        &mut self,
+        world: &World,
+        bundle: B,
+    ) -> Entity {
+        let entity = world.entities.reserve();
+        self.track_allocated(entity);
+        self.changeset
+            .spawn_bundle_raw(entity, &world.components, bundle);
+        entity
     }
 }
 

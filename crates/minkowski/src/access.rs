@@ -1,5 +1,6 @@
 use fixedbitset::FixedBitSet;
 
+use crate::component::ComponentId;
 use crate::query::fetch::WorldQuery;
 use crate::world::World;
 
@@ -64,6 +65,35 @@ impl Access {
         };
 
         Self { reads, writes }
+    }
+
+    /// Create an empty access set (no reads, no writes).
+    pub fn empty() -> Self {
+        Self {
+            reads: FixedBitSet::new(),
+            writes: FixedBitSet::new(),
+        }
+    }
+
+    /// Add a read on the given component ID.
+    pub fn add_read(&mut self, id: ComponentId) {
+        self.reads.grow(id + 1);
+        self.reads.insert(id);
+    }
+
+    /// Add a write on the given component ID.
+    pub fn add_write(&mut self, id: ComponentId) {
+        self.writes.grow(id + 1);
+        self.writes.insert(id);
+    }
+
+    /// Merge two access sets: union of reads, union of writes.
+    pub fn merge(&self, other: &Access) -> Access {
+        let mut reads = self.reads.clone();
+        let mut writes = self.writes.clone();
+        reads.union_with(&other.reads);
+        writes.union_with(&other.writes);
+        Access { reads, writes }
     }
 
     /// Components this query reads but does not write.
@@ -211,6 +241,52 @@ mod tests {
         let a = Access::of::<(Option<&Pos>,)>(&mut world);
         let b = Access::of::<(&Pos,)>(&mut world);
         assert!(!a.conflicts_with(&b), "two readers never conflict");
+    }
+
+    // ── Builder API tests ─────────────────────────────────────────
+
+    #[test]
+    fn builder_empty() {
+        let a = Access::empty();
+        assert!(a.reads().is_empty());
+        assert!(a.writes().is_empty());
+    }
+
+    #[test]
+    fn builder_add_read() {
+        let mut a = Access::empty();
+        a.add_read(0);
+        assert!(a.reads()[0]);
+        assert!(a.writes().is_empty());
+    }
+
+    #[test]
+    fn builder_add_write() {
+        let mut a = Access::empty();
+        a.add_write(0);
+        assert!(a.reads().is_empty());
+        assert!(a.writes()[0]);
+    }
+
+    #[test]
+    fn builder_merge() {
+        let mut a = Access::empty();
+        a.add_read(0);
+        let mut b = Access::empty();
+        b.add_write(1);
+        let merged = a.merge(&b);
+        assert!(merged.reads()[0]);
+        assert!(merged.writes()[1]);
+    }
+
+    #[test]
+    fn builder_conflicts_with_of() {
+        let mut world = World::new();
+        let from_query = Access::of::<(&mut Pos,)>(&mut world);
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let mut from_builder = Access::empty();
+        from_builder.add_read(pos_id);
+        assert!(from_query.conflicts_with(&from_builder));
     }
 
     #[test]
