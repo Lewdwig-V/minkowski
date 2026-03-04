@@ -277,6 +277,27 @@ impl World {
         }
     }
 
+    /// Get a component by pre-resolved ComponentId. Same as `get::<T>()` but
+    /// skips the TypeId → ComponentId lookup. No sparse check (reducer
+    /// components are always archetype-stored).
+    #[allow(dead_code)]
+    pub(crate) fn get_by_id<T: Component>(
+        &self,
+        entity: Entity,
+        comp_id: ComponentId,
+    ) -> Option<&T> {
+        if !self.entities.is_alive(entity) {
+            return None;
+        }
+        let location = self.entity_locations[entity.index() as usize]?;
+        let archetype = &self.archetypes.archetypes[location.archetype_id.0];
+        let col_idx = archetype.component_index.get(&comp_id)?;
+        unsafe {
+            let ptr = archetype.columns[*col_idx].get_ptr(location.row) as *const T;
+            Some(&*ptr)
+        }
+    }
+
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
         self.drain_orphans();
         if !self.entities.is_alive(entity) {
@@ -1382,5 +1403,33 @@ mod tests {
         let id = world.register_component::<f32>();
         assert!(world.component_name(id).unwrap().contains("f32"));
         assert_eq!(world.component_layout(id).unwrap().size(), 4);
+    }
+
+    // ── get_by_id tests ──────────────────────────────────────────
+
+    #[test]
+    fn get_by_id_basic() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let comp_id = world.components.id::<Pos>().unwrap();
+        let pos = world.get_by_id::<Pos>(e, comp_id);
+        assert_eq!(pos, Some(&Pos { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn get_by_id_missing_component() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let vel_id = world.register_component::<Vel>();
+        assert_eq!(world.get_by_id::<Vel>(e, vel_id), None);
+    }
+
+    #[test]
+    fn get_by_id_dead_entity() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let comp_id = world.components.id::<Pos>().unwrap();
+        world.despawn(e);
+        assert_eq!(world.get_by_id::<Pos>(e, comp_id), None);
     }
 }

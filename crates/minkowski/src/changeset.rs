@@ -2,7 +2,7 @@ use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 
 use crate::bundle::Bundle;
-use crate::component::{Component, ComponentId};
+use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
 use crate::world::{get_pair_mut, EntityLocation, World};
 
@@ -264,6 +264,56 @@ impl EnumChangeSet {
         // Register drop entries for components that need cleanup.
         for &(comp_id, offset, _) in &components {
             if let Some(drop_fn) = world.components.info(comp_id).drop_fn {
+                self.drop_entries.push(DropEntry { offset, drop_fn });
+            }
+        }
+        self.mutations.push(Mutation::Spawn { entity, components });
+    }
+}
+
+// ── Pre-resolved helpers (pub(crate)) ────────────────────────────
+
+impl EnumChangeSet {
+    /// Insert with a pre-resolved ComponentId. Same as `insert()` but
+    /// skips `world.register_component::<T>()`. Used by typed reducer handles.
+    #[allow(dead_code)]
+    pub(crate) fn insert_raw<T: Component>(
+        &mut self,
+        entity: Entity,
+        comp_id: ComponentId,
+        value: T,
+    ) {
+        let layout = Layout::new::<T>();
+        let value = std::mem::ManuallyDrop::new(value);
+        let offset = self.record_insert(entity, comp_id, &*value as *const T as *const u8, layout);
+        if std::mem::needs_drop::<T>() {
+            self.drop_entries.push(DropEntry {
+                offset,
+                drop_fn: crate::component::drop_ptr::<T>,
+            });
+        }
+    }
+
+    /// Spawn a bundle with pre-resolved ComponentIds. Same as `spawn_bundle()`
+    /// but takes `&ComponentRegistry` instead of `&mut World`. Used by Spawner.
+    ///
+    /// The caller must guarantee that `entity` is unplaced (e.g. via `reserve()`).
+    #[allow(dead_code)]
+    pub(crate) fn spawn_bundle_raw<B: Bundle>(
+        &mut self,
+        entity: Entity,
+        registry: &ComponentRegistry,
+        bundle: B,
+    ) {
+        let mut components = Vec::new();
+        unsafe {
+            bundle.put(registry, &mut |comp_id, ptr, layout| {
+                let offset = self.arena.alloc(ptr, layout);
+                components.push((comp_id, offset, layout));
+            });
+        }
+        for &(comp_id, offset, _) in &components {
+            if let Some(drop_fn) = registry.info(comp_id).drop_fn {
                 self.drop_entries.push(DropEntry { offset, drop_fn });
             }
         }
@@ -1120,5 +1170,53 @@ mod tests {
             1,
             "reverse drop should clean up owned value"
         );
+    }
+
+    // ── insert_raw / spawn_bundle_raw tests ──────────────────────
+
+    #[test]
+    fn insert_raw_and_apply() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let vel_id = world.register_component::<Vel>();
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert_raw::<Vel>(e, vel_id, Vel { dx: 3.0, dy: 4.0 });
+        let _reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
+    }
+
+    #[test]
+    fn insert_raw_drop_on_abort() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let tracked_id = world.register_component::<Tracked>();
+
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.insert_raw::<Tracked>(e, tracked_id, Tracked::new(42, &drops));
+            // drop without apply
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn spawn_bundle_raw_and_apply() {
+        let mut world = World::new();
+        // Pre-register component types
+        world.register_component::<Pos>();
+        world.register_component::<Vel>();
+
+        let entity = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle_raw(
+            entity,
+            &world.components,
+            (Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }),
+        );
+        let _reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
+        assert_eq!(world.get::<Vel>(entity), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
 }
