@@ -16,6 +16,7 @@ pub mod entity;
 pub mod index;
 pub(crate) mod lock_table;
 pub mod query;
+pub mod reducer;
 pub mod storage;
 pub mod table;
 pub(crate) mod tick;
