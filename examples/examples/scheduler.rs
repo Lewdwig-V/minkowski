@@ -1,11 +1,13 @@
-//! Minimal parallel scheduler — exercises `Access` for conflict detection.
+//! Minimal parallel scheduler — exercises `ReducerRegistry` for access metadata
+//! and conflict detection.
 //!
 //! Run: cargo run -p minkowski-examples --example scheduler --release
 //!
-//! This is NOT a real framework scheduler. It demonstrates how a framework
-//! author would use `Access::of` and `conflicts_with` to build one.
+//! Six systems registered as query reducers. The scheduler uses
+//! `registry.query_reducer_access(id)` to build a conflict matrix and assign
+//! systems to batches via greedy graph coloring.
 //!
-//! Six systems, three batches:
+//! Three batches:
 //! - Batch 0: movement (writes Pos, reads Vel) + health_regen (writes Health)
 //! - Batch 1: gravity (writes Vel) + apply_damage (writes Health)
 //! - Batch 2: log_positions (reads Pos) + log_health (reads Health)
@@ -13,9 +15,9 @@
 //! Within each batch, systems touch disjoint component sets and could run
 //! in parallel. Across batches, conflicts require sequential execution.
 
-use minkowski::{Access, World};
+use minkowski::{QueryMut, QueryReducerId, QueryRef, ReducerRegistry, World};
 
-// ── Components ──────────────────────────────────────────────────────
+// -- Components ---------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 struct Pos {
@@ -32,63 +34,21 @@ struct Vel {
 #[derive(Clone, Copy)]
 struct Health(u32);
 
-// ── Systems ─────────────────────────────────────────────────────────
-
-fn movement(world: &mut World) {
-    for (pos, vel) in world.query::<(&mut Pos, &Vel)>() {
-        pos.x += vel.dx;
-        pos.y += vel.dy;
-    }
-}
-
-fn gravity(world: &mut World) {
-    for vel in world.query::<(&mut Vel,)>() {
-        vel.0.dy -= 9.8;
-    }
-}
-
-fn health_regen(world: &mut World) {
-    for hp in world.query::<(&mut Health,)>() {
-        hp.0 .0 = hp.0 .0.saturating_add(1);
-    }
-}
-
-fn apply_damage(world: &mut World) {
-    for hp in world.query::<(&mut Health,)>() {
-        hp.0 .0 = hp.0 .0.saturating_sub(5);
-    }
-}
-
-fn log_positions(world: &mut World) {
-    let count = world.query::<(&Pos,)>().count();
-    println!("    log_positions: {count} entities");
-}
-
-fn log_health(world: &mut World) {
-    let total: u32 = world.query::<(&Health,)>().map(|h| h.0 .0).sum();
-    println!("    log_health: total HP = {total}");
-}
-
-// ── Greedy batch scheduler ──────────────────────────────────────────
-
-struct SystemEntry {
-    name: &'static str,
-    access: Access,
-    run: fn(&mut World),
-}
+// -- Greedy batch scheduler ---------------------------------------------------
 
 /// Assign systems to batches using greedy graph coloring.
 /// Systems in the same batch have no conflicts and could run in parallel.
-fn assign_batches(systems: &[SystemEntry]) -> Vec<Vec<usize>> {
+fn assign_batches(registry: &ReducerRegistry, ids: &[QueryReducerId]) -> Vec<Vec<usize>> {
     let mut batches: Vec<Vec<usize>> = Vec::new();
 
-    for i in 0..systems.len() {
-        // Find the first batch where system i has no conflicts
+    for i in 0..ids.len() {
+        let access_i = registry.query_reducer_access(ids[i]);
         let mut assigned = false;
         for (b, batch) in batches.iter().enumerate() {
-            let conflicts_with_batch = batch
-                .iter()
-                .any(|&j| systems[i].access.conflicts_with(&systems[j].access));
+            let conflicts_with_batch = batch.iter().any(|&j| {
+                let access_j = registry.query_reducer_access(ids[j]);
+                access_i.conflicts_with(access_j)
+            });
             if !conflicts_with_batch {
                 batches[b].push(i);
                 assigned = true;
@@ -103,10 +63,11 @@ fn assign_batches(systems: &[SystemEntry]) -> Vec<Vec<usize>> {
     batches
 }
 
-// ── Main ────────────────────────────────────────────────────────────
+// -- Main ---------------------------------------------------------------------
 
 fn main() {
     let mut world = World::new();
+    let mut registry = ReducerRegistry::new();
 
     // Spawn some entities
     for i in 0..100 {
@@ -120,56 +81,106 @@ fn main() {
         ));
     }
 
-    // Register systems with their access metadata
-    let systems = vec![
-        SystemEntry {
-            name: "movement",
-            access: Access::of::<(&mut Pos, &Vel)>(&mut world),
-            run: movement,
+    // -- Register the 6 systems as query reducers -----------------------------
+
+    let movement_id = registry.register_query::<(&mut Pos, &Vel), (), _>(
+        &mut world,
+        "movement",
+        |mut query: QueryMut<'_, (&mut Pos, &Vel)>, ()| {
+            query.for_each(|(pos, vel)| {
+                pos.x += vel.dx;
+                pos.y += vel.dy;
+            });
         },
-        SystemEntry {
-            name: "gravity",
-            access: Access::of::<(&mut Vel,)>(&mut world),
-            run: gravity,
+    );
+
+    let gravity_id = registry.register_query::<(&mut Vel,), (), _>(
+        &mut world,
+        "gravity",
+        |mut query: QueryMut<'_, (&mut Vel,)>, ()| {
+            query.for_each(|(vel,)| {
+                vel.dy -= 9.8;
+            });
         },
-        SystemEntry {
-            name: "health_regen",
-            access: Access::of::<(&mut Health,)>(&mut world),
-            run: health_regen,
+    );
+
+    let health_regen_id = registry.register_query::<(&mut Health,), (), _>(
+        &mut world,
+        "health_regen",
+        |mut query: QueryMut<'_, (&mut Health,)>, ()| {
+            query.for_each(|(hp,)| {
+                hp.0 = hp.0.saturating_add(1);
+            });
         },
-        SystemEntry {
-            name: "apply_damage",
-            access: Access::of::<(&mut Health,)>(&mut world),
-            run: apply_damage,
+    );
+
+    let apply_damage_id = registry.register_query::<(&mut Health,), (), _>(
+        &mut world,
+        "apply_damage",
+        |mut query: QueryMut<'_, (&mut Health,)>, ()| {
+            query.for_each(|(hp,)| {
+                hp.0 = hp.0.saturating_sub(5);
+            });
         },
-        SystemEntry {
-            name: "log_positions",
-            access: Access::of::<(&Pos,)>(&mut world),
-            run: log_positions,
+    );
+
+    let log_positions_id = registry.register_query_ref::<(&Pos,), (), _>(
+        &mut world,
+        "log_positions",
+        |mut query: QueryRef<'_, (&Pos,)>, ()| {
+            let count = query.count();
+            println!("    log_positions: {count} entities");
         },
-        SystemEntry {
-            name: "log_health",
-            access: Access::of::<(&Health,)>(&mut world),
-            run: log_health,
+    );
+
+    let log_health_id = registry.register_query_ref::<(&Health,), (), _>(
+        &mut world,
+        "log_health",
+        |mut query: QueryRef<'_, (&Health,)>, ()| {
+            let mut total: u32 = 0;
+            query.for_each(|(h,)| {
+                total += h.0;
+            });
+            println!("    log_health: total HP = {total}");
         },
+    );
+
+    // Ordered list of system IDs (names retrieved via registry for display)
+    let system_names = [
+        "movement",
+        "gravity",
+        "health_regen",
+        "apply_damage",
+        "log_positions",
+        "log_health",
+    ];
+    let system_ids = [
+        movement_id,
+        gravity_id,
+        health_regen_id,
+        apply_damage_id,
+        log_positions_id,
+        log_health_id,
     ];
 
-    // ── Conflict matrix ─────────────────────────────────────────────
+    // -- Conflict matrix ------------------------------------------------------
 
     println!("Conflict matrix:");
     println!();
-    let max_name = systems.iter().map(|s| s.name.len()).max().unwrap_or(0);
-    for (i, a) in systems.iter().enumerate() {
-        for (_j, b) in systems.iter().enumerate().skip(i + 1) {
-            let tag = if a.access.conflicts_with(&b.access) {
+    let max_name = system_names.iter().map(|s| s.len()).max().unwrap_or(0);
+    for i in 0..system_ids.len() {
+        let access_i = registry.query_reducer_access(system_ids[i]);
+        for j in (i + 1)..system_ids.len() {
+            let access_j = registry.query_reducer_access(system_ids[j]);
+            let tag = if access_i.conflicts_with(access_j) {
                 "CONFLICT"
             } else {
                 "independent"
             };
             println!(
                 "  {:>width$} <-> {:<width$}  {}",
-                a.name,
-                b.name,
+                system_names[i],
+                system_names[j],
                 tag,
                 width = max_name
             );
@@ -177,18 +188,18 @@ fn main() {
     }
     println!();
 
-    // ── Batch assignment ────────────────────────────────────────────
+    // -- Batch assignment -----------------------------------------------------
 
-    let batches = assign_batches(&systems);
+    let batches = assign_batches(&registry, &system_ids);
 
     println!("Batch assignment ({} batches):", batches.len());
     for (b, batch) in batches.iter().enumerate() {
-        let names: Vec<_> = batch.iter().map(|&i| systems[i].name).collect();
+        let names: Vec<_> = batch.iter().map(|&i| system_names[i]).collect();
         println!("  batch {b}: [{}]", names.join(", "));
     }
     println!();
 
-    // ── Execute ─────────────────────────────────────────────────────
+    // -- Execute --------------------------------------------------------------
 
     println!("Running 10 frames:");
     for frame in 0..10 {
@@ -196,13 +207,13 @@ fn main() {
             // Within a batch, systems could run in parallel — they touch
             // disjoint component sets. A real framework would use rayon or
             // scoped threads here. We run sequentially to keep the example
-            // focused on Access, not unsafe parallel execution.
+            // focused on ReducerRegistry, not unsafe parallel execution.
             for &i in batch {
-                (systems[i].run)(&mut world);
+                registry.run(&mut world, system_ids[i], ());
             }
 
             if frame == 0 {
-                let names: Vec<_> = batch.iter().map(|&i| systems[i].name).collect();
+                let names: Vec<_> = batch.iter().map(|&i| system_names[i]).collect();
                 println!("  frame {frame}, batch {b}: ran [{}]", names.join(", "));
             }
         }
