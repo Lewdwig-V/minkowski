@@ -1618,7 +1618,8 @@ impl<'a> DynamicReducerBuilder<'a> {
     /// TypeId entry for runtime validation.
     pub fn can_remove<T: crate::component::Component>(mut self) -> Self {
         let comp_id = self.world.register_component::<T>();
-        self.access.add_write(comp_id);
+        self.access.add_read(comp_id); // removal implies read (inspect before removing)
+        self.access.add_write(comp_id); // removal is a structural write
         self.entries.push((TypeId::of::<T>(), comp_id));
         self.remove_ids.insert(TypeId::of::<T>());
         self
