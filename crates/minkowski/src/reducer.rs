@@ -483,6 +483,17 @@ impl QueryReducerId {
     }
 }
 
+/// Opaque identifier for a dynamic reducer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DynamicReducerId(pub(crate) usize);
+
+impl DynamicReducerId {
+    /// Raw index for serialization / external storage.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// Type-erased entity reducer adapter. Receives changeset + allocated list
 /// (from Tx), world (for reads), resolved IDs, target entity, and type-erased args.
 type EntityAdapter = Box<
@@ -493,6 +504,9 @@ type EntityAdapter = Box<
 
 /// Type-erased scheduled reducer adapter.
 type ScheduledAdapter = Box<dyn Fn(&mut World, &dyn Any) + Send + Sync>;
+
+/// Type-erased dynamic reducer adapter.
+type DynamicAdapter = Box<dyn Fn(&mut DynamicCtx, &dyn Any) + Send + Sync>;
 
 /// Two execution models for reducers.
 enum ReducerKind {
@@ -510,18 +524,37 @@ struct ReducerEntry {
     kind: ReducerKind,
 }
 
+#[allow(dead_code)]
+struct DynamicReducerEntry {
+    name: &'static str,
+    access: Access,
+    resolved: DynamicResolved,
+    closure: DynamicAdapter,
+}
+
+/// Discriminant for the `by_name` lookup table.
+#[derive(Clone, Copy)]
+enum ReducerSlot {
+    Unified(usize),
+    #[allow(dead_code)]
+    Dynamic(usize),
+}
+
 /// External registry of typed reducers. Owns closures, Access metadata,
 /// and pre-resolved ComponentIds. Composes with World + Transact strategies
 /// the same way SpatialIndex composes with World — no World API growth.
 pub struct ReducerRegistry {
     reducers: Vec<ReducerEntry>,
-    by_name: HashMap<&'static str, usize>,
+    #[allow(dead_code)]
+    dynamic_reducers: Vec<DynamicReducerEntry>,
+    by_name: HashMap<&'static str, ReducerSlot>,
 }
 
 impl ReducerRegistry {
     pub fn new() -> Self {
         Self {
             reducers: Vec::new(),
+            dynamic_reducers: Vec::new(),
             by_name: HashMap::new(),
         }
     }
@@ -721,22 +754,28 @@ impl ReducerRegistry {
     }
 
     /// Look up a transactional reducer by name. Returns `None` if the name
-    /// is not registered or points to a scheduled reducer.
+    /// is not registered, points to a scheduled reducer, or is a dynamic reducer.
     pub fn reducer_id_by_name(&self, name: &str) -> Option<ReducerId> {
-        let &idx = self.by_name.get(name)?;
-        match &self.reducers[idx].kind {
-            ReducerKind::EntityTransactional(_) => Some(ReducerId(idx)),
-            ReducerKind::Scheduled(_) => None,
+        let &slot = self.by_name.get(name)?;
+        match slot {
+            ReducerSlot::Unified(idx) => match &self.reducers[idx].kind {
+                ReducerKind::EntityTransactional(_) => Some(ReducerId(idx)),
+                ReducerKind::Scheduled(_) => None,
+            },
+            ReducerSlot::Dynamic(_) => None,
         }
     }
 
     /// Look up a scheduled query reducer by name. Returns `None` if the name
-    /// is not registered or points to a transactional reducer.
+    /// is not registered, points to a transactional reducer, or is a dynamic reducer.
     pub fn query_reducer_id_by_name(&self, name: &str) -> Option<QueryReducerId> {
-        let &idx = self.by_name.get(name)?;
-        match &self.reducers[idx].kind {
-            ReducerKind::Scheduled(_) => Some(QueryReducerId(idx)),
-            ReducerKind::EntityTransactional(_) => None,
+        let &slot = self.by_name.get(name)?;
+        match slot {
+            ReducerSlot::Unified(idx) => match &self.reducers[idx].kind {
+                ReducerKind::Scheduled(_) => Some(QueryReducerId(idx)),
+                ReducerKind::EntityTransactional(_) => None,
+            },
+            ReducerSlot::Dynamic(_) => None,
         }
     }
 
@@ -765,14 +804,14 @@ impl ReducerRegistry {
         kind: ReducerKind,
     ) -> ReducerId {
         let id = self.reducers.len();
-        if let Some(&existing) = self.by_name.get(name) {
+        if self.by_name.contains_key(name) {
             panic!(
                 "ReducerRegistry: duplicate reducer name '{}' \
                  (already registered at index {})",
-                name, existing
+                name, id
             );
         }
-        self.by_name.insert(name, id);
+        self.by_name.insert(name, ReducerSlot::Unified(id));
         self.reducers.push(ReducerEntry {
             name,
             access,
