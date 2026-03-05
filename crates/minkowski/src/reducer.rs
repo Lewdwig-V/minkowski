@@ -45,13 +45,11 @@ pub(crate) struct ResolvedComponents(pub(crate) Vec<ComponentId>);
 /// Entries sorted by TypeId for O(log n) binary search at runtime.
 pub(crate) struct DynamicResolved {
     entries: Vec<(TypeId, ComponentId)>,
-    #[allow(dead_code)]
     access: Access,
     spawn_bundles: HashSet<TypeId>,
 }
 
 impl DynamicResolved {
-    #[allow(dead_code)]
     pub(crate) fn new(
         mut entries: Vec<(TypeId, ComponentId)>,
         access: Access,
@@ -66,7 +64,6 @@ impl DynamicResolved {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn lookup<T: 'static>(&self) -> Option<ComponentId> {
         let tid = TypeId::of::<T>();
         self.entries
@@ -75,12 +72,10 @@ impl DynamicResolved {
             .map(|idx| self.entries[idx].1)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn access(&self) -> &Access {
         &self.access
     }
 
-    #[allow(dead_code)]
     pub(crate) fn has_spawn_bundle<B: 'static>(&self) -> bool {
         self.spawn_bundles.contains(&TypeId::of::<B>())
     }
@@ -101,7 +96,6 @@ pub struct DynamicCtx<'a> {
 }
 
 impl<'a> DynamicCtx<'a> {
-    #[allow(dead_code)]
     pub(crate) fn new(
         world: &'a World,
         changeset: &'a mut EnumChangeSet,
@@ -524,8 +518,8 @@ struct ReducerEntry {
     kind: ReducerKind,
 }
 
-#[allow(dead_code)]
 struct DynamicReducerEntry {
+    #[allow(dead_code)]
     name: &'static str,
     access: Access,
     resolved: DynamicResolved,
@@ -536,7 +530,6 @@ struct DynamicReducerEntry {
 #[derive(Clone, Copy)]
 enum ReducerSlot {
     Unified(usize),
-    #[allow(dead_code)]
     Dynamic(usize),
 }
 
@@ -545,7 +538,6 @@ enum ReducerSlot {
 /// the same way SpatialIndex composes with World — no World API growth.
 pub struct ReducerRegistry {
     reducers: Vec<ReducerEntry>,
-    #[allow(dead_code)]
     dynamic_reducers: Vec<DynamicReducerEntry>,
     by_name: HashMap<&'static str, ReducerSlot>,
 }
@@ -811,6 +803,43 @@ impl ReducerRegistry {
     /// Access metadata by raw index.
     pub fn access(&self, idx: usize) -> &Access {
         &self.reducers[idx].access
+    }
+
+    // ── Dynamic dispatch ────────────────────────────────────────
+
+    /// Call a dynamic reducer with a chosen transaction strategy.
+    pub fn dynamic_call<S: Transact, Args: 'static>(
+        &self,
+        strategy: &S,
+        world: &mut World,
+        id: DynamicReducerId,
+        args: &Args,
+    ) -> Result<(), Conflict> {
+        let entry = &self.dynamic_reducers[id.0];
+        let access = &entry.access;
+        let closure = &entry.closure;
+        let resolved = &entry.resolved;
+
+        strategy.transact(world, access, |tx, world| {
+            let (changeset, allocated) = tx.reducer_parts();
+            let world_ref: &World = world;
+            let mut ctx = DynamicCtx::new(world_ref, changeset, allocated, resolved);
+            closure(&mut ctx, args);
+        })
+    }
+
+    /// Look up a dynamic reducer by name.
+    pub fn dynamic_id_by_name(&self, name: &str) -> Option<DynamicReducerId> {
+        let &slot = self.by_name.get(name)?;
+        match slot {
+            ReducerSlot::Dynamic(idx) => Some(DynamicReducerId(idx)),
+            ReducerSlot::Unified(_) => None,
+        }
+    }
+
+    /// Access metadata for a dynamic reducer.
+    pub fn dynamic_access(&self, id: DynamicReducerId) -> &Access {
+        &self.dynamic_reducers[id.0].access
     }
 
     // ── Internal ─────────────────────────────────────────────────
@@ -1125,6 +1154,70 @@ mod tests {
         reducers
             .dynamic("shared_name", &mut world)
             .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+    }
+
+    // ── Dynamic dispatch tests ────────────────────────────────────
+
+    #[test]
+    fn dynamic_call_reads_and_writes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+
+        let mut reducers = ReducerRegistry::new();
+        let id = reducers
+            .dynamic("apply_vel", &mut world)
+            .can_read::<Vel>()
+            .can_write::<Pos>()
+            .build(|ctx: &mut DynamicCtx, entity: &Entity| {
+                let vel = ctx.read::<Vel>(*entity).0;
+                let pos = ctx.read::<Pos>(*entity).0;
+                ctx.write(*entity, Pos(pos + vel));
+            });
+
+        reducers
+            .dynamic_call(&strategy, &mut world, id, &e)
+            .unwrap();
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 3.0);
+    }
+
+    #[test]
+    fn dynamic_id_by_name_lookup() {
+        let mut world = World::new();
+        let mut reducers = ReducerRegistry::new();
+        let dyn_id = reducers
+            .dynamic("my_dyn", &mut world)
+            .can_read::<Pos>()
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+        reducers.register_entity::<(Health,), (), _>(&mut world, "entity_one", |_e, ()| {});
+
+        // Dynamic lookup finds dynamic reducer
+        assert_eq!(reducers.dynamic_id_by_name("my_dyn"), Some(dyn_id));
+        // Dynamic lookup does not find unified reducer
+        assert_eq!(reducers.dynamic_id_by_name("entity_one"), None);
+        // Dynamic lookup does not find nonexistent
+        assert_eq!(reducers.dynamic_id_by_name("nope"), None);
+        // Unified lookup does not find dynamic reducer
+        assert_eq!(reducers.reducer_id_by_name("my_dyn"), None);
+    }
+
+    #[test]
+    fn dynamic_access_metadata() {
+        let mut world = World::new();
+        let mut reducers = ReducerRegistry::new();
+        let id = reducers
+            .dynamic("test_access", &mut world)
+            .can_read::<Pos>()
+            .can_write::<Vel>()
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let vel_id = world.components.id::<Vel>().unwrap();
+        let access = reducers.dynamic_access(id);
+        assert!(access.reads()[pos_id]);
+        assert!(access.reads()[vel_id]);
+        assert!(access.writes()[vel_id]);
+        assert!(!access.writes()[pos_id]);
     }
 
     // ── ComponentSet tests ──────────────────────────────────────
