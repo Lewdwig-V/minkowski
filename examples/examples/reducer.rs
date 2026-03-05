@@ -10,6 +10,7 @@
 //! 6. Name-based lookup
 //! 7. Access conflict detection between registered reducers
 //! 8. Dynamic reducer — conditional access based on runtime state
+//! 9. Structural mutations — despawn via dynamic for_each iteration
 
 use minkowski::{
     DynamicCtx, Entity, EntityMut, Optimistic, QueryMut, QueryRef, QueryWriter, ReducerRegistry,
@@ -238,7 +239,47 @@ fn main() {
     let found_shield = registry.dynamic_id_by_name("conditional_shield");
     println!("Dynamic lookup 'conditional_shield' -> {:?}", found_shield);
 
-    // ── 9. Access conflict detection (static vs dynamic) ───────────
+    // ── 9. Structural mutations — remove + despawn ───────────────
+    println!("\n--- Structural mutations ---");
+
+    // Damage enemy to 0 HP for the despawn demo
+    registry
+        .call(&strategy, &mut world, damage_id, (enemy, 20u32))
+        .unwrap();
+    println!(
+        "After extra damage: enemy hp={}",
+        world.get::<Health>(enemy).unwrap().0
+    );
+
+    // Dynamic reducer that despawns dead entities using for_each
+    let reaper_id = registry
+        .dynamic("reaper", &mut world)
+        .can_read::<Health>()
+        .can_despawn()
+        .build(|ctx: &mut DynamicCtx, _args: &()| {
+            let mut to_despawn = Vec::new();
+            ctx.for_each::<(Entity, &Health)>(|(entity, health)| {
+                if health.0 == 0 {
+                    to_despawn.push(entity);
+                }
+            });
+            for entity in to_despawn {
+                ctx.despawn(entity);
+                println!("  [reaper] despawned {:?}", entity);
+            }
+        });
+    println!("Registered 'reaper' dynamic reducer (id={:?})", reaper_id);
+
+    registry
+        .dynamic_call(&strategy, &mut world, reaper_id, &())
+        .unwrap();
+    println!(
+        "After reaper: hero alive={}, enemy alive={}",
+        world.is_alive(hero),
+        world.is_alive(enemy),
+    );
+
+    // ── 10. Access conflict detection (static vs dynamic) ──────────
     println!("\n--- Access conflict detection ---");
     let heal_access = registry.reducer_access(heal_id);
     let damage_access = registry.reducer_access(damage_id);
@@ -292,6 +333,24 @@ fn main() {
             "CONFLICT"
         } else {
             "compatible (disjoint components)"
+        }
+    );
+
+    let reaper_access = registry.dynamic_access(reaper_id);
+    println!(
+        "reaper vs heal: {}",
+        if reaper_access.conflicts_with(heal_access) {
+            "CONFLICT (reaper despawns, heal reads Health)"
+        } else {
+            "compatible"
+        }
+    );
+    println!(
+        "reaper vs gravity: {}",
+        if reaper_access.conflicts_with(gravity_access) {
+            "CONFLICT (reaper despawns, gravity writes Velocity)"
+        } else {
+            "compatible"
         }
     );
 
