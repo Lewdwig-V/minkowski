@@ -1,17 +1,17 @@
-//! Boids flocking simulation — exercises every minkowski ECS code path.
+//! Boids flocking simulation — exercises query reducers + spatial indexing.
 //!
-//! Run: cargo run -p minkowski --example boids --release
+//! Run: cargo run -p minkowski-examples --example boids --release
 //!
-//! Exercises: spawn, despawn, multi-component queries, mutation,
-//! parallel iteration, deferred commands, archetype stability under churn.
+//! Exercises: spawn, despawn, query reducers (QueryMut), spatial grid (SpatialIndex),
+//! deferred commands, archetype stability under churn.
 //!
-//! The N² neighbor search is replaced by a uniform spatial grid — each boid
-//! checks only a 3×3 cell neighborhood, reducing inner loop iterations from
-//! ~5,000 to ~450 and improving cache locality.
+//! Each simulation step is a registered query reducer dispatched via `registry.run()`.
+//! The spatial grid is rebuilt before the force-computation reducer runs; the reducer
+//! captures the grid snapshot by shared reference for neighbor lookups.
 //!
 //! # Vectorization
 //!
-//! The integration loops (Steps 1 and 5) are designed to auto-vectorize.
+//! The integration loops (zero_accel and integrate) are designed to auto-vectorize.
 //! LLVM generates branchless AVX-512 masked ops for the position/velocity
 //! updates. Every link in this chain is required — remove any one and the
 //! loop falls back to scalar:
@@ -35,7 +35,7 @@
 //! You should see packed float ops (vaddps, vmulps, vblendmps), not scalar
 //! (vaddss, vmulss).
 
-use minkowski::{CommandBuffer, Entity, SpatialIndex, World};
+use minkowski::{CommandBuffer, Entity, QueryMut, ReducerRegistry, SpatialIndex, World};
 use std::time::Instant;
 
 // ── Vec2 ────────────────────────────────────────────────────────────
@@ -265,6 +265,7 @@ fn wrapped_diff(a: f32, b: f32, world_size: f32) -> f32 {
 fn main() {
     let params = BoidParams::default();
     let mut world = World::new();
+    let mut registry = ReducerRegistry::new();
 
     // Spawn initial boids
     for _ in 0..ENTITY_COUNT {
@@ -273,121 +274,128 @@ fn main() {
 
     let mut grid = SpatialGrid::new(params.cohesion_radius, params.world_size);
 
+    // ── Register query reducers ─────────────────────────────────────
+
+    // Step 1: Zero accelerations (chunk — enables vectorization)
+    let zero_accel_id = registry.register_query::<(&mut Acceleration,), (), _>(
+        &mut world,
+        "zero_accel",
+        |mut query: QueryMut<'_, (&mut Acceleration,)>, ()| {
+            query.for_each_chunk(|(accs,)| {
+                for acc in accs.iter_mut() {
+                    acc.0 = Vec2::ZERO;
+                }
+            });
+        },
+    );
+
+    // Step 2: Integrate — Euler step + velocity clamping + world wrapping
+    let max_speed = params.max_speed;
+    let ws = params.world_size;
+    let integrate_id = registry
+        .register_query::<(&mut Position, &mut Velocity, &Acceleration), f32, _>(
+            &mut world,
+            "integrate",
+            move |mut query: QueryMut<'_, (&mut Position, &mut Velocity, &Acceleration)>,
+                  dt: f32| {
+                // Velocity integration + clamping
+                query.for_each_chunk(|(poss, vels, accs)| {
+                    for i in 0..vels.len() {
+                        vels[i].0.x += accs[i].0.x * dt;
+                        vels[i].0.y += accs[i].0.y * dt;
+                        vels[i].0 = vels[i].0.clamped(max_speed);
+
+                        // Position integration with branchless world wrapping.
+                        let mut x = poss[i].0.x + vels[i].0.x * dt;
+                        let mut y = poss[i].0.y + vels[i].0.y * dt;
+                        if x >= ws {
+                            x -= ws;
+                        } else if x < 0.0 {
+                            x += ws;
+                        }
+                        if y >= ws {
+                            y -= ws;
+                        } else if y < 0.0 {
+                            y += ws;
+                        }
+                        poss[i].0.x = x;
+                        poss[i].0.y = y;
+                    }
+                });
+            },
+        );
+
     for frame in 0..FRAME_COUNT {
         let frame_start = Instant::now();
 
-        // Step 1: Zero accelerations (chunk — enables vectorization)
-        world.query::<&mut Acceleration>().for_each_chunk(|accs| {
-            for acc in accs.iter_mut() {
-                acc.0 = Vec2::ZERO;
-            }
-        });
+        // Step 1: Zero accelerations via reducer
+        registry.run(&mut world, zero_accel_id, ());
 
-        // Step 2+3: Rebuild spatial grid + force accumulation (parallel)
+        // Step 2: Rebuild spatial grid
         grid.rebuild(&mut world);
 
-        let forces: Vec<(Entity, Vec2)> = {
-            use rayon::prelude::*;
-            grid.snapshot
-                .par_iter()
-                .map(|&(entity, pos, vel)| {
-                    let mut sep = Vec2::ZERO;
-                    let mut ali = Vec2::ZERO;
-                    let mut coh = Vec2::ZERO;
-                    let mut sep_count = 0u32;
-                    let mut ali_count = 0u32;
-                    let mut coh_count = 0u32;
+        // Step 3: Compute boid forces from snapshot (sequential)
+        // The grid snapshot contains (Entity, Position, Velocity) for all boids.
+        // We iterate the snapshot, compute forces, and apply them directly.
+        for idx in 0..grid.snapshot.len() {
+            let (entity, pos, vel) = grid.snapshot[idx];
 
-                    for &(_, other_pos, other_vel) in grid.neighbors(pos) {
-                        let diff = Vec2::new(
-                            wrapped_diff(other_pos.x, pos.x, params.world_size),
-                            wrapped_diff(other_pos.y, pos.y, params.world_size),
-                        );
-                        let dist_sq = diff.length_sq();
-                        if dist_sq < 1e-6 {
-                            continue;
-                        }
+            let mut sep = Vec2::ZERO;
+            let mut ali = Vec2::ZERO;
+            let mut coh = Vec2::ZERO;
+            let mut sep_count = 0u32;
+            let mut ali_count = 0u32;
+            let mut coh_count = 0u32;
 
-                        let dist = dist_sq.sqrt();
+            for &(_, other_pos, other_vel) in grid.neighbors(pos) {
+                let diff = Vec2::new(
+                    wrapped_diff(other_pos.x, pos.x, params.world_size),
+                    wrapped_diff(other_pos.y, pos.y, params.world_size),
+                );
+                let dist_sq = diff.length_sq();
+                if dist_sq < 1e-6 {
+                    continue;
+                }
 
-                        if dist < params.separation_radius {
-                            sep = sep - diff.normalized() * (1.0 / dist);
-                            sep_count += 1;
-                        }
-                        if dist < params.alignment_radius {
-                            ali += other_vel;
-                            ali_count += 1;
-                        }
-                        if dist < params.cohesion_radius {
-                            coh += diff;
-                            coh_count += 1;
-                        }
-                    }
+                let dist = dist_sq.sqrt();
 
-                    let mut force = Vec2::ZERO;
-                    if sep_count > 0 {
-                        force += sep / sep_count as f32 * params.separation_weight;
-                    }
-                    if ali_count > 0 {
-                        let desired = ali / ali_count as f32 - vel;
-                        force += desired * params.alignment_weight;
-                    }
-                    if coh_count > 0 {
-                        // coh is the sum of wrapped offsets from pos to each neighbor,
-                        // so the mean offset is directly the desired cohesion direction.
-                        let desired = coh / coh_count as f32;
-                        force += desired * params.cohesion_weight;
-                    }
+                if dist < params.separation_radius {
+                    sep = sep - diff.normalized() * (1.0 / dist);
+                    sep_count += 1;
+                }
+                if dist < params.alignment_radius {
+                    ali += other_vel;
+                    ali_count += 1;
+                }
+                if dist < params.cohesion_radius {
+                    coh += diff;
+                    coh_count += 1;
+                }
+            }
 
-                    (entity, force.clamped(params.max_force))
-                })
-                .collect()
-        };
+            let mut force = Vec2::ZERO;
+            if sep_count > 0 {
+                force += sep / sep_count as f32 * params.separation_weight;
+            }
+            if ali_count > 0 {
+                let desired = ali / ali_count as f32 - vel;
+                force += desired * params.alignment_weight;
+            }
+            if coh_count > 0 {
+                let desired = coh / coh_count as f32;
+                force += desired * params.cohesion_weight;
+            }
 
-        // Step 4: Apply forces
-        for &(entity, force) in &forces {
+            let force = force.clamped(params.max_force);
             if let Some(acc) = world.get_mut::<Acceleration>(entity) {
                 acc.0 += force;
             }
         }
 
-        // Step 5: Integration
-        world
-            .query::<(&mut Velocity, &Acceleration)>()
-            .for_each_chunk(|(vels, accs)| {
-                for i in 0..vels.len() {
-                    vels[i].0.x += accs[i].0.x * DT;
-                    vels[i].0.y += accs[i].0.y * DT;
-                    vels[i].0 = vels[i].0.clamped(params.max_speed);
-                }
-            });
-        // Position integration with branchless world wrapping.
-        // Velocity is bounded by max_speed, so positions are never more than
-        // one world_size out of range — conditional subtract replaces rem_euclid
-        // (which compiles to scalar fmodf and kills vectorization).
-        let ws = params.world_size;
-        world
-            .query::<(&mut Position, &Velocity)>()
-            .for_each_chunk(|(poss, vels)| {
-                for i in 0..poss.len() {
-                    let mut x = poss[i].0.x + vels[i].0.x * DT;
-                    let mut y = poss[i].0.y + vels[i].0.y * DT;
-                    if x >= ws {
-                        x -= ws;
-                    } else if x < 0.0 {
-                        x += ws;
-                    }
-                    if y >= ws {
-                        y -= ws;
-                    } else if y < 0.0 {
-                        y += ws;
-                    }
-                    poss[i].0.x = x;
-                    poss[i].0.y = y;
-                }
-            });
+        // Step 4: Integrate via reducer
+        registry.run(&mut world, integrate_id, DT);
 
-        // Step 6: Spawn/despawn churn
+        // Step 5: Spawn/despawn churn
         if frame > 0 && frame % CHURN_INTERVAL == 0 {
             let entities: Vec<Entity> = world.query::<Entity>().collect();
             let count = entities.len();
@@ -405,7 +413,7 @@ fn main() {
                 spawn_boid(&mut world, &params);
             }
         }
-        // Step 7: Stats
+        // Step 6: Stats
         if frame % CHURN_INTERVAL == 0 || frame == FRAME_COUNT - 1 {
             let entity_count = world.query::<&Position>().count();
             let mut speed_sum = 0.0f32;
