@@ -51,7 +51,6 @@ pub(crate) struct DynamicResolved {
     entries: Vec<(TypeId, ComponentId)>,
     access: Access,
     spawn_bundles: HashSet<TypeId>,
-    #[allow(dead_code)]
     remove_ids: HashSet<TypeId>,
 }
 
@@ -94,7 +93,6 @@ impl DynamicResolved {
         self.spawn_bundles.contains(&TypeId::of::<B>())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn has_remove<T: 'static>(&self) -> bool {
         self.remove_ids.contains(&TypeId::of::<T>())
     }
@@ -218,6 +216,58 @@ impl<'a> DynamicCtx<'a> {
         self.changeset
             .spawn_bundle_raw(entity, &self.world.components, bundle);
         entity
+    }
+
+    /// Buffer a component removal. The removal is applied on commit
+    /// (archetype migration). Panics if T was not declared via `can_remove`.
+    pub fn remove<T: crate::component::Component>(&mut self, entity: Entity) {
+        let comp_id = self.resolved.lookup::<T>().unwrap_or_else(|| {
+            panic!(
+                "component {} not declared in dynamic reducer (use can_remove)",
+                std::any::type_name::<T>()
+            )
+        });
+        assert!(
+            self.resolved.has_remove::<T>(),
+            "component {} not declared for removal in dynamic reducer \
+             (use can_remove, not can_read/can_write)",
+            std::any::type_name::<T>()
+        );
+        self.changeset.record_remove(entity, comp_id);
+    }
+
+    /// Try to buffer a component removal. Returns `false` if the entity
+    /// does not currently have the component. Panics if T was not declared
+    /// via `can_remove`.
+    pub fn try_remove<T: crate::component::Component>(&mut self, entity: Entity) -> bool {
+        let comp_id = self.resolved.lookup::<T>().unwrap_or_else(|| {
+            panic!(
+                "component {} not declared in dynamic reducer (use can_remove)",
+                std::any::type_name::<T>()
+            )
+        });
+        assert!(
+            self.resolved.has_remove::<T>(),
+            "component {} not declared for removal in dynamic reducer \
+             (use can_remove, not can_read/can_write)",
+            std::any::type_name::<T>()
+        );
+        if self.world.get_by_id::<T>(entity, comp_id).is_some() {
+            self.changeset.record_remove(entity, comp_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Buffer an entity despawn. The entity is destroyed on commit.
+    /// Panics if `can_despawn()` was not declared on the builder.
+    pub fn despawn(&mut self, entity: Entity) {
+        assert!(
+            self.resolved.access().despawns(),
+            "despawn not declared in dynamic reducer (use can_despawn)"
+        );
+        self.changeset.record_despawn(entity);
     }
 }
 
@@ -1786,6 +1836,100 @@ mod tests {
         let dyn_access = registry.dynamic_access(dyn_id);
         let entity_access = registry.reducer_access(entity_id);
         assert!(dyn_access.conflicts_with(entity_access));
+    }
+
+    // ── DynamicCtx structural mutation tests ─────────────────────
+
+    #[test]
+    fn dynamic_ctx_remove_buffers_mutation() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("strip_vel", &mut world)
+            .can_read::<Pos>()
+            .can_remove::<Vel>()
+            .build(|ctx: &mut DynamicCtx, entity: &Entity| {
+                ctx.remove::<Vel>(*entity);
+            });
+        registry
+            .dynamic_call(&strategy, &mut world, id, &e)
+            .unwrap();
+        assert!(world.get::<Vel>(e).is_none());
+        assert!(world.get::<Pos>(e).is_some());
+    }
+
+    #[test]
+    fn dynamic_ctx_try_remove_returns_false_when_missing() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let result = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let result_clone = result.clone();
+        let id = registry
+            .dynamic("try_strip", &mut world)
+            .can_remove::<Vel>()
+            .build(move |ctx: &mut DynamicCtx, entity: &Entity| {
+                let removed = ctx.try_remove::<Vel>(*entity);
+                result_clone.store(removed, std::sync::atomic::Ordering::Relaxed);
+            });
+        registry
+            .dynamic_call(&strategy, &mut world, id, &e)
+            .unwrap();
+        assert!(!result.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    #[should_panic(expected = "not declared")]
+    fn dynamic_ctx_remove_undeclared_panics() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("bad_remove", &mut world)
+            .can_read::<Pos>()
+            .build(|ctx: &mut DynamicCtx, entity: &Entity| {
+                ctx.remove::<Vel>(*entity);
+            });
+        let _ = registry.dynamic_call(&strategy, &mut world, id, &e);
+    }
+
+    #[test]
+    fn dynamic_ctx_despawn_buffers_mutation() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("killer", &mut world)
+            .can_read::<Health>()
+            .can_despawn()
+            .build(|ctx: &mut DynamicCtx, entity: &Entity| {
+                ctx.despawn(*entity);
+            });
+        registry
+            .dynamic_call(&strategy, &mut world, id, &e)
+            .unwrap();
+        assert!(!world.is_alive(e));
+    }
+
+    #[test]
+    #[should_panic(expected = "can_despawn")]
+    fn dynamic_ctx_despawn_without_declaration_panics() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("bad_despawn", &mut world)
+            .can_read::<Pos>()
+            .build(|ctx: &mut DynamicCtx, entity: &Entity| {
+                ctx.despawn(*entity);
+            });
+        let _ = registry.dynamic_call(&strategy, &mut world, id, &e);
     }
 
     // ── Debug assertion tests ────────────────────────────────────
