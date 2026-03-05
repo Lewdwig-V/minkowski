@@ -3,12 +3,12 @@
 //! Demonstrates the full persistence lifecycle:
 //! 1. Create a world and spawn entities
 //! 2. Save a snapshot
-//! 3. Apply mutations via durable transactions (WAL-backed)
+//! 3. Apply mutations via a durable QueryWriter reducer (WAL-backed)
 //! 4. Recover from snapshot + WAL replay
 //!
 //! Run: cargo run -p minkowski-examples --example persist --release
 
-use minkowski::{Access, Optimistic, Transact, World};
+use minkowski::{Optimistic, QueryWriter, ReducerRegistry, World};
 use minkowski_persist::{Bincode, CodecRegistry, Durable, Snapshot, Wal};
 use serde::{Deserialize, Serialize};
 
@@ -62,32 +62,28 @@ fn main() {
         header.entity_count, header.archetype_count, header.wal_seq
     );
 
-    // -- Phase 3: Durable transactions --
-    println!("Phase 3: Simulating 10 frames (durable transactions)...");
+    // -- Phase 3: Durable transactions via QueryWriter reducer --
+    println!("Phase 3: Simulating 10 frames (durable QueryWriter reducer)...");
     let strategy = Optimistic::new(&world);
     let durable = Durable::new(strategy, wal, codecs);
 
-    let access = Access::of::<(minkowski::Entity, &Pos, &Vel, &mut Pos)>(&mut world);
-    for frame in 0..10 {
-        durable
-            .transact(&mut world, &access, |tx, world| {
-                let updates: Vec<_> = tx
-                    .query::<(minkowski::Entity, &Pos, &Vel)>(world)
-                    .map(|(e, p, v)| {
-                        (
-                            e,
-                            Pos {
-                                x: p.x + v.dx,
-                                y: p.y + v.dy,
-                            },
-                        )
-                    })
-                    .collect();
+    let mut registry = ReducerRegistry::new();
+    let writer_id = registry.register_query_writer::<(&mut Pos, &Vel), f32, _>(
+        &mut world,
+        "apply_velocity",
+        |mut query: QueryWriter<'_, (&mut Pos, &Vel)>, dt: f32| {
+            query.for_each(|(mut pos, vel)| {
+                pos.modify(|p| {
+                    p.x += vel.dx * dt;
+                    p.y += vel.dy * dt;
+                });
+            });
+        },
+    );
 
-                for (e, new_pos) in updates {
-                    tx.write::<Pos>(world, e, new_pos);
-                }
-            })
+    for frame in 0..10 {
+        registry
+            .call(&durable, &mut world, writer_id, 1.0f32)
             .unwrap();
 
         if frame == 0 || frame == 9 {
