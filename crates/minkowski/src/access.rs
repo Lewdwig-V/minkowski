@@ -38,6 +38,7 @@ use crate::world::World;
 pub struct Access {
     reads: FixedBitSet,
     writes: FixedBitSet,
+    despawns: bool,
 }
 
 impl Access {
@@ -65,7 +66,11 @@ impl Access {
             writes
         };
 
-        Self { reads, writes }
+        Self {
+            reads,
+            writes,
+            despawns: false,
+        }
     }
 
     /// Create an empty access set (no reads, no writes).
@@ -73,6 +78,7 @@ impl Access {
         Self {
             reads: FixedBitSet::new(),
             writes: FixedBitSet::new(),
+            despawns: false,
         }
     }
 
@@ -88,13 +94,32 @@ impl Access {
         self.writes.insert(id);
     }
 
-    /// Merge two access sets: union of reads, union of writes.
+    /// True if this access set includes the despawn capability.
+    pub fn despawns(&self) -> bool {
+        self.despawns
+    }
+
+    /// Mark this access set as including despawn capability.
+    pub fn set_despawns(&mut self) {
+        self.despawns = true;
+    }
+
+    /// True if this access set touches any component (reads or writes).
+    pub fn has_any_access(&self) -> bool {
+        self.reads.ones().next().is_some() || self.writes.ones().next().is_some()
+    }
+
+    /// Merge two access sets: union of reads, union of writes, OR of despawns.
     pub fn merge(&self, other: &Access) -> Access {
         let mut reads = self.reads.clone();
         let mut writes = self.writes.clone();
         reads.union_with(&other.reads);
         writes.union_with(&other.writes);
-        Access { reads, writes }
+        Access {
+            reads,
+            writes,
+            despawns: self.despawns || other.despawns,
+        }
     }
 
     /// Components this query reads but does not write.
@@ -122,6 +147,13 @@ impl Access {
         // Does other write anything self reads?
         // (other writes ∩ self writes already covered above)
         if other.writes.intersection(&self.reads).next().is_some() {
+            return true;
+        }
+        // Despawn conflicts with any component access on the other side
+        if self.despawns && other.has_any_access() {
+            return true;
+        }
+        if other.despawns && self.has_any_access() {
             return true;
         }
         false
@@ -299,5 +331,90 @@ mod tests {
         let regen = Access::of::<(&mut Health,)>(&mut world);
         // These touch completely different components
         assert!(!movement.conflicts_with(&regen));
+    }
+
+    // ── Despawn flag tests ──────────────────────────────────────
+
+    #[test]
+    fn despawn_flag_default_false() {
+        let a = Access::empty();
+        assert!(!a.despawns());
+    }
+
+    #[test]
+    fn set_despawns() {
+        let mut a = Access::empty();
+        a.set_despawns();
+        assert!(a.despawns());
+    }
+
+    #[test]
+    fn has_any_access_empty() {
+        let a = Access::empty();
+        assert!(!a.has_any_access());
+    }
+
+    #[test]
+    fn has_any_access_with_read() {
+        let mut a = Access::empty();
+        a.add_read(0);
+        assert!(a.has_any_access());
+    }
+
+    #[test]
+    fn has_any_access_with_write() {
+        let mut a = Access::empty();
+        a.add_write(0);
+        assert!(a.has_any_access());
+    }
+
+    #[test]
+    fn despawn_conflicts_with_reader() {
+        let mut a = Access::empty();
+        a.set_despawns();
+        let mut b = Access::empty();
+        b.add_read(0);
+        assert!(a.conflicts_with(&b));
+        assert!(b.conflicts_with(&a));
+    }
+
+    #[test]
+    fn despawn_conflicts_with_writer() {
+        let mut a = Access::empty();
+        a.set_despawns();
+        let mut b = Access::empty();
+        b.add_write(0);
+        assert!(a.conflicts_with(&b));
+        assert!(b.conflicts_with(&a));
+    }
+
+    #[test]
+    fn despawn_no_conflict_with_empty() {
+        let mut a = Access::empty();
+        a.set_despawns();
+        let b = Access::empty();
+        assert!(!a.conflicts_with(&b));
+        assert!(!b.conflicts_with(&a));
+    }
+
+    #[test]
+    fn two_despawners_with_reads_conflict() {
+        let mut a = Access::empty();
+        a.set_despawns();
+        a.add_read(0);
+        let mut b = Access::empty();
+        b.set_despawns();
+        b.add_read(1);
+        assert!(a.conflicts_with(&b));
+        assert!(b.conflicts_with(&a));
+    }
+
+    #[test]
+    fn despawn_merge_preserves_flag() {
+        let mut a = Access::empty();
+        a.set_despawns();
+        let b = Access::empty();
+        let merged = a.merge(&b);
+        assert!(merged.despawns());
     }
 }
