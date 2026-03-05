@@ -166,7 +166,28 @@ Typed reducers narrow what a closure *can* touch so that conflict freedom is pro
   6. Can a type bound be violated by a legal generic instantiation?
   7. Does the API surface of this handle permit any operation not covered by the Access bitset?
 - **Transaction safety invariants**: any query path reachable from `&World` must be bounded by `ReadOnlyWorldQuery`. Any shared structure between World and a strategy uses `Arc` with a `WorldId` check at every entry point. Lock privilege in a `ColumnLockSet` can only escalate, never downgrade. Drop is the abort path — if a transaction can allocate engine resources (entity IDs, locks), it must be able to release them from Drop without `&mut World`, which means those resources route through interior-mutable shared handles (`OrphanQueue`, `Mutex<ColumnLockTable>`).
+- **Verify-before-design rule**: before designing features that depend on existing APIs, `grep` for the actual current methods/types. Confirm which ones exist vs which need to be created. Past bugs: assuming `EntityAllocator::reserve()` had atomics (it didn't exist), proposing `&mut World` in reducer APIs (unsound). The type system doesn't catch "assumed this method exists" — verification does.
+- **Derive macro visibility rule**: after implementing or modifying derive macros or code generation, always test the generated code from an external example/binary target (`minkowski-examples`) to verify `pub` vs `pub(crate)` visibility is correct. In-crate tests won't catch `pub(crate)` leaking into generated code.
+- **Change detection audit rule**: when implementing change detection or mutation tracking, enumerate ALL mutation paths (spawn, get_mut, insert, remove, query `&mut T`, query_table_mut, query_table_raw, changeset apply, any new accessor) and verify each path triggers detection. Consider same-tick interleaving edge cases where two mutations in the same tick must both be visible.
+- **Bug fix workflow rule**: when a specific bug is reported, address it directly with targeted investigation — don't route through brainstorming or design exploration workflows. Brainstorming is for new features and design decisions, not concrete bugs with reproduction steps.
 - **Drop cleanup rule**: if Drop needs to clean up engine state, the cleanup path must be reachable from `&self`. This constrains where state can live. If it's on World, Drop can't reach it. If it's behind `Arc<Mutex<_>>` shared between World and the transaction, Drop can. Every future resource that transactions can allocate — entity IDs, archetype slots, reserved capacity — must follow this pattern or it will leak on abort.
+
+# Unifying principle behind every ID type in the system:
+
+| Type | Proof at construction | Residue after erasure |
+|---|---|---|
+| `ComponentId` | `T: Component`, layout, drop fn | `u32` |
+| `ArchetypeId` | Sorted component set, column allocation | `u32` |
+| `Entity` | Generational uniqueness, archetype placement | `u64` |
+| `ReducerId` | Typed closure, access set, resolved components, args type | `usize` |
+| `QueryReducerId` | `WorldQuery` bound, column access pattern | `usize` |
+| `WorldId` | Unique allocator identity | `u64` |
+| `TxId` | Transaction lifecycle, cleanup registration | `u64` |
+| `ChangeTick` | Monotonic ordering, causal relationship | `u64` |
+
+Every one of these is a small integer that stands in for a proof the type system already verified. The runtime never re-checks the proof — it trusts the integer because the only way to obtain it was through a typed construction path that enforced the invariants.
+
+The corollary is that forging an ID — constructing one from a raw integer without going through the typed path — is the one thing that can violate the system's guarantees. Which is why all the constructors are `pub(crate)` or behind registration APIs. The user can hold IDs, copy them, store them, send them. They can't fabricate them. The type system did its work at the gate and the ID is the stamp that says "verified."
 
 ## Dependencies
 
