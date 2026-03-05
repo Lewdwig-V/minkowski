@@ -86,6 +86,127 @@ impl DynamicResolved {
     }
 }
 
+// ── DynamicCtx ───────────────────────────────────────────────────────
+
+/// Runtime context for dynamic reducer closures. Provides component
+/// access gated by the builder-declared upper bounds in `DynamicResolved`.
+///
+/// Reads go directly to World; writes buffer into an `EnumChangeSet`
+/// applied atomically on commit.
+pub struct DynamicCtx<'a> {
+    world: &'a World,
+    changeset: &'a mut EnumChangeSet,
+    allocated: &'a mut Vec<Entity>,
+    resolved: &'a DynamicResolved,
+}
+
+impl<'a> DynamicCtx<'a> {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        world: &'a World,
+        changeset: &'a mut EnumChangeSet,
+        allocated: &'a mut Vec<Entity>,
+        resolved: &'a DynamicResolved,
+    ) -> Self {
+        Self {
+            world,
+            changeset,
+            allocated,
+            resolved,
+        }
+    }
+
+    /// Read a component from an entity. Panics if the component type was
+    /// not declared via `can_read` / `can_write`, or if the entity does
+    /// not have the component.
+    pub fn read<T: crate::component::Component>(&self, entity: Entity) -> &T {
+        let comp_id = self.resolved.lookup::<T>().unwrap_or_else(|| {
+            panic!(
+                "component {} not declared in dynamic reducer (use can_read/can_write)",
+                std::any::type_name::<T>()
+            )
+        });
+        self.world
+            .get_by_id::<T>(entity, comp_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "component {} missing on entity {:?}",
+                    std::any::type_name::<T>(),
+                    entity,
+                )
+            })
+    }
+
+    /// Try to read a component. Returns `None` if the entity doesn't have it.
+    /// Panics if the component type was not declared.
+    pub fn try_read<T: crate::component::Component>(&self, entity: Entity) -> Option<&T> {
+        let comp_id = self.resolved.lookup::<T>().unwrap_or_else(|| {
+            panic!(
+                "component {} not declared in dynamic reducer (use can_read/can_write)",
+                std::any::type_name::<T>()
+            )
+        });
+        self.world.get_by_id::<T>(entity, comp_id)
+    }
+
+    /// Buffer a component write. The value is applied on commit.
+    /// Panics in debug mode if the component was only declared as readable.
+    pub fn write<T: crate::component::Component>(&mut self, entity: Entity, value: T) {
+        let comp_id = self.resolved.lookup::<T>().unwrap_or_else(|| {
+            panic!(
+                "component {} not declared in dynamic reducer (use can_write)",
+                std::any::type_name::<T>()
+            )
+        });
+        debug_assert!(
+            self.resolved.access().writes().contains(comp_id),
+            "component {} declared as read-only, not writable \
+             (use can_write instead of can_read)",
+            std::any::type_name::<T>()
+        );
+        self.changeset.insert_raw(entity, comp_id, value);
+    }
+
+    /// Buffer a component write only if the entity currently has that component.
+    /// Returns `true` if the write was buffered.
+    pub fn try_write<T: crate::component::Component>(&mut self, entity: Entity, value: T) -> bool {
+        let comp_id = self.resolved.lookup::<T>().unwrap_or_else(|| {
+            panic!(
+                "component {} not declared in dynamic reducer (use can_write)",
+                std::any::type_name::<T>()
+            )
+        });
+        debug_assert!(
+            self.resolved.access().writes().contains(comp_id),
+            "component {} declared as read-only, not writable \
+             (use can_write instead of can_read)",
+            std::any::type_name::<T>()
+        );
+        if self.world.get_by_id::<T>(entity, comp_id).is_some() {
+            self.changeset.insert_raw(entity, comp_id, value);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Spawn an entity with a bundle. The bundle type must have been declared
+    /// via `can_spawn` on the builder.
+    pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
+        debug_assert!(
+            self.resolved.has_spawn_bundle::<B>(),
+            "bundle {} not declared for spawning in dynamic reducer \
+             (use can_spawn)",
+            std::any::type_name::<B>()
+        );
+        let entity = self.world.entities.reserve();
+        self.allocated.push(entity);
+        self.changeset
+            .spawn_bundle_raw(entity, &self.world.components, bundle);
+        entity
+    }
+}
+
 // ── Macro ────────────────────────────────────────────────────────────
 
 macro_rules! impl_component_set {
@@ -716,6 +837,87 @@ mod tests {
         let resolved = DynamicResolved::new(vec![], Access::empty(), bundles);
         assert!(resolved.has_spawn_bundle::<(Pos, Vel)>());
         assert!(!resolved.has_spawn_bundle::<(Health,)>());
+    }
+
+    // ── DynamicCtx tests ──────────────────────────────────────
+
+    #[test]
+    fn dynamic_ctx_read() {
+        use std::any::TypeId;
+        let mut world = World::new();
+        let pos_id = world.register_component::<Pos>();
+        let e = world.spawn((Pos(42.0),));
+
+        let entries = vec![(TypeId::of::<Pos>(), pos_id)];
+        let mut access = Access::empty();
+        access.add_read(pos_id);
+        let resolved = DynamicResolved::new(entries, access, Default::default());
+
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
+        assert_eq!(ctx.read::<Pos>(e).0, 42.0);
+    }
+
+    #[test]
+    fn dynamic_ctx_try_read_none() {
+        use std::any::TypeId;
+        let mut world = World::new();
+        let pos_id = world.register_component::<Pos>();
+        let vel_id = world.register_component::<Vel>();
+        let e = world.spawn((Pos(1.0),)); // no Vel
+
+        let entries = vec![(TypeId::of::<Pos>(), pos_id), (TypeId::of::<Vel>(), vel_id)];
+        let mut access = Access::empty();
+        access.add_read(pos_id);
+        access.add_read(vel_id);
+        let resolved = DynamicResolved::new(entries, access, Default::default());
+
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
+        assert!(ctx.try_read::<Pos>(e).is_some());
+        assert!(ctx.try_read::<Vel>(e).is_none());
+    }
+
+    #[test]
+    fn dynamic_ctx_write_buffers() {
+        use std::any::TypeId;
+        let mut world = World::new();
+        let pos_id = world.register_component::<Pos>();
+        let e = world.spawn((Pos(1.0),));
+
+        let entries = vec![(TypeId::of::<Pos>(), pos_id)];
+        let mut access = Access::empty();
+        access.add_write(pos_id);
+        let resolved = DynamicResolved::new(entries, access, Default::default());
+
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        {
+            let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
+            ctx.write(e, Pos(99.0));
+        }
+        // Not yet applied
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 1.0);
+        // Apply changeset
+        let _reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 99.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "not declared")]
+    fn dynamic_ctx_read_undeclared_panics() {
+        let mut world = World::new();
+        world.register_component::<Pos>();
+        let e = world.spawn((Pos(1.0),));
+
+        // Empty resolved — no components declared
+        let resolved = DynamicResolved::new(vec![], Access::empty(), Default::default());
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
+        let _ = ctx.read::<Pos>(e);
     }
 
     // ── ComponentSet tests ──────────────────────────────────────
