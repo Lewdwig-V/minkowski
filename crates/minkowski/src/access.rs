@@ -8,7 +8,8 @@ use crate::world::World;
 ///
 /// Used by external schedulers to detect conflicts between systems.
 /// Two accesses conflict if either writes a component the other reads or writes
-/// (standard read-write lock rule, applied per component).
+/// (standard read-write lock rule, applied per component), or if either declares
+/// despawn capability while the other accesses any component.
 ///
 /// # Example
 ///
@@ -134,8 +135,9 @@ impl Access {
 
     /// True if these two accesses cannot safely run concurrently.
     ///
-    /// Conflict rule: two accesses conflict iff either writes to a
-    /// component the other reads or writes.
+    /// Conflict rule: two accesses conflict if (1) either writes to a
+    /// component the other reads or writes, or (2) either declares despawn
+    /// capability while the other accesses any component.
     pub fn conflicts_with(&self, other: &Access) -> bool {
         // Does self write anything other reads or writes?
         if self.writes.intersection(&other.reads).next().is_some() {

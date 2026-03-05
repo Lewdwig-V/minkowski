@@ -1570,7 +1570,8 @@ impl Default for ReducerRegistry {
 // ── DynamicReducerBuilder ────────────────────────────────────────────
 
 /// Builder for registering a dynamic reducer. Declare upper-bound access
-/// with `can_read`, `can_write`, and `can_spawn`, then finalize with `build`.
+/// with `can_read`, `can_write`, `can_spawn`, `can_remove`, and `can_despawn`,
+/// then finalize with `build`.
 pub struct DynamicReducerBuilder<'a> {
     registry: &'a mut ReducerRegistry,
     world: &'a mut World,
@@ -2094,6 +2095,46 @@ mod tests {
                 ctx.remove::<Vel>(*entity);
             });
         let _ = registry.dynamic_call(&strategy, &mut world, id, &e);
+    }
+
+    #[test]
+    #[should_panic(expected = "not declared for removal")]
+    fn dynamic_ctx_remove_with_can_write_panics() {
+        // can_write does NOT authorize remove — remove requires can_remove
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("bad_remove2", &mut world)
+            .can_write::<Vel>()
+            .build(|ctx: &mut DynamicCtx, entity: &Entity| {
+                ctx.remove::<Vel>(*entity);
+            });
+        let _ = registry.dynamic_call(&strategy, &mut world, id, &e);
+    }
+
+    #[test]
+    fn dynamic_ctx_try_remove_returns_true_and_removes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let result = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result_clone = result.clone();
+        let id = registry
+            .dynamic("try_strip_ok", &mut world)
+            .can_remove::<Vel>()
+            .build(move |ctx: &mut DynamicCtx, entity: &Entity| {
+                let removed = ctx.try_remove::<Vel>(*entity);
+                result_clone.store(removed, std::sync::atomic::Ordering::Relaxed);
+            });
+        registry
+            .dynamic_call(&strategy, &mut world, id, &e)
+            .unwrap();
+        assert!(result.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(world.get::<Vel>(e).is_none());
+        assert!(world.get::<Pos>(e).is_some());
     }
 
     #[test]
