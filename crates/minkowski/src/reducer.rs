@@ -1,5 +1,5 @@
-use std::any::Any;
-use std::collections::HashMap;
+use std::any::{Any, TypeId};
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use crate::access::Access;
@@ -40,6 +40,51 @@ pub trait Contains<T: Component, const INDEX: usize> {}
 /// `Contains<T, INDEX>` positions index into the inner Vec.
 #[allow(dead_code)]
 pub(crate) struct ResolvedComponents(pub(crate) Vec<ComponentId>);
+
+/// Pre-resolved component lookup for dynamic reducers.
+/// Entries sorted by TypeId for O(log n) binary search at runtime.
+pub(crate) struct DynamicResolved {
+    entries: Vec<(TypeId, ComponentId)>,
+    #[allow(dead_code)]
+    access: Access,
+    spawn_bundles: HashSet<TypeId>,
+}
+
+impl DynamicResolved {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        mut entries: Vec<(TypeId, ComponentId)>,
+        access: Access,
+        spawn_bundles: HashSet<TypeId>,
+    ) -> Self {
+        entries.sort_by_key(|(tid, _)| *tid);
+        entries.dedup_by_key(|(tid, _)| *tid);
+        Self {
+            entries,
+            access,
+            spawn_bundles,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn lookup<T: 'static>(&self) -> Option<ComponentId> {
+        let tid = TypeId::of::<T>();
+        self.entries
+            .binary_search_by_key(&tid, |(t, _)| *t)
+            .ok()
+            .map(|idx| self.entries[idx].1)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn access(&self) -> &Access {
+        &self.access
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_spawn_bundle<B: 'static>(&self) -> bool {
+        self.spawn_bundles.contains(&TypeId::of::<B>())
+    }
+}
 
 // ── Macro ────────────────────────────────────────────────────────────
 
@@ -636,6 +681,44 @@ mod tests {
     #[derive(Clone, Copy)]
     #[allow(dead_code)]
     struct Health(u32);
+
+    // ── DynamicResolved tests ────────────────────────────────────
+
+    #[test]
+    fn dynamic_resolved_lookup() {
+        use std::any::TypeId;
+        let entries = vec![
+            (TypeId::of::<u32>(), 0),
+            (TypeId::of::<f64>(), 2),
+            (TypeId::of::<i64>(), 1),
+        ];
+        let resolved = DynamicResolved::new(entries, Access::empty(), Default::default());
+        assert_eq!(resolved.lookup::<u32>(), Some(0));
+        assert_eq!(resolved.lookup::<f64>(), Some(2));
+        assert_eq!(resolved.lookup::<i64>(), Some(1));
+        assert_eq!(resolved.lookup::<u8>(), None);
+    }
+
+    #[test]
+    fn dynamic_resolved_dedup() {
+        use std::any::TypeId;
+        let entries = vec![(TypeId::of::<u32>(), 0), (TypeId::of::<u32>(), 5)];
+        let resolved = DynamicResolved::new(entries, Access::empty(), Default::default());
+        // After dedup, first entry wins (sorted, then dedup keeps first)
+        assert!(resolved.lookup::<u32>().is_some());
+    }
+
+    #[test]
+    fn dynamic_resolved_has_spawn_bundle() {
+        use std::any::TypeId;
+        let mut bundles = HashSet::new();
+        bundles.insert(TypeId::of::<(Pos, Vel)>());
+        let resolved = DynamicResolved::new(vec![], Access::empty(), bundles);
+        assert!(resolved.has_spawn_bundle::<(Pos, Vel)>());
+        assert!(!resolved.has_spawn_bundle::<(Health,)>());
+    }
+
+    // ── ComponentSet tests ──────────────────────────────────────
 
     #[test]
     fn component_set_count_single() {
