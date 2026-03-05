@@ -51,6 +51,8 @@ pub(crate) struct DynamicResolved {
     entries: Vec<(TypeId, ComponentId)>,
     access: Access,
     spawn_bundles: HashSet<TypeId>,
+    #[allow(dead_code)]
+    remove_ids: HashSet<TypeId>,
 }
 
 impl DynamicResolved {
@@ -58,6 +60,7 @@ impl DynamicResolved {
         mut entries: Vec<(TypeId, ComponentId)>,
         access: Access,
         spawn_bundles: HashSet<TypeId>,
+        remove_ids: HashSet<TypeId>,
     ) -> Self {
         entries.sort_by_key(|(tid, _)| *tid);
         assert!(
@@ -71,6 +74,7 @@ impl DynamicResolved {
             entries,
             access,
             spawn_bundles,
+            remove_ids,
         }
     }
 
@@ -88,6 +92,11 @@ impl DynamicResolved {
 
     pub(crate) fn has_spawn_bundle<B: 'static>(&self) -> bool {
         self.spawn_bundles.contains(&TypeId::of::<B>())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_remove<T: 'static>(&self) -> bool {
+        self.remove_ids.contains(&TypeId::of::<T>())
     }
 }
 
@@ -704,7 +713,6 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
     /// be matched again on the next call unless their columns are modified.
     pub fn for_each(&mut self, mut f: impl FnMut(Q::WriterItem<'_>)) {
         let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
-        let new_tick = self.world.next_tick();
 
         let required = Q::required_ids(&self.world.components);
         let cs_ptr = self.changeset;
@@ -724,16 +732,17 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
             }
         }
 
-        self.last_read_tick.store(new_tick.raw(), Ordering::Relaxed);
+        // last_read_tick is updated by call() AFTER the changeset is applied,
+        // ensuring it's newer than any column tick set during commit.
     }
 
     /// Count matching entities (respects `Changed<T>` filters).
     ///
-    /// Advances the change detection tick (same as `for_each`): entities
-    /// counted here will NOT be matched again unless their columns are modified.
+    /// `last_read_tick` is updated by `call()` after the changeset is applied,
+    /// so entities counted here will NOT be matched again unless their columns
+    /// are modified externally.
     pub fn count(&mut self) -> usize {
         let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
-        let new_tick = self.world.next_tick();
 
         let required = Q::required_ids(&self.world.components);
         let mut total = 0;
@@ -747,7 +756,7 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
             total += arch.len();
         }
 
-        self.last_read_tick.store(new_tick.raw(), Ordering::Relaxed);
+        // last_read_tick is updated by call() AFTER the changeset is applied.
         total
     }
 }
@@ -907,6 +916,9 @@ struct ReducerEntry {
     access: Access,
     resolved: ResolvedComponents,
     kind: ReducerKind,
+    /// Per-reducer tick for `Changed<T>` support in `QueryWriter`.
+    /// `None` for non-query-writer reducers.
+    last_read_tick: Option<Arc<AtomicU64>>,
 }
 
 struct DynamicReducerEntry {
@@ -977,7 +989,13 @@ impl ReducerRegistry {
                 f(handle, args);
             });
 
-        self.push_entry(name, access, resolved, ReducerKind::Transactional(adapter))
+        self.push_entry(
+            name,
+            access,
+            resolved,
+            ReducerKind::Transactional(adapter),
+            None,
+        )
     }
 
     /// Register a spawner reducer: `f(Spawner<B>, args)`.
@@ -1010,7 +1028,13 @@ impl ReducerRegistry {
                 f(handle, args);
             });
 
-        self.push_entry(name, access, resolved, ReducerKind::Transactional(adapter))
+        self.push_entry(
+            name,
+            access,
+            resolved,
+            ReducerKind::Transactional(adapter),
+            None,
+        )
     }
 
     /// Register a query writer reducer: `f(QueryWriter<Q>, args)`.
@@ -1053,7 +1077,13 @@ impl ReducerRegistry {
                 f(qw, args);
             });
 
-        self.push_entry(name, access, resolved, ReducerKind::Transactional(adapter))
+        self.push_entry(
+            name,
+            access,
+            resolved,
+            ReducerKind::Transactional(adapter),
+            Some(last_read_tick),
+        )
     }
 
     // ── Scheduled registration ───────────────────────────────────
@@ -1087,7 +1117,13 @@ impl ReducerRegistry {
             f(qm, args);
         });
 
-        let id = self.push_entry(name, access, resolved, ReducerKind::Scheduled(adapter));
+        let id = self.push_entry(
+            name,
+            access,
+            resolved,
+            ReducerKind::Scheduled(adapter),
+            None,
+        );
         QueryReducerId(id.0)
     }
 
@@ -1123,7 +1159,13 @@ impl ReducerRegistry {
             f(qr, args);
         });
 
-        let id = self.push_entry(name, access, resolved, ReducerKind::Scheduled(adapter));
+        let id = self.push_entry(
+            name,
+            access,
+            resolved,
+            ReducerKind::Scheduled(adapter),
+            None,
+        );
         QueryReducerId(id.0)
     }
 
@@ -1143,6 +1185,7 @@ impl ReducerRegistry {
             access: Access::empty(),
             entries: Vec::new(),
             spawn_bundles: HashSet::new(),
+            remove_ids: HashSet::new(),
         }
     }
 
@@ -1166,11 +1209,21 @@ impl ReducerRegistry {
         let access = &entry.access;
         let resolved = &entry.resolved;
 
-        strategy.transact(world, access, |tx, world| {
+        let tick_arc = entry.last_read_tick.clone();
+        let result = strategy.transact(world, access, |tx, world| {
             let (changeset, allocated) = tx.reducer_parts();
             let mut tw = TransactionalWorld(world);
             adapter(changeset, allocated, &mut tw, resolved, &args);
-        })
+        });
+        // Update last_read_tick AFTER the changeset is applied (by transact),
+        // so that the stored tick is newer than any column tick set during commit.
+        if result.is_ok() {
+            if let Some(arc) = &tick_arc {
+                let new_tick = world.next_tick();
+                arc.store(new_tick.raw(), Ordering::Relaxed);
+            }
+        }
+        result
     }
 
     /// Run a scheduled query reducer directly. Caller guarantees exclusivity.
@@ -1270,6 +1323,7 @@ impl ReducerRegistry {
         access: Access,
         resolved: ResolvedComponents,
         kind: ReducerKind,
+        last_read_tick: Option<Arc<AtomicU64>>,
     ) -> ReducerId {
         let id = self.reducers.len();
         if let Some(slot) = self.by_name.get(name) {
@@ -1289,6 +1343,7 @@ impl ReducerRegistry {
             access,
             resolved,
             kind,
+            last_read_tick,
         });
         ReducerId(id)
     }
@@ -1311,6 +1366,7 @@ pub struct DynamicReducerBuilder<'a> {
     access: Access,
     entries: Vec<(TypeId, ComponentId)>,
     spawn_bundles: HashSet<TypeId>,
+    remove_ids: HashSet<TypeId>,
 }
 
 impl<'a> DynamicReducerBuilder<'a> {
@@ -1344,6 +1400,25 @@ impl<'a> DynamicReducerBuilder<'a> {
         self
     }
 
+    /// Declare that the closure may remove component `T` from entities.
+    /// Marks T as written (removal is a structural write) and adds a
+    /// TypeId entry for runtime validation.
+    pub fn can_remove<T: crate::component::Component>(mut self) -> Self {
+        let comp_id = self.world.register_component::<T>();
+        self.access.add_write(comp_id);
+        self.entries.push((TypeId::of::<T>(), comp_id));
+        self.remove_ids.insert(TypeId::of::<T>());
+        self
+    }
+
+    /// Declare that the closure may despawn entities. Sets a blanket
+    /// conflict flag — this reducer conflicts with any other reducer
+    /// that accesses any component.
+    pub fn can_despawn(mut self) -> Self {
+        self.access.set_despawns();
+        self
+    }
+
     /// Finalize registration. The closure receives `&mut DynamicCtx` and
     /// type-erased `&Args`. Returns the opaque `DynamicReducerId`.
     pub fn build<Args, F>(self, f: F) -> DynamicReducerId
@@ -1351,7 +1426,12 @@ impl<'a> DynamicReducerBuilder<'a> {
         Args: 'static,
         F: Fn(&mut DynamicCtx, &Args) + Send + Sync + 'static,
     {
-        let resolved = DynamicResolved::new(self.entries, self.access.clone(), self.spawn_bundles);
+        let resolved = DynamicResolved::new(
+            self.entries,
+            self.access.clone(),
+            self.spawn_bundles,
+            self.remove_ids,
+        );
 
         let closure: DynamicAdapter = Box::new(move |ctx, args_any| {
             let args = args_any.downcast_ref::<Args>().unwrap_or_else(|| {
@@ -1411,7 +1491,12 @@ mod tests {
             (TypeId::of::<f64>(), 2),
             (TypeId::of::<i64>(), 1),
         ];
-        let resolved = DynamicResolved::new(entries, Access::empty(), Default::default());
+        let resolved = DynamicResolved::new(
+            entries,
+            Access::empty(),
+            Default::default(),
+            Default::default(),
+        );
         assert_eq!(resolved.lookup::<u32>(), Some(0));
         assert_eq!(resolved.lookup::<f64>(), Some(2));
         assert_eq!(resolved.lookup::<i64>(), Some(1));
@@ -1422,7 +1507,12 @@ mod tests {
     fn dynamic_resolved_dedup() {
         use std::any::TypeId;
         let entries = vec![(TypeId::of::<u32>(), 0), (TypeId::of::<u32>(), 0)];
-        let resolved = DynamicResolved::new(entries, Access::empty(), Default::default());
+        let resolved = DynamicResolved::new(
+            entries,
+            Access::empty(),
+            Default::default(),
+            Default::default(),
+        );
         // After dedup, duplicate entries are collapsed
         assert_eq!(resolved.lookup::<u32>(), Some(0));
     }
@@ -1432,7 +1522,7 @@ mod tests {
         use std::any::TypeId;
         let mut bundles = HashSet::new();
         bundles.insert(TypeId::of::<(Pos, Vel)>());
-        let resolved = DynamicResolved::new(vec![], Access::empty(), bundles);
+        let resolved = DynamicResolved::new(vec![], Access::empty(), bundles, Default::default());
         assert!(resolved.has_spawn_bundle::<(Pos, Vel)>());
         assert!(!resolved.has_spawn_bundle::<(Health,)>());
     }
@@ -1449,7 +1539,8 @@ mod tests {
         let entries = vec![(TypeId::of::<Pos>(), pos_id)];
         let mut access = Access::empty();
         access.add_read(pos_id);
-        let resolved = DynamicResolved::new(entries, access, Default::default());
+        let resolved =
+            DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
@@ -1469,7 +1560,8 @@ mod tests {
         let mut access = Access::empty();
         access.add_read(pos_id);
         access.add_read(vel_id);
-        let resolved = DynamicResolved::new(entries, access, Default::default());
+        let resolved =
+            DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
@@ -1488,7 +1580,8 @@ mod tests {
         let entries = vec![(TypeId::of::<Pos>(), pos_id)];
         let mut access = Access::empty();
         access.add_write(pos_id);
-        let resolved = DynamicResolved::new(entries, access, Default::default());
+        let resolved =
+            DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
@@ -1511,7 +1604,12 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
 
         // Empty resolved — no components declared
-        let resolved = DynamicResolved::new(vec![], Access::empty(), Default::default());
+        let resolved = DynamicResolved::new(
+            vec![],
+            Access::empty(),
+            Default::default(),
+            Default::default(),
+        );
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
         let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
@@ -1647,6 +1745,49 @@ mod tests {
         assert!(!access.writes()[pos_id]);
     }
 
+    #[test]
+    fn can_remove_marks_write_access() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("remover", &mut world)
+            .can_read::<Health>()
+            .can_remove::<Vel>()
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+        let access = registry.dynamic_access(id);
+        let vel_id = world.components.id::<Vel>().unwrap();
+        assert!(access.writes().contains(vel_id));
+    }
+
+    #[test]
+    fn can_despawn_sets_flag() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("despawner", &mut world)
+            .can_read::<Health>()
+            .can_despawn()
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+        let access = registry.dynamic_access(id);
+        assert!(access.despawns());
+    }
+
+    #[test]
+    fn despawn_reducer_conflicts_with_reader() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let dyn_id = registry
+            .dynamic("despawner", &mut world)
+            .can_read::<Health>()
+            .can_despawn()
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+        let entity_id =
+            registry.register_entity::<(Vel,), (), _>(&mut world, "set_vel", |_e, ()| {});
+        let dyn_access = registry.dynamic_access(dyn_id);
+        let entity_access = registry.reducer_access(entity_id);
+        assert!(dyn_access.conflicts_with(entity_access));
+    }
+
     // ── Debug assertion tests ────────────────────────────────────
 
     #[test]
@@ -1661,7 +1802,8 @@ mod tests {
         let entries = vec![(TypeId::of::<Pos>(), pos_id)];
         let mut access = Access::empty();
         access.add_read(pos_id); // read only, no write
-        let resolved = DynamicResolved::new(entries, access, Default::default());
+        let resolved =
+            DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
@@ -1676,7 +1818,12 @@ mod tests {
         world.register_component::<Pos>();
 
         // No spawn bundles declared
-        let resolved = DynamicResolved::new(vec![], Access::empty(), Default::default());
+        let resolved = DynamicResolved::new(
+            vec![],
+            Access::empty(),
+            Default::default(),
+            Default::default(),
+        );
 
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
@@ -2065,7 +2212,8 @@ mod tests {
         let mut access = Access::empty();
         access.add_write(comp_id);
         let entries = vec![(TypeId::of::<u32>(), comp_id)];
-        let resolved = DynamicResolved::new(entries, access, Default::default());
+        let resolved =
+            DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
@@ -2088,7 +2236,8 @@ mod tests {
         let mut access = Access::empty();
         access.add_write(f64_id);
         let entries = vec![(TypeId::of::<f64>(), f64_id)];
-        let resolved = DynamicResolved::new(entries, access, Default::default());
+        let resolved =
+            DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
@@ -2151,7 +2300,12 @@ mod tests {
     fn dynamic_ctx_try_read_undeclared_panics() {
         let mut world = World::new();
         let e = world.spawn((42u32,));
-        let resolved = DynamicResolved::new(vec![], Access::empty(), Default::default());
+        let resolved = DynamicResolved::new(
+            vec![],
+            Access::empty(),
+            Default::default(),
+            Default::default(),
+        );
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
         let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
@@ -2163,7 +2317,12 @@ mod tests {
     fn dynamic_ctx_try_write_undeclared_panics() {
         let mut world = World::new();
         let e = world.spawn((42u32,));
-        let resolved = DynamicResolved::new(vec![], Access::empty(), Default::default());
+        let resolved = DynamicResolved::new(
+            vec![],
+            Access::empty(),
+            Default::default(),
+            Default::default(),
+        );
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
         let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
@@ -2434,5 +2593,151 @@ mod tests {
         let entity_access = registry.reducer_access(entity_id);
         let writer_access = registry.reducer_access(writer_id);
         assert!(!entity_access.conflicts_with(writer_access));
+    }
+
+    // ── API boundary panic tests ─────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "call() on scheduled reducer")]
+    fn call_on_scheduled_panics() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let qid = registry.register_query::<(&Pos,), (), _>(&mut world, "read_pos", |_q, ()| {});
+        let strategy = Optimistic::new(&world);
+        // QueryReducerId and ReducerId share the same index space —
+        // passing ReducerId(qid.0) should hit the Scheduled arm.
+        let _ = registry.call(&strategy, &mut world, ReducerId(qid.0), ());
+    }
+
+    #[test]
+    #[should_panic(expected = "run() called on transactional reducer")]
+    fn run_on_transactional_panics() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let rid = registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_e, ()| {});
+        // ReducerId and QueryReducerId share the same index space.
+        registry.run(&mut world, QueryReducerId(rid.0), ());
+    }
+
+    // ── Multi-archetype QueryWriter test ─────────────────────────
+
+    #[test]
+    fn query_writer_spans_multiple_archetypes() {
+        let mut world = World::new();
+        // Two different archetypes, both containing Vel
+        let e1 = world.spawn((Vel(10.0),));
+        let e2 = world.spawn((Vel(20.0), Pos(0.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+
+        let id = registry.register_query_writer::<(&mut Vel,), f32, _>(
+            &mut world,
+            "scale_vel",
+            |mut query, factor: f32| {
+                query.for_each(|(mut vel,)| {
+                    vel.modify(|v| v.0 *= factor);
+                });
+            },
+        );
+
+        registry.call(&strategy, &mut world, id, 0.5f32).unwrap();
+
+        assert_eq!(world.get::<Vel>(e1).unwrap().0, 5.0);
+        assert_eq!(world.get::<Vel>(e2).unwrap().0, 10.0);
+    }
+
+    // ── Changed<T> filter with QueryWriter ───────────────────────
+
+    #[test]
+    fn query_writer_changed_filter() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+
+        // Track how many entities the query writer visits
+        let visit_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = visit_count.clone();
+
+        let id = registry.register_query_writer::<(Changed<Pos>, &mut Pos), (), _>(
+            &mut world,
+            "changed_pos",
+            move |mut query, ()| {
+                query.for_each(|((), mut pos)| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    pos.modify(|p| p.0 += 1.0);
+                });
+            },
+        );
+
+        // First call: column was never read by this reducer, so Changed matches
+        registry.call(&strategy, &mut world, id, ()).unwrap();
+        assert_eq!(visit_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 2.0);
+
+        // Second call: no mutation since last call, Changed should skip
+        visit_count.store(0, std::sync::atomic::Ordering::Relaxed);
+        registry.call(&strategy, &mut world, id, ()).unwrap();
+        assert_eq!(visit_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Mutate the column externally, then call again
+        visit_count.store(0, std::sync::atomic::Ordering::Relaxed);
+        for (pos,) in world.query::<(&mut Pos,)>() {
+            pos.0 = 99.0;
+        }
+        registry.call(&strategy, &mut world, id, ()).unwrap();
+        assert_eq!(visit_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 100.0);
+    }
+
+    // ── materialize_reserved regression test ─────────────────────
+
+    #[test]
+    fn query_writer_after_spawn_reducer() {
+        // Regression: spawn via changeset (reserve + Mutation::Spawn) must
+        // call materialize_reserved() so that subsequent changesets targeting
+        // the spawned entity pass the is_alive() check.
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+
+        let spawn_id = registry.register_spawner::<(Vel,), f32, _>(
+            &mut world,
+            "spawn",
+            |mut spawner, vel: f32| {
+                spawner.spawn((Vel(vel),));
+            },
+        );
+
+        let writer_id = registry.register_query_writer::<(&mut Vel,), f32, _>(
+            &mut world,
+            "scale",
+            |mut query, factor: f32| {
+                query.for_each(|(mut vel,)| {
+                    vel.modify(|v| v.0 *= factor);
+                });
+            },
+        );
+
+        let strategy = Optimistic::new(&world);
+
+        // Spawn an entity via changeset (uses reserve() internally)
+        registry
+            .call(&strategy, &mut world, spawn_id, 10.0f32)
+            .unwrap();
+
+        // Query writer iterates the spawned entity and buffers a write.
+        // Without materialize_reserved(), this panics with "entity is not alive"
+        // when the query writer's changeset is applied.
+        registry
+            .call(&strategy, &mut world, writer_id, 2.0f32)
+            .unwrap();
+
+        // Verify the spawned entity has the correct value
+        let mut found = false;
+        for (vel,) in world.query::<(&Vel,)>() {
+            assert_eq!(vel.0, 20.0);
+            found = true;
+        }
+        assert!(found);
     }
 }
