@@ -7,7 +7,7 @@ use crate::storage::archetype::Archetype;
 
 /// Send + Sync wrapper for raw pointers used in query fetches.
 pub struct ThinSlicePtr<T> {
-    ptr: *mut T,
+    pub(crate) ptr: *mut T,
     _marker: PhantomData<T>,
 }
 

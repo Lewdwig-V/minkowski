@@ -6,12 +6,14 @@
 //! 2. Query reducer (gravity) — mutates Velocity via QueryMut
 //! 3. Read-only query reducer (logger) — reads via QueryRef
 //! 4. Spawner reducer — creates new entities via Spawner
-//! 5. Name-based lookup
-//! 6. Access conflict detection between registered reducers
-//! 7. Dynamic reducer — conditional access based on runtime state
+//! 5. Query writer reducer (drag) — buffered bulk updates via QueryWriter
+//! 6. Name-based lookup
+//! 7. Access conflict detection between registered reducers
+//! 8. Dynamic reducer — conditional access based on runtime state
 
 use minkowski::{
-    DynamicCtx, Entity, EntityMut, Optimistic, QueryMut, QueryRef, ReducerRegistry, Spawner, World,
+    DynamicCtx, Entity, EntityMut, Optimistic, QueryMut, QueryRef, QueryWriter, ReducerRegistry,
+    Spawner, World,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -103,7 +105,7 @@ fn main() {
 
     // Heal hero
     registry
-        .call_entity(&strategy, &mut world, heal_id, hero, 25u32)
+        .call(&strategy, &mut world, heal_id, (hero, 25u32))
         .unwrap();
     println!(
         "After heal: hero hp={}",
@@ -112,7 +114,7 @@ fn main() {
 
     // Damage enemy
     registry
-        .call_entity(&strategy, &mut world, damage_id, enemy, 30u32)
+        .call(&strategy, &mut world, damage_id, (enemy, 30u32))
         .unwrap();
     println!(
         "After damage: enemy hp={}",
@@ -131,17 +133,43 @@ fn main() {
 
     // Spawn a new unit via spawner reducer
     registry
-        .call_entity(&strategy, &mut world, spawn_id, Entity::DANGLING, 75u32)
+        .call(&strategy, &mut world, spawn_id, 75u32)
         .unwrap();
 
-    // ── 6. Name-based lookup ─────────────────────────────────────────
+    // ── 6. Query writer reducer: persistent bulk update ────────────
+    let drag_id = registry.register_query_writer::<(&mut Velocity,), f32, _>(
+        &mut world,
+        "apply_drag",
+        |mut query: QueryWriter<'_, (&mut Velocity,)>, drag: f32| {
+            query.for_each(|(mut vel,)| {
+                vel.modify(|v| v.0 *= drag);
+            });
+        },
+    );
+    println!(
+        "Registered 'apply_drag' query writer reducer (id={:?})",
+        drag_id
+    );
+
+    // Dispatch — goes through strategy.transact(), compatible with Durable
+    registry
+        .call(&strategy, &mut world, drag_id, 0.9f32)
+        .unwrap();
+    println!(
+        "After drag: hero vel={:.2}",
+        world.get::<Velocity>(hero).unwrap().0
+    );
+
+    // ── 7. Name-based lookup ─────────────────────────────────────────
     println!("\n--- Name-based lookup ---");
     let found_heal = registry.reducer_id_by_name("heal").unwrap();
     println!("'heal' -> {:?}", found_heal);
     let found_gravity = registry.query_reducer_id_by_name("gravity").unwrap();
     println!("'gravity' -> {:?}", found_gravity);
+    let found_drag = registry.reducer_id_by_name("apply_drag").unwrap();
+    println!("'apply_drag' -> {:?}", found_drag);
 
-    // ── 7. Dynamic reducer — conditional access ──────────────────
+    // ── 8. Dynamic reducer — conditional access ──────────────────
     println!("\n--- Dynamic reducers ---");
 
     // Give hero and enemy Energy + Shield components for dynamic reducer demo
@@ -210,11 +238,12 @@ fn main() {
     let found_shield = registry.dynamic_id_by_name("conditional_shield");
     println!("Dynamic lookup 'conditional_shield' -> {:?}", found_shield);
 
-    // ── 8. Access conflict detection (static vs dynamic) ───────────
+    // ── 9. Access conflict detection (static vs dynamic) ───────────
     println!("\n--- Access conflict detection ---");
     let heal_access = registry.reducer_access(heal_id);
     let damage_access = registry.reducer_access(damage_id);
     let gravity_access = registry.query_reducer_access(gravity_id);
+    let drag_access = registry.reducer_access(drag_id);
     let shield_access = registry.dynamic_access(shield_id);
 
     println!(
@@ -228,6 +257,22 @@ fn main() {
     println!(
         "heal vs gravity: {}",
         if heal_access.conflicts_with(gravity_access) {
+            "CONFLICT"
+        } else {
+            "compatible (disjoint components)"
+        }
+    );
+    println!(
+        "gravity vs apply_drag: {}",
+        if gravity_access.conflicts_with(drag_access) {
+            "CONFLICT (both write Velocity)"
+        } else {
+            "compatible"
+        }
+    );
+    println!(
+        "heal vs apply_drag: {}",
+        if heal_access.conflicts_with(drag_access) {
             "CONFLICT"
         } else {
             "compatible (disjoint components)"

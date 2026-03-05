@@ -418,6 +418,11 @@ impl EnumChangeSet {
         for mutation in &self.mutations {
             match mutation {
                 Mutation::Spawn { entity, components } => {
+                    // Ensure the entity allocator's generations vec covers
+                    // reserved indices — reserve() is lock-free and doesn't
+                    // touch generations. Without this, is_alive() returns
+                    // false for reserved-then-spawned entities.
+                    world.entities.materialize_reserved();
                     assert!(
                         !world.is_placed(*entity),
                         "EnumChangeSet::apply: cannot spawn entity {:?} — \

@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo test -p minkowski --lib          # Unit tests (118 tests, fast)
+cargo test -p minkowski --lib          # Unit tests (263 tests, fast)
 cargo test -p minkowski                # All tests including doc tests
 cargo test -p minkowski -- entity      # Run tests matching a filter
 
@@ -22,7 +22,7 @@ cargo run -p minkowski-examples --example scheduler --release   # Access conflic
 cargo run -p minkowski-examples --example transaction --release   # Transaction strategies demo (3 strategies, 100 entities)
 cargo run -p minkowski-examples --example battle --release   # Multi-threaded battle with tunable conflict rates (500 entities, 100 frames)
 cargo run -p minkowski-examples --example persist --release   # Durable transactions: WAL + snapshot save/load/recovery (100 entities, 10 frames)
-cargo run -p minkowski-examples --example reducer --release   # Typed reducer system: entity/query/spawner/dynamic handles + conflict detection
+cargo run -p minkowski-examples --example reducer --release   # Typed reducer system: entity/query/spawner/query-writer/dynamic handles + conflict detection
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -138,23 +138,25 @@ Typed reducers narrow what a closure *can* touch so that conflict freedom is pro
 
 | Model | Handle types | Isolation | Conflict detection |
 |---|---|---|---|
-| Transactional | `EntityMut<C>`, `Spawner<B>` | Buffered writes via EnumChangeSet | Runtime (optimistic ticks or pessimistic locks) |
+| Transactional | `EntityMut<C>`, `Spawner<B>`, `QueryWriter<Q>` | Buffered writes via EnumChangeSet | Runtime (optimistic ticks or pessimistic locks) |
 | Scheduled | `QueryMut<Q>`, `QueryRef<Q>` | Direct `&mut World` (hidden) | Compile-time (Access bitsets) |
 | Dynamic | `DynamicCtx` | Buffered writes via EnumChangeSet | Conservative (builder-declared upper bounds) |
 
 **ComponentSet** declares a set of component types with pre-resolved IDs. **Contains<T, INDEX>** uses a const generic index to avoid coherence conflicts with generic tuple impls — the compiler infers INDEX at call sites. Both are macro-generated for tuples 1–12.
 
-**Typed handles** hide World behind a facade exposing exactly the declared operations: `EntityRef<C>` (read-only), `EntityMut<C>` (read + buffered write), `Spawner<B>` (entity creation via `reserve()`), `QueryRef<Q>` (read-only iteration), `QueryMut<Q>` (read-write iteration). EntityMut and Spawner hold `&mut EnumChangeSet` (not `&mut Tx`) for clean borrow splitting — Tx retains lifecycle ownership, handles borrow disjoint fields.
+**Typed handles** hide World behind a facade exposing exactly the declared operations: `EntityRef<C>` (read-only), `EntityMut<C>` (read + buffered write), `Spawner<B>` (entity creation via `reserve()`), `QueryRef<Q>` (read-only iteration), `QueryMut<Q>` (read-write iteration), `QueryWriter<Q>` (buffered query iteration via `WritableRef<T>`). EntityMut and Spawner hold `&mut EnumChangeSet` (not `&mut Tx`) for clean borrow splitting — Tx retains lifecycle ownership, handles borrow disjoint fields.
+
+**QueryWriter** iterates like a query but buffers writes through `ChangeSet` instead of mutating directly. `&T` items pass through unchanged; `&mut T` items become `WritableRef<T>` handles with `get`/`set`/`modify` methods. Uses manual archetype scanning (not `world.query()`) to avoid marking mutable columns as changed, which would cause self-conflict with optimistic validation. A separate `WriterQuery` trait (not on `WorldQuery`) defines the `&mut T` → `WritableRef<T>` mapping. Per-reducer `AtomicU64` tick state enables `Changed<T>` filter support. Compatible with `Durable` for WAL logging — the motivating use case.
 
 **Dynamic reducers** trade compile-time precision for runtime flexibility. `DynamicReducerBuilder` (via `registry.dynamic(name, &mut world)`) declares upper-bound access with `can_read::<T>()`, `can_write::<T>()`, `can_spawn::<B>()`. `DynamicCtx` provides `read`/`try_read`/`write`/`try_write`/`spawn` — accessing undeclared types, writing to read-only components, and spawning undeclared bundles all panic in all builds. Component IDs pre-resolved at registration; O(log n) binary search by `TypeId` at runtime via `DynamicResolved`.
 
-**ReducerRegistry** is external to World (same composition pattern as SpatialIndex). Registration type-erases closures with Access metadata and pre-resolved ComponentIds. Dispatch: `call_entity()` for transactional reducers (runs through `strategy.transact()`), `run()` for scheduled query reducers (direct `&mut World`), `dynamic_call()` for dynamic reducers (routes through `strategy.transact()`). `id_by_name()` / `dynamic_id_by_name()` enable network dispatch. `access()` / `dynamic_access()` enable scheduler conflict analysis.
+**ReducerRegistry** is external to World (same composition pattern as SpatialIndex). Registration type-erases closures with Access metadata and pre-resolved ComponentIds. Dispatch: `call()` for transactional reducers (entity, spawner, query writer — runs through `strategy.transact()`, entity is part of args), `run()` for scheduled query reducers (direct `&mut World`), `dynamic_call()` for dynamic reducers (routes through `strategy.transact()`). `id_by_name()` / `dynamic_id_by_name()` enable network dispatch. `access()` / `dynamic_access()` enable scheduler conflict analysis.
 
 **EntityAllocator::reserve(&self)** provides lock-free entity ID allocation via `AtomicU32` — enables `Spawner` to work inside transactional closures where only `&World` is available.
 
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`, `Access`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `Spawner`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`, `Access`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `QueryWriter`, `WritableRef`, `WriterQuery`, `Spawner`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.

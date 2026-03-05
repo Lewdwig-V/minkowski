@@ -10,9 +10,14 @@
 pub(crate) struct Tick(u64);
 
 impl Tick {
-    #[cfg(test)]
-    pub fn new(value: u64) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn new(value: u64) -> Self {
         Self(value)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn raw(self) -> u64 {
+        self.0
     }
 
     /// Returns true if `self` is strictly more recent than `other`.
