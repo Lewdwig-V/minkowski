@@ -6,7 +6,7 @@
 //! - Build indexes from world state
 //! - Range query (scores in a range)
 //! - Exact lookup
-//! - Incremental update after mutations via Changed<T>
+//! - Incremental update after mutations via per-index ChangeTick
 //! - Stale entry detection after despawn
 
 use minkowski::{BTreeIndex, HashIndex, SpatialIndex, World};

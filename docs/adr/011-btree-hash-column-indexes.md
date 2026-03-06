@@ -23,9 +23,9 @@ Two independent index types -- `BTreeIndex<T: Ord>` for range queries and `HashI
 ## Consequences
 
 - O(log n) range queries and O(1) exact lookups on component values
-- Incremental updates via `Changed<T>` avoid full rescans
+- Incremental updates via per-index `ChangeTick` and `World::query_changed_since` avoid full rescans (does not use the shared `Changed<T>` query cache)
 - Reverse map costs one `HashMap` entry per indexed entity
-- Stale entries from despawns handled lazily via generational validation, cleaned on rebuild
+- Stale entries from despawns and component removals handled lazily -- `get_valid`/`range_valid` filter at query time, `rebuild` reclaims memory
 - Components must implement `Ord` (B-tree) or `Hash + Eq` (hash) plus `Clone`
 - Not persisted -- rebuilt from world state after crash recovery
 - Concurrency is user-managed -- indexes are external data structures like `SpatialIndex`

@@ -16,7 +16,9 @@ pub(crate) struct Tick(u64);
 /// can call [`update`](crate::SpatialIndex::update) independently without
 /// sharing tick state.
 ///
-/// Obtain via [`World::change_tick`](crate::World::change_tick).
+/// Obtain via [`World::change_tick`](crate::World::change_tick). The default
+/// value (tick 0) causes the first [`update`](crate::SpatialIndex::update) to
+/// treat all columns as changed, equivalent to a full rebuild.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ChangeTick(pub(crate) Tick);
 

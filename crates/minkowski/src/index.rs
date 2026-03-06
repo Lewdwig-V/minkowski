@@ -11,8 +11,8 @@ use crate::world::World;
 ///
 /// Indexes are fully user-owned — the World has no awareness of them.
 /// Implementations use standard query primitives (`world.query()`,
-/// `Changed<T>`) internally. Query methods are defined per concrete
-/// type, not on this trait.
+/// `world.query_changed_since()`) internally. Query methods are defined
+/// per concrete type, not on this trait.
 ///
 /// # Design rationale
 ///
