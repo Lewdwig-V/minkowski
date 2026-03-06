@@ -50,7 +50,7 @@ pub trait Contains<T: Component, const INDEX: usize> {}
 pub(crate) struct ResolvedComponents(pub(crate) Vec<ComponentId>);
 
 /// Pre-resolved component lookup for dynamic reducers.
-/// Entries sorted by TypeId for O(log n) binary search at runtime.
+/// HashMap from TypeId to ComponentId for O(1) lookup at runtime.
 pub(crate) struct DynamicResolved {
     // PERF: HashMap for O(1) TypeId → ComponentId lookup. Replaces sorted
     // Vec + binary search (O(log n) per ctx.read/write/remove call).

@@ -83,7 +83,8 @@ fn bench_wal_append(c: &mut Criterion) {
     let wal_path = dir.path().join("bench.wal");
     let mut wal = Wal::create(&wal_path).unwrap();
 
-    // Pre-populate a changeset with a single mutation
+    // Single-mutation changeset — WAL append cost scales with changeset size,
+    // not world size, so this isolates serialization + I/O overhead.
     let entity = world.spawn((Pos { x: 99.0, y: 99.0 }, Vel { dx: 0.0, dy: 0.0 }));
     let mut cs = minkowski::EnumChangeSet::new();
     cs.insert::<Pos>(&mut world, entity, Pos { x: 100.0, y: 100.0 });
