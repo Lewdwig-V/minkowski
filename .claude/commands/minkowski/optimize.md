@@ -17,6 +17,8 @@ Search the user's codebase for performance-relevant patterns:
 - Component sizes and layouts (oversized components hurt cache performance)
 - `Changed<T>` usage for skipping unchanged data
 - Hot loops that could benefit from vectorization
+- Per-entity `world.get()` in loops (candidate for `get_batch`)
+- `BTreeIndex` / `HashIndex` for narrowing before component fetch
 
 ## Step 2: Recommend
 
@@ -49,11 +51,18 @@ Help write optimized code. Point to relevant examples:
 - **Parallel iteration**: `world.query::<(&Pos, &Mass)>().par_for_each(|(pos, mass)| { /* heavy */ })`
 - **Batch spawning**: Spawn all entities in one loop at startup rather than scattered through the frame
 - **Changed filter**: `world.query::<(&mut Render, Changed<Transform>)>().for_each(...)` — skips archetypes where Transform column hasn't been touched
+- **Index-driven access**: Use `BTreeIndex`/`HashIndex` to narrow the entity set, then `get_batch` instead of per-entity `get()`:
+  ```
+  let candidates = score_index.range(Score(90)..).flat_map(|(_, e)| e).copied().collect::<Vec<_>>();
+  let positions = world.get_batch::<Pos>(&candidates);
+  ```
+  `get_batch` groups by archetype internally — one ComponentId resolution, sequential memory access per archetype. Worth it for ~10+ entities.
 - **Benchmarking**: `cargo bench -p minkowski` runs criterion benchmarks. `cargo bench -p minkowski -- spawn` for a specific benchmark.
 
 **Pitfall alerts:**
 - `world.insert()` in a hot loop: Each call is an archetype migration. If adding the same component to many entities, consider redesigning the archetype.
 - `for_each` where `for_each_chunk` would work: You lose SIMD vectorization. Use `for_each_chunk` for numeric tight loops.
 - Oversized components in hot queries: If a 256-byte component is queried every frame but only 8 bytes are read, split it.
+- Per-entity `world.get()` in a loop over index results: Each call independently resolves ComponentId and jumps to a random archetype. Use `get_batch` to amortize the resolution and group by archetype for cache locality.
 
 For architecture details, see CLAUDE.md § "Column Alignment & Vectorization" and § "Query Caching".

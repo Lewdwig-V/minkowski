@@ -110,6 +110,16 @@ uniform density, tree for clustered.
 - After snapshot restore -> `restore_allocator_state()` calls `sync_reserved()` internally; custom restoration paths must call it manually
 - Mutation path -> `QueryWriter` reducer (buffers writes, changeset goes to WAL)
 
+### Column Indexes
+
+- Need all entities with component value in a range? -> `BTreeIndex<T>` (T: Ord)
+- Need all entities with exact component value? -> `HashIndex<T>` (T: Hash + Eq)
+- After index lookup, need component data for results? -> `world.get_batch::<T>(&entities)`
+- Need mutable access to results? -> `world.get_batch_mut::<T>(&entities)` (panics on duplicates)
+- Multiple component types? -> call `get_batch` once per type
+- Incremental updates? -> each index owns a `ChangeTick`, uses `world.query_changed_since()`
+- Stale entries from despawn/remove? -> `get_valid()`/`range_valid()` filter via `world.has::<T>()`
+
 ### Spatial Indexing
 
 - Do you need spatial neighbor queries at all? -> only if yes, implement `SpatialIndex`
@@ -276,6 +286,7 @@ Each example demonstrates specific patterns. Read the source for concrete API us
 | `transaction` | Three strategies (Sequential/Optimistic/Pessimistic), raw Tx + reducer comparison | `examples/examples/transaction.rs` |
 | `battle` | EntityMut reducers, rayon parallel snapshot computation, sequential dispatch, tunable conflict rates | `examples/examples/battle.rs` |
 | `persist` | QueryWriter + Durable, WAL, snapshots, crash recovery | `examples/examples/persist.rs` |
+| `index` | BTreeIndex range queries, HashIndex exact lookups, incremental update, batch fetch | `examples/examples/index.rs` |
 
 ### Pattern Quick-Find
 

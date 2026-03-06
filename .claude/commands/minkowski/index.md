@@ -1,63 +1,107 @@
 ---
-description: Help with Minkowski ECS spatial indexing — SpatialIndex trait, grids, quadtrees, neighbor queries
+description: Help with Minkowski ECS indexing — SpatialIndex trait, BTreeIndex, HashIndex, grids, quadtrees, batch lookups
 allowed-tools: Bash, Read, Glob, Grep, Write, Edit
 ---
 
-Help the user implement spatial indexing for their Minkowski ECS project.
+Help the user implement indexing for their Minkowski ECS project.
 
 ## Step 1: Assess
 
-Search the user's codebase for existing spatial patterns:
+Search the user's codebase for existing index patterns:
 
-- `SpatialIndex` trait implementations
-- Grid, quadtree, BVH, or k-d tree structs
-- Neighbor query patterns (distance checks, radius searches, nearest-N)
-- `world.is_alive()` checks on entity references from spatial queries
+- `SpatialIndex` trait implementations (grids, quadtrees, BVH)
+- `BTreeIndex` / `HashIndex` usage for column indexes
+- `world.get_batch` / `world.get_batch_mut` for index-driven batch lookups
+- `world.query_changed_since` / `ChangeTick` for incremental index updates
+- `world.is_alive()` / `world.has::<T>()` checks on index query results
 - `rebuild()` / `update()` call patterns
-- `Changed<T>` usage for incremental spatial updates
 - Position component types and their spatial distribution
 
 ## Step 2: Recommend
 
+### Choosing an index type
+
+- **"I need all entities with component value in a range"** -> `BTreeIndex<T>` (T: Ord). Range queries, sorted iteration, O(log n) lookups.
+- **"I need all entities with exact component value"** -> `HashIndex<T>` (T: Hash + Eq). O(1) exact lookups.
+- **"I need spatial neighbor queries (within radius, nearest-N)"** -> Implement `SpatialIndex` trait with a grid or tree.
+- **"I just need to iterate all entities with a component"** -> Use `world.query()` directly. No index needed.
+
+### Column indexes (BTreeIndex, HashIndex)
+
+**Strong defaults:**
+- **Index on whole components** (not fields). Components are what ECS stores — `BTreeIndex<Score>`, not `BTreeIndex<u32>`.
+- **External to World** — same composition pattern as SpatialIndex. No `world.register_index()`.
+- **Each index tracks its own `ChangeTick`** for incremental updates via `world.query_changed_since()`. Two indexes on the same component type update independently.
+- **Two-tier lookup**: `get()`/`range()` return raw results (may include stale entries). `get_valid()`/`range_valid()` filter via `world.has::<T>()` (slower but correct). Use raw for speed when you'll validate anyway; use valid when you need clean results.
+- **Compose with `get_batch`** for efficient multi-entity component fetch after index narrowing:
+  ```
+  let candidates: Vec<Entity> = score_index
+      .range_valid(Score(50)..Score(100), &world)
+      .collect();
+  let positions = world.get_batch::<Position>(&candidates);
+  ```
+- **Rebuild periodically** to reclaim memory from stale entries (despawns, component removals).
+
+### Spatial indexes (SpatialIndex trait)
+
 **Strong defaults:**
 - **Only implement spatial indexing if you do spatial neighbor queries.** Not every simulation needs one.
-- **Uniform density**: Use a grid. Simple, cache-friendly, O(1) cell lookup. Cell size should be roughly the interaction radius.
-- **Clustered or hierarchical density**: Use a quadtree (2D) or octree (3D). Adapts to non-uniform distributions.
-- **Implement `SpatialIndex` trait**: `rebuild(&mut self, world: &mut World)` is required (full reconstruction). `update(&mut self, world: &mut World)` is optional — override for incremental updates using `Changed<T>` to only re-index moved entities.
-- **Always check `world.is_alive(entity)` on query results.** Despawned entities leave stale entries in the index. Generation mismatch catches them at query time. Full `rebuild()` cleans them up.
-- **Indexes are external to World** — they compose from existing query primitives (`world.query()`, `world.is_alive()`). No `world.register_index()`.
-- **Rebuild between frames, not during iteration.** Call `index.rebuild(&mut world)` before the frame's query reducers run.
+- **Uniform density**: Grid. Cell size ~ interaction radius.
+- **Clustered density**: Quadtree (2D), octree (3D), BVH.
+- **Implement `SpatialIndex` trait**: `rebuild` is required. Override `update` for incremental updates using `world.query_changed_since()`.
+- **Always check `world.is_alive(entity)` on query results.** Stale entries cleaned up on next `rebuild()`.
+- **Rebuild between frames, not during iteration.**
+
+### Batch lookups (get_batch / get_batch_mut)
+
+- **Use `get_batch` when fetching a component for many entities from an index.** Groups by archetype internally — resolves ComponentId once, sequential memory access per archetype.
+- **`get_batch_mut` panics on duplicate entities** (aliased `&mut T` is UB). Unconditional check.
+- **For multiple components**, call `get_batch` once per component type. Each call groups by archetype independently.
 
 **Ask if unclear:**
-- "How often do entities move?" — If every frame: full `rebuild()` is simplest. If rarely: implement `update()` for incremental re-indexing using `Changed<Position>`.
-- "What's the spatial distribution?" — Uniform: grid (tune cell size to interaction radius). Clustered: tree (quadtree/BVH). Mixed: consider a two-level structure.
-- "What's the query pattern?" — Range queries (all within radius): grid or tree both work. Nearest-N: tree with priority queue. Ray casting: BVH.
-- "How many entities?" — Under 1K: brute force may be fine. 1K-100K: grid or quadtree. 100K+: consider parallel rebuild.
+- "How often do entities move/change?" — Every frame: `rebuild()`. Rarely: `update()` with per-index ChangeTick.
+- "What's the query pattern?" — Exact match: HashIndex. Range/sorted: BTreeIndex. Spatial: grid/tree.
+- "How many candidates from the index?" — Under ~10: per-entity `get()` is fine. Over ~10: `get_batch` for cache locality.
 
 ## Step 3: Implement
 
-Help write spatial index code. Point to relevant examples:
+Help write index code. Point to relevant examples:
 
+- **BTreeIndex + HashIndex**: See `examples/examples/index.rs` — range queries, exact lookups, incremental update, stale detection, batch fetch composition
 - **Uniform grid**: See `examples/examples/boids.rs` — `SpatialGrid` with cell-based neighbor lookup for 5K boids
 - **Barnes-Hut quadtree**: See `examples/examples/nbody.rs` — `BarnesHutTree` with center-of-mass aggregation for 2K bodies
-- **SpatialIndex trait pattern**:
-  ```
-  struct MyGrid { /* ... */ }
-  impl SpatialIndex for MyGrid {
-      fn rebuild(&mut self, world: &mut World) {
-          self.clear();
-          world.query::<(Entity, &Position)>().for_each(|(entity, pos)| {
-              self.insert(entity, pos);
-          });
-      }
-      // Optional: incremental update
-      fn update(&mut self, world: &mut World) {
-          world.query::<(Entity, &Position, Changed<Position>)>().for_each(|(entity, pos, _)| {
-              self.reindex(entity, pos);
-          });
-      }
-  }
-  ```
-- **Stale entity handling**: Always validate: `if world.is_alive(entity) { /* use it */ }`
+
+**Column index pattern:**
+```
+let mut index = BTreeIndex::<Score>::new();
+index.rebuild(&mut world);
+
+// Incremental update (each index tracks its own tick)
+index.update(&mut world);
+
+// Range query → batch fetch
+let high: Vec<Entity> = index.range(Score(90)..).flat_map(|(_, e)| e).copied().collect();
+let names = world.get_batch::<Name>(&high);
+```
+
+**SpatialIndex trait pattern:**
+```
+struct MyGrid { /* ... */ }
+impl SpatialIndex for MyGrid {
+    fn rebuild(&mut self, world: &mut World) {
+        self.clear();
+        world.query::<(Entity, &Position)>().for_each(|(entity, pos)| {
+            self.insert(entity, pos);
+        });
+    }
+    fn update(&mut self, world: &mut World) {
+        let changed = world.query_changed_since::<Position>(self.last_sync);
+        for (entity, pos) in changed {
+            self.reindex(entity, pos);
+        }
+        self.last_sync = world.change_tick();
+    }
+}
+```
 
 For architecture details, see CLAUDE.md § "Secondary Indexes".

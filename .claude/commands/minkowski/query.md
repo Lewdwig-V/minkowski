@@ -15,6 +15,8 @@ Search the user's codebase for existing query patterns:
 - `Option<&T>` usage for optional components
 - `query_table` / `query_table_mut` calls (Table-based queries)
 - `query_raw` calls (transaction read path — flag if used outside transactions)
+- `world.get_batch` / `world.get_batch_mut` for index-driven batch lookups
+- Per-entity `world.get()` in loops where `get_batch` would be better
 - Queries inside loops that could benefit from caching awareness
 
 ## Step 2: Recommend
@@ -33,6 +35,7 @@ Search the user's codebase for existing query patterns:
 - "Do you need the entity ID alongside component data?" — Include `Entity` in the query tuple.
 - "Is this a hot numeric loop?" — Use `for_each_chunk` for SIMD. Ensure components are `#[repr(align(16))]` for best vectorization.
 - "Is per-entity work expensive (>1us)?" — Consider `par_for_each` for rayon parallelism.
+- "Do you only need a subset of matching entities?" — Use an index (`BTreeIndex`/`HashIndex`) to narrow first, then `get_batch` to fetch components. See `/minkowski:index`.
 
 ## Step 3: Implement
 
@@ -45,5 +48,9 @@ Help write query code. Point to relevant examples:
 - **Optional components**: `world.query::<(&Pos, Option<&DebugLabel>)>().for_each(|(pos, label)| { ... })`
 - **Table queries**: See `examples/examples/life.rs` — `query_table`/`query_table_mut` for named field access
 - **Parallel iteration**: `world.query::<(&Pos,)>().par_for_each(|(pos,)| { /* heavy work */ })`
+- **Index-driven batch fetch**: `let entities = index.range(lo..hi).flat_map(|(_, e)| e).copied().collect(); let data = world.get_batch::<T>(&entities);`
+  - Use `get_batch` when you have entity IDs from an index and need component data.
+  - Use `get_batch_mut` for mutable access — panics on duplicate entities (aliased `&mut T` is UB).
+  - See `examples/examples/index.rs` for the full composition pattern.
 
 For architecture details on query caching and column alignment, see CLAUDE.md § "Query Caching" and § "Column Alignment & Vectorization".
