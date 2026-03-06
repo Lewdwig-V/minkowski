@@ -193,6 +193,9 @@ impl Snapshot {
                     // SAFETY: arch_idx, comp_id, row are all valid — we're iterating
                     // within bounds from the archetype's own metadata.
                     let ptr = unsafe { world.archetype_column_ptr(arch_idx, comp_id, row) };
+                    // PERF: Per-row Vec::new() is unavoidable — ColumnData::values
+                    // owns Vec<Vec<u8>>. The rkyv to_bytes_in optimization in codec.rs
+                    // eliminates the internal double-allocation per value.
                     let mut buf = Vec::new();
                     // SAFETY: ptr points to a valid, aligned component value in the
                     // archetype column.
@@ -355,6 +358,9 @@ impl Snapshot {
                             // Direct copy — archived bytes match native layout.
                             // Safe because: bytes were produced by rkyv::to_bytes
                             // during save, and the envelope was validated by rkyv::access.
+                            // PERF: .to_vec() from mmap is unavoidable — BlobVec needs
+                            // owned memory. Eliminating this copy would require a
+                            // BlobVec::push_from_slice API writing directly from mmap.
                             archived_bytes.to_vec()
                         } else {
                             // Size mismatch — fall back to typed deserialization

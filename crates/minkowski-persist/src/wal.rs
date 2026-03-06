@@ -193,6 +193,9 @@ impl Wal {
             MutationRef::Spawn { entity, components } => {
                 let mut serialized = Vec::new();
                 for &(comp_id, raw_bytes) in components {
+                    // PERF: Per-component Vec::new() is unavoidable — SerializedMutation
+                    // owns Vec<(ComponentId, Vec<u8>)>. The rkyv to_bytes_in optimization
+                    // in codec.rs eliminates the *internal* double-allocation.
                     let mut buf = Vec::new();
                     // SAFETY: raw_bytes points to a valid component value from the Arena.
                     // The byte slice was constructed from arena.get(offset) with the
@@ -302,6 +305,9 @@ impl Wal {
     /// Scan the WAL file to find the last valid sequence number.
     /// If a torn entry is found (partial length prefix or incomplete payload),
     /// the file is truncated to the last valid record boundary.
+    // PERF: Full scan on open is required for crash recovery — the WAL has no
+    // index or footer, so the only way to find the last valid record is linear
+    // scan. This runs once at startup, not per-frame.
     fn scan_last_seq(&mut self) -> Result<u64, WalError> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut last_seq = 0u64;

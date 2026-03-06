@@ -51,6 +51,8 @@ Determine which files to analyze:
 
 Read the scoped files identified in Phase 1. Then dispatch **all 4 agents in a single message** (parallel execution) using the Agent tool. Pass each agent the list of scoped files and the specific functions to examine from the hot path list.
 
+**Important: `// PERF:` annotations** — Code on hot paths may contain `// PERF:` comments explaining why a pattern that *looks* suboptimal is intentional or unavoidable. These were added by previous shakedown runs after analysis determined the pattern is non-actionable. When an agent encounters a `// PERF:` comment, it should report the pattern as `PERF-OK (annotated)` with the rationale from the comment, not re-flag it as an issue. Include this instruction in each agent prompt.
+
 ### Agent 1: data-layout
 
 Use the Agent tool with this prompt:
@@ -169,4 +171,20 @@ Present the final report as:
 
 ### Hot Path List Maintenance
 [Any suggested additions or removals to the static list in this command]
+
+### Non-Actionable Annotations
+[List any findings deemed non-actionable with rationale, to be added as // PERF: comments]
 ```
+
+## Phase 4 — Annotate Non-Actionable Findings
+
+After presenting the report and discussing findings with the user, add `// PERF:` comments to hot path code for any findings confirmed as non-actionable. This prevents future shakedown runs from re-flagging the same patterns.
+
+Format: `// PERF: <concise rationale for why this is intentional or unavoidable>`
+
+Place the comment immediately above or on the line containing the pattern. Examples:
+- `// PERF: No for_each_chunk — WritableRef indirection is inherent to buffered writes.`
+- `// PERF: Per-row Vec::new() unavoidable — ColumnData::values owns Vec<Vec<u8>>.`
+- `// PERF: Full WAL scan on open required for crash recovery — no index or footer.`
+
+Only annotate after user confirmation that the finding is non-actionable. Do not pre-annotate speculatively.
