@@ -8,7 +8,6 @@ use rkyv::bytecheck::CheckBytes;
 use rkyv::de::Pool;
 use rkyv::rancor;
 use rkyv::ser::allocator::ArenaHandle;
-use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 /// Type-erased serialize: reads T from raw pointer, serializes to output buffer.
@@ -82,7 +81,7 @@ impl CodecRegistry {
         T: Component
             + Archive
             + for<'a> RkyvSerialize<
-                rkyv::api::high::HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>,
+                rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
             > + Clone,
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
             + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
@@ -104,9 +103,9 @@ impl CodecRegistry {
 
         let serialize_fn: SerializeFn = |ptr, out| {
             let value = unsafe { &*ptr.cast::<T>() };
-            let bytes = rkyv::to_bytes::<rancor::Error>(value)
+            // Write directly into the caller's Vec — no intermediate AlignedVec.
+            *out = rkyv::api::high::to_bytes_in::<_, rancor::Error>(value, std::mem::take(out))
                 .map_err(|e| CodecError::Serialize(e.to_string()))?;
-            out.extend_from_slice(&bytes);
             Ok(())
         };
 

@@ -335,6 +335,41 @@ impl<'a> DynamicCtx<'a> {
         // last_read_tick is updated by dynamic_call() AFTER the changeset
         // is applied, ensuring it's newer than any column tick set during commit.
     }
+
+    /// Chunk iteration: yields typed slices per archetype for SIMD-friendly
+    /// access. Same validation and semantics as [`for_each`](Self::for_each).
+    ///
+    /// # Panics
+    /// Panics if `Q` accesses any component not declared via `can_read`
+    /// or `can_write` on the builder.
+    pub fn for_each_chunk<Q: ReadOnlyWorldQuery + 'static>(&self, mut f: impl FnMut(Q::Slice<'_>)) {
+        self.queried.store(true, Ordering::Relaxed);
+        let accessed = Q::accessed_ids(&self.world.components);
+        for comp_id in accessed.ones() {
+            assert!(
+                self.resolved.contains_comp_id(comp_id),
+                "query accesses component ID {} which was not declared \
+                 in dynamic reducer (use can_read/can_write)",
+                comp_id,
+            );
+        }
+
+        let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
+        let required = Q::required_ids(&self.world.components);
+
+        for arch in &self.world.archetypes.archetypes {
+            if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                continue;
+            }
+            if !Q::matches_filters(arch, &self.world.components, last_tick) {
+                continue;
+            }
+            let fetch = Q::init_fetch(arch, &self.world.components);
+            // Safety: fetch was initialized from this archetype, len is in bounds.
+            let slices = unsafe { Q::as_slice(&fetch, arch.len()) };
+            f(slices);
+        }
+    }
 }
 
 // ── Macro ────────────────────────────────────────────────────────────
@@ -877,6 +912,10 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
     ///
     /// Advances the change detection tick: entities matched here will NOT
     /// be matched again on the next call unless their columns are modified.
+    ///
+    // PERF: No for_each_chunk variant — WritableRef indirection is inherent
+    // to buffered writes. A chunk API would imply contiguous-slice performance
+    // characteristics that the changeset buffering cannot deliver.
     pub fn for_each(&mut self, mut f: impl FnMut(Q::WriterItem<'_>)) {
         self.queried.store(true, Ordering::Relaxed);
         let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
@@ -2432,6 +2471,48 @@ mod tests {
             .unwrap();
         assert_eq!(visit_count.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(world.get::<Pos>(e).unwrap().0, 100.0);
+    }
+
+    // ── DynamicCtx::for_each_chunk tests ────────────────────────
+
+    #[test]
+    fn dynamic_ctx_for_each_chunk_iterates() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        world.spawn((Pos(2.0),));
+        world.spawn((Vel(3.0),)); // no Pos — not matched
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = count.clone();
+        let id = registry
+            .dynamic("count_pos_chunks", &mut world)
+            .can_read::<Pos>()
+            .build(move |ctx: &mut DynamicCtx, _args: &()| {
+                ctx.for_each_chunk::<(&Pos,)>(|(positions,)| {
+                    counter.fetch_add(positions.len(), std::sync::atomic::Ordering::Relaxed);
+                });
+            });
+        registry
+            .dynamic_call(&strategy, &mut world, id, &())
+            .unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "not declared")]
+    fn dynamic_ctx_for_each_chunk_undeclared_panics() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("bad_chunk_query", &mut world)
+            .can_read::<Pos>()
+            .build(|ctx: &mut DynamicCtx, _args: &()| {
+                ctx.for_each_chunk::<(&Pos, &Vel)>(|(_p, _v)| {});
+            });
+        let _ = registry.dynamic_call(&strategy, &mut world, id, &());
     }
 
     // ── Debug assertion tests ────────────────────────────────────
