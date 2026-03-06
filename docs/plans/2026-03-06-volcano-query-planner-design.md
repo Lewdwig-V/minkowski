@@ -205,7 +205,7 @@ No. Returns `Vec<Option<&T>>` — standard Rust references. No cleanup, no alloc
 
 ### 4. Does dedup/merge/collapse preserve the strongest invariant?
 
-No dedup. If the same entity appears twice in the input, it appears twice in the output. This matches `get()` semantics — calling `get(e)` twice returns two references to the same data.
+`get_batch` (read-only): if the same entity appears twice, it appears twice in the output — two shared references to the same data, which is safe. `get_batch_mut`: duplicate entities are detected during archetype grouping and cause a panic. Aliased `&mut T` is UB, so this is an unconditional `assert!`, not `debug_assert!`.
 
 ### 5. What happens if this is abandoned halfway through?
 
@@ -244,7 +244,7 @@ No dedup. If the same entity appears twice in the input, it appears twice in the
 3. **`crates/minkowski/src/world.rs`** — Add `get_batch_mut::<T>(&mut self, &[Entity]) -> Vec<Option<&mut T>>`
    - Same grouping logic
    - Uses `get_ptr_mut(row, tick)` for change detection
-   - Must handle aliasing: if same entity appears twice, second reference would alias → panic or skip
+   - Unconditional duplicate check: if same entity appears twice, panic (aliased `&mut T` is UB — this is an `assert!` boundary)
 
 4. **Tests**:
    - `get_batch_mut_basic` — mutate via returned references
