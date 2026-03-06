@@ -7,6 +7,10 @@ use std::collections::HashMap;
 pub trait Component: 'static + Send + Sync {}
 impl<T: 'static + Send + Sync> Component for T {}
 
+/// Unique identifier for a registered component type.
+///
+/// Assigned sequentially by the component registry. Use
+/// [`World::component_id`](crate::World::component_id) to look up the ID for a type.
 pub type ComponentId = usize;
 
 #[allow(dead_code)]

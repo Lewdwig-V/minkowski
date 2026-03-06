@@ -85,16 +85,15 @@ pub unsafe trait WorldQuery {
     }
 }
 
-/// Marker trait for query types that only produce shared references.
+/// Marker trait for query types that only read components.
+///
+/// Required by [`Tx::query`](crate::Tx::query) to prevent aliased `&mut T`
+/// during concurrent read phases. Implemented for `&T`, `Entity`,
+/// `Option<&T>`, `Changed<T>`, and tuples of read-only queries.
 ///
 /// # Safety
 /// Implementors must guarantee that `fetch` and `as_slice` never produce
-/// mutable references. This makes `World::query_raw(&self)` sound — multiple
-/// threads can execute read-only queries concurrently against `&World`.
-///
-/// `&mut T` intentionally does NOT implement this trait. Transaction queries
-/// (`Tx::query`) require this bound to
-/// prevent aliased mutable references during concurrent read phases.
+/// mutable references. `&mut T` intentionally does NOT implement this trait.
 pub unsafe trait ReadOnlyWorldQuery: WorldQuery {}
 
 // Safety: &T produces &'w T — shared reference only.
@@ -240,8 +239,13 @@ unsafe impl<T: Component> WorldQuery for Option<&T> {
 
 // --- Changed<T> ---
 
-/// Query filter that skips archetypes where component T hasn't changed
-/// since the query's last read tick.
+/// Query filter that skips archetypes unchanged since the last query evaluation.
+///
+/// "Changed" means "since the last time **this query** observed this column" —
+/// it has no concept of frames or simulation time. The tick is per-query-type
+/// (stored in the query cache) and advances automatically on each mutable access.
+/// Marking is pessimistic: any mutable access path marks the column, even if
+/// no bytes actually changed.
 pub struct Changed<T: Component>(std::marker::PhantomData<T>);
 
 unsafe impl<T: Component> WorldQuery for Changed<T> {

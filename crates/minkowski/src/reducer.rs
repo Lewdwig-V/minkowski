@@ -18,7 +18,11 @@ use crate::world::World;
 // ── ComponentSet & Contains ──────────────────────────────────────────
 
 /// Declares a set of component types with pre-resolved IDs.
-/// Macro-generated for tuples 1–12.
+///
+/// Macro-generated for tuples of 1-12 `Component` types.
+/// Used as the type parameter `C` on [`EntityRef<C>`](EntityRef) and
+/// [`EntityMut<C>`](EntityMut) to constrain which components the handle can access.
+/// See [`ReducerRegistry`] for usage.
 pub trait ComponentSet: 'static {
     const COUNT: usize;
 
