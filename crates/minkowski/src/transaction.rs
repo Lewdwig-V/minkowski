@@ -83,6 +83,41 @@ pub struct Conflict {
     pub component_ids: FixedBitSet,
 }
 
+impl Conflict {
+    /// Format the conflict with resolved component names from the World.
+    ///
+    /// Produces a human-readable message like:
+    /// `"transaction conflict on [Pos, Vel] — try increasing retries or switching to Pessimistic"`
+    pub fn display_with(&self, world: &World) -> String {
+        let names: Vec<&str> = self
+            .component_ids
+            .ones()
+            .filter_map(|id| world.component_name(id))
+            .collect();
+        if names.is_empty() {
+            return format!("{self}");
+        }
+        format!(
+            "transaction conflict on [{}] — \
+             try increasing retries or switching to Pessimistic strategy",
+            names.join(", ")
+        )
+    }
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ids: Vec<usize> = self.component_ids.ones().collect();
+        write!(
+            f,
+            "transaction conflict on component columns {ids:?} — \
+             try increasing retries or switching to Pessimistic strategy"
+        )
+    }
+}
+
+impl std::error::Error for Conflict {}
+
 // ── TxCleanup + Tx ─────────────────────────────────────────────────
 
 /// Strategy-specific teardown logic invoked when a [`Tx`] is dropped
@@ -1110,5 +1145,52 @@ mod tests {
         let access = Access::of::<(&mut Pos,)>(&mut world_a);
         let strategy = Optimistic::new(&world_a);
         let _ = strategy.transact(&mut world_b, &access, |_tx, _world| {});
+    }
+
+    // ── Conflict display tests ──────────────────────────────────────
+
+    #[test]
+    fn conflict_display_shows_component_ids() {
+        let mut bits = FixedBitSet::with_capacity(8);
+        bits.insert(1);
+        bits.insert(5);
+        let conflict = Conflict {
+            component_ids: bits,
+        };
+        let msg = format!("{conflict}");
+        assert!(msg.contains("[1, 5]"), "should list component IDs: {msg}");
+        assert!(
+            msg.contains("Pessimistic"),
+            "should suggest alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn conflict_display_with_resolves_names() {
+        let mut world = World::new();
+        world.register_component::<Pos>();
+        world.register_component::<Vel>();
+        let mut bits = FixedBitSet::with_capacity(2);
+        bits.insert(0);
+        bits.insert(1);
+        let conflict = Conflict {
+            component_ids: bits,
+        };
+        let msg = conflict.display_with(&world);
+        assert!(msg.contains("Pos"), "should resolve Pos: {msg}");
+        assert!(msg.contains("Vel"), "should resolve Vel: {msg}");
+        assert!(
+            msg.contains("Pessimistic"),
+            "should suggest alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn conflict_is_std_error() {
+        let conflict = Conflict {
+            component_ids: FixedBitSet::new(),
+        };
+        // Verify Conflict implements std::error::Error (compiles = passes)
+        let _: &dyn std::error::Error = &conflict;
     }
 }

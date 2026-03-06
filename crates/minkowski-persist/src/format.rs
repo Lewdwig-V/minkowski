@@ -1,15 +1,8 @@
 use crate::record::{SnapshotData, WalRecord};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("rkyv format error: {0}")]
 pub struct FormatError(pub String);
-
-impl std::fmt::Display for FormatError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "format: {}", self.0)
-    }
-}
-
-impl std::error::Error for FormatError {}
 
 pub fn serialize_record(record: &WalRecord) -> Result<Vec<u8>, FormatError> {
     rkyv::to_bytes::<rkyv::rancor::Error>(record)

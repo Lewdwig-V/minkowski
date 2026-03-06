@@ -1,0 +1,7 @@
+{
+  "threshold": 10,
+  "reporters": ["console"],
+  "ignore": ["**/benches/**"],
+  "minLines": 8,
+  "minTokens": 75
+}
