@@ -482,6 +482,9 @@ impl World {
     /// accessed columns as changed for [`Changed<T>`](crate::query::fetch::Changed)
     /// detection.
     ///
+    /// **Note:** Sparse components do not participate in [`Changed<T>`](crate::query::fetch::Changed)
+    /// detection (this matches the behavior of [`get_mut`](Self::get_mut)).
+    ///
     /// # Panics
     ///
     /// Panics if the same entity appears more than once in `entities`.
@@ -1962,5 +1965,43 @@ mod tests {
 
         assert_eq!(world.get::<Health>(e1), Some(&Health(11)));
         assert_eq!(world.get::<Health>(e2), Some(&Health(21)));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate entity")]
+    fn get_batch_mut_sparse_duplicate_panics() {
+        let mut world = World::new();
+        world.components.register_sparse::<Health>();
+        let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.insert_sparse(e, Health(42));
+        let _results = world.get_batch_mut::<Health>(&[e, e]);
+    }
+
+    #[test]
+    fn get_batch_mut_same_index_different_generation_no_panic() {
+        let mut world = World::new();
+        let old = world.spawn((Health(1),));
+        world.despawn(old);
+        let new = world.spawn((Health(2),));
+        // After despawn + respawn, the free list reuses the same index
+        assert_eq!(old.index(), new.index());
+        let results = world.get_batch_mut::<Health>(&[old, new]);
+        assert!(results[0].is_none()); // dead
+        assert_eq!(*results[1].as_ref().unwrap(), &Health(2));
+    }
+
+    #[test]
+    fn get_batch_mut_unregistered_type() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let results = world.get_batch_mut::<Health>(&[e]);
+        assert_eq!(results[0], None);
+    }
+
+    #[test]
+    fn get_batch_mut_empty_input() {
+        let mut world = World::new();
+        let results = world.get_batch_mut::<Health>(&[]);
+        assert!(results.is_empty());
     }
 }
