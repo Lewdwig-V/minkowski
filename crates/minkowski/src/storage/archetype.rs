@@ -1,5 +1,6 @@
-use fixedbitset::FixedBitSet;
 use std::collections::HashMap;
+
+use fixedbitset::FixedBitSet;
 
 use super::blob_vec::BlobVec;
 use crate::component::{ComponentId, ComponentRegistry};
@@ -17,8 +18,12 @@ pub(crate) struct Archetype {
     pub sorted_ids: Vec<ComponentId>,
     /// One BlobVec per component, in sorted_ids order.
     pub columns: Vec<BlobVec>,
-    /// ComponentId -> index into columns.
-    pub component_index: HashMap<ComponentId, usize>,
+    // PERF: Dense Vec indexed by ComponentId — O(1) lookup without hashing.
+    // ComponentIds are assigned sequentially by ComponentRegistry, so the
+    // Vec is at most max_component_id+1 entries. Replaces HashMap for
+    // every init_fetch, get_mut, insert, and migration path.
+    /// ComponentId -> index into columns. Dense array indexed by ComponentId.
+    pub component_index: Vec<Option<usize>>,
     /// Row -> Entity mapping.
     pub entities: Vec<Entity>,
 }
@@ -32,13 +37,13 @@ impl Archetype {
         let max_id = sorted_component_ids.iter().copied().max().unwrap_or(0);
         let mut bitset = FixedBitSet::with_capacity(max_id + 1);
         let mut columns = Vec::with_capacity(sorted_component_ids.len());
-        let mut component_index = HashMap::new();
+        let mut component_index = vec![None; max_id + 1];
 
         for (col_idx, &comp_id) in sorted_component_ids.iter().enumerate() {
             bitset.insert(comp_id);
             let info = registry.info(comp_id);
             columns.push(BlobVec::new(info.layout, info.drop_fn, 0));
-            component_index.insert(comp_id, col_idx);
+            component_index[comp_id] = Some(col_idx);
         }
 
         Self {
@@ -49,6 +54,12 @@ impl Archetype {
             component_index,
             entities: Vec::new(),
         }
+    }
+
+    /// Look up the column index for a component. O(1) indexed access.
+    #[inline]
+    pub fn column_index(&self, comp_id: ComponentId) -> Option<usize> {
+        self.component_index.get(comp_id).copied().flatten()
     }
 
     #[inline]
@@ -147,7 +158,7 @@ mod tests {
         let entity = Entity::new(0, 0);
         let mut pos = Pos { x: 1.0, y: 2.0 };
         unsafe {
-            let col = arch.component_index[&pos_id];
+            let col = arch.column_index(pos_id).unwrap();
             arch.columns[col].push(&mut pos as *mut Pos as *mut u8);
             let _ = pos;
             arch.entities.push(entity);
@@ -155,7 +166,7 @@ mod tests {
         assert_eq!(arch.len(), 1);
 
         unsafe {
-            let col = arch.component_index[&pos_id];
+            let col = arch.column_index(pos_id).unwrap();
             let ptr = arch.columns[col].get_ptr(0) as *const Pos;
             assert_eq!(*ptr, Pos { x: 1.0, y: 2.0 });
         }

@@ -461,7 +461,7 @@ impl EnumChangeSet {
                     let archetype = &mut world.archetypes.archetypes[arch_id.0];
                     for &(comp_id, offset, layout) in components {
                         let src = self.arena.get(offset);
-                        let col = archetype.component_index[&comp_id];
+                        let col = archetype.column_index(comp_id).unwrap();
                         unsafe {
                             archetype.columns[col].push(src as *mut u8);
                         }
@@ -540,7 +540,7 @@ fn changeset_insert_raw(
 
     if src_arch.component_ids.contains(comp_id) {
         // Entity already has this component — overwrite in-place.
-        let col_idx = src_arch.component_index[&comp_id];
+        let col_idx = src_arch.column_index(comp_id).unwrap();
 
         // Capture old value for reverse (read path — no tick).
         let old_ptr = unsafe { src_arch.columns[col_idx].get_ptr(location.row) };
@@ -581,8 +581,8 @@ fn changeset_insert_raw(
         );
 
         // Move shared columns from source to target.
-        for (&cid, &src_col) in &src_arch.component_index {
-            if let Some(&tgt_col) = target_arch.component_index.get(&cid) {
+        for (src_col, &cid) in src_arch.sorted_ids.iter().enumerate() {
+            if let Some(tgt_col) = target_arch.column_index(cid) {
                 unsafe {
                     let ptr = src_arch.columns[src_col].get_ptr(src_row);
                     target_arch.columns[tgt_col].push(ptr);
@@ -592,7 +592,7 @@ fn changeset_insert_raw(
         }
 
         // Write the new component into target.
-        let tgt_col = target_arch.component_index[&comp_id];
+        let tgt_col = target_arch.column_index(comp_id).unwrap();
         unsafe {
             target_arch.columns[tgt_col].push(data_ptr as *mut u8);
         }
@@ -646,7 +646,7 @@ fn changeset_remove_raw(
     let info = world.components.info(comp_id);
     let layout = info.layout;
     let drop_fn = info.drop_fn;
-    let col_idx = src_arch.component_index[&comp_id];
+    let col_idx = src_arch.column_index(comp_id).unwrap();
     let old_ptr = unsafe { src_arch.columns[col_idx].get_ptr(location.row) };
     let offset = reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
     if let Some(drop_fn) = drop_fn {
@@ -667,12 +667,12 @@ fn changeset_remove_raw(
         // Entity has no components left — move to empty archetype.
         let arch = &mut world.archetypes.archetypes[src_arch_id.0];
         // swap_remove_no_drop for the removed component (data already captured)
-        let removed_col = arch.component_index[&comp_id];
+        let removed_col = arch.column_index(comp_id).unwrap();
         unsafe {
             arch.columns[removed_col].swap_remove_no_drop(src_row);
         }
         // swap_remove with drop for remaining columns
-        for (&cid, &col_idx_inner) in &arch.component_index {
+        for (col_idx_inner, &cid) in arch.sorted_ids.iter().enumerate() {
             if cid != comp_id {
                 unsafe {
                     arch.columns[col_idx_inner].swap_remove(src_row);
@@ -708,13 +708,13 @@ fn changeset_remove_raw(
     );
 
     // Move shared columns (skip removed component).
-    for (&cid, &src_col) in &src_arch.component_index {
+    for (src_col, &cid) in src_arch.sorted_ids.iter().enumerate() {
         if cid == comp_id {
             // Already captured — just discard from source.
             unsafe {
                 src_arch.columns[src_col].swap_remove_no_drop(src_row);
             }
-        } else if let Some(&tgt_col) = target_arch.component_index.get(&cid) {
+        } else if let Some(tgt_col) = target_arch.column_index(cid) {
             unsafe {
                 let ptr = src_arch.columns[src_col].get_ptr(src_row);
                 target_arch.columns[tgt_col].push(ptr);

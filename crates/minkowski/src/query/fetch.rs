@@ -133,7 +133,9 @@ unsafe impl<T: Component> WorldQuery for &T {
 
     fn init_fetch(archetype: &Archetype, registry: &ComponentRegistry) -> ThinSlicePtr<T> {
         let id = registry.id::<T>().expect("component not registered");
-        let col_idx = archetype.component_index[&id];
+        let col_idx = archetype
+            .column_index(id)
+            .expect("component not in archetype");
         unsafe { ThinSlicePtr::new(archetype.columns[col_idx].get_ptr(0) as *mut T) }
     }
 
@@ -222,8 +224,8 @@ unsafe impl<T: Component> WorldQuery for Option<&T> {
 
     fn init_fetch(archetype: &Archetype, registry: &ComponentRegistry) -> Option<ThinSlicePtr<T>> {
         let id = registry.id::<T>()?;
-        let col_idx = archetype.component_index.get(&id)?;
-        Some(unsafe { ThinSlicePtr::new(archetype.columns[*col_idx].get_ptr(0) as *mut T) })
+        let col_idx = archetype.column_index(id)?;
+        Some(unsafe { ThinSlicePtr::new(archetype.columns[col_idx].get_ptr(0) as *mut T) })
     }
 
     unsafe fn fetch<'w>(fetch: &Option<ThinSlicePtr<T>>, row: usize) -> Option<&'w T> {
@@ -276,8 +278,8 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
             Some(id) => id,
             None => return false,
         };
-        let col_idx = match archetype.component_index.get(&comp_id) {
-            Some(&idx) => idx,
+        let col_idx = match archetype.column_index(comp_id) {
+            Some(idx) => idx,
             None => return false,
         };
         archetype.columns[col_idx]
@@ -414,7 +416,7 @@ mod tests {
 
         let mut pos = Pos { x: 1.0, y: 2.0 };
         unsafe {
-            let col = arch.component_index[&pos_id];
+            let col = arch.column_index(pos_id).unwrap();
             arch.columns[col].push(&mut pos as *mut Pos as *mut u8);
             let _ = pos;
         }
@@ -433,7 +435,7 @@ mod tests {
 
         let mut pos = Pos { x: 1.0, y: 2.0 };
         unsafe {
-            let col = arch.component_index[&pos_id];
+            let col = arch.column_index(pos_id).unwrap();
             arch.columns[col].push(&mut pos as *mut Pos as *mut u8);
             let _ = pos;
         }

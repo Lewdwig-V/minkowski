@@ -88,7 +88,11 @@ impl TableCache {
             // Map field index -> archetype column index
             let col_indices: Vec<usize> = field_ids
                 .iter()
-                .map(|comp_id| archetype.component_index[comp_id])
+                .map(|comp_id| {
+                    archetype
+                        .column_index(*comp_id)
+                        .expect("component not in archetype")
+                })
                 .collect();
 
             let item_sizes: Vec<usize> = field_ids

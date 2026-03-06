@@ -67,12 +67,12 @@ impl ColumnLockTable {
         let mut requests: Vec<(usize, ComponentId, LockMode)> = Vec::new();
         for arch in archetypes {
             for comp_id in reads.ones() {
-                if arch.component_index.contains_key(&comp_id) {
+                if arch.column_index(comp_id).is_some() {
                     requests.push((arch.id.0, comp_id, LockMode::Shared));
                 }
             }
             for comp_id in writes.ones() {
-                if arch.component_index.contains_key(&comp_id) {
+                if arch.column_index(comp_id).is_some() {
                     requests.push((arch.id.0, comp_id, LockMode::Exclusive));
                 }
             }

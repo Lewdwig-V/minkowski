@@ -187,8 +187,8 @@ impl World {
         let mut results = Vec::new();
 
         for arch in &self.archetypes.archetypes {
-            let col_idx = match arch.component_index.get(&comp_id) {
-                Some(&idx) => idx,
+            let col_idx = match arch.column_index(comp_id) {
+                Some(idx) => idx,
                 None => continue,
             };
             if !arch.columns[col_idx].changed_tick.is_newer_than(since_tick) {
@@ -277,7 +277,7 @@ impl World {
         let archetype = &mut self.archetypes.archetypes[arch_id.0];
         unsafe {
             bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
-                let col = archetype.component_index[&comp_id];
+                let col = archetype.column_index(comp_id).unwrap();
                 archetype.columns[col].push(ptr as *mut u8);
             });
         }
@@ -370,9 +370,9 @@ impl World {
         }
 
         let archetype = &self.archetypes.archetypes[location.archetype_id.0];
-        let col_idx = archetype.component_index.get(&comp_id)?;
+        let col_idx = archetype.column_index(comp_id)?;
         unsafe {
-            let ptr = archetype.columns[*col_idx].get_ptr(location.row) as *const T;
+            let ptr = archetype.columns[col_idx].get_ptr(location.row) as *const T;
             Some(&*ptr)
         }
     }
@@ -391,9 +391,9 @@ impl World {
         }
         let location = self.entity_locations[entity.index() as usize]?;
         let archetype = &self.archetypes.archetypes[location.archetype_id.0];
-        let col_idx = archetype.component_index.get(&comp_id)?;
+        let col_idx = archetype.column_index(comp_id)?;
         unsafe {
-            let ptr = archetype.columns[*col_idx].get_ptr(location.row) as *const T;
+            let ptr = archetype.columns[col_idx].get_ptr(location.row) as *const T;
             Some(&*ptr)
         }
     }
@@ -412,7 +412,7 @@ impl World {
 
         let tick = self.next_tick();
         let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
-        let col_idx = *archetype.component_index.get(&comp_id)?;
+        let col_idx = archetype.column_index(comp_id)?;
         unsafe {
             let ptr = archetype.columns[col_idx].get_ptr_mut(location.row, tick) as *mut T;
             Some(&mut *ptr)
@@ -464,7 +464,7 @@ impl World {
         // Fetch per-archetype: one column lookup per archetype, not per entity.
         for (arch_idx, rows) in &by_arch {
             let arch = &self.archetypes.archetypes[*arch_idx];
-            if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+            if let Some(col_idx) = arch.column_index(comp_id) {
                 for &(result_idx, row) in rows {
                     results[result_idx] = unsafe {
                         let ptr = arch.columns[col_idx].get_ptr(row) as *const T;
@@ -552,7 +552,7 @@ impl World {
         let tick = self.next_tick();
         for (arch_idx, rows) in &by_arch {
             let arch = &mut self.archetypes.archetypes[*arch_idx];
-            if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+            if let Some(col_idx) = arch.column_index(comp_id) {
                 for &(result_idx, row) in rows {
                     results[result_idx] = unsafe {
                         let ptr = arch.columns[col_idx].get_ptr_mut(row, tick) as *mut T;
@@ -625,7 +625,7 @@ impl World {
             for &aid in &filtered_ids {
                 for comp_id in mutable.ones() {
                     let arch = &self.archetypes.archetypes[aid.0];
-                    if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                    if let Some(col_idx) = arch.column_index(comp_id) {
                         self.archetypes.archetypes[aid.0].columns[col_idx].mark_changed(tick);
                     }
                 }
@@ -731,7 +731,7 @@ impl World {
             if has_component {
                 let tick = self.next_tick();
                 let src_arch = &mut self.archetypes.archetypes[location.archetype_id.0];
-                let col_idx = src_arch.component_index[&comp_id];
+                let col_idx = src_arch.column_index(comp_id).unwrap();
                 unsafe {
                     let ptr = src_arch.columns[col_idx].get_ptr_mut(location.row, tick) as *mut T;
                     std::ptr::drop_in_place(ptr);
@@ -759,8 +759,8 @@ impl World {
         );
 
         // Move shared columns: read ptr from source, push to target, swap_remove_no_drop source
-        for (&cid, &src_col) in &src_arch.component_index {
-            if let Some(&tgt_col) = target_arch.component_index.get(&cid) {
+        for (src_col, &cid) in src_arch.sorted_ids.iter().enumerate() {
+            if let Some(tgt_col) = target_arch.column_index(cid) {
                 unsafe {
                     let ptr = src_arch.columns[src_col].get_ptr(src_row);
                     target_arch.columns[tgt_col].push(ptr);
@@ -770,7 +770,7 @@ impl World {
         }
 
         // Write the new component into target
-        let tgt_col = target_arch.component_index[&comp_id];
+        let tgt_col = target_arch.column_index(comp_id).unwrap();
         unsafe {
             let comp = std::mem::ManuallyDrop::new(component);
             target_arch.columns[tgt_col].push(&*comp as *const T as *mut u8);
@@ -815,7 +815,7 @@ impl World {
 
         // Read the component value before migration
         let removed = unsafe {
-            let col_idx = src_arch.component_index[&comp_id];
+            let col_idx = src_arch.column_index(comp_id).unwrap();
             let ptr = src_arch.columns[col_idx].get_ptr(location.row) as *const T;
             std::ptr::read(ptr)
         };
@@ -834,12 +834,12 @@ impl World {
             // Entity has no components left — move to empty archetype
             let arch = &mut self.archetypes.archetypes[src_arch_id.0];
             // swap_remove_no_drop for the removed component (already read)
-            let removed_col = arch.component_index[&comp_id];
+            let removed_col = arch.column_index(comp_id).unwrap();
             unsafe {
                 arch.columns[removed_col].swap_remove_no_drop(src_row);
             }
             // swap_remove with drop for remaining columns
-            for (&cid, &col_idx) in &arch.component_index {
+            for (col_idx, &cid) in arch.sorted_ids.iter().enumerate() {
                 if cid != comp_id {
                     unsafe {
                         arch.columns[col_idx].swap_remove(src_row);
@@ -873,13 +873,13 @@ impl World {
         );
 
         // Move shared columns (skip removed component)
-        for (&cid, &src_col) in &src_arch.component_index {
+        for (src_col, &cid) in src_arch.sorted_ids.iter().enumerate() {
             if cid == comp_id {
                 // Already read — just discard from source
                 unsafe {
                     src_arch.columns[src_col].swap_remove_no_drop(src_row);
                 }
-            } else if let Some(&tgt_col) = target_arch.component_index.get(&cid) {
+            } else if let Some(tgt_col) = target_arch.column_index(cid) {
                 unsafe {
                     let ptr = src_arch.columns[src_col].get_ptr(src_row);
                     target_arch.columns[tgt_col].push(ptr);
@@ -926,7 +926,7 @@ impl World {
             .sorted_ids
             .iter()
             .map(|&comp_id| {
-                let col_idx = archetype.component_index[&comp_id];
+                let col_idx = archetype.column_index(comp_id).unwrap();
                 let info = self.components.info(comp_id);
                 let ptr = unsafe { archetype.columns[col_idx].get_ptr(location.row) };
                 (comp_id, ptr as *const u8, info.layout)
@@ -947,7 +947,7 @@ impl World {
         let mut ticks = Vec::new();
         for arch in &self.archetypes.archetypes {
             for comp_id in component_ids.ones() {
-                if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                if let Some(col_idx) = arch.column_index(comp_id) {
                     ticks.push((arch.id.0, comp_id, arch.columns[col_idx].changed_tick));
                 }
             }
@@ -966,7 +966,7 @@ impl World {
         #[allow(clippy::collapsible_if)]
         for &(arch_idx, comp_id, begin_tick) in snapshot {
             if let Some(arch) = self.archetypes.archetypes.get(arch_idx) {
-                if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                if let Some(col_idx) = arch.column_index(comp_id) {
                     if arch.columns[col_idx].changed_tick.is_newer_than(begin_tick) {
                         conflicts.grow(comp_id + 1);
                         conflicts.insert(comp_id);
@@ -1034,7 +1034,7 @@ impl World {
         row: usize,
     ) -> *const u8 {
         let arch = &self.archetypes.archetypes[arch_idx];
-        let col_idx = arch.component_index[&comp_id];
+        let col_idx = arch.column_index(comp_id).unwrap();
         unsafe { arch.columns[col_idx].get_ptr(row) as *const u8 }
     }
 
@@ -1315,7 +1315,7 @@ mod tests {
         let loc = world.entity_locations[e.index() as usize].unwrap();
         let arch = &world.archetypes.archetypes[loc.archetype_id.0];
         let comp_id = world.components.id::<Pos>().unwrap();
-        let col_idx = arch.component_index[&comp_id];
+        let col_idx = arch.column_index(comp_id).unwrap();
         // get_mut should advance the tick beyond spawn's tick
         assert!(arch.columns[col_idx].changed_tick.is_newer_than(spawn_tick));
     }
@@ -1910,7 +1910,7 @@ mod tests {
         let loc = world.entity_locations[e.index() as usize].unwrap();
         let arch = &world.archetypes.archetypes[loc.archetype_id.0];
         let comp_id = world.components.id::<Health>().unwrap();
-        let col_idx = arch.component_index[&comp_id];
+        let col_idx = arch.column_index(comp_id).unwrap();
         assert!(arch.columns[col_idx].changed_tick.is_newer_than(spawn_tick));
     }
 
