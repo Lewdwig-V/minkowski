@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo test -p minkowski --lib          # Unit tests (341 tests, fast)
+cargo test -p minkowski --lib          # Unit tests (344 tests, fast)
 cargo test -p minkowski                # All tests including doc tests
 cargo test -p minkowski -- entity      # Run tests matching a filter
 
@@ -209,6 +209,7 @@ The corollary is that forging an ID — constructing one from a raw integer with
 | `minkowski-persist` | WAL, snapshots, codec registry, `Durable<S>` wrapper |
 | `rkyv` (persist) | Zero-copy serialization for WAL records and snapshots |
 | `memmap2` (persist) | Memory-mapped file I/O for zero-copy snapshot loading |
+| `thiserror` (persist) | Derive macros for `std::error::Error` impls |
 | `criterion` (dev) | Benchmark harness |
 | `hecs` (dev) | Benchmark comparison target |
 | `fastrand` (examples) | Example RNG |

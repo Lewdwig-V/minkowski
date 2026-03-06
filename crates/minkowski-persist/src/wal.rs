@@ -18,35 +18,14 @@ fn read_exact_at(file: &File, pos: u64, buf: &mut [u8]) -> io::Result<()> {
     f.read_exact(buf)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WalError {
-    Io(io::Error),
-    Codec(CodecError),
+    #[error("WAL I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("WAL codec error: {0}")]
+    Codec(#[from] CodecError),
+    #[error("WAL format error: {0}")]
     Format(String),
-}
-
-impl std::fmt::Display for WalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "WAL I/O: {e}"),
-            Self::Codec(e) => write!(f, "WAL codec: {e}"),
-            Self::Format(msg) => write!(f, "WAL format: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for WalError {}
-
-impl From<io::Error> for WalError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-impl From<CodecError> for WalError {
-    fn from(e: CodecError) -> Self {
-        Self::Codec(e)
-    }
 }
 
 /// Append-only write-ahead log. Each record is an rkyv-serialized changeset
@@ -129,49 +108,55 @@ impl Wal {
         let mut pos: u64 = 0;
         let mut last_seq = if from_seq > 0 { from_seq - 1 } else { 0 };
 
-        loop {
-            let record_start = pos;
-            let mut len_buf = [0u8; 4];
-            match read_exact_at(&self.file, record_start, &mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    self.file.set_len(record_start)?;
-                    break;
-                }
-                Err(e) => return Err(e.into()),
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut payload = vec![0u8; len];
-            match read_exact_at(&self.file, record_start + 4, &mut payload) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    self.file.set_len(record_start)?;
-                    break;
-                }
-                Err(e) => return Err(e.into()),
-            }
-
-            let record = match format::deserialize_record(&payload) {
-                Ok(r) => r,
-                Err(_) => {
-                    // Corrupted payload — treat as torn entry, truncate.
-                    self.file.set_len(record_start)?;
-                    break;
-                }
-            };
-
+        while let Some((record, next_pos)) = self.read_next_record(pos)? {
             if record.seq >= from_seq {
                 Self::apply_record(&record, world, codecs)?;
                 last_seq = record.seq;
             }
-
-            pos = record_start + 4 + len as u64;
+            pos = next_pos;
         }
 
         Ok(last_seq)
     }
 
     // ── Internal helpers ─────────────────────────────────────────────
+
+    /// Try to read and deserialize the next WAL record starting at `pos`.
+    ///
+    /// Returns `Ok(Some((record, next_pos)))` on success, `Ok(None)` if the
+    /// file ends cleanly or a torn/corrupt entry was found (truncated to
+    /// `pos`).
+    fn read_next_record(
+        &mut self,
+        pos: u64,
+    ) -> Result<Option<(crate::record::WalRecord, u64)>, WalError> {
+        let mut len_buf = [0u8; 4];
+        match read_exact_at(&self.file, pos, &mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.file.set_len(pos)?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        match read_exact_at(&self.file, pos + 4, &mut payload) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.file.set_len(pos)?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        match format::deserialize_record(&payload) {
+            Ok(record) => Ok(Some((record, pos + 4 + len as u64))),
+            Err(_) => {
+                self.file.set_len(pos)?;
+                Ok(None)
+            }
+        }
+    }
 
     fn changeset_to_record(
         seq: u64,
@@ -311,46 +296,11 @@ impl Wal {
     fn scan_last_seq(&mut self) -> Result<u64, WalError> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut last_seq = 0u64;
-        let mut valid_end: u64 = 0;
+        let mut pos: u64 = 0;
 
-        loop {
-            let record_start = valid_end;
-            let mut len_buf = [0u8; 4];
-            match read_exact_at(&self.file, record_start, &mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // Torn length prefix — truncate to last valid boundary
-                    self.file.set_len(valid_end)?;
-                    break;
-                }
-                Err(e) => return Err(e.into()),
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut payload = vec![0u8; len];
-            match read_exact_at(&self.file, record_start + 4, &mut payload) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // Torn payload — truncate to start of this record
-                    self.file.set_len(record_start)?;
-                    break;
-                }
-                Err(e) => return Err(e.into()),
-            }
-
-            match format::deserialize_record(&payload) {
-                Ok(record) => {
-                    last_seq = record.seq;
-                    valid_end = record_start + 4 + len as u64;
-                }
-                Err(_) => {
-                    // Corrupted payload — treat as torn entry, truncate.
-                    // A crash can produce a length-complete but content-corrupt
-                    // record. Truncating to the last valid boundary preserves
-                    // all prior records for replay.
-                    self.file.set_len(record_start)?;
-                    break;
-                }
-            }
+        while let Some((record, next_pos)) = self.read_next_record(pos)? {
+            last_seq = record.seq;
+            pos = next_pos;
         }
 
         Ok(last_seq)

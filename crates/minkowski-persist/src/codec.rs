@@ -27,24 +27,18 @@ type SerializeSparseFn =
 /// Type-erased sparse insertion: deserializes bytes and inserts into World's sparse storage.
 type InsertSparseFn = fn(&mut World, Entity, &[u8]) -> Result<(), CodecError>;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CodecError {
+    #[error("failed to serialize component: {0}")]
     Serialize(String),
+    #[error("failed to deserialize component: {0}")]
     Deserialize(String),
+    #[error(
+        "no codec registered for component id {0} — \
+         call `codecs.register::<T>(&mut world)` for each component type before persisting"
+    )]
     UnregisteredComponent(ComponentId),
 }
-
-impl std::fmt::Display for CodecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Serialize(msg) => write!(f, "serialize: {msg}"),
-            Self::Deserialize(msg) => write!(f, "deserialize: {msg}"),
-            Self::UnregisteredComponent(id) => write!(f, "no codec for component {id}"),
-        }
-    }
-}
-
-impl std::error::Error for CodecError {}
 
 struct ComponentCodec {
     name: &'static str,

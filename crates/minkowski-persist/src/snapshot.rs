@@ -8,35 +8,14 @@ use crate::codec::{CodecError, CodecRegistry};
 use crate::format;
 use crate::record::*;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
-    Io(std::io::Error),
-    Codec(CodecError),
+    #[error("snapshot I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("snapshot codec error: {0}")]
+    Codec(#[from] CodecError),
+    #[error("snapshot format error: {0}")]
     Format(String),
-}
-
-impl std::fmt::Display for SnapshotError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "snapshot I/O: {e}"),
-            Self::Codec(e) => write!(f, "snapshot codec: {e}"),
-            Self::Format(msg) => write!(f, "snapshot format: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for SnapshotError {}
-
-impl From<std::io::Error> for SnapshotError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-impl From<CodecError> for SnapshotError {
-    fn from(e: CodecError) -> Self {
-        Self::Codec(e)
-    }
 }
 
 /// Full-world snapshot: serialize all archetype data to disk and reconstruct on load.
