@@ -31,6 +31,19 @@ fn iterate_minkowski(c: &mut Criterion) {
             }
         });
     });
+
+    c.bench_function("minkowski/iterate_chunk_10k", |b| {
+        b.iter(|| {
+            world.query::<(&mut Position, &Velocity)>().for_each_chunk(
+                |(positions, velocities)| {
+                    for i in 0..positions.len() {
+                        positions[i].x += velocities[i].dx;
+                        positions[i].y += velocities[i].dy;
+                    }
+                },
+            );
+        });
+    });
 }
 
 fn iterate_hecs(c: &mut Criterion) {

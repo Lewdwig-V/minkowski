@@ -12,3 +12,8 @@ fixedbitset = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "persist"
+harness = false
