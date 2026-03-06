@@ -8,17 +8,6 @@ Minkowski is an [archetype][archetype] [ECS][ecs] that doubles as a transactiona
 Most ECS engines give you fast iteration but no persistence, no rollback, no concurrency control. Most databases give you transactions but can't iterate 100,000 components per frame without blowing your cache budget. minkowski gives you both without making you pay for the one you're not using.
 The core insight: archetype-based column storage is already a columnar database. Minkowski makes that explicit. Components are stored in flat, aligned, SIMD-friendly arrays. Queries resolve to bitset comparisons. Change detection uses a monotonic tick counter that provides total ordering without per-entity overhead. Everything you need for a database is already present in a well-designed ECS — you just have to expose the right primitives.
 
-## What makes this interesting
-
-- **[Column-oriented][column-store] ECS that's also a transactional database engine** — three mutation tiers (direct, transactional, durable) over the same columnar storage
-- **Typed reducers** — closures whose type signatures prove conflict freedom, enabling compile-time scheduling without runtime validation. A reducer is a function with a declared access pattern encoded in its type signature. The engine extracts read/write bitsets from the types at registration time and uses them for conflict analysis. Two reducers with disjoint component access are proven non-conflicting at compile time — no runtime locks, no optimistic retry, no scheduler overhead. If you try to access a component you didn't declare, the compiler rejects it.
-- **Split-phase transactions** — `Tx` does not hold `&mut World`, so concurrent reads via `&World` are sound by construction. Transactions read from shared &World references and buffer writes into a private changeset. Multiple transactions execute concurrently in a parallel phase, then commit sequentially. The Rust borrow checker enforces the phase boundary — you can't start committing until all shared references are released. No manual synchronization required.
-- **AI-powered developer tooling** — an auto-triggering skill provides passive expertise; 13 slash commands guide design decisions across the paradigm
-- **No undefined behaviour** — Miri verified under Tree Borrows
-- **Composable persistence** — The Durable<S, F> wrapper takes any transaction strategy and any wire format, and guarantees that every committed transaction is WAL-logged before the caller sees the result. If the WAL write fails, the process panics — there's no silent data loss. Crash recovery replays the log from the last snapshot. The core engine has zero dependency on serde or any serialization framework.
-- **Zero-cost tiers** — Users who don't need transactions pay nothing — direct world.get_mut() has no overhead. Users who need transactions but not persistence pay only for the changeset buffer. Users who need durability add the Durable wrapper. Each tier adds cost only for the guarantees it provides.
-- **Mechanisms, not policy** — There's no built-in scheduler, no application lifecycle, no domain-specific component types. Scheduling, system ordering, and parallelism strategy are the framework author's job — minkowski provides `Access` bitsets and `is_compatible()` so they can build their own. Secondary indexes (spatial grids, B-trees) are external consumers of the change detection system, not engine features. The litmus test: "does this require knowledge of what the user's program does?" If yes, it doesn't belong in minkowski.
-
 ## Quick start
 
 > 💡 **Working with Claude Code?** The auto-triggering skill (`minkowski-guide.md`) provides passive ECS expertise in every session. Use `/design-doc` to plan a new feature, `/soundness-audit` to review concurrency invariants, or `/validate-api` and `/validate-macro` for compile-time correctness checks. Eight domain commands — `/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize` — explain the paradigm in depth. See [AI-Assisted Development](#ai-assisted-development) for the full list.
@@ -54,6 +43,17 @@ let move_id = registry.register_query::<(&mut Pos, &Vel), (), _>(
 // Dispatch — Access bitset extracted from the type signature at registration
 registry.run(&mut world, move_id, ());
 ```
+
+## What makes this interesting
+
+- **[Column-oriented][column-store] ECS that's also a transactional database engine** — three mutation tiers (direct, transactional, durable) over the same columnar storage
+- **Typed reducers** — closures whose type signatures prove conflict freedom, enabling compile-time scheduling without runtime validation. A reducer is a function with a declared access pattern encoded in its type signature. The engine extracts read/write bitsets from the types at registration time and uses them for conflict analysis. Two reducers with disjoint component access are proven non-conflicting at compile time — no runtime locks, no optimistic retry, no scheduler overhead. If you try to access a component you didn't declare, the compiler rejects it.
+- **Split-phase transactions** — `Tx` does not hold `&mut World`, so concurrent reads via `&World` are sound by construction. Transactions read from shared &World references and buffer writes into a private changeset. Multiple transactions execute concurrently in a parallel phase, then commit sequentially. The Rust borrow checker enforces the phase boundary — you can't start committing until all shared references are released. No manual synchronization required.
+- **AI-powered developer tooling** — an auto-triggering skill provides passive expertise; 13 slash commands guide design decisions across the paradigm
+- **No undefined behaviour** — Miri verified under Tree Borrows
+- **Composable persistence** — The Durable<S, F> wrapper takes any transaction strategy and any wire format, and guarantees that every committed transaction is WAL-logged before the caller sees the result. If the WAL write fails, the process panics — there's no silent data loss. Crash recovery replays the log from the last snapshot. The core engine has zero dependency on serde or any serialization framework.
+- **Zero-cost tiers** — Users who don't need transactions pay nothing — direct world.get_mut() has no overhead. Users who need transactions but not persistence pay only for the changeset buffer. Users who need durability add the Durable wrapper. Each tier adds cost only for the guarantees it provides.
+- **Mechanisms, not policy** — There's no built-in scheduler, no application lifecycle, no domain-specific component types. Scheduling, system ordering, and parallelism strategy are the framework author's job — minkowski provides `Access` bitsets and `is_compatible()` so they can build their own. Secondary indexes (spatial grids, B-trees) are external consumers of the change detection system, not engine features. The litmus test: "does this require knowledge of what the user's program does?" If yes, it doesn't belong in minkowski.
 
 ## Column-Oriented Storage
 
