@@ -21,7 +21,7 @@ MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p 
 
 Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows; `-Zmiri-ignore-leaks` only for the two `par_for_each` tests because rayon's thread pool intentionally outlives main.
 
-Pre-commit hooks run `cargo fmt` and `cargo clippy -D warnings` on commit, `cargo test` on push.
+Pre-commit hooks run `cargo fmt`, `cargo check`, and `cargo clippy` on commit (see `.pre-commit-config.yaml` for exact stages and args).
 
 ## CI
 
@@ -81,7 +81,7 @@ Each BlobVec column stores a `changed_tick: Tick`. `Changed<T>` is a `WorldQuery
 - `pub` for user-facing API; `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`). `ComponentRegistry` is `#[doc(hidden)] pub` — only for derive macro codegen.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional.
-- Every module has `#[cfg(test)] mod tests` with inline tests.
+- Most core modules define `#[cfg(test)] mod tests` with inline tests; prefer adding tests inline with the code they cover.
 - **Change detection invariant**: every path that hands out a mutable pointer to column data must use `BlobVec::get_ptr_mut(row, tick)` (marks the column changed). `BlobVec::get_ptr` is the read path — writing through it silently bypasses `Changed<T>`. If you add a new mutable accessor, it must go through `get_ptr_mut`.
 - **Bypass-path invariant rule**: when adding a new code path that skips the normal access/mutation pipeline, verify that ALL existing invariants are maintained through the bypass: change detection ticks, query cache invalidation, Access bitset accuracy, entity lifecycle tracking.
 - **Assert boundary rule**: if violating a check makes the scheduler's Access bitset disagree with reality, it's `assert!` (runs in release). `debug_assert!` is only for checks within an already-correct access boundary.
