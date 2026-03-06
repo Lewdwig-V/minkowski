@@ -600,8 +600,9 @@ impl World {
             entry.last_archetype_count = total;
         }
 
-        // Extract what we need from the cache entry, dropping the borrow
-        let matched_ids = entry.matched_ids.clone();
+        // Take the Vec to release the &mut borrow on query_cache.
+        // Avoids cloning — the Vec is put back after filtering.
+        let matched_ids = std::mem::take(&mut entry.matched_ids);
         let last_read_tick = entry.last_read_tick;
 
         // Compute which component IDs this query mutates
@@ -632,10 +633,11 @@ impl World {
             }
         }
 
-        // Update last_read_tick with a fresh tick (distinct from any mutation tick)
+        // Update last_read_tick and restore the matched_ids Vec to the cache.
         let read_tick = self.next_tick();
         if let Some(entry) = self.query_cache.get_mut(&type_id) {
             entry.last_read_tick = read_tick;
+            entry.matched_ids = matched_ids;
         }
 
         // Pass 2: build fetches (only immutable borrows of archetypes from here)
