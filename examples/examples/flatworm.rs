@@ -16,6 +16,7 @@
 //! Food pellets respawn at random positions to maintain a steady supply.
 
 use minkowski::{CommandBuffer, Entity, QueryMut, QueryRef, ReducerRegistry, SpatialIndex, World};
+use std::collections::HashSet;
 use std::time::Instant;
 
 // ── Vec2 ────────────────────────────────────────────────────────────
@@ -394,10 +395,14 @@ fn main() {
                 .collect();
 
             let mut eaten = CommandBuffer::new();
+            let mut eaten_set = HashSet::new();
             let eat_r_sq = params.eat_radius * params.eat_radius;
 
             for (worm_entity, worm_pos) in &worms {
                 for &(food_entity, food_pos, nutrition) in food_grid.neighbors(*worm_pos) {
+                    if eaten_set.contains(&food_entity) {
+                        continue;
+                    }
                     let diff = Vec2::new(
                         wrapped_diff(food_pos.x, worm_pos.x, params.world_size),
                         wrapped_diff(food_pos.y, worm_pos.y, params.world_size),
@@ -406,6 +411,7 @@ fn main() {
                         if let Some(energy) = world.get_mut::<Energy>(*worm_entity) {
                             energy.0 += nutrition;
                         }
+                        eaten_set.insert(food_entity);
                         eaten.despawn(food_entity);
                     }
                 }
