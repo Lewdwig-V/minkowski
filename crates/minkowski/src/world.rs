@@ -317,6 +317,29 @@ impl World {
         self.entities.is_alive(entity)
     }
 
+    /// Returns true if the entity is alive and currently carries component `T`.
+    ///
+    /// This is an archetype bitset check — no component data is touched.
+    /// Returns false if the entity is dead or if `T` was removed.
+    pub fn has<T: Component>(&self, entity: Entity) -> bool {
+        if !self.entities.is_alive(entity) {
+            return false;
+        }
+        let location = match self.entity_locations[entity.index() as usize] {
+            Some(loc) => loc,
+            None => return false,
+        };
+        let comp_id = match self.components.id::<T>() {
+            Some(id) => id,
+            None => return false,
+        };
+        if self.components.is_sparse(comp_id) {
+            return self.sparse.contains::<T>(comp_id, entity);
+        }
+        let archetype = &self.archetypes.archetypes[location.archetype_id.0];
+        archetype.component_ids.contains(comp_id)
+    }
+
     pub fn get<T: Component>(&self, entity: Entity) -> Option<&T> {
         if !self.entities.is_alive(entity) {
             return None;

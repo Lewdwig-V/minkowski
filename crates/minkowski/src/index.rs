@@ -67,13 +67,22 @@ pub trait SpatialIndex {
 /// instance tracks its own [`ChangeTick`], so multiple indexes on the same
 /// component type can call `update` independently without interfering.
 ///
-/// # Stale entries after despawn
+/// # Stale entries
 ///
-/// Despawned entities are **not** eagerly removed. Callers should filter
-/// results with [`World::is_alive`] at query time. The next [`rebuild`]
-/// call cleans up stale entries.
+/// Component removal (without despawn) leaves stale entries in the
+/// index. These are filtered at query time by [`get_valid`](Self::get_valid)
+/// and [`range_valid`](Self::range_valid), which check that the entity still
+/// carries the indexed component. Memory from stale entries is reclaimed on
+/// the next [`rebuild`](SpatialIndex::rebuild).
 ///
-/// [`rebuild`]: SpatialIndex::rebuild
+/// For most workloads, component removal is rare compared to value
+/// mutation. If removal is frequent, call `rebuild` periodically
+/// to compact the index.
+///
+/// | Method | Checks | Use case |
+/// |---|---|---|
+/// | [`get`](Self::get) | None | Caller knows entities are valid |
+/// | [`get_valid`](Self::get_valid) | [`World::has`] | Filters despawns and removals |
 pub struct BTreeIndex<T: Component + Ord + Clone> {
     tree: BTreeMap<T, Vec<Entity>>,
     reverse: HashMap<Entity, T>,
@@ -100,6 +109,33 @@ impl<T: Component + Ord + Clone> BTreeIndex<T> {
     /// Iterate over `(value, entities)` pairs whose keys fall within `range`.
     pub fn range<R: RangeBounds<T>>(&self, range: R) -> impl Iterator<Item = (&T, &[Entity])> {
         self.tree.range(range).map(|(k, v)| (k, v.as_slice()))
+    }
+
+    /// Validated lookup — filters entities that were despawned or had `T` removed.
+    pub fn get_valid<'a>(
+        &'a self,
+        value: &T,
+        world: &'a World,
+    ) -> impl Iterator<Item = Entity> + 'a {
+        self.get(value)
+            .iter()
+            .copied()
+            .filter(|&entity| world.has::<T>(entity))
+    }
+
+    /// Validated range query — filters entities that were despawned or had `T` removed.
+    pub fn range_valid<'a, R: RangeBounds<T> + 'a>(
+        &'a self,
+        range: R,
+        world: &'a World,
+    ) -> impl Iterator<Item = (&'a T, Entity)> + 'a {
+        self.range(range).flat_map(move |(k, entities)| {
+            entities
+                .iter()
+                .copied()
+                .filter(|&entity| world.has::<T>(entity))
+                .map(move |entity| (k, entity))
+        })
     }
 
     fn remove_entity(&mut self, entity: Entity) {
@@ -157,13 +193,18 @@ impl<T: Component + Ord + Clone> SpatialIndex for BTreeIndex<T> {
 /// instance tracks its own [`ChangeTick`], so multiple indexes on the same
 /// component type can call `update` independently without interfering.
 ///
-/// # Stale entries after despawn
+/// # Stale entries
 ///
-/// Despawned entities are **not** eagerly removed. Callers should filter
-/// results with [`World::is_alive`] at query time. The next [`rebuild`]
-/// call cleans up stale entries.
+/// Component removal (without despawn) leaves stale entries in the
+/// index. These are filtered at query time by [`get_valid`](Self::get_valid),
+/// which checks that the entity still carries the indexed component.
+/// Memory from stale entries is reclaimed on the next
+/// [`rebuild`](SpatialIndex::rebuild).
 ///
-/// [`rebuild`]: SpatialIndex::rebuild
+/// | Method | Checks | Use case |
+/// |---|---|---|
+/// | [`get`](Self::get) | None | Caller knows entities are valid |
+/// | [`get_valid`](Self::get_valid) | [`World::has`] | Filters despawns and removals |
 pub struct HashIndex<T: Component + Hash + Eq + Clone> {
     map: HashMap<T, Vec<Entity>>,
     reverse: HashMap<Entity, T>,
@@ -185,6 +226,18 @@ impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
     /// Returns an empty slice if no entities match.
     pub fn get(&self, value: &T) -> &[Entity] {
         self.map.get(value).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Validated lookup — filters entities that were despawned or had `T` removed.
+    pub fn get_valid<'a>(
+        &'a self,
+        value: &T,
+        world: &'a World,
+    ) -> impl Iterator<Item = Entity> + 'a {
+        self.get(value)
+            .iter()
+            .copied()
+            .filter(|&entity| world.has::<T>(entity))
     }
 
     fn remove_entity(&mut self, entity: Entity) {
@@ -515,6 +568,35 @@ mod tests {
         for idx in &mut indexes {
             idx.update(&mut world);
         }
+    }
+
+    #[test]
+    fn btree_get_valid_filters_removed_component() {
+        let mut world = World::new();
+        // Spawn with two components so remove::<Score> migrates, doesn't despawn
+        let e1 = world.spawn((Score(10), Pos { x: 0.0, y: 0.0 }));
+        let e2 = world.spawn((Score(10), Pos { x: 1.0, y: 1.0 }));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        assert_eq!(idx.get(&Score(10)).len(), 2);
+
+        // Remove Score from e1 — entity stays alive, but loses the component
+        world.remove::<Score>(e1);
+        assert!(world.is_alive(e1));
+        assert!(!world.has::<Score>(e1));
+
+        // Raw get still returns stale entry
+        assert_eq!(idx.get(&Score(10)).len(), 2);
+
+        // get_valid filters it out
+        let valid: Vec<_> = idx.get_valid(&Score(10), &world).collect();
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0], e2);
+
+        // Rebuild cleans up
+        idx.rebuild(&mut world);
+        assert_eq!(idx.get(&Score(10)).len(), 1);
     }
 
     #[test]

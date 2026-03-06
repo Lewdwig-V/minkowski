@@ -46,6 +46,13 @@ impl SparseStorage {
             .get_mut(&entity)
     }
 
+    pub fn contains<T: Component>(&self, comp_id: ComponentId, entity: Entity) -> bool {
+        self.storages
+            .get(&comp_id)
+            .and_then(|s| s.downcast_ref::<HashMap<Entity, T>>())
+            .is_some_and(|m| m.contains_key(&entity))
+    }
+
     pub fn remove<T: Component>(&mut self, comp_id: ComponentId, entity: Entity) -> Option<T> {
         self.storages
             .get_mut(&comp_id)?
