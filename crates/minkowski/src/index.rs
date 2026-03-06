@@ -99,6 +99,21 @@ impl<T: Component + Ord + Clone> BTreeIndex<T> {
         }
     }
 
+    /// Number of entities tracked by the index (including stale entries).
+    pub fn len(&self) -> usize {
+        self.reverse.len()
+    }
+
+    /// Returns true if the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.reverse.is_empty()
+    }
+
+    /// Returns true if the entity is tracked by the index (may be stale).
+    pub fn contains(&self, entity: Entity) -> bool {
+        self.reverse.contains_key(&entity)
+    }
+
     /// Return all entities with exactly the given component value.
     ///
     /// Returns an empty slice if no entities match.
@@ -226,6 +241,21 @@ impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
     /// Returns an empty slice if no entities match.
     pub fn get(&self, value: &T) -> &[Entity] {
         self.map.get(value).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Number of entities tracked by the index (including stale entries).
+    pub fn len(&self) -> usize {
+        self.reverse.len()
+    }
+
+    /// Returns true if the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.reverse.is_empty()
+    }
+
+    /// Returns true if the entity is tracked by the index (may be stale).
+    pub fn contains(&self, entity: Entity) -> bool {
+        self.reverse.contains_key(&entity)
     }
 
     /// Validated lookup — filters entities that were despawned or had `T` removed.
@@ -623,5 +653,83 @@ mod tests {
 
         assert!(hash.get(&Score(10)).is_empty());
         assert_eq!(hash.get(&Score(30)).len(), 1);
+    }
+
+    #[test]
+    fn btree_range_valid_filters_removed_component() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10), Pos { x: 0.0, y: 0.0 }));
+        let e2 = world.spawn((Score(15), Pos { x: 0.0, y: 0.0 }));
+        let e3 = world.spawn((Score(20), Pos { x: 0.0, y: 0.0 }));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        // Remove Score from e2
+        world.remove::<Score>(e2);
+
+        // Raw range still returns all 3
+        let raw: Vec<_> = idx.range(Score(5)..Score(25)).collect();
+        assert_eq!(raw.len(), 3);
+
+        // range_valid filters e2
+        let valid: Vec<_> = idx.range_valid(Score(5)..Score(25), &world).collect();
+        assert_eq!(valid.len(), 2);
+        assert!(valid.iter().any(|(_, e)| e == &e1));
+        assert!(valid.iter().any(|(_, e)| e == &e3));
+        assert!(!valid.iter().any(|(_, e)| e == &e2));
+    }
+
+    #[test]
+    fn hash_get_valid_filters_removed_component() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42), Pos { x: 0.0, y: 0.0 }));
+        let e2 = world.spawn((Score(42), Pos { x: 1.0, y: 1.0 }));
+
+        let mut idx = HashIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        assert_eq!(idx.get(&Score(42)).len(), 2);
+
+        world.remove::<Score>(e1);
+
+        // Raw get still returns stale entry
+        assert_eq!(idx.get(&Score(42)).len(), 2);
+
+        // get_valid filters it
+        let valid: Vec<_> = idx.get_valid(&Score(42), &world).collect();
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0], e2);
+    }
+
+    #[test]
+    fn btree_len_contains() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        let e2 = world.spawn((Score(20),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        assert!(idx.is_empty());
+        assert_eq!(idx.len(), 0);
+
+        idx.rebuild(&mut world);
+        assert_eq!(idx.len(), 2);
+        assert!(!idx.is_empty());
+        assert!(idx.contains(e1));
+        assert!(idx.contains(e2));
+        assert!(!idx.contains(Entity::DANGLING));
+    }
+
+    #[test]
+    fn hash_len_contains() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+
+        let mut idx = HashIndex::<Score>::new();
+        assert!(idx.is_empty());
+
+        idx.rebuild(&mut world);
+        assert_eq!(idx.len(), 1);
+        assert!(idx.contains(e1));
+        assert!(!idx.contains(Entity::DANGLING));
     }
 }
