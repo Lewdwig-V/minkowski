@@ -31,13 +31,11 @@
 //! Entity IDs allocated during a transaction (`tx.spawn`) are tracked in a
 //! `spawned_entities` vec. On successful commit they become placed entities.
 //! On abort — whether from an explicit drop or a failed optimistic validation
-//! — the IDs must be reclaimed. `Drop` pushes them to an [`OrphanQueue`]
+//! — the IDs must be reclaimed. `Drop` pushes them to an `OrphanQueue`
 //! shared with World via `Arc<Mutex<Vec<Entity>>>`. World drains this queue
 //! automatically at the top of every `&mut self` method, bumping generations
 //! and recycling indices. No entity ID ever leaks, regardless of how the
 //! transaction ends, and no manual cleanup step is required.
-//!
-//! [`OrphanQueue`]: crate::world::OrphanQueue
 //!
 //! ## Cooperative locking (pessimistic)
 //!
@@ -52,12 +50,10 @@
 //!
 //! ## World identity
 //!
-//! Each World gets a unique [`WorldId`] at construction. Strategies capture it
+//! Each World gets a unique `WorldId` at construction. Strategies capture it
 //! and assert it matches in `begin()` and `commit()`. This prevents a strategy
 //! created from world A being used with world B, which would push aborted
 //! entity IDs into the wrong orphan queue and corrupt unrelated live entities.
-//!
-//! [`WorldId`]: crate::world::WorldId
 
 use std::sync::atomic::AtomicU64;
 
@@ -181,7 +177,7 @@ impl TxCleanup for PessimisticCleanup<'_> {
 
 /// Unified transaction object. Holds a buffered changeset and tracks
 /// entity IDs allocated during the transaction. Strategy-specific
-/// teardown is delegated to a boxed [`TxCleanup`] implementor.
+/// teardown is delegated to a boxed `TxCleanup` implementor.
 ///
 /// Does not hold a World reference — methods take `&World` or
 /// `&mut World` as parameters, enabling split-phase execution where

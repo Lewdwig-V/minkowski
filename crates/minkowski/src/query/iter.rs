@@ -1,3 +1,7 @@
+//! Query iterators — [`QueryIter`] for sequential, parallel
+//! ([`par_for_each`](QueryIter::par_for_each)), and chunk-based
+//! ([`for_each_chunk`](QueryIter::for_each_chunk)) iteration over matched archetypes.
+
 use super::fetch::WorldQuery;
 use rayon::prelude::*;
 use std::marker::PhantomData;

@@ -75,7 +75,7 @@ pub unsafe trait WorldQuery {
     }
 
     /// Archetype-level filter. Returns false to skip this archetype entirely.
-    /// Used by Changed<T> to skip archetypes whose column tick is stale.
+    /// Used by `Changed<T>` to skip archetypes whose column tick is stale.
     fn matches_filters(
         _archetype: &Archetype,
         _registry: &ComponentRegistry,

@@ -1,3 +1,8 @@
+//! Bundle trait for tuple-based entity construction.
+//!
+//! Bundles define which components an entity is spawned with. Tuple types
+//! up to 12 elements implement [`Bundle`] automatically.
+
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use std::alloc::Layout;
 
