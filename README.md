@@ -170,9 +170,9 @@ Minkowski was built with Claude Code from the first commit. The development work
 
 The skills teach the paradigm, not just the API -- they encode the design principles and invariants that emerged across 26 PRs of iterative development.
 
-## Design Documents
+## Architecture Decision Records
 
-Design docs for each feature live in [`docs/plans/`](docs/plans/), organized by date. Each feature was designed before implementation -- the design conversation catches semantic bugs (concurrent state corruption, entity ID leaks, lock privilege errors) that compilation and tests miss. Six bugs in the transaction system were caught during design review that would have shipped silently through compilation and testing.
+Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each records what was decided, what alternatives were considered, and what trade-offs were accepted. Every feature was designed before implementation -- the design conversation catches semantic bugs (concurrent state corruption, entity ID leaks, lock privilege errors) that compilation and tests miss.
 
 ## Building & Testing
 
