@@ -9,6 +9,19 @@
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub(crate) struct Tick(u64);
 
+/// Opaque change-detection timestamp for secondary indexes.
+///
+/// Each [`BTreeIndex`](crate::BTreeIndex) and [`HashIndex`](crate::HashIndex)
+/// stores its own `ChangeTick` so that multiple indexes on the same component
+/// can call [`update`](crate::SpatialIndex::update) independently without
+/// sharing tick state.
+///
+/// Obtain via [`World::change_tick`](crate::World::change_tick). The default
+/// value (tick 0) causes the first [`update`](crate::SpatialIndex::update) to
+/// treat all columns as changed, equivalent to a full rebuild.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ChangeTick(pub(crate) Tick);
+
 impl Tick {
     #[allow(dead_code)]
     pub(crate) fn new(value: u64) -> Self {

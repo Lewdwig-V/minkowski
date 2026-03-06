@@ -152,7 +152,7 @@ for row in world.query_table::<Transform>() {
 
 `SpatialIndex` is a lifecycle trait for user-owned spatial data structures. Indexes are fully external to World -- they compose from existing query primitives. The trait has two methods: `rebuild` (full reconstruction) and `update` (optional, for incremental updates via `Changed<T>`). Stale entity references are caught by generational validation at query time.
 
-Two implementations ship as examples: a [uniform grid][uniform-grid] for O(N*k) neighbor search (boids) and a [Barnes-Hut][barnes-hut] quadtree for O(N log N) force approximation (nbody). Both demonstrate that the trait accommodates structurally different algorithms without friction.
+Two implementations ship as examples: a [uniform grid][uniform-grid] for O(N*k) neighbor search (boids) and a [Barnes-Hut][barnes-hut] quadtree for O(N log N) force approximation (nbody). Both demonstrate that the trait accommodates structurally different algorithms without friction. For column-value lookups, `BTreeIndex<T>` provides O(log n) range queries and `HashIndex<T>` provides O(1) exact match -- both use `Changed<T>` for incremental updates.
 
 ## Examples
 
@@ -166,6 +166,7 @@ Two implementations ship as examples: a [uniform grid][uniform-grid] for O(N*k) 
 | `battle` | EntityMut reducers, rayon parallel snapshots, tunable conflict | `cargo run -p minkowski-examples --example battle --release` |
 | `persist` | QueryWriter reducer, Durable WAL, snapshot recovery | `cargo run -p minkowski-examples --example persist --release` |
 | `reducer` | All 6 handle types, structural mutations, dynamic reducers | `cargo run -p minkowski-examples --example reducer --release` |
+| `index` | BTreeIndex range queries, HashIndex exact lookups, incremental update | `cargo run -p minkowski-examples --example index --release` |
 
 ## AI-Assisted Development
 
@@ -184,7 +185,7 @@ Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each record
 ## Building & Testing
 
 ```
-cargo test -p minkowski                # 295 tests
+cargo test -p minkowski                # 305 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
@@ -197,7 +198,6 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 | Feature | Rationale |
 |---|---|
 | Query planning (Volcano model) | Optimize complex queries across indexes |
-| B-tree / hash indexes | O(log n) lookups by column value |
 | rkyv zero-copy snapshots | Zero-copy deserialization matching BlobVec layout |
 | Replication & sync | Filtered WAL replay for read replicas and client mirrors |
 

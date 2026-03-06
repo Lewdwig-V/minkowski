@@ -23,6 +23,7 @@ cargo run -p minkowski-examples --example transaction --release   # Transaction 
 cargo run -p minkowski-examples --example battle --release   # Multi-threaded EntityMut reducers with tunable conflict (500 entities, 100 frames)
 cargo run -p minkowski-examples --example persist --release   # Durable QueryWriter reducer: WAL + snapshots (100 entities, 10 frames)
 cargo run -p minkowski-examples --example reducer --release   # Typed reducer system: entity/query/spawner/query-writer/dynamic handles + structural mutations + conflict detection
+cargo run -p minkowski-examples --example index --release   # B-tree range queries + hash exact lookups (200 entities)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -156,7 +157,7 @@ Typed reducers narrow what a closure *can* touch so that conflict freedom is pro
 
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`, `Access`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `QueryWriter`, `WritableRef`, `WriterQuery`, `Spawner`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ChangeTick`, `ComponentId`, `SpatialIndex`, `Access`, `BTreeIndex`, `HashIndex`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `QueryWriter`, `WritableRef`, `WriterQuery`, `Spawner`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.

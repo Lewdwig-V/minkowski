@@ -143,6 +143,68 @@ impl World {
         self.id
     }
 
+    /// Return the current change tick. Secondary indexes store this to
+    /// track their sync point — see [`BTreeIndex`](crate::BTreeIndex).
+    pub fn change_tick(&self) -> crate::tick::ChangeTick {
+        crate::tick::ChangeTick(self.current_tick)
+    }
+
+    /// Returns `(Entity, T)` pairs (cloned) from archetypes whose `T` column
+    /// was mutably accessed after `since`.
+    ///
+    /// Granularity is per-archetype-column, not per-entity — all entities in
+    /// a changed archetype are returned, even if only one was mutated. This
+    /// matches the pessimistic marking used by [`Changed<T>`](crate::Changed).
+    ///
+    /// Unlike the `Changed<T>` filter used by [`World::query`], this method
+    /// does **not** use the shared query cache — the caller owns the tick via
+    /// [`ChangeTick`](crate::ChangeTick), so multiple indexes on the same
+    /// component type can call this independently.
+    ///
+    /// Values are cloned because the returned `Vec` must own its data
+    /// independently of the World borrow.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that `T` is not a sparse component. Sparse components
+    /// are not stored in archetypes and have no column-level change ticks.
+    /// Use [`rebuild`](crate::SpatialIndex::rebuild) for sparse components.
+    pub fn query_changed_since<T: Component + Clone>(
+        &mut self,
+        since: crate::tick::ChangeTick,
+    ) -> Vec<(Entity, T)> {
+        self.drain_orphans();
+        let comp_id = match self.components.id::<T>() {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+        debug_assert!(
+            !self.components.is_sparse(comp_id),
+            "query_changed_since does not support sparse components — use rebuild() instead"
+        );
+
+        let since_tick = since.0;
+        let mut results = Vec::new();
+
+        for arch in &self.archetypes.archetypes {
+            let col_idx = match arch.component_index.get(&comp_id) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            if !arch.columns[col_idx].changed_tick.is_newer_than(since_tick) {
+                continue;
+            }
+            for row in 0..arch.len() {
+                let entity = arch.entities[row];
+                let ptr = unsafe { arch.columns[col_idx].get_ptr(row) as *const T };
+                let value = unsafe { (*ptr).clone() };
+                results.push((entity, value));
+            }
+        }
+
+        results
+    }
+
     /// Look up the ComponentId for a type. Returns None if the type has
     /// never been spawned or registered.
     pub fn component_id<T: Component>(&self) -> Option<ComponentId> {
@@ -270,6 +332,30 @@ impl World {
 
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.entities.is_alive(entity)
+    }
+
+    /// Returns true if the entity is alive and currently carries component `T`.
+    ///
+    /// For archetype components, this is a bitset check. For sparse components,
+    /// it checks the sparse storage map. No component data is read in either case.
+    /// Returns false if the entity is dead, unplaced, or if `T` was removed.
+    pub fn has<T: Component>(&self, entity: Entity) -> bool {
+        if !self.entities.is_alive(entity) {
+            return false;
+        }
+        let location = match self.entity_locations[entity.index() as usize] {
+            Some(loc) => loc,
+            None => return false,
+        };
+        let comp_id = match self.components.id::<T>() {
+            Some(id) => id,
+            None => return false,
+        };
+        if self.components.is_sparse(comp_id) {
+            return self.sparse.contains::<T>(comp_id, entity);
+        }
+        let archetype = &self.archetypes.archetypes[location.archetype_id.0];
+        archetype.component_ids.contains(comp_id)
     }
 
     pub fn get<T: Component>(&self, entity: Entity) -> Option<&T> {
@@ -1447,5 +1533,100 @@ mod tests {
         let comp_id = world.components.id::<Pos>().unwrap();
         world.despawn(e);
         assert_eq!(world.get_by_id::<Pos>(e, comp_id), None);
+    }
+
+    // ── World::has tests ────────────────────────────────────────
+
+    #[test]
+    fn has_alive_entity_with_component() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        assert!(world.has::<Pos>(e));
+        assert!(world.has::<Vel>(e));
+    }
+
+    #[test]
+    fn has_alive_entity_without_component() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        assert!(!world.has::<Vel>(e));
+    }
+
+    #[test]
+    fn has_dead_entity() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.despawn(e);
+        assert!(!world.has::<Pos>(e));
+    }
+
+    #[test]
+    fn has_after_component_removed() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        world.remove::<Vel>(e);
+        assert!(world.has::<Pos>(e));
+        assert!(!world.has::<Vel>(e));
+    }
+
+    #[test]
+    fn has_unregistered_component() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        #[derive(Clone, Copy)]
+        struct Unregistered;
+        assert!(!world.has::<Unregistered>(e));
+    }
+
+    // ── World::query_changed_since tests ────────────────────────
+
+    #[test]
+    fn query_changed_since_returns_changed() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let _e2 = world.spawn((Pos { x: 2.0, y: 0.0 },));
+
+        let tick = world.change_tick();
+
+        // Mutate e1
+        *world.get_mut::<Pos>(e1).unwrap() = Pos { x: 99.0, y: 0.0 };
+
+        let changed = world.query_changed_since::<Pos>(tick);
+        // e1's archetype column was touched, so all entities in that archetype returned
+        assert!(!changed.is_empty());
+        assert!(changed.iter().any(|(e, _)| *e == e1));
+    }
+
+    #[test]
+    fn query_changed_since_empty_when_no_changes() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        let tick = world.change_tick();
+        // No mutations
+        let changed = world.query_changed_since::<Pos>(tick);
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn query_changed_since_default_tick_returns_all() {
+        use crate::tick::ChangeTick;
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        world.spawn((Pos { x: 2.0, y: 0.0 },));
+
+        let changed = world.query_changed_since::<Pos>(ChangeTick::default());
+        assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    fn query_changed_since_unregistered_type() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        #[derive(Clone, Copy)]
+        struct Unknown;
+        let changed = world.query_changed_since::<Unknown>(crate::tick::ChangeTick::default());
+        assert!(changed.is_empty());
     }
 }

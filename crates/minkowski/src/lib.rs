@@ -82,7 +82,7 @@ pub mod query;
 pub mod reducer;
 pub mod storage;
 pub mod table;
-pub(crate) mod tick;
+pub mod tick;
 pub mod transaction;
 pub mod world;
 
@@ -91,7 +91,7 @@ pub use changeset::{EnumChangeSet, MutationRef};
 pub use command::CommandBuffer;
 pub use component::ComponentId;
 pub use entity::Entity;
-pub use index::SpatialIndex;
+pub use index::{BTreeIndex, HashIndex, SpatialIndex};
 pub use minkowski_derive::Table;
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
 pub use reducer::{
@@ -99,5 +99,6 @@ pub use reducer::{
     EntityRef, QueryMut, QueryReducerId, QueryRef, QueryWriter, ReducerId, ReducerRegistry,
     Spawner, WritableRef, WriterQuery,
 };
+pub use tick::ChangeTick;
 pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
 pub use world::World;
