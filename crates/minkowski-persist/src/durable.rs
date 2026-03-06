@@ -3,7 +3,6 @@ use parking_lot::Mutex;
 use minkowski::{Access, Conflict, EnumChangeSet, Transact, Tx, World};
 
 use crate::codec::CodecRegistry;
-use crate::format::WireFormat;
 use crate::wal::Wal;
 
 /// Wraps any [`Transact`] strategy to guarantee WAL logging on commit.
@@ -12,14 +11,14 @@ use crate::wal::Wal;
 /// before applying it to World. Failed attempts (retries) are not logged.
 ///
 /// WAL write failure panics — the durability invariant is non-negotiable.
-pub struct Durable<S: Transact, W: WireFormat> {
+pub struct Durable<S: Transact> {
     inner: S,
-    wal: Mutex<Wal<W>>,
+    wal: Mutex<Wal>,
     codecs: CodecRegistry,
 }
 
-impl<S: Transact, W: WireFormat> Durable<S, W> {
-    pub fn new(strategy: S, wal: Wal<W>, codecs: CodecRegistry) -> Self {
+impl<S: Transact> Durable<S> {
+    pub fn new(strategy: S, wal: Wal, codecs: CodecRegistry) -> Self {
         Self {
             inner: strategy,
             wal: Mutex::new(wal),
@@ -33,7 +32,7 @@ impl<S: Transact, W: WireFormat> Durable<S, W> {
     }
 }
 
-impl<S: Transact, W: WireFormat> Transact for Durable<S, W> {
+impl<S: Transact> Transact for Durable<S> {
     fn begin(&self, world: &mut World, access: &Access) -> Tx<'_> {
         self.inner.begin(world, access)
     }
@@ -89,18 +88,17 @@ impl<S: Transact, W: WireFormat> Transact for Durable<S, W> {
 mod tests {
     use super::*;
     use crate::codec::CodecRegistry;
-    use crate::format::Bincode;
     use crate::wal::Wal;
     use minkowski::{Optimistic, Pessimistic};
-    use serde::{Deserialize, Serialize};
+    use rkyv::{Archive, Deserialize, Serialize};
 
-    #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
+    #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
-    #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
+    #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]
     struct Health(u32);
 
     #[test]
@@ -112,7 +110,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register::<Pos>(&mut world);
 
-        let wal = Wal::create(&wal_path, Bincode).unwrap();
+        let wal = Wal::create(&wal_path).unwrap();
         let strategy = Optimistic::new(&world);
         let durable = Durable::new(strategy, wal, codecs);
 
@@ -138,7 +136,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register::<Health>(&mut world);
 
-        let wal = Wal::create(&wal_path, Bincode).unwrap();
+        let wal = Wal::create(&wal_path).unwrap();
         let strategy = Pessimistic::new(&world);
         let durable = Durable::new(strategy, wal, codecs);
 
@@ -163,7 +161,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register::<Pos>(&mut world);
 
-        let wal = Wal::create(&wal_path, Bincode).unwrap();
+        let wal = Wal::create(&wal_path).unwrap();
         let strategy = Optimistic::with_retries(&world, 3);
         let durable = Durable::new(strategy, wal, codecs);
 

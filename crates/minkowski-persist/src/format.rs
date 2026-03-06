@@ -1,36 +1,36 @@
 use crate::record::{SnapshotData, WalRecord};
 
-/// Abstracts the serialization format. Bincode now, rkyv later as a second impl.
-pub trait WireFormat {
-    type Error: std::error::Error + Send + Sync + 'static;
+#[derive(Debug)]
+pub struct FormatError(pub String);
 
-    fn serialize_record(&self, record: &WalRecord) -> Result<Vec<u8>, Self::Error>;
-    fn deserialize_record(&self, bytes: &[u8]) -> Result<WalRecord, Self::Error>;
-    fn serialize_snapshot(&self, snapshot: &SnapshotData) -> Result<Vec<u8>, Self::Error>;
-    fn deserialize_snapshot(&self, bytes: &[u8]) -> Result<SnapshotData, Self::Error>;
+impl std::fmt::Display for FormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "format: {}", self.0)
+    }
 }
 
-/// Bincode wire format — compact, fast, serde-native.
-pub struct Bincode;
+impl std::error::Error for FormatError {}
 
-impl WireFormat for Bincode {
-    type Error = bincode::Error;
+pub fn serialize_record(record: &WalRecord) -> Result<Vec<u8>, FormatError> {
+    rkyv::to_bytes::<rkyv::rancor::Error>(record)
+        .map(|v| v.to_vec())
+        .map_err(|e| FormatError(e.to_string()))
+}
 
-    fn serialize_record(&self, record: &WalRecord) -> Result<Vec<u8>, Self::Error> {
-        bincode::serialize(record)
-    }
+pub fn deserialize_record(bytes: &[u8]) -> Result<WalRecord, FormatError> {
+    rkyv::from_bytes::<WalRecord, rkyv::rancor::Error>(bytes)
+        .map_err(|e| FormatError(e.to_string()))
+}
 
-    fn deserialize_record(&self, bytes: &[u8]) -> Result<WalRecord, Self::Error> {
-        bincode::deserialize(bytes)
-    }
+pub fn serialize_snapshot(snapshot: &SnapshotData) -> Result<Vec<u8>, FormatError> {
+    rkyv::to_bytes::<rkyv::rancor::Error>(snapshot)
+        .map(|v| v.to_vec())
+        .map_err(|e| FormatError(e.to_string()))
+}
 
-    fn serialize_snapshot(&self, snapshot: &SnapshotData) -> Result<Vec<u8>, Self::Error> {
-        bincode::serialize(snapshot)
-    }
-
-    fn deserialize_snapshot(&self, bytes: &[u8]) -> Result<SnapshotData, Self::Error> {
-        bincode::deserialize(bytes)
-    }
+pub fn deserialize_snapshot(bytes: &[u8]) -> Result<SnapshotData, FormatError> {
+    rkyv::from_bytes::<SnapshotData, rkyv::rancor::Error>(bytes)
+        .map_err(|e| FormatError(e.to_string()))
 }
 
 #[cfg(test)]
@@ -54,9 +54,8 @@ mod tests {
             ],
         };
 
-        let fmt = Bincode;
-        let bytes = fmt.serialize_record(&record).unwrap();
-        let restored = fmt.deserialize_record(&bytes).unwrap();
+        let bytes = serialize_record(&record).unwrap();
+        let restored = deserialize_record(&bytes).unwrap();
 
         assert_eq!(restored.seq, 42);
         assert_eq!(restored.mutations.len(), 2);
@@ -90,9 +89,8 @@ mod tests {
             sparse: vec![],
         };
 
-        let fmt = Bincode;
-        let bytes = fmt.serialize_snapshot(&snap).unwrap();
-        let restored = fmt.deserialize_snapshot(&bytes).unwrap();
+        let bytes = serialize_snapshot(&snap).unwrap();
+        let restored = deserialize_snapshot(&bytes).unwrap();
 
         assert_eq!(restored.wal_seq, 100);
         assert_eq!(restored.archetypes.len(), 1);
@@ -105,9 +103,8 @@ mod tests {
             seq: 0,
             mutations: vec![],
         };
-        let fmt = Bincode;
-        let bytes = fmt.serialize_record(&record).unwrap();
-        let restored = fmt.deserialize_record(&bytes).unwrap();
+        let bytes = serialize_record(&record).unwrap();
+        let restored = deserialize_record(&bytes).unwrap();
         assert_eq!(restored.seq, 0);
         assert!(restored.mutations.is_empty());
     }

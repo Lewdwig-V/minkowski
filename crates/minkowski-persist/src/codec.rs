@@ -3,7 +3,13 @@ use std::collections::HashMap;
 
 use minkowski::component::Component;
 use minkowski::{ComponentId, Entity, World};
-use serde::{de::DeserializeOwned, Serialize};
+use rkyv::api::high::HighValidator;
+use rkyv::bytecheck::CheckBytes;
+use rkyv::de::Pool;
+use rkyv::rancor;
+use rkyv::ser::allocator::ArenaHandle;
+use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 /// Type-erased serialize: reads T from raw pointer, serializes to output buffer.
 type SerializeFn = unsafe fn(*const u8, &mut Vec<u8>) -> Result<(), CodecError>;
@@ -51,7 +57,7 @@ struct ComponentCodec {
     insert_sparse_fn: InsertSparseFn,
 }
 
-/// Maps ComponentId to serde codecs. Separate from core's ComponentRegistry --
+/// Maps ComponentId to rkyv codecs. Separate from core's ComponentRegistry —
 /// different concerns, different crates, different lifetimes.
 pub struct CodecRegistry {
     codecs: HashMap<ComponentId, ComponentCodec>,
@@ -65,23 +71,32 @@ impl CodecRegistry {
     }
 
     /// Register a component type for persistence.
-    /// Requires Serialize + DeserializeOwned. Uses world to obtain the ComponentId.
-    pub fn register<T: Component + Serialize + DeserializeOwned>(&mut self, world: &mut World) {
+    /// Requires rkyv Archive + Serialize + Deserialize bounds.
+    pub fn register<T>(&mut self, world: &mut World)
+    where
+        T: Component
+            + Archive
+            + for<'a> RkyvSerialize<
+                rkyv::api::high::HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>,
+            > + Clone,
+        T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+    {
         let comp_id = world.register_component::<T>();
         let layout = Layout::new::<T>();
         let name = std::any::type_name::<T>();
 
         let serialize_fn: SerializeFn = |ptr, out| {
             let value = unsafe { &*ptr.cast::<T>() };
-            let bytes =
-                bincode::serialize(value).map_err(|e| CodecError::Serialize(e.to_string()))?;
+            let bytes = rkyv::to_bytes::<rancor::Error>(value)
+                .map_err(|e| CodecError::Serialize(e.to_string()))?;
             out.extend_from_slice(&bytes);
             Ok(())
         };
 
         let deserialize_fn: DeserializeFn = |bytes| {
-            let value: T =
-                bincode::deserialize(bytes).map_err(|e| CodecError::Deserialize(e.to_string()))?;
+            let value: T = rkyv::from_bytes::<T, rancor::Error>(bytes)
+                .map_err(|e| CodecError::Deserialize(e.to_string()))?;
             let layout = Layout::new::<T>();
             let mut buf = vec![0u8; layout.size()];
             unsafe {
@@ -113,8 +128,8 @@ impl CodecRegistry {
         };
 
         let insert_sparse_fn: InsertSparseFn = |world, entity, data| {
-            let value: T =
-                bincode::deserialize(data).map_err(|e| CodecError::Deserialize(e.to_string()))?;
+            let value: T = rkyv::from_bytes::<T, rancor::Error>(data)
+                .map_err(|e| CodecError::Deserialize(e.to_string()))?;
             world.insert_sparse::<T>(entity, value);
             Ok(())
         };
@@ -228,15 +243,15 @@ impl Default for CodecRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Deserialize, Serialize};
+    use rkyv::{Archive, Deserialize, Serialize};
 
-    #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
+    #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
-    #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
+    #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]
     struct Vel {
         dx: f32,
         dy: f32,

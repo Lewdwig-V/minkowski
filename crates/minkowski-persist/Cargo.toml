@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 minkowski = { path = "../minkowski" }
-serde = { version = "1", features = ["derive"] }
-bincode = "1"
+rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
+memmap2 = "0.9"
 parking_lot = "0.12"
 fixedbitset = "0.5"
 

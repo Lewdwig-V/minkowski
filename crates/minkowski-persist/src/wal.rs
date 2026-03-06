@@ -5,11 +5,11 @@ use std::path::Path;
 use minkowski::{Entity, EnumChangeSet, MutationRef, World};
 
 use crate::codec::{CodecError, CodecRegistry};
-use crate::format::WireFormat;
+use crate::format;
 use crate::record::SerializedMutation;
 
 // WAL file format: `[len: u32 LE][payload: len bytes]` repeated.
-// Each payload is a `WalRecord` serialized through `WireFormat`.
+// Each payload is a `WalRecord` serialized through rkyv.
 
 /// Read exactly `buf.len()` bytes from `file` starting at byte offset `pos`.
 fn read_exact_at(file: &File, pos: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -49,37 +49,28 @@ impl From<CodecError> for WalError {
     }
 }
 
-/// Append-only write-ahead log. Each record is a serialized changeset
+/// Append-only write-ahead log. Each record is an rkyv-serialized changeset
 /// with a monotonic sequence number.
-pub struct Wal<W: WireFormat> {
+pub struct Wal {
     file: File,
-    format: W,
     next_seq: u64,
 }
 
-impl<W: WireFormat> Wal<W> {
+impl Wal {
     /// Create a new WAL file. Fails if the file already exists.
-    pub fn create(path: &Path, format: W) -> Result<Self, WalError> {
+    pub fn create(path: &Path) -> Result<Self, WalError> {
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .read(true)
             .open(path)?;
-        Ok(Self {
-            file,
-            format,
-            next_seq: 0,
-        })
+        Ok(Self { file, next_seq: 0 })
     }
 
     /// Open an existing WAL file. Scans to find the next sequence number.
-    pub fn open(path: &Path, format: W) -> Result<Self, WalError> {
+    pub fn open(path: &Path) -> Result<Self, WalError> {
         let file = OpenOptions::new().read(true).append(true).open(path)?;
-        let mut wal = Self {
-            file,
-            format,
-            next_seq: 0,
-        };
+        let mut wal = Self { file, next_seq: 0 };
         let last = wal.scan_last_seq()?;
         wal.next_seq = if last > 0 || wal.has_records()? {
             last + 1
@@ -103,10 +94,8 @@ impl<W: WireFormat> Wal<W> {
     ) -> Result<u64, WalError> {
         let seq = self.next_seq;
         let record = Self::changeset_to_record(seq, changeset, codecs)?;
-        let payload = self
-            .format
-            .serialize_record(&record)
-            .map_err(|e| WalError::Format(e.to_string()))?;
+        let payload =
+            format::serialize_record(&record).map_err(|e| WalError::Format(e.to_string()))?;
 
         let mut writer = BufWriter::new(&self.file);
         let len = payload.len() as u32;
@@ -157,9 +146,7 @@ impl<W: WireFormat> Wal<W> {
                 Err(e) => return Err(e.into()),
             }
 
-            let record = self
-                .format
-                .deserialize_record(&payload)
+            let record = format::deserialize_record(&payload)
                 .map_err(|e| WalError::Format(e.to_string()))?;
 
             if record.seq >= from_seq {
@@ -333,9 +320,7 @@ impl<W: WireFormat> Wal<W> {
                 Err(e) => return Err(e.into()),
             }
 
-            let record = self
-                .format
-                .deserialize_record(&payload)
+            let record = format::deserialize_record(&payload)
                 .map_err(|e| WalError::Format(e.to_string()))?;
             last_seq = record.seq;
             valid_end = record_start + 4 + len as u64;
@@ -354,16 +339,15 @@ impl<W: WireFormat> Wal<W> {
 mod tests {
     use super::*;
     use crate::codec::CodecRegistry;
-    use crate::format::Bincode;
-    use serde::{Deserialize, Serialize};
+    use rkyv::{Archive, Deserialize, Serialize};
 
-    #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
+    #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
-    #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
+    #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]
     struct Health(u32);
 
     #[test]
@@ -381,7 +365,7 @@ mod tests {
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
 
         // Write the changeset to WAL before applying
-        let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+        let mut wal = Wal::create(&wal_path).unwrap();
         let seq = wal.append(&cs, &codecs).unwrap();
         assert_eq!(seq, 0);
         assert_eq!(wal.next_seq(), 1);
@@ -401,14 +385,14 @@ mod tests {
         codecs.register::<Health>(&mut world);
 
         {
-            let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+            let mut wal = Wal::create(&wal_path).unwrap();
             for _ in 0..3 {
                 let cs = EnumChangeSet::new(); // empty changeset
                 wal.append(&cs, &codecs).unwrap();
             }
         }
 
-        let wal2 = Wal::open(&wal_path, Bincode).unwrap();
+        let wal2 = Wal::open(&wal_path).unwrap();
         assert_eq!(wal2.next_seq(), 3);
     }
 
@@ -421,7 +405,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register::<Health>(&mut world);
 
-        let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+        let mut wal = Wal::create(&wal_path).unwrap();
 
         // Append 3 empty records
         for _ in 0..3 {
@@ -442,7 +426,7 @@ mod tests {
         let mut world = World::new();
         let codecs = CodecRegistry::new();
 
-        let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+        let mut wal = Wal::create(&wal_path).unwrap();
         let last = wal.replay(&mut world, &codecs).unwrap();
         assert_eq!(last, 0);
     }
@@ -459,7 +443,7 @@ mod tests {
         codecs.register::<Health>(&mut world);
 
         {
-            let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+            let mut wal = Wal::create(&wal_path).unwrap();
             wal.append(&EnumChangeSet::new(), &codecs).unwrap();
             wal.append(&EnumChangeSet::new(), &codecs).unwrap();
         }
@@ -476,7 +460,7 @@ mod tests {
         let file_len_before = std::fs::metadata(&wal_path).unwrap().len();
 
         // open() should detect the torn entry, truncate it, and recover
-        let wal2 = Wal::open(&wal_path, Bincode).unwrap();
+        let wal2 = Wal::open(&wal_path).unwrap();
         assert_eq!(
             wal2.next_seq(),
             2,
@@ -498,7 +482,7 @@ mod tests {
         codecs.register::<Health>(&mut world);
 
         {
-            let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+            let mut wal = Wal::create(&wal_path).unwrap();
             wal.append(&EnumChangeSet::new(), &codecs).unwrap();
         }
 
@@ -510,7 +494,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        let mut wal2 = Wal::open(&wal_path, Bincode).unwrap();
+        let mut wal2 = Wal::open(&wal_path).unwrap();
         let mut world2 = World::new();
         let last = wal2.replay(&mut world2, &codecs).unwrap();
         assert_eq!(last, 0, "should replay the one valid record");

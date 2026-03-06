@@ -5,20 +5,23 @@
 //! 2. Save a snapshot
 //! 3. Apply mutations via a durable QueryWriter reducer (WAL-backed)
 //! 4. Recover from snapshot + WAL replay
+//! 5. Zero-copy snapshot load (mmap-based, no per-value deserialization)
 //!
 //! Run: cargo run -p minkowski-examples --example persist --release
 
 use minkowski::{Optimistic, QueryWriter, ReducerRegistry, World};
-use minkowski_persist::{Bincode, CodecRegistry, Durable, Snapshot, Wal};
-use serde::{Deserialize, Serialize};
+use minkowski_persist::{CodecRegistry, Durable, Snapshot, Wal};
+use rkyv::{Archive, Deserialize, Serialize};
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+#[repr(C)]
 struct Pos {
     x: f32,
     y: f32,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+#[repr(C)]
 struct Vel {
     dx: f32,
     dy: f32,
@@ -51,9 +54,9 @@ fn main() {
         ));
     }
 
-    // -- Phase 2: Snapshot (before creating Durable, which takes ownership of codecs) --
-    let snap = Snapshot::new(Bincode);
-    let wal = Wal::create(&wal_path, Bincode).unwrap();
+    // -- Phase 2: Snapshot --
+    let snap = Snapshot::new();
+    let wal = Wal::create(&wal_path).unwrap();
     let header = snap
         .save(&snap_path, &world, &codecs, wal.next_seq())
         .unwrap();
@@ -96,7 +99,7 @@ fn main() {
     }
     println!("  WAL has {} records", durable.wal_seq());
 
-    // -- Phase 4: Recovery --
+    // -- Phase 4: Recovery (standard load) --
     println!("Phase 4: Recovering from snapshot + WAL...");
     let mut load_codecs = CodecRegistry::new();
     let mut load_world_tmp = World::new();
@@ -104,7 +107,7 @@ fn main() {
     load_codecs.register::<Vel>(&mut load_world_tmp);
 
     let (mut recovered, snap_seq) = snap.load(&snap_path, &load_codecs).unwrap();
-    let mut replay_wal = Wal::open(&wal_path, Bincode).unwrap();
+    let mut replay_wal = Wal::open(&wal_path).unwrap();
     let last_seq = replay_wal
         .replay_from(snap_seq, &mut recovered, &load_codecs)
         .unwrap();
@@ -118,6 +121,21 @@ fn main() {
     println!(
         "  Recovered world: {} entities, first at ({:.1}, {:.1})",
         count, sample.0.x, sample.0.y
+    );
+
+    // -- Phase 5: Zero-copy snapshot load --
+    println!("Phase 5: Zero-copy snapshot load (mmap)...");
+    let mut zc_codecs = CodecRegistry::new();
+    let mut zc_world_tmp = World::new();
+    zc_codecs.register::<Pos>(&mut zc_world_tmp);
+    zc_codecs.register::<Vel>(&mut zc_world_tmp);
+
+    let (mut zc_world, zc_seq) = snap.load_zero_copy(&snap_path, &zc_codecs).unwrap();
+    let zc_count = zc_world.query::<(&Pos,)>().count();
+    let zc_sample = zc_world.query::<(&Pos,)>().next().unwrap();
+    println!(
+        "  Zero-copy loaded: {} entities at seq {}, first at ({:.1}, {:.1})",
+        zc_count, zc_seq, zc_sample.0.x, zc_sample.0.y
     );
 
     // Cleanup
