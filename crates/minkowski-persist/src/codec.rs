@@ -41,7 +41,7 @@ pub enum CodecError {
 }
 
 struct ComponentCodec {
-    name: &'static str,
+    name: String,
     layout: Layout,
     serialize_fn: SerializeFn,
     deserialize_fn: DeserializeFn,
@@ -59,17 +59,20 @@ struct ComponentCodec {
 /// different concerns, different crates, different lifetimes.
 pub struct CodecRegistry {
     codecs: HashMap<ComponentId, ComponentCodec>,
+    by_name: HashMap<String, ComponentId>,
 }
 
 impl CodecRegistry {
     pub fn new() -> Self {
         Self {
             codecs: HashMap::new(),
+            by_name: HashMap::new(),
         }
     }
 
     /// Register a component type for persistence.
     /// Requires rkyv Archive + Serialize + Deserialize bounds.
+    /// Uses `std::any::type_name::<T>()` as the default stable name.
     pub fn register<T>(&mut self, world: &mut World)
     where
         T: Component
@@ -80,9 +83,61 @@ impl CodecRegistry {
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
             + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
     {
+        let name = std::any::type_name::<T>().to_owned();
+        self.register_with_name::<T>(name, world);
+    }
+
+    /// Register a component type for persistence with an explicit stable name.
+    /// The name must be unique across all registered components — duplicate
+    /// names mapped to different ComponentIds will panic.
+    pub fn register_as<T>(&mut self, stable_name: &str, world: &mut World)
+    where
+        T: Component
+            + Archive
+            + for<'a> RkyvSerialize<
+                rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
+            > + Clone,
+        T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+    {
+        self.register_with_name::<T>(stable_name.to_owned(), world);
+    }
+
+    fn register_with_name<T>(&mut self, stable_name: String, world: &mut World)
+    where
+        T: Component
+            + Archive
+            + for<'a> RkyvSerialize<
+                rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
+            > + Clone,
+        T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+    {
         let comp_id = world.register_component::<T>();
+
+        // Idempotent: same type re-registered with same name is a no-op.
+        if let Some(existing) = self.codecs.get(&comp_id) {
+            assert!(
+                existing.name == stable_name,
+                "component already registered with name {:?}, cannot re-register as {:?}",
+                existing.name,
+                stable_name
+            );
+            return;
+        }
+
+        // Duplicate name to a different ComponentId is a hard error.
+        if let Some(&existing_id) = self.by_name.get(&stable_name) {
+            if existing_id != comp_id {
+                panic!(
+                    "duplicate stable name {:?}: already registered for ComponentId {}, \
+                     cannot register for ComponentId {}",
+                    stable_name, existing_id, comp_id
+                );
+            }
+        }
+
         let layout = Layout::new::<T>();
-        let name = std::any::type_name::<T>();
 
         // If the archived type has the same size as the native type, archived
         // bytes can be copied directly into BlobVec without rkyv::from_bytes.
@@ -143,10 +198,11 @@ impl CodecRegistry {
             Ok(())
         };
 
+        self.by_name.insert(stable_name.clone(), comp_id);
         self.codecs.insert(
             comp_id,
             ComponentCodec {
-                name,
+                name: stable_name,
                 layout,
                 serialize_fn,
                 deserialize_fn,
@@ -192,8 +248,18 @@ impl CodecRegistry {
     }
 
     /// Get the type name for a registered component.
-    pub fn name(&self, id: ComponentId) -> Option<&'static str> {
-        self.codecs.get(&id).map(|c| c.name)
+    pub fn name(&self, id: ComponentId) -> Option<&str> {
+        self.codecs.get(&id).map(|c| c.name.as_str())
+    }
+
+    /// Get the stable name for a registered component.
+    pub fn stable_name(&self, id: ComponentId) -> Option<&str> {
+        self.codecs.get(&id).map(|c| c.name.as_str())
+    }
+
+    /// Resolve a stable name to its ComponentId.
+    pub fn resolve_name(&self, name: &str) -> Option<ComponentId> {
+        self.by_name.get(name).copied()
     }
 
     /// Check if a component has a registered codec.
@@ -335,5 +401,46 @@ mod tests {
             std::mem::size_of::<Pos>()
         );
         assert!(codecs.name(id).unwrap().contains("Pos"));
+    }
+
+    #[test]
+    fn register_as_assigns_stable_name() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        let id = world.component_id::<Pos>().unwrap();
+        assert_eq!(codecs.stable_name(id), Some("pos"));
+    }
+
+    #[test]
+    fn register_defaults_to_type_name() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        let id = world.component_id::<Pos>().unwrap();
+        let name = codecs.stable_name(id).unwrap();
+        assert!(
+            name.contains("Pos"),
+            "default name should contain type name, got: {name}"
+        );
+    }
+
+    #[test]
+    fn resolve_name_returns_component_id() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        let id = world.component_id::<Pos>().unwrap();
+        assert_eq!(codecs.resolve_name("pos"), Some(id));
+        assert_eq!(codecs.resolve_name("nonexistent"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate stable name")]
+    fn duplicate_name_panics() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("collision", &mut world);
+        codecs.register_as::<Vel>("collision", &mut world);
     }
 }
