@@ -26,12 +26,12 @@ for current state, and ``history_to_polars()`` for recorded trajectory data.
 """
 
 try:
-    from minkowski_py._minkowski import BoidsSim, NBodySim, LifeSim
+    from minkowski_py._minkowski import BoidsSim, LifeSim, NBodySim
 except ImportError as e:
     raise ImportError(
         "Failed to import Minkowski native module. "
         "Build with: cd crates/minkowski-py && maturin develop --release"
     ) from e
 
-__all__ = ["BoidsSim", "NBodySim", "LifeSim"]
+__all__ = ["BoidsSim", "LifeSim", "NBodySim"]
 __version__ = "0.1.0"

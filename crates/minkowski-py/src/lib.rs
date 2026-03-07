@@ -6,7 +6,11 @@
 
 use pyo3::prelude::*;
 
+mod bridge;
+mod components;
+mod schema;
+
 #[pymodule]
-fn _minkowski(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _minkowski(_m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
