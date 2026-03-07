@@ -578,7 +578,7 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.1, dy: 0.2 }));
         world.spawn((Pos { x: 3.0, y: 4.0 }, Vel { dx: 0.3, dy: 0.4 }));
 
-        let mut wal = Wal::create(&wal_path).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
         let snap = Snapshot::new();
         let _header = snap
             .save(&snap_path, &world, &codecs, wal.next_seq())
@@ -862,7 +862,7 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         world.spawn((Pos { x: 3.0, y: 4.0 },));
 
-        let mut wal = Wal::create(&wal_path).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
         let snap = Snapshot::new();
         snap.save(&snap_path, &world, &codecs, wal.next_seq())
             .unwrap();

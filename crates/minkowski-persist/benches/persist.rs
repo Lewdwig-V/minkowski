@@ -81,7 +81,7 @@ fn bench_wal_append(c: &mut Criterion) {
     let (mut world, codecs) = setup();
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("bench.wal");
-    let mut wal = Wal::create(&wal_path).unwrap();
+    let mut wal = Wal::create(&wal_path, &codecs).unwrap();
 
     // Single-mutation changeset — WAL append cost scales with changeset size,
     // not world size, so this isolates serialization + I/O overhead.

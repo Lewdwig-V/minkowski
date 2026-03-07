@@ -49,10 +49,10 @@ fn main() {
     println!("Phase 1: Creating world with 100 entities across 3 archetypes...");
     let mut world = World::new();
     let mut codecs = CodecRegistry::new();
-    codecs.register::<Pos>(&mut world);
-    codecs.register::<Vel>(&mut world);
-    codecs.register::<Health>(&mut world);
-    codecs.register::<Score>(&mut world);
+    codecs.register_as::<Pos>("pos", &mut world);
+    codecs.register_as::<Vel>("vel", &mut world);
+    codecs.register_as::<Health>("health", &mut world);
+    codecs.register_as::<Score>("score", &mut world);
 
     // Archetype 1: (Pos, Vel) — moving entities
     for i in 0..50 {
@@ -99,7 +99,7 @@ fn main() {
 
     // -- Phase 2: Snapshot --
     let snap = Snapshot::new();
-    let wal = Wal::create(&wal_path).unwrap();
+    let wal = Wal::create(&wal_path, &codecs).unwrap();
     let header = snap
         .save(&snap_path, &world, &codecs, wal.next_seq())
         .unwrap();
@@ -146,13 +146,13 @@ fn main() {
     println!("Phase 4: Recovering from snapshot + WAL...");
     let mut load_codecs = CodecRegistry::new();
     let mut load_world_tmp = World::new();
-    load_codecs.register::<Pos>(&mut load_world_tmp);
-    load_codecs.register::<Vel>(&mut load_world_tmp);
-    load_codecs.register::<Health>(&mut load_world_tmp);
-    load_codecs.register::<Score>(&mut load_world_tmp);
+    load_codecs.register_as::<Pos>("pos", &mut load_world_tmp);
+    load_codecs.register_as::<Vel>("vel", &mut load_world_tmp);
+    load_codecs.register_as::<Health>("health", &mut load_world_tmp);
+    load_codecs.register_as::<Score>("score", &mut load_world_tmp);
 
     let (mut recovered, snap_seq) = snap.load(&snap_path, &load_codecs).unwrap();
-    let mut replay_wal = Wal::open(&wal_path).unwrap();
+    let mut replay_wal = Wal::open(&wal_path, &load_codecs).unwrap();
     let last_seq = replay_wal
         .replay_from(snap_seq, &mut recovered, &load_codecs)
         .unwrap();
@@ -176,10 +176,10 @@ fn main() {
     println!("Phase 5: Zero-copy snapshot load (mmap)...");
     let mut zc_codecs = CodecRegistry::new();
     let mut zc_world_tmp = World::new();
-    zc_codecs.register::<Pos>(&mut zc_world_tmp);
-    zc_codecs.register::<Vel>(&mut zc_world_tmp);
-    zc_codecs.register::<Health>(&mut zc_world_tmp);
-    zc_codecs.register::<Score>(&mut zc_world_tmp);
+    zc_codecs.register_as::<Pos>("pos", &mut zc_world_tmp);
+    zc_codecs.register_as::<Vel>("vel", &mut zc_world_tmp);
+    zc_codecs.register_as::<Health>("health", &mut zc_world_tmp);
+    zc_codecs.register_as::<Score>("score", &mut zc_world_tmp);
 
     let (mut zc_world, zc_seq) = snap.load_zero_copy(&snap_path, &zc_codecs).unwrap();
     let zc_pos = zc_world.query::<(&Pos,)>().count();
