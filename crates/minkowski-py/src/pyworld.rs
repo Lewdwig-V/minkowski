@@ -98,7 +98,7 @@ fn spawn_typed(
 
         // ── Two-component bundles ──
         "Position,Velocity" => Ok(world.spawn((build_position(kwargs)?, build_velocity(kwargs)?))),
-        "Position,Mass" => Ok(world.spawn((build_position(kwargs)?, build_mass(kwargs)?))),
+        "Mass,Position" => Ok(world.spawn((build_mass(kwargs)?, build_position(kwargs)?))),
         "Heading,Position" => Ok(world.spawn((build_heading(kwargs)?, build_position(kwargs)?))),
 
         // ── Three-component bundles ──
