@@ -59,7 +59,7 @@ registry.run(&mut world, move_id, ());
 
 Each unique combination of [component][component] types gets an [archetype][archetype] — a [struct of arrays][soa] where each column is a `BlobVec` (type-erased growable byte array with 64-byte alignment). Queries match archetypes via [bitset][bitset] subset checks, then iterate columns with raw pointer arithmetic. No virtual dispatch in the hot path.
 
-Entities are [generational][generational-index] `u64` IDs (32-bit index + 32-bit generation). Recycled indices get bumped generations to prevent use-after-free. O(1) lookup from entity to archetype row via `Vec<Option<EntityLocation>>`. Sparse components (`HashMap<Entity, T>`) are opt-in for tags and rarely-queried data, preventing archetype fragmentation.
+Entities are [generational][generational-index] `u64` IDs (32-bit index + 32-bit generation). Recycled indices get bumped generations to prevent use-after-free. O(1) lookup from entity to archetype row via `Vec<Option<EntityLocation>>`. Sparse components (paged sparse sets with O(1) lookup) are opt-in for tags and rarely-queried data, preventing archetype fragmentation.
 
 ```rust
 let mut world = World::new();
@@ -234,7 +234,7 @@ Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each record
 ## Building & Testing
 
 ```
-cargo test -p minkowski                # 320 tests
+cargo test -p minkowski                # 368 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
@@ -247,6 +247,7 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 | Feature | Rationale |
 |---|---|
 | Replication & sync | Filtered WAL replay for read replicas and client mirrors |
+| Observability companion crate | `minkowski-observe`: pure consumer that calls `world.snapshot_metrics()`, diffs consecutive snapshots, computes rates (entity churn, changeset throughput, cache hit rates), and exports. Stretch within stretch: [ratatui][ratatui] TUI dashboard for live archetype sizes and sync diagnostics. Placed after replication because replication adds the most interesting metrics — sync latency, conflict rate across clients, changeset sizes over the wire |
 
 ## Glossary
 
@@ -291,4 +292,5 @@ This project is licensed under the [Mozilla Public License 2.0](https://www.mozi
 [soa]: https://en.wikipedia.org/wiki/AoS_and_SoA#Structure_of_arrays
 [tree-borrows]: https://perso.crans.org/vanille/treebor/
 [uniform-grid]: https://en.wikipedia.org/wiki/Grid_(spatial_index)
+[ratatui]: https://github.com/ratatui/ratatui
 [wal]: https://en.wikipedia.org/wiki/Write-ahead_logging

@@ -1092,6 +1092,17 @@ impl World {
         QueryIter::new(fetches)
     }
 
+    // ── Introspection ─────────────────────────────────────────────────
+
+    /// Number of live (placed) entities across all archetypes.
+    pub fn entity_count(&self) -> usize {
+        self.archetypes
+            .archetypes
+            .iter()
+            .map(|arch| arch.len())
+            .sum()
+    }
+
     // ── Persistence accessors ────────────────────────────────────────
 
     /// Number of archetypes (for iteration bounds).
@@ -2235,5 +2246,18 @@ mod tests {
         });
         values.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(values, vec![2.0, 4.0]);
+    }
+
+    #[test]
+    fn entity_count() {
+        let mut world = World::new();
+        assert_eq!(world.entity_count(), 0);
+
+        let a = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let _b = world.spawn((Pos { x: 1.0, y: 1.0 }, Vel { dx: 1.0, dy: 1.0 }));
+        assert_eq!(world.entity_count(), 2);
+
+        world.despawn(a);
+        assert_eq!(world.entity_count(), 1);
     }
 }
