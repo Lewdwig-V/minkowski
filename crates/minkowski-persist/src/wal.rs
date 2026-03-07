@@ -40,12 +40,16 @@ pub struct WalConfig {
     /// Maximum bytes per segment file before rolling to a new segment.
     /// Default: 64 MB.
     pub max_segment_bytes: usize,
+    /// Maximum bytes of mutation data between checkpoint markers.
+    /// `None` disables checkpoint enforcement (default).
+    pub max_bytes_between_checkpoints: Option<usize>,
 }
 
 impl Default for WalConfig {
     fn default() -> Self {
         Self {
             max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: None,
         }
     }
 }
@@ -193,6 +197,8 @@ pub struct Wal {
     next_seq: u64,
     config: WalConfig,
     schema: WalSchema,
+    last_checkpoint_seq: Option<u64>,
+    bytes_since_checkpoint: u64,
 }
 
 impl Wal {
@@ -214,6 +220,8 @@ impl Wal {
             next_seq: 0,
             config,
             schema,
+            last_checkpoint_seq: None,
+            bytes_since_checkpoint: 0,
         };
         wal.active_bytes = wal.write_schema_preamble()?;
         Ok(wal)
@@ -247,6 +255,8 @@ impl Wal {
             next_seq: 0,
             config,
             schema,
+            last_checkpoint_seq: None,
+            bytes_since_checkpoint: 0,
         };
 
         // Crash recovery: scan the active segment, truncating torn/corrupt tail
@@ -263,9 +273,12 @@ impl Wal {
                 let mut seg_last = 0u64;
                 let mut seg_has = false;
                 while let Some((entry, next_pos)) = read_next_frame(&seg_file, pos)? {
-                    if let WalEntry::Mutations(record) = entry {
-                        seg_last = record.seq;
-                        seg_has = true;
+                    match entry {
+                        WalEntry::Mutations(record) => {
+                            seg_last = record.seq;
+                            seg_has = true;
+                        }
+                        WalEntry::Schema(_) | WalEntry::Checkpoint { .. } => {}
                     }
                     pos = next_pos;
                 }
@@ -282,6 +295,44 @@ impl Wal {
     /// Current sequence number (next append will use this).
     pub fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// Returns `true` when the WAL has accumulated more bytes since the
+    /// last checkpoint than `max_bytes_between_checkpoints` allows.
+    pub fn checkpoint_needed(&self) -> bool {
+        match self.config.max_bytes_between_checkpoints {
+            Some(max) => self.bytes_since_checkpoint >= max as u64,
+            None => false,
+        }
+    }
+
+    /// The sequence number of the last acknowledged snapshot, if any.
+    pub fn last_checkpoint_seq(&self) -> Option<u64> {
+        self.last_checkpoint_seq
+    }
+
+    /// Record that a snapshot was taken at the given seq.
+    /// Writes a `Checkpoint` entry to the WAL stream and resets the byte counter.
+    pub fn acknowledge_snapshot(&mut self, seq: u64) -> Result<(), WalError> {
+        let entry = WalEntry::Checkpoint { snapshot_seq: seq };
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
+            .map_err(|e| WalError::Format(e.to_string()))?;
+
+        {
+            let mut writer = BufWriter::new(&self.active_file);
+            let len: u32 = payload
+                .len()
+                .try_into()
+                .map_err(|_| WalError::Format("checkpoint entry too large".into()))?;
+            writer.write_all(&len.to_le_bytes())?;
+            writer.write_all(&payload)?;
+            writer.flush()?;
+        }
+
+        self.active_bytes += 4 + payload.len() as u64;
+        self.last_checkpoint_seq = Some(seq);
+        self.bytes_since_checkpoint = 0;
+        Ok(())
     }
 
     /// Serialize and append a changeset as a WAL record.
@@ -310,7 +361,9 @@ impl Wal {
             writer.flush()?;
         }
 
-        self.active_bytes += 4 + payload.len() as u64;
+        let frame_bytes = 4 + payload.len() as u64;
+        self.active_bytes += frame_bytes;
+        self.bytes_since_checkpoint += frame_bytes;
         self.next_seq += 1;
 
         // Roll to new segment if threshold exceeded
@@ -355,6 +408,7 @@ impl Wal {
                             last_seq = record.seq;
                         }
                     }
+                    WalEntry::Checkpoint { .. } => {}
                 }
                 pos = next_pos;
             }
@@ -469,15 +523,26 @@ impl Wal {
         let mut last_seq = 0u64;
         let mut has_mutations = false;
         let mut pos: u64 = 0;
+        let mut bytes_after_checkpoint: u64 = 0;
 
         while let Some((entry, next_pos)) = self.read_next_entry(pos)? {
-            if let WalEntry::Mutations(record) = entry {
-                last_seq = record.seq;
-                has_mutations = true;
+            let frame_bytes = next_pos - pos;
+            match entry {
+                WalEntry::Mutations(record) => {
+                    last_seq = record.seq;
+                    has_mutations = true;
+                    bytes_after_checkpoint += frame_bytes;
+                }
+                WalEntry::Checkpoint { snapshot_seq } => {
+                    self.last_checkpoint_seq = Some(snapshot_seq);
+                    bytes_after_checkpoint = 0;
+                }
+                WalEntry::Schema(_) => {}
             }
             pos = next_pos;
         }
 
+        self.bytes_since_checkpoint = bytes_after_checkpoint;
         Ok((last_seq, has_mutations))
     }
 
@@ -566,6 +631,7 @@ mod tests {
     fn small_config() -> WalConfig {
         WalConfig {
             max_segment_bytes: 128,
+            max_bytes_between_checkpoints: None,
         }
     }
 
@@ -1083,6 +1149,179 @@ mod tests {
         assert!(deleted > 0);
         assert_eq!(wal.segment_count(), before - deleted);
         assert!(wal.oldest_seq().is_some());
+    }
+
+    // ── Checkpoint tests ──────────────────────────────────────────
+
+    #[test]
+    fn wal_config_checkpoint_default_disabled() {
+        let config = WalConfig::default();
+        assert!(config.max_bytes_between_checkpoints.is_none());
+    }
+
+    #[test]
+    fn checkpoint_needed_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        assert!(!wal.checkpoint_needed());
+        assert_eq!(wal.last_checkpoint_seq(), None);
+    }
+
+    #[test]
+    fn checkpoint_needed_after_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(128),
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+
+        assert!(!wal.checkpoint_needed());
+
+        for i in 0..10 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+
+        assert!(wal.checkpoint_needed());
+    }
+
+    #[test]
+    fn acknowledge_snapshot_writes_checkpoint_and_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(128),
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+
+        for i in 0..10 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+        assert!(wal.checkpoint_needed());
+
+        let seq = wal.next_seq();
+        wal.acknowledge_snapshot(seq).unwrap();
+
+        assert_eq!(wal.last_checkpoint_seq(), Some(seq));
+        assert!(!wal.checkpoint_needed());
+    }
+
+    #[test]
+    fn acknowledge_snapshot_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(1024),
+        };
+
+        {
+            let mut wal = Wal::create(&wal_dir, &codecs, config.clone()).unwrap();
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+
+            wal.acknowledge_snapshot(wal.next_seq()).unwrap();
+        }
+
+        let wal2 = Wal::open(&wal_dir, &codecs, config).unwrap();
+        assert_eq!(wal2.last_checkpoint_seq(), Some(1));
+        assert!(!wal2.checkpoint_needed());
+    }
+
+    #[test]
+    fn replay_skips_checkpoint_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+
+        for i in 0..3 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+        wal.acknowledge_snapshot(wal.next_seq()).unwrap();
+        for i in 3..5 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+
+        let mut world2 = World::new();
+        codecs.register_one(world.component_id::<Pos>().unwrap(), &mut world2);
+        let last = wal.replay(&mut world2, &codecs).unwrap();
+        assert_eq!(last, 4);
+        assert_eq!(world2.query::<(&Pos,)>().count(), 5);
     }
 
     #[test]

@@ -93,6 +93,7 @@ pub struct WalSchema {
 pub enum WalEntry {
     Schema(WalSchema),
     Mutations(WalRecord),
+    Checkpoint { snapshot_seq: u64 },
 }
 
 /// Returned after a successful snapshot save.
@@ -118,6 +119,15 @@ mod tests {
         let cloned = schema.clone();
         assert_eq!(cloned.id, 0);
         assert_eq!(cloned.name, "pos");
+    }
+
+    #[test]
+    fn wal_entry_checkpoint_variant() {
+        let checkpoint = WalEntry::Checkpoint { snapshot_seq: 42 };
+        assert!(matches!(
+            checkpoint,
+            WalEntry::Checkpoint { snapshot_seq: 42 }
+        ));
     }
 
     #[test]

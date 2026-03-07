@@ -2,6 +2,7 @@ use parking_lot::Mutex;
 
 use minkowski::{Access, Conflict, EnumChangeSet, Transact, Tx, World};
 
+use crate::checkpoint::CheckpointHandler;
 use crate::codec::CodecRegistry;
 use crate::wal::Wal;
 
@@ -15,6 +16,7 @@ pub struct Durable<S: Transact> {
     inner: S,
     wal: Mutex<Wal>,
     codecs: CodecRegistry,
+    checkpoint_handler: Option<Mutex<Box<dyn CheckpointHandler>>>,
 }
 
 impl<S: Transact> Durable<S> {
@@ -23,6 +25,23 @@ impl<S: Transact> Durable<S> {
             inner: strategy,
             wal: Mutex::new(wal),
             codecs,
+            checkpoint_handler: None,
+        }
+    }
+
+    /// Create a `Durable` wrapper with a checkpoint handler that fires
+    /// when the WAL exceeds `max_bytes_between_checkpoints`.
+    pub fn with_checkpoint(
+        strategy: S,
+        wal: Wal,
+        codecs: CodecRegistry,
+        handler: impl CheckpointHandler + 'static,
+    ) -> Self {
+        Self {
+            inner: strategy,
+            wal: Mutex::new(wal),
+            codecs,
+            checkpoint_handler: Some(Mutex::new(Box::new(handler))),
         }
     }
 
@@ -70,6 +89,16 @@ impl<S: Transact> Transact for Durable<S> {
                         .append(&forward, &self.codecs)
                         .expect("WAL write failed — durable commit impossible");
                     forward.apply(world);
+
+                    // Fire checkpoint handler if threshold exceeded
+                    if let Some(ref handler_mutex) = self.checkpoint_handler {
+                        let mut wal = self.wal.lock();
+                        if wal.checkpoint_needed() {
+                            let mut handler = handler_mutex.lock();
+                            handler.on_checkpoint_needed(world, &mut wal, &self.codecs);
+                        }
+                    }
+
                     return Ok(value);
                 }
                 Err(conflict) => {
@@ -87,10 +116,13 @@ impl<S: Transact> Transact for Durable<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::CheckpointHandler;
     use crate::codec::CodecRegistry;
     use crate::wal::{Wal, WalConfig};
     use minkowski::{Optimistic, Pessimistic};
     use rkyv::{Archive, Deserialize, Serialize};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]
     struct Pos {
@@ -150,6 +182,91 @@ mod tests {
             .unwrap();
 
         assert_eq!(durable.wal_seq(), 1);
+    }
+
+    struct CountingHandler {
+        count: Arc<AtomicU32>,
+    }
+
+    impl CheckpointHandler for CountingHandler {
+        fn on_checkpoint_needed(
+            &mut self,
+            _world: &mut World,
+            wal: &mut Wal,
+            _codecs: &CodecRegistry,
+        ) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            wal.acknowledge_snapshot(wal.next_seq()).unwrap();
+        }
+    }
+
+    #[test]
+    fn durable_fires_checkpoint_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(64),
+        };
+        let wal = Wal::create(&wal_path, &codecs, config).unwrap();
+        let strategy = Optimistic::new(&world);
+
+        let count = Arc::new(AtomicU32::new(0));
+        let handler = CountingHandler {
+            count: count.clone(),
+        };
+        let durable = Durable::with_checkpoint(strategy, wal, codecs, handler);
+
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        for _ in 0..20 {
+            durable
+                .transact(&mut world, &access, |tx, world| {
+                    tx.write::<Pos>(world, e, Pos { x: 10.0, y: 20.0 });
+                })
+                .unwrap();
+        }
+
+        assert!(
+            count.load(Ordering::SeqCst) >= 1,
+            "handler should have fired"
+        );
+    }
+
+    #[test]
+    fn durable_no_handler_backward_compat() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(64),
+        };
+        let wal = Wal::create(&wal_path, &codecs, config).unwrap();
+        let strategy = Optimistic::new(&world);
+        let durable = Durable::new(strategy, wal, codecs);
+
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        // Should work fine without handler, even if threshold is exceeded
+        for _ in 0..20 {
+            durable
+                .transact(&mut world, &access, |tx, world| {
+                    tx.write::<Pos>(world, e, Pos { x: 10.0, y: 20.0 });
+                })
+                .unwrap();
+        }
     }
 
     #[test]

@@ -62,6 +62,9 @@ impl WalCursor {
                     }
                     pos = _next_pos;
                 }
+                Some((WalEntry::Checkpoint { .. }, next_pos)) => {
+                    pos = next_pos;
+                }
                 None => break,
             }
         }
@@ -92,6 +95,9 @@ impl WalCursor {
                 Some((WalEntry::Mutations(record), next_pos)) => {
                     self.next_seq = record.seq + 1;
                     records.push(record);
+                    self.pos = next_pos;
+                }
+                Some((WalEntry::Checkpoint { .. }, next_pos)) => {
                     self.pos = next_pos;
                 }
                 None => {
@@ -519,6 +525,58 @@ mod tests {
 
         let last_seq = apply_batch(&batch, &mut world, &codecs).unwrap();
         assert_eq!(last_seq, None);
+    }
+
+    #[test]
+    fn cursor_skips_checkpoint_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
+
+        // Write 3 records, checkpoint, then 2 more
+        for i in 0..3 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+        wal.acknowledge_snapshot(wal.next_seq()).unwrap();
+        for i in 3..5 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+
+        drop(wal);
+
+        let mut cursor = WalCursor::open(&wal_dir, 0).unwrap();
+        let batch = cursor.next_batch(100).unwrap();
+        // Should see all 5 mutation records, no checkpoint in batch
+        assert_eq!(batch.records.len(), 5);
+        assert_eq!(batch.records[0].seq, 0);
+        assert_eq!(batch.records[4].seq, 4);
     }
 
     // ── Error path tests ─────────────────────────────────────────
