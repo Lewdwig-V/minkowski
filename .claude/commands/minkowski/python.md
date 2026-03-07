@@ -1,10 +1,6 @@
 ---
-description: >
-  Help with Minkowski ECS Python bindings — adding components and reducers
-  to the bridge, setting up maturin/uv build tooling, calling the ECS from
-  Python/Jupyter. Use when: "Python binding", "add component to Python",
-  "register reducer for Python", "maturin", "Jupyter notebook", "query from
-  Python", "write_column", "spawn from Python", "PyO3 bridge", "pyo3-arrow".
+description: Help with Minkowski ECS Python bindings — adding components and reducers to the bridge, setting up maturin/uv build tooling, calling the ECS from Python/Jupyter. Use when "Python binding", "add component to Python", "register reducer for Python", "maturin", "Jupyter notebook", "query from Python", "write_column", "spawn from Python", "PyO3 bridge", "pyo3-arrow".
+allowed-tools: Bash, Read, Glob, Grep, Write, Edit
 ---
 
 # Minkowski Python Bridge

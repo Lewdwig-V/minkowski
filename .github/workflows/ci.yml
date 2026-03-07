@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Override .cargo/config.toml's target-cpu=native — CI runners have
+  # varying CPU generations and SIGILL if the compiled code uses
+  # instructions the runner doesn't support.
+  RUSTFLAGS: ""
 
 jobs:
   fmt:

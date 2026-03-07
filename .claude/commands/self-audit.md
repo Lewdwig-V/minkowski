@@ -26,14 +26,8 @@ Run a self-audit on the current branch's implementation changes. This is complem
    - Despawn-during-iteration: are structural changes properly deferred via CommandBuffer or EnumChangeSet?
    - Component removal: do indexes, caches, or lookups handle entities that had a component removed?
 
-5. **Quick-Find pointer audit**: If any file in `examples/examples/` was changed:
-   - Read `.claude/skills/minkowski-guide.md` and find the `### Pattern Quick-Find` section
-   - For every pointer that references a changed example file, grep for the pattern name (function/method/type) in the example and verify the line numbers still match
-   - Flag any pointer whose line range no longer contains the referenced pattern
-   - Check if new patterns were added to the example that should have a Quick-Find entry
-
-6. **Report**: List findings with severity and file:line references:
-   - ISSUE: must fix before merging (missed change detection, visibility bug, unsound edge case, broken Quick-Find pointer)
+5. **Report**: List findings with severity and file:line references:
+   - ISSUE: must fix before merging (missed change detection, visibility bug, unsound edge case)
    - NOTE: worth checking but may be intentional (unusual pattern, potential edge case)
 
 If no issues are found, say so explicitly.
