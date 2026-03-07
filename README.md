@@ -10,7 +10,7 @@ The core insight: archetype-based column storage is already a columnar database.
 
 ## Quick start
 
-> 💡 **Working with Claude Code?** The auto-triggering skill (`minkowski-guide.md`) provides passive ECS expertise in every session. Use `/design-doc` to plan a new feature, `/soundness-audit` to review concurrency invariants, or `/validate-api` and `/validate-macro` for compile-time correctness checks. Nine domain commands — `/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize`, `/minkowski:python` — explain the paradigm in depth. See [AI-Assisted Development](#ai-assisted-development) for the full list.
+> 💡 **Working with Claude Code?** custom commands provide on-demand ECS expertise in every session. Use `/design-doc` to plan a new feature, `/soundness-audit` to review concurrency invariants, or `/validate-api` and `/validate-macro` for compile-time correctness checks. Nine domain commands — `/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize`, `/minkowski:python` — explain the paradigm in depth. See [AI-Assisted Development](#ai-assisted-development) for the full list.
 
 ```rust
 use minkowski::{World, ReducerRegistry, QueryMut};
