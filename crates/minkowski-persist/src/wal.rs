@@ -353,6 +353,11 @@ impl Wal {
 
     /// Serialize and append a changeset as a WAL record.
     /// Returns the sequence number assigned to this record.
+    ///
+    /// If the active segment exceeds `max_segment_bytes` after the write,
+    /// rollover to a new segment is attempted. Rollover failure is *not*
+    /// propagated — the mutation is already durable in the current segment
+    /// and the next `append` will retry the roll.
     pub fn append(
         &mut self,
         changeset: &EnumChangeSet,
@@ -382,9 +387,11 @@ impl Wal {
         self.bytes_since_checkpoint += frame_bytes;
         self.next_seq += 1;
 
-        // Roll to new segment if threshold exceeded
+        // Roll to new segment if threshold exceeded. Failure is non-fatal:
+        // the mutation is already persisted and the oversized segment is
+        // still valid. The next append will retry.
         if self.active_bytes >= self.config.max_segment_bytes as u64 {
-            self.roll_segment()?;
+            let _ = self.roll_segment();
         }
 
         Ok(seq)
