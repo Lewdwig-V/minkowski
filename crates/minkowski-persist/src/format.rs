@@ -104,13 +104,13 @@ mod tests {
     fn wal_schema_round_trip() {
         let schema = WalSchema {
             components: vec![
-                WalComponentDef {
+                ComponentSchema {
                     id: 0,
                     name: "pos".into(),
                     size: 8,
                     align: 4,
                 },
-                WalComponentDef {
+                ComponentSchema {
                     id: 1,
                     name: "vel".into(),
                     size: 8,

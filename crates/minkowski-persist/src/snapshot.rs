@@ -139,7 +139,12 @@ impl Snapshot {
                 let name = codecs
                     .stable_name(id)
                     .map(|s| s.to_string())
-                    .unwrap_or_else(|| world.component_name(id).unwrap_or("unknown").to_string());
+                    .unwrap_or_else(|| {
+                        world
+                            .component_name(id)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("__unnamed_{id}"))
+                    });
                 ComponentSchema {
                     id,
                     name,
@@ -254,23 +259,17 @@ impl Snapshot {
         }
 
         // Build remap from snapshot schema: sender ComponentId → receiver ComponentId.
-        // After registration above, the fresh world has IDs assigned in schema order.
-        // The remap translates sender's IDs to whatever the fresh world assigned.
-        let schema_defs: Vec<WalComponentDef> = data
+        // Filter to only components the receiver knows about (by stable name).
+        let known_schema: Vec<&ComponentSchema> = data
             .schema
             .iter()
             .filter(|entry| codecs.resolve_name(&entry.name).is_some())
-            .map(|entry| WalComponentDef {
-                id: entry.id,
-                name: entry.name.clone(),
-                size: entry.size,
-                align: entry.align,
-            })
             .collect();
 
-        let remap = if !schema_defs.is_empty() {
+        let remap = if !known_schema.is_empty() {
+            let defs: Vec<ComponentSchema> = known_schema.iter().map(|e| (*e).clone()).collect();
             codecs
-                .build_remap(&schema_defs)
+                .build_remap(&defs)
                 .map_err(|e| SnapshotError::Format(e.to_string()))?
         } else {
             HashMap::new()
@@ -356,11 +355,11 @@ impl Snapshot {
         }
 
         // Build remap from archived schema: sender ComponentId → receiver ComponentId.
-        let schema_defs: Vec<WalComponentDef> = data
+        let schema_defs: Vec<ComponentSchema> = data
             .schema
             .iter()
             .filter(|entry| codecs.resolve_name(entry.name.as_str()).is_some())
-            .map(|entry| WalComponentDef {
+            .map(|entry| ComponentSchema {
                 id: u32::from(entry.id) as usize,
                 name: entry.name.as_str().to_owned(),
                 size: u32::from(entry.size) as usize,
@@ -1094,5 +1093,42 @@ mod tests {
             .map(|v| (v.0.dx, v.0.dy))
             .collect();
         assert_eq!(velocities, vec![(30.0, 40.0)]);
+    }
+
+    #[test]
+    fn snapshot_cross_process_sparse_different_registration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("cross_sparse.snap");
+
+        let mut world_a = World::new();
+        let mut codecs_a = CodecRegistry::new();
+        codecs_a.register_as::<Pos>("pos", &mut world_a);
+        codecs_a.register_as::<Vel>("vel", &mut world_a);
+
+        let e = world_a.spawn((Pos { x: 1.0, y: 2.0 },));
+        world_a.insert_sparse::<Vel>(e, Vel { dx: 10.0, dy: 20.0 });
+
+        let snap = Snapshot::new();
+        snap.save(&snap_path, &world_a, &codecs_a, 0).unwrap();
+
+        // Opposite order
+        let mut world_b_tmp = World::new();
+        let mut codecs_b = CodecRegistry::new();
+        codecs_b.register_as::<Vel>("vel", &mut world_b_tmp);
+        codecs_b.register_as::<Pos>("pos", &mut world_b_tmp);
+
+        let (mut world_b, _) = snap.load(&snap_path, &codecs_b).unwrap();
+
+        let positions: Vec<(f32, f32)> =
+            world_b.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert_eq!(positions, vec![(1.0, 2.0)]);
+
+        let vel_id = world_b.component_id::<Vel>().unwrap();
+        let sparse: Vec<(f32, f32)> = world_b
+            .iter_sparse::<Vel>(vel_id)
+            .unwrap()
+            .map(|(_, v)| (v.dx, v.dy))
+            .collect();
+        assert_eq!(sparse, vec![(10.0, 20.0)]);
     }
 }

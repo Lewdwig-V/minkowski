@@ -7,7 +7,7 @@ use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 
 use crate::codec::{CodecError, CodecRegistry};
 use crate::format;
-use crate::record::{SerializedMutation, WalComponentDef, WalEntry, WalSchema};
+use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 
 // WAL file format: `[len: u32 LE][payload: len bytes]` repeated.
 // Each payload is a `WalRecord` serialized through rkyv.
@@ -138,7 +138,7 @@ impl Wal {
         for &id in &codecs.registered_ids() {
             let name = codecs.stable_name(id).unwrap().to_string();
             let layout = codecs.layout(id).unwrap();
-            components.push(WalComponentDef {
+            components.push(ComponentSchema {
                 id,
                 name,
                 size: layout.size(),
@@ -261,8 +261,17 @@ impl Wal {
         codecs: &CodecRegistry,
         remap: Option<&HashMap<ComponentId, ComponentId>>,
     ) -> Result<(), WalError> {
-        let remap_id = |id: ComponentId| -> ComponentId {
-            remap.map_or(id, |r| r.get(&id).copied().unwrap_or(id))
+        // When no schema preamble exists (legacy WAL), use identity mapping.
+        // When a schema exists, unmapped IDs are an error — the sender wrote
+        // a mutation for a component not in its own preamble, which is corrupt.
+        let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
+            match remap {
+                None => Ok(id),
+                Some(r) => r
+                    .get(&id)
+                    .copied()
+                    .ok_or(WalError::Codec(CodecError::UnregisteredComponent(id))),
+            }
         };
 
         let mut changeset = EnumChangeSet::new();
@@ -284,7 +293,7 @@ impl Wal {
                         std::alloc::Layout,
                     )> = Vec::new();
                     for (comp_id, data) in components {
-                        let local_id = remap_id(*comp_id);
+                        let local_id = remap_id(*comp_id)?;
                         let raw = codecs.deserialize(local_id, data)?;
                         let layout = codecs
                             .layout(local_id)
@@ -305,7 +314,7 @@ impl Wal {
                     component_id,
                     data,
                 } => {
-                    let local_id = remap_id(*component_id);
+                    let local_id = remap_id(*component_id)?;
                     let raw = codecs.deserialize(local_id, data)?;
                     let layout = codecs
                         .layout(local_id)
@@ -321,7 +330,7 @@ impl Wal {
                     entity,
                     component_id,
                 } => {
-                    changeset.record_remove(Entity::from_bits(*entity), remap_id(*component_id));
+                    changeset.record_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
                 }
             }
         }
@@ -617,9 +626,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wal_without_schema_replays() {
-        // Simulate a legacy WAL: write WalEntry::Mutations records directly
-        // without a Schema preamble (as old code would have produced).
+    fn wal_without_schema_preamble_replays_with_identity_mapping() {
+        // WAL with Mutations entries but no Schema preamble — replay uses
+        // identity mapping (no remap). Note: this is NOT backwards-compatible
+        // with pre-stable-identity WAL files (which used a different rkyv root
+        // type). This tests the "no schema" branch of the new format.
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("legacy.wal");
 
@@ -707,5 +718,49 @@ mod tests {
 
         let health: Vec<u32> = world_b.query::<(&Health,)>().map(|h| h.0 .0).collect();
         assert_eq!(health, vec![100]);
+    }
+
+    #[test]
+    fn wal_cross_process_insert_and_remove_remapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("cross_insert.wal");
+
+        // "Process A": Pos=0, Health=1
+        let mut world_a = World::new();
+        let mut codecs_a = CodecRegistry::new();
+        codecs_a.register_as::<Pos>("pos", &mut world_a);
+        codecs_a.register_as::<Health>("health", &mut world_a);
+
+        let mut wal = Wal::create(&wal_path, &codecs_a).unwrap();
+
+        // Spawn with Pos only
+        let e = world_a.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 },));
+        wal.append(&cs, &codecs_a).unwrap();
+        cs.apply(&mut world_a);
+
+        // Insert Health, then Remove Pos
+        let mut cs2 = EnumChangeSet::new();
+        cs2.insert::<Health>(&mut world_a, e, Health(50));
+        cs2.remove::<Pos>(&mut world_a, e);
+        wal.append(&cs2, &codecs_a).unwrap();
+        cs2.apply(&mut world_a);
+
+        drop(wal);
+
+        // "Process B": opposite order
+        let mut world_b = World::new();
+        let mut codecs_b = CodecRegistry::new();
+        codecs_b.register_as::<Health>("health", &mut world_b);
+        codecs_b.register_as::<Pos>("pos", &mut world_b);
+
+        let mut wal_b = Wal::open(&wal_path, &codecs_b).unwrap();
+        wal_b.replay(&mut world_b, &codecs_b).unwrap();
+
+        // Entity should have Health(50) but no Pos
+        let health: Vec<u32> = world_b.query::<(&Health,)>().map(|h| h.0 .0).collect();
+        assert_eq!(health, vec![50]);
+        assert_eq!(world_b.query::<(&Pos,)>().count(), 0);
     }
 }

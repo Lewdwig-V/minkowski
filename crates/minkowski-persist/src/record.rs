@@ -32,7 +32,9 @@ pub struct WalRecord {
     pub mutations: Vec<SerializedMutation>,
 }
 
-/// Schema entry for a component type in a snapshot.
+/// Schema entry describing a component type. Used in both snapshot schemas
+/// and WAL preambles. Fields are sender-local: `id` is meaningful only in
+/// the originating World's ID space.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 pub struct ComponentSchema {
     pub id: ComponentId,
@@ -80,19 +82,10 @@ pub struct SnapshotData {
     pub sparse: Vec<SparseComponentData>,
 }
 
-/// A single component definition in a WAL schema preamble.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct WalComponentDef {
-    pub id: ComponentId,
-    pub name: String,
-    pub size: usize,
-    pub align: usize,
-}
-
 /// Schema preamble: maps sender-local IDs to stable names.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 pub struct WalSchema {
-    pub components: Vec<WalComponentDef>,
+    pub components: Vec<ComponentSchema>,
 }
 
 /// A WAL file entry: either a schema preamble (first record) or mutation data.
@@ -108,4 +101,34 @@ pub struct SnapshotHeader {
     pub wal_seq: u64,
     pub archetype_count: usize,
     pub entity_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_schema_clone() {
+        let schema = ComponentSchema {
+            id: 0,
+            name: "pos".into(),
+            size: 8,
+            align: 4,
+        };
+        let cloned = schema.clone();
+        assert_eq!(cloned.id, 0);
+        assert_eq!(cloned.name, "pos");
+    }
+
+    #[test]
+    fn wal_entry_variants() {
+        let schema = WalEntry::Schema(WalSchema { components: vec![] });
+        assert!(matches!(schema, WalEntry::Schema(_)));
+
+        let mutations = WalEntry::Mutations(WalRecord {
+            seq: 0,
+            mutations: vec![],
+        });
+        assert!(matches!(mutations, WalEntry::Mutations(_)));
+    }
 }
