@@ -79,16 +79,20 @@ impl Snapshot {
             return Err(SnapshotError::Format("file too small".to_string()));
         }
 
-        // Validate length prefix against actual file size
+        // Validate length prefix against actual file size.
+        // Use checked arithmetic to prevent overflow on crafted length prefixes.
         let len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-        if mmap.len() < 8 + len {
+        let end = 8usize
+            .checked_add(len)
+            .ok_or_else(|| SnapshotError::Format(format!("invalid payload length: {len}")))?;
+        if mmap.len() < end {
             return Err(SnapshotError::Format(format!(
                 "file truncated: expected {} payload bytes, got {}",
                 len,
                 mmap.len() - 8
             )));
         }
-        let payload = &mmap[8..8 + len];
+        let payload = &mmap[8..end];
 
         let archived = rkyv::access::<ArchivedSnapshotData, rkyv::rancor::Error>(payload)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
