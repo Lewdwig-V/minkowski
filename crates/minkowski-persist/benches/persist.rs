@@ -62,21 +62,6 @@ fn bench_snapshot_load(c: &mut Criterion) {
     });
 }
 
-fn bench_snapshot_load_zero_copy(c: &mut Criterion) {
-    let (world, codecs) = setup();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bench.snap");
-    let snap = Snapshot::new();
-    snap.save(&path, &world, &codecs, 0).unwrap();
-
-    c.bench_function("persist/snapshot_zero_copy_1k", |b| {
-        b.iter(|| {
-            let snap = Snapshot::new();
-            let (_world, _seq) = snap.load_zero_copy(&path, &codecs).unwrap();
-        });
-    });
-}
-
 fn bench_wal_append(c: &mut Criterion) {
     let (mut world, codecs) = setup();
     let dir = tempfile::tempdir().unwrap();
@@ -100,7 +85,6 @@ criterion_group!(
     benches,
     bench_snapshot_save,
     bench_snapshot_load,
-    bench_snapshot_load_zero_copy,
     bench_wal_append,
 );
 criterion_main!(benches);

@@ -5,7 +5,6 @@
 //! 2. Save a snapshot
 //! 3. Apply mutations via a durable QueryWriter reducer (WAL-backed)
 //! 4. Recover from snapshot + WAL replay
-//! 5. Zero-copy snapshot load (mmap-based, no per-value deserialization)
 //!
 //! Run: cargo run -p minkowski-examples --example persist --release
 
@@ -142,7 +141,7 @@ fn main() {
     }
     println!("  WAL has {} records", durable.wal_seq());
 
-    // -- Phase 4: Recovery (standard load) --
+    // -- Phase 4: Recovery --
     println!("Phase 4: Recovering from snapshot + WAL...");
     let mut load_codecs = CodecRegistry::new();
     let mut load_world_tmp = World::new();
@@ -171,33 +170,6 @@ fn main() {
     let score_id = recovered.component_id::<Score>().unwrap();
     let sparse_scores: Vec<_> = recovered.iter_sparse::<Score>(score_id).unwrap().collect();
     println!("  Sparse scores recovered: {}", sparse_scores.len());
-
-    // -- Phase 5: Zero-copy snapshot load --
-    println!("Phase 5: Zero-copy snapshot load (mmap)...");
-    let mut zc_codecs = CodecRegistry::new();
-    let mut zc_world_tmp = World::new();
-    zc_codecs.register_as::<Pos>("pos", &mut zc_world_tmp);
-    zc_codecs.register_as::<Vel>("vel", &mut zc_world_tmp);
-    zc_codecs.register_as::<Health>("health", &mut zc_world_tmp);
-    zc_codecs.register_as::<Score>("score", &mut zc_world_tmp);
-
-    let (mut zc_world, zc_seq) = snap.load_zero_copy(&snap_path, &zc_codecs).unwrap();
-    let zc_pos = zc_world.query::<(&Pos,)>().count();
-    let zc_vel = zc_world.query::<(&Vel,)>().count();
-    let zc_health = zc_world.query::<(&Health,)>().count();
-    let zc_score_id = zc_world.component_id::<Score>().unwrap();
-    let zc_sparse: Vec<_> = zc_world
-        .iter_sparse::<Score>(zc_score_id)
-        .unwrap()
-        .collect();
-    println!(
-        "  Zero-copy (seq {}): {} Pos, {} Vel, {} Health, {} sparse Scores",
-        zc_seq,
-        zc_pos,
-        zc_vel,
-        zc_health,
-        zc_sparse.len()
-    );
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&dir);

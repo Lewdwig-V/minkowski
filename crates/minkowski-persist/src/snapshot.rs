@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use minkowski::{ComponentId, Entity, EnumChangeSet, World};
@@ -61,41 +61,18 @@ impl Snapshot {
     /// Load a world from a snapshot file.
     /// Returns `(world, wal_seq)` — the `wal_seq` is the sequence number at snapshot time.
     ///
-    /// Component types are resolved by stable name — registration order does not
-    /// need to match the original world. Components in the snapshot schema whose
-    /// stable name resolves in the receiver's `CodecRegistry` are remapped
-    /// automatically. Unresolved components are filled as raw placeholders.
-    pub fn load(&self, path: &Path, codecs: &CodecRegistry) -> Result<(World, u64), SnapshotError> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-
-        let mut len_buf = [0u8; 8];
-        reader.read_exact(&mut len_buf)?;
-        let len = u64::from_le_bytes(len_buf) as usize;
-
-        let mut bytes = vec![0u8; len];
-        reader.read_exact(&mut bytes)?;
-
-        let data = format::deserialize_snapshot(&bytes)
-            .map_err(|e| SnapshotError::Format(e.to_string()))?;
-
-        let world = self.restore_world(&data, codecs)?;
-        Ok((world, data.wal_seq))
-    }
-
-    /// Load a snapshot with zero-copy component data.
-    ///
     /// mmaps the snapshot file and validates the archived structure in-place
     /// via `rkyv::access` (no allocation for the envelope). For components
     /// whose archived layout matches native (`#[repr(C)]` POD types on LE),
     /// archived bytes are copied directly into BlobVec without typed
     /// deserialization. Other components fall back to `rkyv::from_bytes`.
     /// The mmap is dropped after load completes.
-    pub fn load_zero_copy(
-        &self,
-        path: &Path,
-        codecs: &CodecRegistry,
-    ) -> Result<(World, u64), SnapshotError> {
+    ///
+    /// Component types are resolved by stable name — registration order does not
+    /// need to match the original world. Components in the snapshot schema whose
+    /// stable name resolves in the receiver's `CodecRegistry` are remapped
+    /// automatically. Unresolved components are filled as raw placeholders.
+    pub fn load(&self, path: &Path, codecs: &CodecRegistry) -> Result<(World, u64), SnapshotError> {
         let file = File::open(path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
@@ -117,7 +94,7 @@ impl Snapshot {
         let archived = rkyv::access::<ArchivedSnapshotData, rkyv::rancor::Error>(payload)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
 
-        let world = self.restore_world_zero_copy(archived, codecs)?;
+        let world = self.restore_world(archived, codecs)?;
         let wal_seq: u64 = archived.wal_seq.into();
         Ok((world, wal_seq))
     }
@@ -233,103 +210,6 @@ impl Snapshot {
     }
 
     fn restore_world(
-        &self,
-        data: &SnapshotData,
-        codecs: &CodecRegistry,
-    ) -> Result<World, SnapshotError> {
-        let mut world = World::new();
-
-        // Register components in schema order, preserving ID slots.
-        // Codec'd components get their typed registration; others get raw placeholders.
-        // This ensures the fresh world's ComponentId space mirrors the sender's.
-        for entry in &data.schema {
-            if let Some(local_id) = codecs.resolve_name(&entry.name) {
-                codecs.register_one(local_id, &mut world);
-            } else {
-                let layout =
-                    std::alloc::Layout::from_size_align(entry.size, entry.align).map_err(|_| {
-                        SnapshotError::Format(format!(
-                            "invalid layout for component '{}': size={}, align={}",
-                            entry.name, entry.size, entry.align
-                        ))
-                    })?;
-                let name: &'static str = Box::leak(entry.name.clone().into_boxed_str());
-                world.register_component_raw(name, layout);
-            }
-        }
-
-        // Build remap from snapshot schema: sender ComponentId → receiver ComponentId.
-        // Filter to only components the receiver knows about (by stable name).
-        let known_schema: Vec<&ComponentSchema> = data
-            .schema
-            .iter()
-            .filter(|entry| codecs.resolve_name(&entry.name).is_some())
-            .collect();
-
-        let remap = if !known_schema.is_empty() {
-            let defs: Vec<ComponentSchema> = known_schema.iter().map(|e| (*e).clone()).collect();
-            codecs
-                .build_remap(&defs)
-                .map_err(|e| SnapshotError::Format(e.to_string()))?
-        } else {
-            HashMap::new()
-        };
-        let remap_id = |id: ComponentId| -> ComponentId { remap.get(&id).copied().unwrap_or(id) };
-
-        // Restore archetypes via EnumChangeSet.
-        // Components were registered in schema order, so the fresh world's IDs
-        // match the sender's IDs. Use sender IDs for record_spawn, but remap
-        // to receiver's codec IDs for deserialization.
-        for arch_data in &data.archetypes {
-            let mut changeset = EnumChangeSet::new();
-
-            for (row, &entity_bits) in arch_data.entities.iter().enumerate() {
-                let entity = Entity::from_bits(entity_bits);
-                world.alloc_entity();
-
-                let mut raw_components: Vec<(minkowski::ComponentId, Vec<u8>, std::alloc::Layout)> =
-                    Vec::new();
-                for col in &arch_data.columns {
-                    let codec_id = remap_id(col.component_id);
-                    let raw = codecs.deserialize(codec_id, &col.values[row])?;
-                    let layout = codecs
-                        .layout(codec_id)
-                        .ok_or(CodecError::UnregisteredComponent(codec_id))?;
-                    // Use sender's component_id for spawn — it matches the fresh world's ID space.
-                    raw_components.push((col.component_id, raw, layout));
-                }
-
-                let ptrs: Vec<_> = raw_components
-                    .iter()
-                    .map(|(id, raw, layout)| (*id, raw.as_ptr(), *layout))
-                    .collect();
-                changeset.record_spawn(entity, &ptrs);
-            }
-
-            changeset.apply(&mut world);
-        }
-
-        // Restore sparse components: sender IDs for insertion, codec IDs for deserialization.
-        for sparse_data in &data.sparse {
-            for (entity_bits, bytes) in &sparse_data.entries {
-                let entity = Entity::from_bits(*entity_bits);
-                // insert_sparse_raw uses the codec_id for deserialization, then inserts
-                // by type (not by ID), so we use the receiver's codec ID.
-                let codec_id = remap_id(sparse_data.component_id);
-                codecs.insert_sparse_raw(codec_id, &mut world, entity, bytes)?;
-            }
-        }
-
-        // Restore allocator state AFTER all entities are placed.
-        world.restore_allocator_state(
-            data.allocator.generations.clone(),
-            data.allocator.free_list.clone(),
-        );
-
-        Ok(world)
-    }
-
-    fn restore_world_zero_copy(
         &self,
         data: &ArchivedSnapshotData,
         codecs: &CodecRegistry,
@@ -743,214 +623,10 @@ mod tests {
         assert_eq!(positions, vec![(42.0, 99.0)]);
     }
 
-    // ── Zero-copy load tests ────────────────────────────────────────
-
-    #[test]
-    fn zero_copy_load_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("zc.snap");
-
-        let mut world = World::new();
-        let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
-
-        world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
-        world.spawn((Pos { x: 5.0, y: 6.0 }, Vel { dx: 7.0, dy: 8.0 }));
-
-        let snap = Snapshot::new();
-        snap.save(&snap_path, &world, &codecs, 42).unwrap();
-
-        let (mut world2, wal_seq) = snap.load_zero_copy(&snap_path, &codecs).unwrap();
-        assert_eq!(wal_seq, 42);
-
-        let mut positions: Vec<(f32, f32)> =
-            world2.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
-        positions.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        assert_eq!(positions, vec![(1.0, 2.0), (5.0, 6.0)]);
-    }
-
-    #[test]
-    fn zero_copy_load_empty_world() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("zc_empty.snap");
-
-        let world = World::new();
-        let codecs = CodecRegistry::new();
-
-        let snap = Snapshot::new();
-        snap.save(&snap_path, &world, &codecs, 0).unwrap();
-
-        let (_, seq) = snap.load_zero_copy(&snap_path, &codecs).unwrap();
-        assert_eq!(seq, 0);
-    }
-
-    #[test]
-    fn zero_copy_load_multiple_archetypes() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("zc_multi.snap");
-
-        let mut world = World::new();
-        let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
-
-        world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.1, dy: 0.2 }));
-        world.spawn((Pos { x: 3.0, y: 4.0 },));
-
-        let snap = Snapshot::new();
-        snap.save(&snap_path, &world, &codecs, 0).unwrap();
-
-        let (mut world2, _) = snap.load_zero_copy(&snap_path, &codecs).unwrap();
-        assert_eq!(world2.query::<(&Pos,)>().count(), 2);
-        assert_eq!(world2.query::<(&Vel,)>().count(), 1);
-    }
-
-    #[test]
-    fn zero_copy_load_sparse() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("zc_sparse.snap");
-
-        let mut world = World::new();
-        let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
-
-        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        world.insert_sparse::<Vel>(e1, Vel { dx: 10.0, dy: 20.0 });
-
-        let snap = Snapshot::new();
-        snap.save(&snap_path, &world, &codecs, 0).unwrap();
-
-        let (mut world2, _) = snap.load_zero_copy(&snap_path, &codecs).unwrap();
-        assert_eq!(world2.query::<(&Pos,)>().count(), 1);
-
-        let vel_id = world2.component_id::<Vel>().unwrap();
-        let entries: Vec<_> = world2.iter_sparse::<Vel>(vel_id).unwrap().collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].1.dx, 10.0);
-    }
-
-    #[test]
-    fn zero_copy_matches_standard_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("compare.snap");
-
-        let mut world = World::new();
-        let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
-
-        world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
-        world.spawn((Pos { x: 5.0, y: 6.0 },));
-
-        let snap = Snapshot::new();
-        snap.save(&snap_path, &world, &codecs, 99).unwrap();
-
-        let (mut w_standard, seq1) = snap.load(&snap_path, &codecs).unwrap();
-        let (mut w_zero_copy, seq2) = snap.load_zero_copy(&snap_path, &codecs).unwrap();
-
-        assert_eq!(seq1, seq2);
-
-        // Compare Pos
-        let mut pos_std: Vec<(f32, f32)> = w_standard
-            .query::<(&Pos,)>()
-            .map(|p| (p.0.x, p.0.y))
-            .collect();
-        let mut pos_zc: Vec<(f32, f32)> = w_zero_copy
-            .query::<(&Pos,)>()
-            .map(|p| (p.0.x, p.0.y))
-            .collect();
-        pos_std.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        pos_zc.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        assert_eq!(pos_std, pos_zc);
-
-        // Compare Vel
-        let mut vel_std: Vec<(f32, f32)> = w_standard
-            .query::<(&Vel,)>()
-            .map(|v| (v.0.dx, v.0.dy))
-            .collect();
-        let mut vel_zc: Vec<(f32, f32)> = w_zero_copy
-            .query::<(&Vel,)>()
-            .map(|v| (v.0.dx, v.0.dy))
-            .collect();
-        vel_std.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        vel_zc.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        assert_eq!(vel_std, vel_zc);
-    }
-
-    #[test]
-    fn zero_copy_preserves_component_id_gaps() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("zc_gap.snap");
-
-        let mut world = World::new();
-        let mut codecs = CodecRegistry::new();
-
-        #[derive(Clone, Copy)]
-        #[allow(dead_code)]
-        struct Hidden(u32);
-        world.register_component::<Hidden>();
-
-        codecs.register::<Pos>(&mut world);
-        let pos_id = world.component_id::<Pos>().unwrap();
-        assert_eq!(pos_id, 1);
-
-        let e = world.spawn((Pos { x: 42.0, y: 99.0 },));
-
-        let snap = Snapshot::new();
-        snap.save(&snap_path, &world, &codecs, 0).unwrap();
-
-        let (world2, _) = snap.load_zero_copy(&snap_path, &codecs).unwrap();
-        let restored_id = world2.component_id::<Pos>().unwrap();
-        assert_eq!(restored_id, pos_id);
-        assert!(world2.is_alive(e));
-        assert_eq!(world2.get::<Pos>(e).unwrap().x, 42.0);
-    }
-
-    #[test]
-    fn zero_copy_plus_wal_recovery() {
-        use crate::wal::Wal;
-
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("zc_recovery.snap");
-        let wal_path = dir.path().join("zc_recovery.wal");
-
-        let mut world = World::new();
-        let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-
-        world.spawn((Pos { x: 1.0, y: 2.0 },));
-        world.spawn((Pos { x: 3.0, y: 4.0 },));
-
-        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
-        let snap = Snapshot::new();
-        snap.save(&snap_path, &world, &codecs, wal.next_seq())
-            .unwrap();
-
-        // Mutation after snapshot
-        let e3 = world.alloc_entity();
-        let mut cs = minkowski::EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e3, (Pos { x: 5.0, y: 6.0 },));
-        wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
-
-        // Recover using zero-copy load + WAL
-        let mut load_codecs = CodecRegistry::new();
-        let mut tmp = World::new();
-        load_codecs.register::<Pos>(&mut tmp);
-
-        let (mut recovered, snap_seq) = snap.load_zero_copy(&snap_path, &load_codecs).unwrap();
-        wal.replay_from(snap_seq, &mut recovered, &load_codecs)
-            .unwrap();
-
-        assert_eq!(recovered.query::<(&Pos,)>().count(), 3);
-    }
-
     // ── Error path tests ────────────────────────────────────────────
 
     #[test]
-    fn zero_copy_load_corrupted_payload() {
+    fn load_corrupted_payload() {
         let dir = tempfile::tempdir().unwrap();
         let snap_path = dir.path().join("corrupt.snap");
 
@@ -969,12 +645,12 @@ mod tests {
         }
         std::fs::write(&snap_path, &data).unwrap();
 
-        let result = snap.load_zero_copy(&snap_path, &codecs);
+        let result = snap.load(&snap_path, &codecs);
         assert!(result.is_err());
     }
 
     #[test]
-    fn zero_copy_load_file_too_small() {
+    fn load_file_too_small() {
         let dir = tempfile::tempdir().unwrap();
         let snap_path = dir.path().join("tiny.snap");
 
@@ -982,12 +658,12 @@ mod tests {
 
         let snap = Snapshot::new();
         let codecs = CodecRegistry::new();
-        let result = snap.load_zero_copy(&snap_path, &codecs);
+        let result = snap.load(&snap_path, &codecs);
         assert!(matches!(result, Err(SnapshotError::Format(_))));
     }
 
     #[test]
-    fn zero_copy_load_truncated_payload() {
+    fn load_truncated_payload() {
         let dir = tempfile::tempdir().unwrap();
         let snap_path = dir.path().join("truncated.snap");
 
@@ -999,28 +675,16 @@ mod tests {
 
         let snap = Snapshot::new();
         let codecs = CodecRegistry::new();
-        let result = snap.load_zero_copy(&snap_path, &codecs);
+        let result = snap.load(&snap_path, &codecs);
         assert!(matches!(result, Err(SnapshotError::Format(_))));
     }
 
     #[test]
-    fn zero_copy_load_nonexistent_file() {
+    fn load_nonexistent_file() {
         let snap = Snapshot::new();
         let codecs = CodecRegistry::new();
-        let result = snap.load_zero_copy(std::path::Path::new("/nonexistent"), &codecs);
+        let result = snap.load(std::path::Path::new("/nonexistent"), &codecs);
         assert!(matches!(result, Err(SnapshotError::Io(_))));
-    }
-
-    #[test]
-    fn deserialize_corrupted_snapshot_returns_error() {
-        let result = crate::format::deserialize_snapshot(&[0xFF; 64]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn deserialize_corrupted_record_returns_error() {
-        let result = crate::format::deserialize_record(&[0xFF; 32]);
-        assert!(result.is_err());
     }
 
     // ── Cross-process remap tests ────────────────────────────────────
@@ -1058,41 +722,6 @@ mod tests {
             .map(|v| (v.0.dx, v.0.dy))
             .collect();
         assert_eq!(velocities, vec![(3.0, 4.0)]);
-    }
-
-    #[test]
-    fn snapshot_cross_process_zero_copy_different_registration_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("cross_zc.snap");
-
-        // "Process A": Pos first, then Vel
-        let mut world_a = World::new();
-        let mut codecs_a = CodecRegistry::new();
-        codecs_a.register_as::<Pos>("pos", &mut world_a);
-        codecs_a.register_as::<Vel>("vel", &mut world_a);
-
-        world_a.spawn((Pos { x: 10.0, y: 20.0 }, Vel { dx: 30.0, dy: 40.0 }));
-
-        let snap = Snapshot::new();
-        snap.save(&snap_path, &world_a, &codecs_a, 0).unwrap();
-
-        // "Process B": opposite order
-        let mut world_b_tmp = World::new();
-        let mut codecs_b = CodecRegistry::new();
-        codecs_b.register_as::<Vel>("vel", &mut world_b_tmp);
-        codecs_b.register_as::<Pos>("pos", &mut world_b_tmp);
-
-        let (mut world_b, _) = snap.load_zero_copy(&snap_path, &codecs_b).unwrap();
-
-        let positions: Vec<(f32, f32)> =
-            world_b.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
-        assert_eq!(positions, vec![(10.0, 20.0)]);
-
-        let velocities: Vec<(f32, f32)> = world_b
-            .query::<(&Vel,)>()
-            .map(|v| (v.0.dx, v.0.dy))
-            .collect();
-        assert_eq!(velocities, vec![(30.0, 40.0)]);
     }
 
     #[test]
