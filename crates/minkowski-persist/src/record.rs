@@ -80,6 +80,28 @@ pub struct SnapshotData {
     pub sparse: Vec<SparseComponentData>,
 }
 
+/// A single component definition in a WAL schema preamble.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct WalComponentDef {
+    pub id: ComponentId,
+    pub name: String,
+    pub size: usize,
+    pub align: usize,
+}
+
+/// Schema preamble: maps sender-local IDs to stable names.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct WalSchema {
+    pub components: Vec<WalComponentDef>,
+}
+
+/// A WAL file entry: either a schema preamble (first record) or mutation data.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub enum WalEntry {
+    Schema(WalSchema),
+    Mutations(WalRecord),
+}
+
 /// Returned after a successful snapshot save.
 #[derive(Debug, Clone)]
 pub struct SnapshotHeader {
