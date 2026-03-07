@@ -2,7 +2,8 @@
 
 use crate::bridge::query_to_record_batch;
 use crate::components::{
-    Acceleration, CellState, Energy, Faction, Heading, Health, Mass, Position, Velocity,
+    Acceleration, CellState, Energy, Faction, Heading, Health, Mass, Nutrition, Position, Velocity,
+    WormSize,
 };
 use crate::schema::SchemaRegistry;
 use minkowski::{Entity, World};
@@ -77,6 +78,16 @@ fn build_faction(kwargs: &Bound<'_, PyDict>) -> PyResult<Faction> {
     Ok(Faction(kwarg!(kwargs, "faction", u8)?))
 }
 
+/// Build a WormSize from kwargs.
+fn build_worm_size(kwargs: &Bound<'_, PyDict>) -> PyResult<WormSize> {
+    Ok(WormSize(kwarg!(kwargs, "worm_size", f32)?))
+}
+
+/// Build a Nutrition from kwargs.
+fn build_nutrition(kwargs: &Bound<'_, PyDict>) -> PyResult<Nutrition> {
+    Ok(Nutrition(kwarg!(kwargs, "nutrition", f32)?))
+}
+
 /// Typed spawn dispatch. Matches a sorted component-name key to a typed
 /// `world.spawn(...)` call. Returns the spawned Entity.
 fn spawn_typed(
@@ -95,11 +106,16 @@ fn spawn_typed(
         "Mass" => Ok(world.spawn((build_mass(kwargs)?,))),
         "Position" => Ok(world.spawn((build_position(kwargs)?,))),
         "Velocity" => Ok(world.spawn((build_velocity(kwargs)?,))),
+        "WormSize" => Ok(world.spawn((build_worm_size(kwargs)?,))),
+        "Nutrition" => Ok(world.spawn((build_nutrition(kwargs)?,))),
 
         // ── Two-component bundles ──
         "Position,Velocity" => Ok(world.spawn((build_position(kwargs)?, build_velocity(kwargs)?))),
         "Mass,Position" => Ok(world.spawn((build_mass(kwargs)?, build_position(kwargs)?))),
         "Heading,Position" => Ok(world.spawn((build_heading(kwargs)?, build_position(kwargs)?))),
+        "Nutrition,Position" => {
+            Ok(world.spawn((build_nutrition(kwargs)?, build_position(kwargs)?)))
+        }
 
         // ── Three-component bundles ──
         "Acceleration,Position,Velocity" => Ok(world.spawn((
@@ -121,6 +137,14 @@ fn spawn_typed(
             build_faction(kwargs)?,
             build_health(kwargs)?,
             build_position(kwargs)?,
+        ))),
+
+        // ── Four-component bundles (worm) ──
+        "Energy,Heading,Position,WormSize" => Ok(world.spawn((
+            build_energy(kwargs)?,
+            build_heading(kwargs)?,
+            build_position(kwargs)?,
+            build_worm_size(kwargs)?,
         ))),
 
         // ── Four-component bundles ──
@@ -191,6 +215,8 @@ fn write_field_to_entity(
         ("Energy", "energy") => write_arm!(world, entity, value, Energy),
         ("Health", "health") => write_arm!(world, entity, value, Health),
         ("Faction", "faction") => write_arm!(world, entity, value, Faction),
+        ("WormSize", "worm_size") => write_arm!(world, entity, value, WormSize),
+        ("Nutrition", "nutrition") => write_arm!(world, entity, value, Nutrition),
         _ => Err(PyValueError::new_err(format!(
             "unknown field: {component_name}.{field_name}"
         ))),

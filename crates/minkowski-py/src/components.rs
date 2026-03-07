@@ -51,6 +51,14 @@ pub struct Health(pub u32);
 #[repr(transparent)]
 pub struct Faction(pub u8);
 
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct WormSize(pub f32);
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct Nutrition(pub f32);
+
 // ── Helper macro for schema registration ──
 
 macro_rules! register_schema {
@@ -147,5 +155,19 @@ pub fn register_all(registry: &mut SchemaRegistry, world: &mut World) {
         "Faction",
         Faction,
         [("faction", DataType::UInt8, 0),]
+    );
+    register_schema!(
+        registry,
+        world,
+        "WormSize",
+        WormSize,
+        [("worm_size", DataType::Float32, 0),]
+    );
+    register_schema!(
+        registry,
+        world,
+        "Nutrition",
+        Nutrition,
+        [("nutrition", DataType::Float32, 0),]
     );
 }

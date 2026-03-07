@@ -7,6 +7,7 @@
 use pyo3::prelude::*;
 
 mod bridge;
+mod circuit;
 mod components;
 mod pyregistry;
 mod pyworld;
@@ -19,5 +20,6 @@ fn _minkowski(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pyworld::PyWorld>()?;
     m.add_class::<pyregistry::PyReducerRegistry>()?;
     m.add_class::<spatial::PySpatialGrid>()?;
+    m.add_class::<circuit::PyCircuitSim>()?;
     Ok(())
 }
