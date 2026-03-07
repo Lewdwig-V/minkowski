@@ -6,7 +6,6 @@ use std::path::Path;
 use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 
 use crate::codec::{CodecError, CodecRegistry};
-use crate::format;
 use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 
 // WAL file format: `[len: u32 LE][payload: len bytes]` repeated.
@@ -74,8 +73,8 @@ impl Wal {
         let seq = self.next_seq;
         let record = Self::changeset_to_record(seq, changeset, codecs)?;
         let entry = WalEntry::Mutations(record);
-        let payload =
-            format::serialize_wal_entry(&entry).map_err(|e| WalError::Format(e.to_string()))?;
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
+            .map_err(|e| WalError::Format(e.to_string()))?;
 
         let mut writer = BufWriter::new(&self.file);
         let len: u32 = payload.len().try_into().map_err(|_| {
@@ -146,8 +145,8 @@ impl Wal {
             });
         }
         let entry = WalEntry::Schema(WalSchema { components });
-        let payload =
-            format::serialize_wal_entry(&entry).map_err(|e| WalError::Format(e.to_string()))?;
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
+            .map_err(|e| WalError::Format(e.to_string()))?;
         let mut writer = BufWriter::new(&self.file);
         let len: u32 = payload
             .len()
@@ -188,7 +187,7 @@ impl Wal {
         // Pre-stable-identity WAL files used a different rkyv root type (bare
         // WalRecord) and are not compatible with the WalEntry envelope. This is
         // an intentional format break — there are no deployed WAL files to migrate.
-        match format::deserialize_wal_entry(&payload) {
+        match rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&payload) {
             Ok(entry) => Ok(Some((entry, pos + 4 + len as u64))),
             Err(_) => {
                 self.file.set_len(pos)?;
@@ -662,7 +661,7 @@ mod tests {
             }
             let record = crate::record::WalRecord { seq: 0, mutations };
             let entry = WalEntry::Mutations(record);
-            let payload = crate::format::serialize_wal_entry(&entry).unwrap();
+            let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).unwrap();
 
             let mut writer = std::io::BufWriter::new(&file);
             writer
