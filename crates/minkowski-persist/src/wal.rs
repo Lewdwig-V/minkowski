@@ -615,4 +615,97 @@ mod tests {
         let wal2 = Wal::open(&wal_path, &codecs).unwrap();
         assert_eq!(wal2.next_seq(), 0);
     }
+
+    #[test]
+    fn legacy_wal_without_schema_replays() {
+        // Simulate a legacy WAL: write WalEntry::Mutations records directly
+        // without a Schema preamble (as old code would have produced).
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("legacy.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        // Manually write a WAL with only Mutations (no Schema preamble)
+        {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .read(true)
+                .open(&wal_path)
+                .unwrap();
+
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(&mut world, e, (Pos { x: 42.0, y: 99.0 },));
+
+            // Build mutation record manually
+            let mut mutations = Vec::new();
+            for m in cs.iter_mutations() {
+                mutations.push(Wal::serialize_mutation(&m, &codecs).unwrap());
+            }
+            let record = crate::record::WalRecord { seq: 0, mutations };
+            let entry = WalEntry::Mutations(record);
+            let payload = crate::format::serialize_wal_entry(&entry).unwrap();
+
+            let mut writer = std::io::BufWriter::new(&file);
+            writer
+                .write_all(&(payload.len() as u32).to_le_bytes())
+                .unwrap();
+            writer.write_all(&payload).unwrap();
+            writer.flush().unwrap();
+        }
+
+        // Open and replay — should work without schema (no remapping)
+        let mut wal = Wal::open(&wal_path, &codecs).unwrap();
+        let mut world2 = World::new();
+        codecs.register_one(world.component_id::<Pos>().unwrap(), &mut world2);
+
+        let last = wal.replay(&mut world2, &codecs).unwrap();
+        assert_eq!(last, 0);
+        assert_eq!(world2.query::<(&Pos,)>().count(), 1);
+        let p = world2.query::<(&Pos,)>().next().unwrap().0;
+        assert_eq!(p.x, 42.0);
+        assert_eq!(p.y, 99.0);
+    }
+
+    #[test]
+    fn wal_cross_process_different_registration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("cross.wal");
+
+        // "Process A": Pos=0, Health=1
+        let mut world_a = World::new();
+        let mut codecs_a = CodecRegistry::new();
+        codecs_a.register_as::<Pos>("pos", &mut world_a);
+        codecs_a.register_as::<Health>("health", &mut world_a);
+
+        let mut wal = Wal::create(&wal_path, &codecs_a).unwrap();
+
+        let e = world_a.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 }, Health(100)));
+        wal.append(&cs, &codecs_a).unwrap();
+        cs.apply(&mut world_a);
+
+        drop(wal);
+
+        // "Process B": Health=0, Pos=1 (opposite order)
+        let mut world_b = World::new();
+        let mut codecs_b = CodecRegistry::new();
+        codecs_b.register_as::<Health>("health", &mut world_b);
+        codecs_b.register_as::<Pos>("pos", &mut world_b);
+
+        let mut wal_b = Wal::open(&wal_path, &codecs_b).unwrap();
+        wal_b.replay(&mut world_b, &codecs_b).unwrap();
+
+        // Verify: data is correct despite different registration order
+        let positions: Vec<(f32, f32)> =
+            world_b.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert_eq!(positions, vec![(1.0, 2.0)]);
+
+        let health: Vec<u32> = world_b.query::<(&Health,)>().map(|h| h.0 .0).collect();
+        assert_eq!(health, vec![100]);
+    }
 }
