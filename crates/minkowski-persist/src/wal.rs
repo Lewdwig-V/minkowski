@@ -263,6 +263,14 @@ impl Wal {
         let (active_last_seq, active_has) = wal.scan_active_segment()?;
         wal.active_bytes = wal.active_file.metadata()?.len();
 
+        // If crash recovery truncated the schema preamble itself (e.g. a
+        // crash during roll_segment tore the very first frame), the segment
+        // is empty and no longer self-describing. Rewrite the preamble so
+        // subsequent appends produce a valid, cross-process-replayable segment.
+        if wal.active_bytes == 0 {
+            wal.active_bytes = wal.write_schema_preamble()?;
+        }
+
         if active_has {
             wal.next_seq = active_last_seq + 1;
         } else {
@@ -1410,6 +1418,72 @@ mod tests {
             "next_seq {} regressed below {} after reopen with truncated segments",
             wal2.next_seq(),
             last_seq,
+        );
+    }
+
+    #[test]
+    fn open_rewrites_schema_after_torn_preamble() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Health>("health", &mut world);
+
+        // Create WAL with enough appends to roll over
+        {
+            let mut wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
+            for i in 0..10 {
+                let e = world.alloc_entity();
+                let mut cs = EnumChangeSet::new();
+                cs.spawn_bundle(
+                    &mut world,
+                    e,
+                    (Pos {
+                        x: i as f32,
+                        y: 0.0,
+                    },),
+                );
+                wal.append(&cs, &codecs).unwrap();
+                cs.apply(&mut world);
+            }
+            assert!(wal.segment_count() > 1);
+        }
+
+        // Simulate a crash that tore the active segment's schema preamble:
+        // truncate the last segment file to 0 bytes.
+        let segments = list_segments(&wal_dir).unwrap();
+        let (_, last_seg_path) = segments.last().unwrap();
+        std::fs::write(last_seg_path, b"").unwrap();
+
+        // Reopen — should recover and rewrite the schema preamble
+        let mut wal2 = Wal::open(&wal_dir, &codecs, small_config()).unwrap();
+
+        // Append a new record and verify the segment is self-describing
+        // by replaying from a fresh process with different registration order.
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 99.0, y: 99.0 },));
+        wal2.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world);
+        drop(wal2);
+
+        // Open with reversed registration order to exercise remap
+        let mut world_b = World::new();
+        let mut codecs_b = CodecRegistry::new();
+        codecs_b.register_as::<Health>("health", &mut world_b);
+        codecs_b.register_as::<Pos>("pos", &mut world_b);
+
+        let mut wal_b = Wal::open(&wal_dir, &codecs_b, small_config()).unwrap();
+        wal_b.replay(&mut world_b, &codecs_b).unwrap();
+
+        // The post-recovery record should have been remapped correctly
+        let positions: Vec<(f32, f32)> =
+            world_b.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert!(
+            positions.contains(&(99.0, 99.0)),
+            "post-recovery record should be replayable with remap"
         );
     }
 }
