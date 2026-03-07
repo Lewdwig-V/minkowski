@@ -23,6 +23,7 @@ cargo run -p minkowski-examples --example scheduler --release   # ReducerRegistr
 cargo run -p minkowski-examples --example transaction --release   # Transaction strategies: raw Tx + reducer comparison (3 strategies, 100 entities)
 cargo run -p minkowski-examples --example battle --release   # Multi-threaded EntityMut reducers with tunable conflict (500 entities, 100 frames)
 cargo run -p minkowski-examples --example persist --release   # Durable QueryWriter reducer: WAL + rkyv snapshots + zero-copy load (100 entities, 3 archetypes, 10 frames)
+cargo run -p minkowski-examples --example replicate --release   # Pull-based WAL replication: cursor + batch + apply to replica (20 source + 10 WAL, convergence check)
 cargo run -p minkowski-examples --example reducer --release   # Typed reducer system: entity/query/spawner/query-writer/dynamic handles + structural mutations + conflict detection
 cargo run -p minkowski-examples --example index --release   # B-tree range queries + hash exact lookups (200 entities)
 cargo run -p minkowski-examples --example flatworm --release   # Flatworm (planarian) simulator: chemotaxis, fission, starvation, spatial grid (200 worms, 1K frames)
