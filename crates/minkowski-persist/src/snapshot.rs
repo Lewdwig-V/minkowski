@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -60,9 +61,10 @@ impl Snapshot {
     /// Load a world from a snapshot file.
     /// Returns `(world, wal_seq)` — the `wal_seq` is the sequence number at snapshot time.
     ///
-    /// The caller must have registered codecs (via `CodecRegistry::register`) for all
-    /// component types in the same order as the original world so that `ComponentId`s
-    /// match. Schema validation is a future enhancement.
+    /// Component types are resolved by stable name — registration order does not
+    /// need to match the original world. Components in the snapshot schema whose
+    /// stable name resolves in the receiver's `CodecRegistry` are remapped
+    /// automatically. Unresolved components are filled as raw placeholders.
     pub fn load(&self, path: &Path, codecs: &CodecRegistry) -> Result<(World, u64), SnapshotError> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
@@ -131,12 +133,19 @@ impl Snapshot {
         // Schema — one entry per registered component in the world (not just codecs).
         // This preserves the full ComponentId space so that restore can fill gaps
         // for non-persisted components, preventing ID shifts.
+        // Use stable names from codecs when available; fall back to world names.
         let schema: Vec<ComponentSchema> = (0..world.component_count())
-            .map(|id| ComponentSchema {
-                id,
-                name: world.component_name(id).unwrap_or("unknown").to_string(),
-                size: world.component_layout(id).map(|l| l.size()).unwrap_or(0),
-                align: world.component_layout(id).map(|l| l.align()).unwrap_or(1),
+            .map(|id| {
+                let name = codecs
+                    .stable_name(id)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| world.component_name(id).unwrap_or("unknown").to_string());
+                ComponentSchema {
+                    id,
+                    name,
+                    size: world.component_layout(id).map(|l| l.size()).unwrap_or(0),
+                    align: world.component_layout(id).map(|l| l.align()).unwrap_or(1),
+                }
             })
             .collect();
 
@@ -225,10 +234,12 @@ impl Snapshot {
     ) -> Result<World, SnapshotError> {
         let mut world = World::new();
 
-        // Register all component types from the schema into the new World.
+        // Register components in schema order, preserving ID slots.
+        // Codec'd components get their typed registration; others get raw placeholders.
+        // This ensures the fresh world's ComponentId space mirrors the sender's.
         for entry in &data.schema {
-            if codecs.has_codec(entry.id) {
-                codecs.register_one(entry.id, &mut world);
+            if let Some(local_id) = codecs.resolve_name(&entry.name) {
+                codecs.register_one(local_id, &mut world);
             } else {
                 let layout =
                     std::alloc::Layout::from_size_align(entry.size, entry.align).map_err(|_| {
@@ -242,7 +253,34 @@ impl Snapshot {
             }
         }
 
-        // Restore archetypes via EnumChangeSet
+        // Build remap from snapshot schema: sender ComponentId → receiver ComponentId.
+        // After registration above, the fresh world has IDs assigned in schema order.
+        // The remap translates sender's IDs to whatever the fresh world assigned.
+        let schema_defs: Vec<WalComponentDef> = data
+            .schema
+            .iter()
+            .filter(|entry| codecs.resolve_name(&entry.name).is_some())
+            .map(|entry| WalComponentDef {
+                id: entry.id,
+                name: entry.name.clone(),
+                size: entry.size,
+                align: entry.align,
+            })
+            .collect();
+
+        let remap = if !schema_defs.is_empty() {
+            codecs
+                .build_remap(&schema_defs)
+                .map_err(|e| SnapshotError::Format(e.to_string()))?
+        } else {
+            HashMap::new()
+        };
+        let remap_id = |id: ComponentId| -> ComponentId { remap.get(&id).copied().unwrap_or(id) };
+
+        // Restore archetypes via EnumChangeSet.
+        // Components were registered in schema order, so the fresh world's IDs
+        // match the sender's IDs. Use sender IDs for record_spawn, but remap
+        // to receiver's codec IDs for deserialization.
         for arch_data in &data.archetypes {
             let mut changeset = EnumChangeSet::new();
 
@@ -253,10 +291,12 @@ impl Snapshot {
                 let mut raw_components: Vec<(minkowski::ComponentId, Vec<u8>, std::alloc::Layout)> =
                     Vec::new();
                 for col in &arch_data.columns {
-                    let raw = codecs.deserialize(col.component_id, &col.values[row])?;
+                    let codec_id = remap_id(col.component_id);
+                    let raw = codecs.deserialize(codec_id, &col.values[row])?;
                     let layout = codecs
-                        .layout(col.component_id)
-                        .ok_or(CodecError::UnregisteredComponent(col.component_id))?;
+                        .layout(codec_id)
+                        .ok_or(CodecError::UnregisteredComponent(codec_id))?;
+                    // Use sender's component_id for spawn — it matches the fresh world's ID space.
                     raw_components.push((col.component_id, raw, layout));
                 }
 
@@ -270,11 +310,14 @@ impl Snapshot {
             changeset.apply(&mut world);
         }
 
-        // Restore sparse components
+        // Restore sparse components: sender IDs for insertion, codec IDs for deserialization.
         for sparse_data in &data.sparse {
             for (entity_bits, bytes) in &sparse_data.entries {
                 let entity = Entity::from_bits(*entity_bits);
-                codecs.insert_sparse_raw(sparse_data.component_id, &mut world, entity, bytes)?;
+                // insert_sparse_raw uses the codec_id for deserialization, then inserts
+                // by type (not by ID), so we use the receiver's codec ID.
+                let codec_id = remap_id(sparse_data.component_id);
+                codecs.insert_sparse_raw(codec_id, &mut world, entity, bytes)?;
             }
         }
 
@@ -294,11 +337,11 @@ impl Snapshot {
     ) -> Result<World, SnapshotError> {
         let mut world = World::new();
 
-        // Register all component types from the archived schema.
+        // Register components in schema order, preserving ID slots.
         for entry in data.schema.iter() {
-            let id: ComponentId = u32::from(entry.id) as usize;
-            if codecs.has_codec(id) {
-                codecs.register_one(id, &mut world);
+            let name_str = entry.name.as_str();
+            if let Some(local_id) = codecs.resolve_name(name_str) {
+                codecs.register_one(local_id, &mut world);
             } else {
                 let size: usize = u32::from(entry.size) as usize;
                 let align: usize = u32::from(entry.align) as usize;
@@ -307,15 +350,38 @@ impl Snapshot {
                         "invalid layout for component: size={size}, align={align}"
                     ))
                 })?;
-                let name: &'static str = Box::leak(entry.name.as_str().to_owned().into_boxed_str());
+                let name: &'static str = Box::leak(name_str.to_owned().into_boxed_str());
                 world.register_component_raw(name, layout);
             }
         }
 
-        // Restore archetypes. For components where the archived layout matches
-        // native (raw_copy_size is Some), copy archived bytes directly — no
-        // rkyv::from_bytes, no typed construction. For others, fall back to
-        // full deserialization through the codec.
+        // Build remap from archived schema: sender ComponentId → receiver ComponentId.
+        let schema_defs: Vec<WalComponentDef> = data
+            .schema
+            .iter()
+            .filter(|entry| codecs.resolve_name(entry.name.as_str()).is_some())
+            .map(|entry| WalComponentDef {
+                id: u32::from(entry.id) as usize,
+                name: entry.name.as_str().to_owned(),
+                size: u32::from(entry.size) as usize,
+                align: u32::from(entry.align) as usize,
+            })
+            .collect();
+
+        let remap = if !schema_defs.is_empty() {
+            codecs
+                .build_remap(&schema_defs)
+                .map_err(|e| SnapshotError::Format(e.to_string()))?
+        } else {
+            HashMap::new()
+        };
+        let remap_id = |id: ComponentId| -> ComponentId { remap.get(&id).copied().unwrap_or(id) };
+
+        // Restore archetypes. Components were registered in schema order, so the
+        // fresh world's IDs match the sender's IDs. Use sender IDs for record_spawn,
+        // but remap to receiver's codec IDs for deserialization.
+        // For components where the archived layout matches native (raw_copy_size is
+        // Some), copy archived bytes directly — no rkyv::from_bytes.
         for arch_data in data.archetypes.iter() {
             let mut changeset = EnumChangeSet::new();
 
@@ -326,29 +392,24 @@ impl Snapshot {
                 let mut raw_components: Vec<(minkowski::ComponentId, Vec<u8>, std::alloc::Layout)> =
                     Vec::new();
                 for col in arch_data.columns.iter() {
-                    let comp_id: ComponentId = u32::from(col.component_id) as usize;
+                    let sender_id: ComponentId = u32::from(col.component_id) as usize;
+                    let codec_id = remap_id(sender_id);
                     let archived_bytes: &[u8] = col.values[row].as_slice();
                     let layout = codecs
-                        .layout(comp_id)
-                        .ok_or(CodecError::UnregisteredComponent(comp_id))?;
+                        .layout(codec_id)
+                        .ok_or(CodecError::UnregisteredComponent(codec_id))?;
 
-                    let raw = if let Some(size) = codecs.raw_copy_size(comp_id) {
+                    let raw = if let Some(size) = codecs.raw_copy_size(codec_id) {
                         if archived_bytes.len() == size {
-                            // Direct copy — archived bytes match native layout.
-                            // Safe because: bytes were produced by rkyv::to_bytes
-                            // during save, and the envelope was validated by rkyv::access.
-                            // PERF: .to_vec() from mmap is unavoidable — BlobVec needs
-                            // owned memory. Eliminating this copy would require a
-                            // BlobVec::push_from_slice API writing directly from mmap.
                             archived_bytes.to_vec()
                         } else {
-                            // Size mismatch — fall back to typed deserialization
-                            codecs.deserialize(comp_id, archived_bytes)?
+                            codecs.deserialize(codec_id, archived_bytes)?
                         }
                     } else {
-                        codecs.deserialize(comp_id, archived_bytes)?
+                        codecs.deserialize(codec_id, archived_bytes)?
                     };
-                    raw_components.push((comp_id, raw, layout));
+                    // Use sender_id for spawn — it matches the fresh world's ID space.
+                    raw_components.push((sender_id, raw, layout));
                 }
 
                 let ptrs: Vec<_> = raw_components
@@ -361,14 +422,15 @@ impl Snapshot {
             changeset.apply(&mut world);
         }
 
-        // Restore sparse components from archived data
+        // Restore sparse components: sender IDs for insertion, codec IDs for deserialization.
         for sparse_data in data.sparse.iter() {
-            let comp_id: ComponentId = u32::from(sparse_data.component_id) as usize;
+            let sender_id: ComponentId = u32::from(sparse_data.component_id) as usize;
+            let codec_id = remap_id(sender_id);
             for entry in sparse_data.entries.iter() {
                 let entity_bits: u64 = entry.0.into();
                 let bytes: &[u8] = entry.1.as_slice();
                 let entity = Entity::from_bits(entity_bits);
-                codecs.insert_sparse_raw(comp_id, &mut world, entity, bytes)?;
+                codecs.insert_sparse_raw(codec_id, &mut world, entity, bytes)?;
             }
         }
 
@@ -960,5 +1022,77 @@ mod tests {
     fn deserialize_corrupted_record_returns_error() {
         let result = crate::format::deserialize_record(&[0xFF; 32]);
         assert!(result.is_err());
+    }
+
+    // ── Cross-process remap tests ────────────────────────────────────
+
+    #[test]
+    fn snapshot_cross_process_different_registration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("cross.snap");
+
+        // "Process A": Pos first, then Vel
+        let mut world_a = World::new();
+        let mut codecs_a = CodecRegistry::new();
+        codecs_a.register_as::<Pos>("pos", &mut world_a);
+        codecs_a.register_as::<Vel>("vel", &mut world_a);
+
+        world_a.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+
+        let snap = Snapshot::new();
+        snap.save(&snap_path, &world_a, &codecs_a, 0).unwrap();
+
+        // "Process B": opposite order
+        let mut world_b_tmp = World::new();
+        let mut codecs_b = CodecRegistry::new();
+        codecs_b.register_as::<Vel>("vel", &mut world_b_tmp);
+        codecs_b.register_as::<Pos>("pos", &mut world_b_tmp);
+
+        let (mut world_b, _) = snap.load(&snap_path, &codecs_b).unwrap();
+
+        let positions: Vec<(f32, f32)> =
+            world_b.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert_eq!(positions, vec![(1.0, 2.0)]);
+
+        let velocities: Vec<(f32, f32)> = world_b
+            .query::<(&Vel,)>()
+            .map(|v| (v.0.dx, v.0.dy))
+            .collect();
+        assert_eq!(velocities, vec![(3.0, 4.0)]);
+    }
+
+    #[test]
+    fn snapshot_cross_process_zero_copy_different_registration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("cross_zc.snap");
+
+        // "Process A": Pos first, then Vel
+        let mut world_a = World::new();
+        let mut codecs_a = CodecRegistry::new();
+        codecs_a.register_as::<Pos>("pos", &mut world_a);
+        codecs_a.register_as::<Vel>("vel", &mut world_a);
+
+        world_a.spawn((Pos { x: 10.0, y: 20.0 }, Vel { dx: 30.0, dy: 40.0 }));
+
+        let snap = Snapshot::new();
+        snap.save(&snap_path, &world_a, &codecs_a, 0).unwrap();
+
+        // "Process B": opposite order
+        let mut world_b_tmp = World::new();
+        let mut codecs_b = CodecRegistry::new();
+        codecs_b.register_as::<Vel>("vel", &mut world_b_tmp);
+        codecs_b.register_as::<Pos>("pos", &mut world_b_tmp);
+
+        let (mut world_b, _) = snap.load_zero_copy(&snap_path, &codecs_b).unwrap();
+
+        let positions: Vec<(f32, f32)> =
+            world_b.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert_eq!(positions, vec![(10.0, 20.0)]);
+
+        let velocities: Vec<(f32, f32)> = world_b
+            .query::<(&Vel,)>()
+            .map(|v| (v.0.dx, v.0.dy))
+            .collect();
+        assert_eq!(velocities, vec![(30.0, 40.0)]);
     }
 }
