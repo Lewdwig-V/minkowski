@@ -127,8 +127,10 @@ impl UnitGrid {
                 let ny = (cy as i32 + dy).rem_euclid(grid_w as i32) as usize;
                 for &j in &self.cells[ny * grid_w + nx] {
                     let (e, ex, ey, f) = self.snapshot[j];
-                    let ddx = ex - x;
-                    let ddy = ey - y;
+                    let ddx = (ex - x).abs();
+                    let ddy = (ey - y).abs();
+                    let ddx = ddx.min(MAP_SIZE - ddx);
+                    let ddy = ddy.min(MAP_SIZE - ddy);
                     if ddx * ddx + ddy * ddy <= range_sq {
                         result.push((e, ex, ey, f));
                     }
@@ -310,49 +312,52 @@ fn operator_thread(
         }
     }
 
-    // Receive replication updates until server is done
-    for tick in 0..TICK_COUNT {
-        // Drain all available replication packets
-        while let Ok(events) = repl_rx.try_recv() {
-            for event in &events {
-                match event {
-                    ReplicationEvent::Despawn { entity_bits } => {
-                        if let Some(local_e) = entity_map.remove(entity_bits) {
-                            world.despawn(local_e);
+    // Receive replication updates via blocking recv — one packet per server tick.
+    // The channel closes when the server drops its sender, ending the loop.
+    let mut ticks_received = 0u32;
+    while let Ok(events) = repl_rx.recv() {
+        for event in &events {
+            match event {
+                ReplicationEvent::Despawn { entity_bits } => {
+                    if let Some(local_e) = entity_map.remove(entity_bits) {
+                        world.despawn(local_e);
+                    }
+                }
+                ReplicationEvent::UpdateHealth {
+                    entity_bits,
+                    health,
+                } => {
+                    if let Some(&local_e) = entity_map.get(entity_bits) {
+                        if let Some(h) = world.get_mut::<Health>(local_e) {
+                            h.0 = *health;
                         }
                     }
-                    ReplicationEvent::UpdateHealth {
-                        entity_bits,
-                        health,
-                    } => {
-                        if let Some(&local_e) = entity_map.get(entity_bits) {
-                            if let Some(h) = world.get_mut::<Health>(local_e) {
-                                h.0 = *health;
-                            }
-                        }
-                    }
-                    ReplicationEvent::Spawn { .. } => {
-                        // Already handled during initial replication
-                    }
+                }
+                ReplicationEvent::Spawn { .. } => {
+                    // Already handled during initial replication
                 }
             }
         }
-
-        // On last tick, check sparse intel reports
-        if tick == TICK_COUNT - 1 {
-            if let Some(intel_id) = world.component_id::<IntelReport>() {
-                let count = world
-                    .iter_sparse::<IntelReport>(intel_id)
-                    .map(|iter| iter.count())
-                    .unwrap_or(0);
-                println!("  [{}] intel reports on spotted enemies: {}", name, count);
-            } else {
-                println!("  [{}] no intel reports (component never registered)", name);
-            }
-        }
+        ticks_received += 1;
     }
 
-    println!("  [{}] finished, {} live entities", name, entity_map.len());
+    // Check sparse intel reports after all replication is consumed
+    if let Some(intel_id) = world.component_id::<IntelReport>() {
+        let count = world
+            .iter_sparse::<IntelReport>(intel_id)
+            .map(|iter| iter.count())
+            .unwrap_or(0);
+        println!("  [{}] intel reports on spotted enemies: {}", name, count);
+    } else {
+        println!("  [{}] no intel reports (component never registered)", name);
+    }
+
+    println!(
+        "  [{}] finished, {} ticks received, {} live entities",
+        name,
+        ticks_received,
+        entity_map.len()
+    );
 }
 
 // -- Main (server) ------------------------------------------------------------
@@ -821,8 +826,7 @@ fn main() {
             }
         }
 
-        // Small delay to let operator threads process
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // No delay needed — operators block on recv() until we send
     }
 
     // Drop senders so operator threads will finish
