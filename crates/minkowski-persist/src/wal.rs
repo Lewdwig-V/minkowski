@@ -184,6 +184,10 @@ impl Wal {
             }
             Err(e) => return Err(e.into()),
         }
+        // NOTE: This intentionally does NOT fall back to deserialize_record().
+        // Pre-stable-identity WAL files used a different rkyv root type (bare
+        // WalRecord) and are not compatible with the WalEntry envelope. This is
+        // an intentional format break — there are no deployed WAL files to migrate.
         match format::deserialize_wal_entry(&payload) {
             Ok(entry) => Ok(Some((entry, pos + 4 + len as u64))),
             Err(_) => {
