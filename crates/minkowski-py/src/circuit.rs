@@ -99,6 +99,19 @@ struct OpAmp {
     node_out: usize,
 }
 
+// ── Circuit topology ─────────────────────────────────────────────────
+
+struct CircuitTopology {
+    timer: Timer555,
+    nodes: Vec<Node>,
+    resistors: Vec<Resistor>,
+    inductors: Vec<Inductor>,
+    opamps: Vec<OpAmp>,
+    idx_555_out: usize,
+    idx_filter: usize,
+    idx_opamp_out: usize,
+}
+
 // ── CircuitSim pyclass ───────────────────────────────────────────────
 
 #[pyclass(name = "CircuitSim")]
@@ -122,15 +135,7 @@ pub struct PyCircuitSim {
 }
 
 impl PyCircuitSim {
-    fn build_circuit(
-        vcc: f64,
-    ) -> (
-        Timer555,
-        Vec<Node>,
-        Vec<Resistor>,
-        Vec<Inductor>,
-        Vec<OpAmp>,
-    ) {
+    fn build_circuit(vcc: f64) -> CircuitTopology {
         let timer = Timer555::new(10e3, 10e3, 10e-9, vcc);
 
         // Node indices: 0=GND, 1=555_out, 2=L_in, 3=filter, 4=opamp_out
@@ -203,7 +208,24 @@ impl PyCircuitSim {
             node_out: 4,
         }];
 
-        (timer, nodes, resistors, inductors, opamps)
+        // Node indices: 0=GND, 1=555_out, 2=L_in, 3=filter, 4=opamp_out
+        let idx_555_out = 1;
+        let idx_filter = 3;
+        let idx_opamp_out = 4;
+        debug_assert!(idx_555_out < nodes.len());
+        debug_assert!(idx_filter < nodes.len());
+        debug_assert!(idx_opamp_out < nodes.len());
+
+        CircuitTopology {
+            timer,
+            nodes,
+            resistors,
+            inductors,
+            opamps,
+            idx_555_out,
+            idx_filter,
+            idx_opamp_out,
+        }
     }
 
     fn simulate_step(&mut self) {
@@ -271,6 +293,9 @@ impl PyCircuitSim {
     /// The circuit is a hardcoded 555 astable → LCR bandpass → 741 follower.
     /// `vcc` sets the supply voltage, `dt` the timestep in seconds,
     /// `sample_every` how many steps between waveform samples.
+    ///
+    /// The `_world` parameter is unused but required for API consistency with
+    /// other Minkowski Python classes (SpatialGrid, ReducerRegistry).
     #[new]
     #[pyo3(signature = (_world, vcc=12.0, dt=1e-7, sample_every=20))]
     fn new(_world: &mut PyWorld, vcc: f64, dt: f64, sample_every: usize) -> PyResult<Self> {
@@ -284,20 +309,20 @@ impl PyCircuitSim {
             return Err(PyValueError::new_err("sample_every must be >= 1"));
         }
 
-        let (timer, nodes, resistors, inductors, opamps) = Self::build_circuit(vcc);
+        let topo = Self::build_circuit(vcc);
 
         Ok(PyCircuitSim {
             dt,
             sample_every,
             step_count: 0,
-            timer,
-            nodes,
-            resistors,
-            inductors,
-            opamps,
-            idx_555_out: 1,
-            idx_filter: 3,
-            idx_opamp_out: 4,
+            timer: topo.timer,
+            nodes: topo.nodes,
+            resistors: topo.resistors,
+            inductors: topo.inductors,
+            opamps: topo.opamps,
+            idx_555_out: topo.idx_555_out,
+            idx_filter: topo.idx_filter,
+            idx_opamp_out: topo.idx_opamp_out,
             times: Vec::new(),
             v_555: Vec::new(),
             v_filter: Vec::new(),
@@ -352,13 +377,15 @@ impl PyCircuitSim {
         self.v_opamp.clear();
         self.step_count = 0;
 
-        let vcc = self.timer.vcc;
-        let (timer, nodes, resistors, inductors, opamps) = Self::build_circuit(vcc);
-        self.timer = timer;
-        self.nodes = nodes;
-        self.resistors = resistors;
-        self.inductors = inductors;
-        self.opamps = opamps;
+        let topo = Self::build_circuit(self.timer.vcc);
+        self.timer = topo.timer;
+        self.nodes = topo.nodes;
+        self.resistors = topo.resistors;
+        self.inductors = topo.inductors;
+        self.opamps = topo.opamps;
+        self.idx_555_out = topo.idx_555_out;
+        self.idx_filter = topo.idx_filter;
+        self.idx_opamp_out = topo.idx_opamp_out;
     }
 
     /// Total number of simulation steps executed since creation or last reset.

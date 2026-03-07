@@ -396,6 +396,13 @@ pub fn register_all(
     );
     map.insert("movement".to_string(), id);
 
+    // ── Worm constants ──
+    const FULL_ENERGY: f32 = 100.0; // energy at which speed factor = 1.0
+    const MIN_SPEED_FACTOR: f32 = 0.1; // speed factor at zero energy
+    const SHRINK_THRESHOLD: f32 = 20.0; // energy below which worms shrink
+    const SHRINK_RATE: f32 = 0.1; // size loss per unit time when shrinking
+    const MIN_SIZE: f32 = 0.5; // minimum worm size
+
     // ── worm_move ──
     // Heading-based movement scaled by energy (low energy = slower).
     let id = registry.register_query::<(&mut Position, &Heading, &Energy), WormMoveParams, _>(
@@ -406,7 +413,7 @@ pub fn register_all(
             let dt = params.dt;
             let speed = params.speed;
             query.for_each(|(pos, heading, energy)| {
-                let e_factor = (energy.0 / 100.0).clamp(0.1, 1.0);
+                let e_factor = (energy.0 / FULL_ENERGY).clamp(MIN_SPEED_FACTOR, 1.0);
                 let h = heading.0;
                 pos.x = wrap(pos.x + h.cos() * speed * e_factor * dt, ws);
                 pos.y = wrap(pos.y + h.sin() * speed * e_factor * dt, ws);
@@ -423,8 +430,8 @@ pub fn register_all(
         |mut query: QueryMut<'_, (&mut Energy, &mut WormSize)>, params: WormMetabolismParams| {
             query.for_each(|(energy, size)| {
                 energy.0 = (energy.0 - params.drain_rate * params.dt).max(0.0);
-                if energy.0 < 20.0 {
-                    size.0 = (size.0 - 0.1 * params.dt).max(0.5);
+                if energy.0 < SHRINK_THRESHOLD {
+                    size.0 = (size.0 - SHRINK_RATE * params.dt).max(MIN_SIZE);
                 }
             });
         },
