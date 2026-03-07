@@ -289,6 +289,9 @@ Each example demonstrates specific patterns. Read the source for concrete API us
 | `battle` | EntityMut reducers, rayon parallel snapshot computation, sequential dispatch, tunable conflict rates | `examples/examples/battle.rs` |
 | `persist` | QueryWriter + Durable, WAL, rkyv snapshots, zero-copy load, crash recovery | `examples/examples/persist.rs` |
 | `index` | BTreeIndex range queries, HashIndex exact lookups, incremental update, batch fetch | `examples/examples/index.rs` |
+| `flatworm` | SpatialIndex (FoodGrid), chemotaxis, CommandBuffer spawn/despawn, entity lifecycle (fission + starvation), query reducers | `examples/examples/flatworm.rs` |
+| `circuit` | Entity-based circuit topology (node connectivity), query reducers (QueryMut, QueryRef), symplectic Euler integration, ReducerRegistry scheduling | `examples/examples/circuit.rs` |
+| `tactical` | Sparse components (insert_sparse, iter_sparse), par_for_each, Optimistic Conflict inspection, Entity::to_bits/from_bits, world introspection, register_entity_despawn, HashIndex get_valid(), EnumChangeSet/MutationRef iteration, multi-threaded replication | `examples/examples/tactical.rs` |
 
 ### Pattern Quick-Find
 
@@ -308,6 +311,16 @@ Each example demonstrates specific patterns. Read the source for concrete API us
 - **BTreeIndex range + HashIndex exact:** `index.rs` lines 40-63
 - **Incremental index update (ChangeTick):** `index.rs` lines 65-89
 - **Index -> get_batch composition:** `index.rs` lines 110-137
+- **SpatialIndex + CommandBuffer lifecycle:** `flatworm.rs` (FoodGrid, fission spawn, starvation despawn)
+- **Entity-based circuit connectivity:** `circuit.rs` (nodes as entities, elements reference node Entity handles)
+- **Sparse component lifecycle:** `tactical.rs` (insert_sparse for MoveOrder/IntelReport, iter_sparse for intel queries)
+- **Entity bit packing for serialization:** `tactical.rs` (to_bits in commands, from_bits in replication)
+- **EnumChangeSet as replication journal:** `tactical.rs` (iter_mutations + MutationRef pattern matching)
+- **Optimistic Conflict inspection:** `tactical.rs` (catch Err(Conflict), display_with)
+- **World introspection (archetype/component metadata):** `tactical.rs`
+- **HashIndex stale filtering:** `tactical.rs` (get_valid after despawns)
+- **par_for_each parallel iteration:** `tactical.rs` (position clamping pass)
+- **register_entity_despawn:** `tactical.rs` (combat cleanup reducer)
 
 ## Common Patterns
 

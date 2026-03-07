@@ -339,12 +339,12 @@ fn main() {
 
         // Step 4: Chemotaxis — worms turn toward nearest food
         {
-            let worms: Vec<(Entity, Vec2, f32)> = world
-                .query::<(Entity, &Position, &Heading, &Worm)>()
-                .map(|(e, p, h, _)| (e, p.0, h.0))
+            let worms: Vec<(Entity, Vec2)> = world
+                .query::<(Entity, &Position, &Worm)>()
+                .map(|(e, p, _)| (e, p.0))
                 .collect();
 
-            for (entity, pos, _heading) in &worms {
+            for (entity, pos) in &worms {
                 // Find best food within sense radius (nutrition / distance² gradient)
                 let mut best_dir = Vec2::ZERO;
                 let mut best_score = 0.0_f32;
@@ -464,14 +464,12 @@ fn main() {
                 .map(|(e, _, _)| e)
                 .collect();
 
-            if !starved.is_empty() {
-                let mut cmds = CommandBuffer::new();
-                for entity in &starved {
-                    cmds.despawn(*entity);
-                }
-                total_deaths += starved.len();
-                cmds.apply(&mut world);
+            let mut cmds = CommandBuffer::new();
+            for entity in starved.iter().copied() {
+                cmds.despawn(entity);
             }
+            total_deaths += starved.len();
+            cmds.apply(&mut world);
         }
 
         // Step 8: Replenish food

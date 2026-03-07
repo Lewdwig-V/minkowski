@@ -2,8 +2,8 @@
 //!
 //! Run: cargo run -p minkowski-examples --example circuit --release
 //!
-//! Exercises: spawn, query reducers (QueryMut, QueryRef), Changed<T> filter,
-//! CommandBuffer, ReducerRegistry scheduling, entity-based connectivity.
+//! Exercises: spawn, query reducers (QueryMut, QueryRef), ReducerRegistry
+//! scheduling, entity-based connectivity.
 //!
 //! Circuit topology:
 //! ```
@@ -13,7 +13,7 @@
 //!                                    │
 //!                                    ├─── R_load=10kΩ ─── GND
 //!                                    │
-//!                                    └─── [741 follower] ─── V_out
+//!                                    └─── [741 follower, ±12V, V-=V_out] ─── V_out
 //! ```
 //!
 //! The 555 generates a ~4.8 kHz square wave. The series LCR bandpass filter
@@ -21,16 +21,20 @@
 //! The 741 voltage follower buffers the output with realistic gain, slew rate,
 //! and rail saturation.
 //!
-//! Simulation uses symplectic Euler integration for L/C elements (energy-preserving)
-//! and samples node voltages every N steps to print a waveform summary.
+//! Simulation uses symplectic Euler integration for L/C elements (bounded energy
+//! drift) and samples node voltages every N steps to print a waveform summary.
 
 use minkowski::{Entity, QueryMut, QueryRef, ReducerRegistry, World};
 use std::time::Instant;
 
+fn read_voltage(world: &World, node: Entity) -> f64 {
+    world.get::<Voltage>(node).map(|v| v.0).unwrap_or(0.0)
+}
+
 // ── Simulation parameters ────────────────────────────────────────────
 
 const VCC: f64 = 12.0;
-const DT: f64 = 1e-7; // 100 ns timestep (need ~20 samples per cycle at 5 kHz)
+const DT: f64 = 1e-7; // 100 ns timestep (~2000 samples per cycle at 5 kHz)
 const STEPS: usize = 200_000; // 20 ms of simulation time
 const SAMPLE_INTERVAL: usize = 20; // sample every 20 steps = 2 µs
 const REPORT_INTERVAL: usize = 50_000; // progress report every 5 ms sim-time
@@ -42,9 +46,6 @@ const REPORT_INTERVAL: usize = 50_000; // progress report every 5 ms sim-time
 #[derive(Clone, Copy, Debug)]
 struct Voltage(f64);
 
-#[derive(Clone, Copy, Debug)]
-struct PrevVoltage(f64); // for change detection / trapezoidal correction
-
 // ── 555 Timer ────────────────────────────────────────────────────────
 // Astable mode: charges C_t through R1+R2, discharges through R2.
 // Comparator thresholds: 2/3 Vcc (upper), 1/3 Vcc (lower).
@@ -52,7 +53,7 @@ struct PrevVoltage(f64); // for change detection / trapezoidal correction
 
 #[derive(Clone, Copy, Debug)]
 struct Timer555 {
-    r1: f64, // charge path (R1+R2 during charge, R2 during discharge)
+    r1: f64, // upper timing resistor (charge through R1+R2, discharge through R2)
     r2: f64,
     cap: f64,          // timing capacitor
     v_cap: f64,        // voltage across timing capacitor
@@ -121,14 +122,6 @@ struct Inductor {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // fields used for circuit documentation; capacitance modeled via NodeCapacitance
-struct Capacitor {
-    capacitance: f64,
-    node_a: Entity, // positive terminal
-    node_b: Entity,
-}
-
-#[derive(Clone, Copy, Debug)]
 struct Resistor {
     resistance: f64,
     node_a: Entity,
@@ -152,12 +145,6 @@ struct OpAmp741 {
 }
 
 // ── Waveform recorder ────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // node stored for potential runtime probe queries
-struct Probe {
-    node: Entity,
-}
 
 struct WaveformData {
     times: Vec<f64>,
@@ -205,37 +192,11 @@ fn main() {
     // Node 3: op-amp output
     // GND: ground reference
 
-    let gnd = world.spawn((
-        Voltage(0.0),
-        PrevVoltage(0.0),
-        Ground,
-        CurrentSum(0.0),
-        NodeCapacitance(1.0),
-    ));
-    let node_555_out = world.spawn((
-        Voltage(0.0),
-        PrevVoltage(0.0),
-        CurrentSum(0.0),
-        NodeCapacitance(1e-10),
-    )); // parasitic
-    let node_l_in = world.spawn((
-        Voltage(0.0),
-        PrevVoltage(0.0),
-        CurrentSum(0.0),
-        NodeCapacitance(1e-10),
-    ));
-    let node_filter = world.spawn((
-        Voltage(0.0),
-        PrevVoltage(0.0),
-        CurrentSum(0.0),
-        NodeCapacitance(100e-9),
-    )); // C_filt
-    let node_opamp_out = world.spawn((
-        Voltage(0.0),
-        PrevVoltage(0.0),
-        CurrentSum(0.0),
-        NodeCapacitance(1e-10),
-    ));
+    let gnd = world.spawn((Voltage(0.0), Ground, CurrentSum(0.0), NodeCapacitance(1.0)));
+    let node_555_out = world.spawn((Voltage(0.0), CurrentSum(0.0), NodeCapacitance(1e-10))); // parasitic
+    let node_l_in = world.spawn((Voltage(0.0), CurrentSum(0.0), NodeCapacitance(1e-10)));
+    let node_filter = world.spawn((Voltage(0.0), CurrentSum(0.0), NodeCapacitance(100e-9))); // C_filt
+    let node_opamp_out = world.spawn((Voltage(0.0), CurrentSum(0.0), NodeCapacitance(1e-10)));
 
     // ── Create circuit elements ──────────────────────────────────────
 
@@ -258,13 +219,7 @@ fn main() {
         node_b: node_filter,
     },));
 
-    // C_filt: 100nF capacitor from node_filter to ground
-    // (modeled as node capacitance on node_filter, already set above)
-    let _c_filt = world.spawn((Capacitor {
-        capacitance: 100e-9,
-        node_a: node_filter,
-        node_b: gnd,
-    },));
+    // C_filt: 100nF from node_filter to ground (modeled as NodeCapacitance above)
 
     // R_load: 10kΩ from node_filter to ground
     let _r_load = world.spawn((Resistor {
@@ -286,14 +241,6 @@ fn main() {
         node_out: node_opamp_out,
     },));
 
-    // ── Probes ───────────────────────────────────────────────────────
-
-    let _probe_555 = world.spawn((Probe { node: node_555_out },));
-    let _probe_filter = world.spawn((Probe { node: node_filter },));
-    let _probe_opamp = world.spawn((Probe {
-        node: node_opamp_out,
-    },));
-
     // ── Register query reducers ──────────────────────────────────────
 
     // Phase 1: Reset current accumulators on all nodes
@@ -307,14 +254,10 @@ fn main() {
         },
     );
 
-    // Phase 2: 555 timer update (sets its output node voltage directly)
-    // Can't easily use a reducer for this since it needs node entity access,
-    // so we'll do this in the main loop.
+    // Phases 2-6 (555 timer, resistors, inductors, voltage update, op-amp)
+    // are done manually in the loop since they need cross-entity node access.
 
-    // Phase 3: Resistor current contributions (read-only query on voltages,
-    // but we need to write CurrentSum — so we do this manually in the loop)
-
-    // Phase 4: Census — count entities and report (read-only)
+    // Census — count entities and report (read-only)
     let census_id = registry.register_query_ref::<(&Voltage,), (), _>(
         &mut world,
         "node_census",
@@ -359,28 +302,15 @@ fn main() {
         // ── Phase 1: Reset current sums ──────────────────────────────
         registry.run(&mut world, reset_currents_id, ());
 
-        // ── Phase 2: Save previous voltages ──────────────────────────
-        {
-            let snapshot: Vec<(Entity, f64)> = world
-                .query::<(Entity, &Voltage)>()
-                .map(|(e, v)| (e, v.0))
-                .collect();
-            for (entity, v) in snapshot {
-                if let Some(pv) = world.get_mut::<PrevVoltage>(entity) {
-                    pv.0 = v;
-                }
-            }
-        }
-
-        // ── Phase 3: 555 timer step ──────────────────────────────────
+        // ── Phase 2: 555 timer step ──────────────────────────────────
         {
             let timer_output: f64 = {
-                let timers: Vec<(Entity,)> = world
+                let timers: Vec<Entity> = world
                     .query::<(Entity, &Timer555)>()
-                    .map(|(e, _)| (e,))
+                    .map(|(e, _)| e)
                     .collect();
                 let mut out = 0.0;
-                for (entity,) in timers {
+                for entity in timers {
                     if let Some(t) = world.get_mut::<Timer555>(entity) {
                         out = t.step(DT);
                     }
@@ -394,7 +324,7 @@ fn main() {
             }
         }
 
-        // ── Phase 4: Resistor currents ───────────────────────────────
+        // ── Phase 3: Resistor currents ───────────────────────────────
         {
             let resistors: Vec<(f64, Entity, Entity)> = world
                 .query::<(&Resistor,)>()
@@ -402,8 +332,8 @@ fn main() {
                 .collect();
 
             for (resistance, node_a, node_b) in &resistors {
-                let va = world.get::<Voltage>(*node_a).map(|v| v.0).unwrap_or(0.0);
-                let vb = world.get::<Voltage>(*node_b).map(|v| v.0).unwrap_or(0.0);
+                let va = read_voltage(&world, *node_a);
+                let vb = read_voltage(&world, *node_b);
                 let current = (va - vb) / resistance; // flows from a to b
 
                 // Current leaves node_a, enters node_b
@@ -416,7 +346,7 @@ fn main() {
             }
         }
 
-        // ── Phase 5: Inductor update (symplectic Euler) ──────────────
+        // ── Phase 4: Inductor update (symplectic Euler) ──────────────
         // V = L * dI/dt → dI = V/L * dt (update current from voltage)
         // Then current contributes to node current sums
         {
@@ -426,8 +356,8 @@ fn main() {
                 .collect();
 
             for (entity, inductance, node_a, node_b) in &inductors {
-                let va = world.get::<Voltage>(*node_a).map(|v| v.0).unwrap_or(0.0);
-                let vb = world.get::<Voltage>(*node_b).map(|v| v.0).unwrap_or(0.0);
+                let va = read_voltage(&world, *node_a);
+                let vb = read_voltage(&world, *node_b);
                 let v_across = va - vb;
 
                 // Update inductor current: dI/dt = V/L
@@ -446,7 +376,7 @@ fn main() {
             }
         }
 
-        // ── Phase 6: Update node voltages from current sums ──────────
+        // ── Phase 5: Update node voltages from current sums ──────────
         // For nodes with capacitance: dV/dt = I/C
         // Ground node is clamped to 0V.
         // 555 output node is driven directly.
@@ -476,7 +406,7 @@ fn main() {
             }
         }
 
-        // ── Phase 7: Op-amp update ───────────────────────────────────
+        // ── Phase 6: Op-amp update ───────────────────────────────────
         {
             let opamps: Vec<(Entity, OpAmp741)> = world
                 .query::<(Entity, &OpAmp741)>()
@@ -484,16 +414,10 @@ fn main() {
                 .collect();
 
             for (entity, snapshot) in &opamps {
-                let v_plus = world
-                    .get::<Voltage>(snapshot.node_plus)
-                    .map(|v| v.0)
-                    .unwrap_or(0.0);
-                let v_minus = world
-                    .get::<Voltage>(snapshot.node_minus)
-                    .map(|v| v.0)
-                    .unwrap_or(0.0);
+                let v_plus = read_voltage(&world, snapshot.node_plus);
+                let v_minus = read_voltage(&world, snapshot.node_minus);
 
-                if let Some(op) = world.get_mut::<OpAmp741>(*entity) {
+                let v_out_val = if let Some(op) = world.get_mut::<OpAmp741>(*entity) {
                     let v_diff = v_plus - v_minus;
                     let v_ideal = (snapshot.open_loop_gain * v_diff)
                         .clamp(snapshot.v_sat_neg, snapshot.v_sat_pos);
@@ -506,13 +430,12 @@ fn main() {
                     } else {
                         v_ideal
                     };
-                }
+                    op.v_out
+                } else {
+                    0.0
+                };
 
                 // Drive output node
-                let v_out_val = world
-                    .get::<OpAmp741>(*entity)
-                    .map(|op| op.v_out)
-                    .unwrap_or(0.0);
                 if let Some(v) = world.get_mut::<Voltage>(snapshot.node_out) {
                     v.0 = v_out_val;
                 }
@@ -524,26 +447,16 @@ fn main() {
             let t = step as f64 * DT;
             waveform.times.push(t);
             for (i, node) in probe_nodes.iter().enumerate() {
-                let v = world.get::<Voltage>(*node).map(|v| v.0).unwrap_or(0.0);
-                waveform.samples[i].push(v);
+                waveform.samples[i].push(read_voltage(&world, *node));
             }
         }
 
         // ── Progress report ──────────────────────────────────────────
         if step > 0 && step % REPORT_INTERVAL == 0 {
             let t_ms = step as f64 * DT * 1e3;
-            let v_555 = world
-                .get::<Voltage>(node_555_out)
-                .map(|v| v.0)
-                .unwrap_or(0.0);
-            let v_filt = world
-                .get::<Voltage>(node_filter)
-                .map(|v| v.0)
-                .unwrap_or(0.0);
-            let v_out = world
-                .get::<Voltage>(node_opamp_out)
-                .map(|v| v.0)
-                .unwrap_or(0.0);
+            let v_555 = read_voltage(&world, node_555_out);
+            let v_filt = read_voltage(&world, node_filter);
+            let v_out = read_voltage(&world, node_opamp_out);
             println!(
                 "  t={:.2}ms | 555={:+.2}V | filter={:+.3}V | opamp={:+.3}V",
                 t_ms, v_555, v_filt, v_out
