@@ -3,6 +3,7 @@
 use crate::components::Position;
 use crate::pyworld::PyWorld;
 use minkowski::Entity;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
@@ -11,29 +12,36 @@ type CellMap = HashMap<(i32, i32), Vec<(Entity, f32, f32)>>;
 #[pyclass(name = "SpatialGrid")]
 pub struct PySpatialGrid {
     world_size: f32,
+    cell_size: f32,
     inv_cell: f32,
     cells: CellMap,
-    count: usize,
 }
 
 #[pymethods]
 impl PySpatialGrid {
     #[new]
-    fn new(world_size: f32, cell_size: f32) -> Self {
-        assert!(world_size > 0.0, "world_size must be positive");
-        assert!(cell_size > 0.0, "cell_size must be positive");
-        PySpatialGrid {
+    fn new(world_size: f32, cell_size: f32) -> PyResult<Self> {
+        if !world_size.is_finite() || world_size <= 0.0 {
+            return Err(PyValueError::new_err(
+                "world_size must be finite and positive",
+            ));
+        }
+        if !cell_size.is_finite() || cell_size <= 0.0 {
+            return Err(PyValueError::new_err(
+                "cell_size must be finite and positive",
+            ));
+        }
+        Ok(PySpatialGrid {
             world_size,
+            cell_size,
             inv_cell: 1.0 / cell_size,
             cells: HashMap::new(),
-            count: 0,
-        }
+        })
     }
 
     /// Rebuild the grid from all entities with a Position component.
     fn rebuild(&mut self, world: &mut PyWorld) {
         self.cells.clear();
-        self.count = 0;
         let ws = self.world_size;
         let inv = self.inv_cell;
 
@@ -46,11 +54,15 @@ impl PySpatialGrid {
                 let cx = (x * inv) as i32;
                 let cy = (y * inv) as i32;
                 self.cells.entry((cx, cy)).or_default().push((entity, x, y));
-                self.count += 1;
             });
     }
 
     /// Return entity IDs within `radius` of `(x, y)`, using toroidal distance.
+    ///
+    /// Results reflect the last `rebuild()` call. If entities have been spawned,
+    /// despawned, or moved since then, call `rebuild()` first. Returned IDs
+    /// should be validated with `world.is_alive()` if mutations occurred since
+    /// the last rebuild.
     fn query_radius(&self, x: f32, y: f32, radius: f32) -> Vec<u64> {
         let ws = self.world_size;
         let half = ws * 0.5;
@@ -90,9 +102,21 @@ impl PySpatialGrid {
         result
     }
 
-    /// Number of entities in the grid.
+    /// Number of entities in the grid (as of last `rebuild()`).
     #[getter]
     fn entity_count(&self) -> usize {
-        self.count
+        self.cells.values().map(|v| v.len()).sum()
+    }
+
+    /// Cell size used for grid bucketing.
+    #[getter]
+    fn cell_size(&self) -> f32 {
+        self.cell_size
+    }
+
+    /// World size (toroidal domain extent).
+    #[getter]
+    fn world_size(&self) -> f32 {
+        self.world_size
     }
 }

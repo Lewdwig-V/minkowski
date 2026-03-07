@@ -58,9 +58,18 @@ Four notebooks in `crates/minkowski-py/notebooks/`:
 All notebooks use matplotlib (no extra deps beyond polars + matplotlib).
 Animation via `IPython.display.clear_output` + loop, not FuncAnimation (simpler, works in all Jupyter environments).
 
-### Dependencies
+### Environment Setup
 
-Add `matplotlib` to `pyproject.toml` optional deps.
+```bash
+cd crates/minkowski-py
+uv sync --all-extras && source .venv/bin/activate
+maturin develop --release
+jupyter lab notebooks/quickstart.ipynb
+```
+
+`uv sync --all-extras` creates a venv and installs all dependencies (polars, pyarrow,
+matplotlib, numpy, jupyter, maturin). `maturin develop --release` builds the native
+module into the venv.
 
 ## What's NOT in scope
 
