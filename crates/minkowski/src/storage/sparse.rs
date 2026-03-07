@@ -13,6 +13,9 @@ const EMPTY: u32 = u32::MAX;
 /// [`PAGE_SIZE`]. Each page entry stores a dense index (`u32`) or [`EMPTY`].
 /// Generation is validated against `dense_entities` to reject stale handles.
 pub(crate) struct PagedSparseSet {
+    // PERF: Two pointer chases per lookup (Vec data → Box page → array slot).
+    // Inherent to paged design — flat array would be 16 GiB for u32 index space.
+    // Prefer archetype-stored components for hot-path queries.
     pages: Vec<Option<Box<[u32; PAGE_SIZE]>>>,
     dense_entities: Vec<Entity>,
     pub(crate) dense_values: BlobVec,
@@ -293,6 +296,8 @@ impl SparseStorage {
     }
 
     /// Removes the entity from all sparse component sets.
+    // PERF: O(sparse_types) per entity. Sparse types typically < 5; per-probe
+    // cost is one page lookup (~3ns). Not worth per-entity tracking overhead.
     pub fn remove_all(&mut self, entity: Entity) {
         for set in self.storages.values_mut() {
             set.remove(entity);

@@ -343,14 +343,13 @@ impl World {
         let mut by_archetype: HashMap<usize, Vec<(usize, Entity)>> = HashMap::new();
         let mut to_dealloc: Vec<Entity> = Vec::new();
 
-        let mut seen = FixedBitSet::new();
+        let mut seen = FixedBitSet::with_capacity(self.entities.generations.len());
         for &entity in entities {
             if !self.entities.is_alive(entity) {
                 continue;
             }
             let index = entity.index() as usize;
             // Deduplicate: skip if we've already recorded this entity index
-            seen.grow(index + 1);
             if seen.contains(index) {
                 continue;
             }
@@ -372,6 +371,8 @@ impl World {
         }
 
         // Phase 3: For each archetype, sort rows descending, sweep back-to-front
+        // PERF: Non-vectorizable by design — drop_fn is opaque, memcpy is variable-size.
+        // Batch wins via amortized archetype resolution, not SIMD.
         for (arch_idx, mut row_entities) in by_archetype {
             row_entities.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             let archetype = &mut self.archetypes.archetypes[arch_idx];
