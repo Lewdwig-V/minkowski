@@ -11,13 +11,8 @@ use std::collections::HashMap;
 // ── Toroidal helpers ─────────────────────────────────────────────────
 
 /// Wrap a coordinate into [0, world_size).
-fn wrap(mut v: f32, world_size: f32) -> f32 {
-    if v >= world_size {
-        v -= world_size;
-    } else if v < 0.0 {
-        v += world_size;
-    }
-    v
+fn wrap(v: f32, world_size: f32) -> f32 {
+    v.rem_euclid(world_size)
 }
 
 /// Minimum-image signed difference on a toroidal domain.
@@ -99,9 +94,9 @@ pub fn register_all(
             |mut query: QueryMut<'_, (&mut Acceleration, &Position, &Velocity, Entity)>,
              params: BoidsForceParams| {
                 // Pass 1: snapshot all boid data.
-                let mut snapshot: Vec<(Entity, f32, f32, f32, f32)> = Vec::new();
-                query.for_each(|(_acc, pos, vel, entity)| {
-                    snapshot.push((entity, pos.x, pos.y, vel.x, vel.y));
+                let mut snapshot: Vec<(f32, f32, f32, f32)> = Vec::new();
+                query.for_each(|(_acc, pos, vel, _entity)| {
+                    snapshot.push((pos.x, pos.y, vel.x, vel.y));
                 });
 
                 // Build simple spatial grid for neighbor lookups.
@@ -109,15 +104,15 @@ pub fn register_all(
                 let grid_w = (params.world_size / cell_size).ceil() as usize;
                 let grid_w = grid_w.max(1);
                 let mut cells: Vec<Vec<usize>> = vec![Vec::new(); grid_w * grid_w];
-                for (i, &(_, px, py, _, _)) in snapshot.iter().enumerate() {
+                for (i, &(px, py, _, _)) in snapshot.iter().enumerate() {
                     let cx = ((px / cell_size) as usize).min(grid_w - 1);
                     let cy = ((py / cell_size) as usize).min(grid_w - 1);
                     cells[cy * grid_w + cx].push(i);
                 }
 
                 // Compute forces into a local buffer.
-                let mut forces: Vec<(Entity, f32, f32)> = Vec::with_capacity(snapshot.len());
-                for &(entity, px, py, vx, vy) in &snapshot {
+                let mut forces: Vec<(f32, f32)> = Vec::with_capacity(snapshot.len());
+                for &(px, py, vx, vy) in &snapshot {
                     let cx = ((px / cell_size) as usize).min(grid_w - 1);
                     let cy = ((py / cell_size) as usize).min(grid_w - 1);
 
@@ -136,7 +131,7 @@ pub fn register_all(
                             let nx = (cx as i32 + dx).rem_euclid(grid_w as i32) as usize;
                             let ny = (cy as i32 + dy).rem_euclid(grid_w as i32) as usize;
                             for &j in &cells[ny * grid_w + nx] {
-                                let (_, ox, oy, ovx, ovy) = snapshot[j];
+                                let (ox, oy, ovx, ovy) = snapshot[j];
                                 let diff_x = wrapped_diff(ox, px, params.world_size);
                                 let diff_y = wrapped_diff(oy, py, params.world_size);
                                 let dist_sq = diff_x * diff_x + diff_y * diff_y;
@@ -147,10 +142,10 @@ pub fn register_all(
 
                                 if dist < params.sep_r {
                                     let inv = 1.0 / dist;
-                                    let nx = diff_x * inv;
-                                    let ny = diff_y * inv;
-                                    sep_x -= nx * inv;
-                                    sep_y -= ny * inv;
+                                    let dir_x = diff_x * inv;
+                                    let dir_y = diff_y * inv;
+                                    sep_x -= dir_x * inv;
+                                    sep_y -= dir_y * inv;
                                     sep_count += 1;
                                 }
                                 if dist < params.ali_r {
@@ -195,23 +190,17 @@ pub fn register_all(
                         fy = fy / f_len * params.max_force;
                     }
 
-                    forces.push((entity, fx, fy));
+                    forces.push((fx, fy));
                 }
 
                 // Pass 2: write forces into accelerations.
-                // Build a lookup from Entity -> force index.
-                let force_map: HashMap<u64, usize> = forces
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &(e, _, _))| (e.to_bits(), i))
-                    .collect();
-
-                query.for_each(|(acc, _pos, _vel, entity)| {
-                    if let Some(&idx) = force_map.get(&entity.to_bits()) {
-                        let (_, fx, fy) = forces[idx];
-                        acc.x = fx;
-                        acc.y = fy;
-                    }
+                // Iteration order is stable between passes, so use index counter.
+                let mut i = 0;
+                query.for_each(|(acc, _pos, _vel, _entity)| {
+                    let (fx, fy) = forces[i];
+                    acc.x = fx;
+                    acc.y = fy;
+                    i += 1;
                 });
             },
         );
@@ -257,9 +246,9 @@ pub fn register_all(
             |mut query: QueryMut<'_, (&mut Velocity, &mut Position, &Mass, Entity)>,
              params: GravityParams| {
                 // Snapshot all bodies.
-                let mut bodies: Vec<(Entity, f32, f32, f32)> = Vec::new(); // entity, x, y, mass
-                query.for_each(|(_vel, pos, mass, entity)| {
-                    bodies.push((entity, pos.x, pos.y, mass.0));
+                let mut bodies: Vec<(f32, f32, f32)> = Vec::new(); // x, y, mass
+                query.for_each(|(_vel, pos, mass, _entity)| {
+                    bodies.push((pos.x, pos.y, mass.0));
                 });
 
                 let n = bodies.len();
@@ -267,9 +256,9 @@ pub fn register_all(
 
                 // Compute pairwise gravitational accelerations.
                 for i in 0..n {
-                    let (_, ix, iy, im) = bodies[i];
+                    let (ix, iy, im) = bodies[i];
                     for j in (i + 1)..n {
-                        let (_, jx, jy, jm) = bodies[j];
+                        let (jx, jy, jm) = bodies[j];
                         let dx = wrapped_diff(jx, ix, params.world_size);
                         let dy = wrapped_diff(jy, iy, params.world_size);
                         let dist_sq = dx * dx + dy * dy + params.softening * params.softening;
@@ -286,24 +275,18 @@ pub fn register_all(
                     }
                 }
 
-                // Build entity -> accel lookup.
-                let accel_map: HashMap<u64, usize> = bodies
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &(e, _, _, _))| (e.to_bits(), i))
-                    .collect();
-
                 // Apply: update velocities and positions.
+                // Iteration order is stable between passes, so use index counter.
                 let dt = params.dt;
                 let ws = params.world_size;
-                query.for_each(|(vel, pos, _mass, entity)| {
-                    if let Some(&idx) = accel_map.get(&entity.to_bits()) {
-                        let (ax, ay) = accels[idx];
-                        vel.x += ax * dt;
-                        vel.y += ay * dt;
-                        pos.x = wrap(pos.x + vel.x * dt, ws);
-                        pos.y = wrap(pos.y + vel.y * dt, ws);
-                    }
+                let mut i = 0;
+                query.for_each(|(vel, pos, _mass, _entity)| {
+                    let (ax, ay) = accels[i];
+                    vel.x += ax * dt;
+                    vel.y += ay * dt;
+                    pos.x = wrap(pos.x + vel.x * dt, ws);
+                    pos.y = wrap(pos.y + vel.y * dt, ws);
+                    i += 1;
                 });
             },
         );
@@ -320,17 +303,19 @@ pub fn register_all(
             let h = params.height;
 
             // Snapshot current cell states in entity order.
-            let mut cells: Vec<(Entity, bool)> = Vec::new();
-            query.for_each(|(cs, entity)| {
-                cells.push((entity, cs.0));
+            let mut cells: Vec<bool> = Vec::new();
+            query.for_each(|(cs, _entity)| {
+                cells.push(cs.0);
             });
 
             let n = cells.len();
-            if n != w * h {
-                // Mismatch — skip silently. The Python layer should ensure
-                // the entity count matches width * height.
-                return;
-            }
+            assert_eq!(
+                n,
+                w * h,
+                "life_step: entity count ({n}) != grid dimensions ({w}x{h} = {}). \
+                 Ensure exactly width*height CellState entities exist.",
+                w * h
+            );
 
             // Compute neighbor counts.
             let mut new_states: Vec<bool> = Vec::with_capacity(n);
@@ -355,27 +340,21 @@ pub fn register_all(
 
                 let mut count = 0u8;
                 for &ni in &neighbors {
-                    if cells[ni].1 {
+                    if cells[ni] {
                         count += 1;
                     }
                 }
 
-                let alive = cells[idx].1;
+                let alive = cells[idx];
                 let new_alive = matches!((alive, count), (true, 2) | (true, 3) | (false, 3));
                 new_states.push(new_alive);
             }
 
-            // Write back. Build entity -> new_state lookup.
-            let state_map: HashMap<u64, bool> = cells
-                .iter()
-                .enumerate()
-                .map(|(i, &(e, _))| (e.to_bits(), new_states[i]))
-                .collect();
-
-            query.for_each(|(cs, entity)| {
-                if let Some(&new) = state_map.get(&entity.to_bits()) {
-                    cs.0 = new;
-                }
+            // Write back. Iteration order is stable between passes.
+            let mut i = 0;
+            query.for_each(|(cs, _entity)| {
+                cs.0 = new_states[i];
+                i += 1;
             });
         },
     );
@@ -411,7 +390,8 @@ use pyo3::types::PyDict;
 
 /// Extract an f32 kwarg with a default.
 fn kwarg_f32(kwargs: Option<&Bound<'_, PyDict>>, key: &str, default: f32) -> PyResult<f32> {
-    match kwargs.and_then(|kw| kw.get_item(key).ok().flatten()) {
+    let Some(kw) = kwargs else { return Ok(default) };
+    match kw.get_item(key)? {
         Some(v) => v.extract(),
         None => Ok(default),
     }
@@ -419,12 +399,27 @@ fn kwarg_f32(kwargs: Option<&Bound<'_, PyDict>>, key: &str, default: f32) -> PyR
 
 /// Extract a usize kwarg, required.
 fn kwarg_usize(kwargs: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<usize> {
-    match kwargs.and_then(|kw| kw.get_item(key).ok().flatten()) {
+    let Some(kw) = kwargs else {
+        return Err(PyValueError::new_err(format!(
+            "missing required kwarg: {key}"
+        )));
+    };
+    match kw.get_item(key)? {
         Some(v) => v.extract(),
         None => Err(PyValueError::new_err(format!(
             "missing required kwarg: {key}"
         ))),
     }
+}
+
+/// Validate that a parameter is finite and positive.
+fn validate_positive(name: &str, v: f32) -> PyResult<()> {
+    if !v.is_finite() || v <= 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be a finite positive number (got {v})"
+        )));
+    }
+    Ok(())
 }
 
 /// Dispatch a reducer call by name, extracting typed parameters from kwargs.
@@ -447,6 +442,11 @@ pub fn dispatch(
                 coh_w: kwarg_f32(kwargs, "coh_w", 1.0)?,
                 max_force: kwarg_f32(kwargs, "max_force", 0.1)?,
             };
+            validate_positive("world_size", params.world_size)?;
+            validate_positive("sep_r", params.sep_r)?;
+            validate_positive("ali_r", params.ali_r)?;
+            validate_positive("coh_r", params.coh_r)?;
+            validate_positive("max_force", params.max_force)?;
             registry.run(world, id, params);
         }
         "boids_integrate" => {
@@ -455,6 +455,8 @@ pub fn dispatch(
                 dt: kwarg_f32(kwargs, "dt", 0.016)?,
                 world_size: kwarg_f32(kwargs, "world_size", 500.0)?,
             };
+            validate_positive("world_size", params.world_size)?;
+            validate_positive("dt", params.dt)?;
             registry.run(world, id, params);
         }
         "gravity" => {
@@ -464,6 +466,9 @@ pub fn dispatch(
                 dt: kwarg_f32(kwargs, "dt", 0.001)?,
                 world_size: kwarg_f32(kwargs, "world_size", 500.0)?,
             };
+            validate_positive("world_size", params.world_size)?;
+            validate_positive("dt", params.dt)?;
+            validate_positive("softening", params.softening)?;
             registry.run(world, id, params);
         }
         "life_step" => {
@@ -478,6 +483,8 @@ pub fn dispatch(
                 dt: kwarg_f32(kwargs, "dt", 0.016)?,
                 world_size: kwarg_f32(kwargs, "world_size", 500.0)?,
             };
+            validate_positive("world_size", params.world_size)?;
+            validate_positive("dt", params.dt)?;
             registry.run(world, id, params);
         }
         _ => {

@@ -13,90 +13,68 @@ use pyo3_arrow::PyRecordBatch;
 
 // ── Typed spawn dispatch ──────────────────────────────────────────
 
-/// Helper: extract an f32 kwarg, defaulting to 0.0 if missing.
-fn kwarg_f32(kwargs: &Bound<'_, PyDict>, key: &str) -> PyResult<f32> {
-    match kwargs.get_item(key)? {
-        Some(v) => v.extract(),
-        None => Ok(0.0),
-    }
-}
-
-/// Helper: extract a u32 kwarg, defaulting to 0 if missing.
-fn kwarg_u32(kwargs: &Bound<'_, PyDict>, key: &str) -> PyResult<u32> {
-    match kwargs.get_item(key)? {
-        Some(v) => v.extract(),
-        None => Ok(0),
-    }
-}
-
-/// Helper: extract a u8 kwarg, defaulting to 0 if missing.
-fn kwarg_u8(kwargs: &Bound<'_, PyDict>, key: &str) -> PyResult<u8> {
-    match kwargs.get_item(key)? {
-        Some(v) => v.extract(),
-        None => Ok(0),
-    }
-}
-
-/// Helper: extract a bool kwarg, defaulting to false if missing.
-fn kwarg_bool(kwargs: &Bound<'_, PyDict>, key: &str) -> PyResult<bool> {
-    match kwargs.get_item(key)? {
-        Some(v) => v.extract(),
-        None => Ok(false),
-    }
+macro_rules! kwarg {
+    ($kwargs:expr, $key:expr, $T:ty) => {{
+        let kwargs: &Bound<'_, PyDict> = $kwargs;
+        match kwargs.get_item($key)? {
+            Some(v) => v.extract::<$T>(),
+            None => Ok(<$T>::default()),
+        }
+    }};
 }
 
 /// Build a Position from kwargs.
 fn build_position(kwargs: &Bound<'_, PyDict>) -> PyResult<Position> {
     Ok(Position {
-        x: kwarg_f32(kwargs, "pos_x")?,
-        y: kwarg_f32(kwargs, "pos_y")?,
+        x: kwarg!(kwargs, "pos_x", f32)?,
+        y: kwarg!(kwargs, "pos_y", f32)?,
     })
 }
 
 /// Build a Velocity from kwargs.
 fn build_velocity(kwargs: &Bound<'_, PyDict>) -> PyResult<Velocity> {
     Ok(Velocity {
-        x: kwarg_f32(kwargs, "vel_x")?,
-        y: kwarg_f32(kwargs, "vel_y")?,
+        x: kwarg!(kwargs, "vel_x", f32)?,
+        y: kwarg!(kwargs, "vel_y", f32)?,
     })
 }
 
 /// Build an Acceleration from kwargs.
 fn build_acceleration(kwargs: &Bound<'_, PyDict>) -> PyResult<Acceleration> {
     Ok(Acceleration {
-        x: kwarg_f32(kwargs, "acc_x")?,
-        y: kwarg_f32(kwargs, "acc_y")?,
+        x: kwarg!(kwargs, "acc_x", f32)?,
+        y: kwarg!(kwargs, "acc_y", f32)?,
     })
 }
 
 /// Build a Mass from kwargs.
 fn build_mass(kwargs: &Bound<'_, PyDict>) -> PyResult<Mass> {
-    Ok(Mass(kwarg_f32(kwargs, "mass")?))
+    Ok(Mass(kwarg!(kwargs, "mass", f32)?))
 }
 
 /// Build a CellState from kwargs.
 fn build_cell_state(kwargs: &Bound<'_, PyDict>) -> PyResult<CellState> {
-    Ok(CellState(kwarg_bool(kwargs, "alive")?))
+    Ok(CellState(kwarg!(kwargs, "alive", bool)?))
 }
 
 /// Build a Heading from kwargs.
 fn build_heading(kwargs: &Bound<'_, PyDict>) -> PyResult<Heading> {
-    Ok(Heading(kwarg_f32(kwargs, "heading")?))
+    Ok(Heading(kwarg!(kwargs, "heading", f32)?))
 }
 
 /// Build an Energy from kwargs.
 fn build_energy(kwargs: &Bound<'_, PyDict>) -> PyResult<Energy> {
-    Ok(Energy(kwarg_f32(kwargs, "energy")?))
+    Ok(Energy(kwarg!(kwargs, "energy", f32)?))
 }
 
 /// Build a Health from kwargs.
 fn build_health(kwargs: &Bound<'_, PyDict>) -> PyResult<Health> {
-    Ok(Health(kwarg_u32(kwargs, "health")?))
+    Ok(Health(kwarg!(kwargs, "health", u32)?))
 }
 
 /// Build a Faction from kwargs.
 fn build_faction(kwargs: &Bound<'_, PyDict>) -> PyResult<Faction> {
-    Ok(Faction(kwarg_u8(kwargs, "faction")?))
+    Ok(Faction(kwarg!(kwargs, "faction", u8)?))
 }
 
 /// Typed spawn dispatch. Matches a sorted component-name key to a typed
@@ -174,6 +152,25 @@ fn spawn_typed(
 
 // ── Typed write dispatch ──────────────────────────────────────────
 
+macro_rules! write_arm {
+    ($world:expr, $entity:expr, $value:expr, $Comp:ty, $field:ident) => {{
+        let v = $value.extract()?;
+        $world
+            .get_mut::<$Comp>($entity)
+            .ok_or_else(|| PyValueError::new_err(concat!("entity missing ", stringify!($Comp))))?
+            .$field = v;
+        Ok(())
+    }};
+    ($world:expr, $entity:expr, $value:expr, $Comp:ty) => {{
+        let v = $value.extract()?;
+        $world
+            .get_mut::<$Comp>($entity)
+            .ok_or_else(|| PyValueError::new_err(concat!("entity missing ", stringify!($Comp))))?
+            .0 = v;
+        Ok(())
+    }};
+}
+
 fn write_field_to_entity(
     world: &mut World,
     entity: Entity,
@@ -182,97 +179,22 @@ fn write_field_to_entity(
     value: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     match (component_name, field_name) {
-        ("Position", "pos_x") => {
-            let v: f32 = value.extract()?;
-            world
-                .get_mut::<Position>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Position"))?
-                .x = v;
-        }
-        ("Position", "pos_y") => {
-            let v: f32 = value.extract()?;
-            world
-                .get_mut::<Position>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Position"))?
-                .y = v;
-        }
-        ("Velocity", "vel_x") => {
-            let v: f32 = value.extract()?;
-            world
-                .get_mut::<Velocity>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Velocity"))?
-                .x = v;
-        }
-        ("Velocity", "vel_y") => {
-            let v: f32 = value.extract()?;
-            world
-                .get_mut::<Velocity>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Velocity"))?
-                .y = v;
-        }
-        ("Acceleration", "acc_x") => {
-            let v: f32 = value.extract()?;
-            world
-                .get_mut::<Acceleration>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Acceleration"))?
-                .x = v;
-        }
-        ("Acceleration", "acc_y") => {
-            let v: f32 = value.extract()?;
-            world
-                .get_mut::<Acceleration>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Acceleration"))?
-                .y = v;
-        }
-        ("Mass", "mass") => {
-            let v: f32 = value.extract()?;
-            world
-                .get_mut::<Mass>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Mass"))?
-                .0 = v;
-        }
-        ("CellState", "alive") => {
-            let v: bool = value.extract()?;
-            world
-                .get_mut::<CellState>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing CellState"))?
-                .0 = v;
-        }
-        ("Heading", "heading") => {
-            let v: f32 = value.extract()?;
-            world
-                .get_mut::<Heading>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Heading"))?
-                .0 = v;
-        }
-        ("Energy", "energy") => {
-            let v: f32 = value.extract()?;
-            world
-                .get_mut::<Energy>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Energy"))?
-                .0 = v;
-        }
-        ("Health", "health") => {
-            let v: u32 = value.extract()?;
-            world
-                .get_mut::<Health>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Health"))?
-                .0 = v;
-        }
-        ("Faction", "faction") => {
-            let v: u8 = value.extract()?;
-            world
-                .get_mut::<Faction>(entity)
-                .ok_or_else(|| PyValueError::new_err("entity missing Faction"))?
-                .0 = v;
-        }
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "unknown field: {component_name}.{field_name}"
-            )));
-        }
+        ("Position", "pos_x") => write_arm!(world, entity, value, Position, x),
+        ("Position", "pos_y") => write_arm!(world, entity, value, Position, y),
+        ("Velocity", "vel_x") => write_arm!(world, entity, value, Velocity, x),
+        ("Velocity", "vel_y") => write_arm!(world, entity, value, Velocity, y),
+        ("Acceleration", "acc_x") => write_arm!(world, entity, value, Acceleration, x),
+        ("Acceleration", "acc_y") => write_arm!(world, entity, value, Acceleration, y),
+        ("Mass", "mass") => write_arm!(world, entity, value, Mass),
+        ("CellState", "alive") => write_arm!(world, entity, value, CellState),
+        ("Heading", "heading") => write_arm!(world, entity, value, Heading),
+        ("Energy", "energy") => write_arm!(world, entity, value, Energy),
+        ("Health", "health") => write_arm!(world, entity, value, Health),
+        ("Faction", "faction") => write_arm!(world, entity, value, Faction),
+        _ => Err(PyValueError::new_err(format!(
+            "unknown field: {component_name}.{field_name}"
+        ))),
     }
-    Ok(())
 }
 
 // ── PyWorld ───────────────────────────────────────────────────────
@@ -334,6 +256,18 @@ impl PyWorld {
             .get_item(&first_key)?
             .ok_or_else(|| PyValueError::new_err("spawn_batch data must be non-empty"))?;
         let n: usize = first_list.len()?;
+
+        // Validate all columns have the same length
+        for kv in data.iter() {
+            let (k, v) = kv;
+            let col_len: usize = v.len()?;
+            if col_len != n {
+                return Err(PyValueError::new_err(format!(
+                    "column '{}' has length {col_len}, expected {n}",
+                    k
+                )));
+            }
+        }
 
         // Build a row-dict for each entity and spawn one at a time
         let mut entities = Vec::with_capacity(n);
@@ -425,10 +359,31 @@ impl PyWorld {
             })
             .collect();
 
+        // Validate column lengths match entity_ids
+        for kv in kwargs.iter() {
+            let (k, v) = kv;
+            let col_len: usize = v.len()?;
+            if col_len != entity_ids.len() {
+                return Err(PyValueError::new_err(format!(
+                    "column '{}' has length {col_len}, expected {} (entity_ids length)",
+                    k,
+                    entity_ids.len()
+                )));
+            }
+        }
+
+        // Extract column lists once before entity loop
+        let columns: Vec<(&str, Bound<'_, PyAny>)> = field_names
+            .iter()
+            .filter_map(|&name| kwargs.get_item(name).ok().flatten().map(|v| (name, v)))
+            .collect();
+
         for (i, &bits) in entity_ids.iter().enumerate() {
             let entity = Entity::from_bits(bits);
-            for &field_name in &field_names {
-                let py_list = kwargs.get_item(field_name)?.unwrap();
+            if !self.world.is_alive(entity) {
+                return Err(PyValueError::new_err(format!("entity {bits} is not alive")));
+            }
+            for (field_name, ref py_list) in &columns {
                 let value = py_list.get_item(i)?;
                 write_field_to_entity(&mut self.world, entity, component, field_name, &value)?;
             }

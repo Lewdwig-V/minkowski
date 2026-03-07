@@ -7,39 +7,48 @@ use minkowski::World;
 // ── Component structs ──
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct Velocity {
     pub x: f32,
     pub y: f32,
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct Acceleration {
     pub x: f32,
     pub y: f32,
 }
 
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Mass(pub f32);
 
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct CellState(pub bool);
 
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Heading(pub f32);
 
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Energy(pub f32);
 
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Health(pub u32);
 
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Faction(pub u8);
 
 // ── Helper macro for schema registration ──

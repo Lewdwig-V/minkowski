@@ -11,7 +11,6 @@ pub struct ComponentSchema {
     /// Minkowski ComponentId (resolved at registration)
     pub component_id: ComponentId,
     /// Size of the Rust struct in bytes
-    #[allow(dead_code)]
     pub size: usize,
     /// Arrow fields with byte offsets into the struct
     pub fields: Vec<FieldMapping>,
@@ -44,6 +43,18 @@ impl SchemaRegistry {
     }
 
     pub fn register(&mut self, schema: ComponentSchema) {
+        for fm in &schema.fields {
+            let fs = crate::bridge::field_byte_size(&fm.data_type).expect("validated data type");
+            assert!(
+                fm.offset + fs <= schema.size,
+                "field '{}' offset {} + size {} exceeds component '{}' size {}",
+                fm.column_name,
+                fm.offset,
+                fs,
+                schema.name,
+                schema.size
+            );
+        }
         let name = schema.name;
         let id = schema.component_id;
         self.id_to_name.insert(id, name);

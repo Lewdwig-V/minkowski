@@ -66,7 +66,7 @@ pub fn query_to_record_batch(
                 data_type: fm.data_type.clone(),
                 offset: fm.offset,
                 comp_id: schema.component_id,
-                bytes: Vec::with_capacity(total * field_byte_size(&fm.data_type)),
+                bytes: Vec::with_capacity(total * field_byte_size(&fm.data_type)?),
             });
         }
     }
@@ -78,7 +78,7 @@ pub fn query_to_record_batch(
         entity_ids.extend(entities.iter().map(|e| e.to_bits()));
 
         for collector in &mut collectors {
-            let field_size = field_byte_size(&collector.data_type);
+            let field_size = field_byte_size(&collector.data_type)?;
             for row in 0..len {
                 // SAFETY: arch_idx and comp_id are valid (we checked contains above),
                 // row < len. We only read, never write.
@@ -134,13 +134,13 @@ pub fn query_to_record_batch(
 }
 
 /// Returns the byte size of a single value for the given Arrow data type.
-fn field_byte_size(dt: &DataType) -> usize {
+pub(crate) fn field_byte_size(dt: &DataType) -> Result<usize, String> {
     match dt {
-        DataType::Float32 => 4,
-        DataType::UInt32 => 4,
-        DataType::UInt8 => 1,
-        DataType::UInt64 => 8,
-        DataType::Boolean => 1, // stored as u8 in Rust component
-        _ => panic!("unsupported data type: {dt:?}"),
+        DataType::Float32 => Ok(4),
+        DataType::UInt32 => Ok(4),
+        DataType::UInt8 => Ok(1),
+        DataType::UInt64 => Ok(8),
+        DataType::Boolean => Ok(1), // stored as u8 in Rust component
+        _ => Err(format!("unsupported data type: {dt:?}")),
     }
 }
