@@ -21,16 +21,16 @@ Determine which files to analyze:
 ### Static Hot Path List
 
 **Storage (per-entity, per-archetype)** — `crates/minkowski/src/`
-- `storage/blob_vec.rs` — `push`, `get_ptr`, `get_ptr_mut`, `swap_remove_no_drop`, `realloc`
+- `storage/blob_vec.rs` — `push`, `get_ptr`, `get_ptr_mut`, `swap_remove`, `swap_remove_no_drop`, `drop_in_place`, `copy_unchecked`, `set_len`
 - `storage/archetype.rs` — `push`, `swap_remove`, entity/column iteration
-- `storage/sparse.rs` — `insert`, `get`, `remove`, iteration
+- `storage/sparse.rs` — `PagedSparseSet::dense_index` (page lookup + generation check), `insert`, `get`, `remove`, `remove_internal`, `iter`; `SparseStorage::remove_all` (per-despawn)
 
 **Query (per-entity iteration)** — `crates/minkowski/src/`
 - `query/iter.rs` — `QueryIter::next`, `for_each`, `for_each_chunk`, `par_for_each`
 - `query/fetch.rs` — `init_fetch`, `fetch`, `as_slice`
 
 **Mutation (spawn, migrate, changeset apply)** — `crates/minkowski/src/`
-- `world.rs` — `spawn`, `insert`, `remove`, `get_mut`, `get_batch_mut`, `query`, `query_table_mut`
+- `world.rs` — `spawn`, `insert`, `remove`, `despawn`, `despawn_batch` (group-sort-sweep), `get_mut`, `get_batch_mut`, `query`, `query_table_mut`
 - `bundle.rs` — `Bundle::put`, `component_ids`
 - `changeset.rs` — `EnumChangeSet::apply`, `record_insert`, arena allocation
 
