@@ -9,7 +9,7 @@ Minkowski needs a storage model that combines the runtime flexibility of an ECS 
 
 ## Decision
 
-Store components in type-erased `BlobVec` columns grouped into archetypes, where each unique set of component types gets its own archetype. Columns are allocated with 64-byte alignment (cache line). Entities are generational IDs (u32 index + u32 generation packed into u64) with O(1) lookup via `entity_locations: Vec<Option<EntityLocation>>`. Optional sparse components (`HashMap<Entity, T>`) are available via `register_sparse` for data present on fewer than 5% of entities.
+Store components in type-erased `BlobVec` columns grouped into archetypes, where each unique set of component types gets its own archetype. Columns are allocated with 64-byte alignment (cache line). Entities are generational IDs (u32 index + u32 generation packed into u64) with O(1) lookup via `entity_locations: Vec<Option<EntityLocation>>`. Optional sparse components are available via `register_sparse` for data present on fewer than 5% of entities, stored in a paged sparse set (`PagedSparseSet`) backed by BlobVec.
 
 **Key insight: archetypes are an optimization, not a data model — the column layout gives database performance while the archetype system provides runtime flexibility.**
 
@@ -27,3 +27,4 @@ Store components in type-erased `BlobVec` columns grouped into archetypes, where
 - Structural changes (insert/remove component) require archetype migration — copying all columns from old archetype to new
 - Generational entity IDs prevent use-after-despawn without a notification system
 - 64-byte column alignment + `target-cpu=native` enables platform-specific SIMD instructions
+- Sparse storage uses paged sparse sets: 4096-entry pages (16 KB, fits L1 cache) index into a dense BlobVec. O(1) lookup via page index + generation check against the dense entity array. Sequential entity allocation means co-spawned entities share a page — one cache miss amortized across a burst of related lookups. `SparseStorage` is `HashMap<ComponentId, PagedSparseSet>` with no `dyn Any` downcast — all sets are the same concrete type since BlobVec is type-erased

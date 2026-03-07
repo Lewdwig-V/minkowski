@@ -26,3 +26,5 @@ Two complementary systems: `CommandBuffer` stores `Vec<Box<dyn FnOnce(&mut World
 - Typed safe helpers (`insert<T>`, `remove<T>`, `spawn_bundle<B>`) auto-register component types and handle `ManuallyDrop`
 - Two systems to learn, but each is optimized for its use case with no impedance mismatch
 - `EnumChangeSet` is the foundation for both the transaction system and the persistence layer
+- `EnumChangeSet::apply` batches despawn mutations: partitions despawns out, captures component data upfront for the reverse changeset, then calls `World::despawn_batch` once. Remaining mutations (Spawn, Insert, Remove) are applied in original order. Despawns are order-independent (each targets a distinct entity) so extraction is safe
+- `World::despawn_batch` groups entities by archetype, sorts rows descending, sweeps back-to-front using decomposed BlobVec ops (`drop_in_place`, `copy_unchecked`, `set_len`). Back-to-front ordering guarantees the swap-remove target is never an entity pending despawn. Sparse cleanup runs before entity deallocation (generation bump would reject the removal)
