@@ -6,7 +6,6 @@ use std::path::Path;
 use minkowski::{ComponentId, Entity, EnumChangeSet, World};
 
 use crate::codec::{CodecError, CodecRegistry};
-use crate::format;
 use crate::record::*;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,8 +44,8 @@ impl Snapshot {
             entity_count: data.archetypes.iter().map(|a| a.entities.len()).sum(),
         };
 
-        let bytes =
-            format::serialize_snapshot(&data).map_err(|e| SnapshotError::Format(e.to_string()))?;
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
+            .map_err(|e| SnapshotError::Format(e.to_string()))?;
 
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);

@@ -1,14 +1,8 @@
-use crate::record::{SnapshotData, WalEntry};
+use crate::record::WalEntry;
 
 #[derive(Debug, thiserror::Error)]
 #[error("rkyv format error: {0}")]
 pub struct FormatError(pub String);
-
-pub fn serialize_snapshot(snapshot: &SnapshotData) -> Result<Vec<u8>, FormatError> {
-    rkyv::to_bytes::<rkyv::rancor::Error>(snapshot)
-        .map(|v| v.to_vec())
-        .map_err(|e| FormatError(e.to_string()))
-}
 
 pub fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, FormatError> {
     rkyv::to_bytes::<rkyv::rancor::Error>(entry)
