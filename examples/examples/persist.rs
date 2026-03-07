@@ -9,7 +9,7 @@
 //! Run: cargo run -p minkowski-examples --example persist --release
 
 use minkowski::{Optimistic, QueryWriter, ReducerRegistry, World};
-use minkowski_persist::{CodecRegistry, Durable, Snapshot, Wal};
+use minkowski_persist::{CodecRegistry, Durable, Snapshot, Wal, WalConfig};
 use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
@@ -37,11 +37,11 @@ struct Score(u32);
 fn main() {
     let dir = std::env::temp_dir().join("minkowski-persist-example");
     std::fs::create_dir_all(&dir).unwrap();
-    let wal_path = dir.join("example.wal");
+    let wal_dir = dir.join("example.wal");
     let snap_path = dir.join("example.snap");
 
     // Clean up from previous runs
-    let _ = std::fs::remove_file(&wal_path);
+    let _ = std::fs::remove_dir_all(&wal_dir);
     let _ = std::fs::remove_file(&snap_path);
 
     // -- Phase 1: Create world with multiple archetypes --
@@ -98,7 +98,7 @@ fn main() {
 
     // -- Phase 2: Snapshot --
     let snap = Snapshot::new();
-    let wal = Wal::create(&wal_path, &codecs).unwrap();
+    let wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
     let header = snap
         .save(&snap_path, &world, &codecs, wal.next_seq())
         .unwrap();
@@ -151,7 +151,7 @@ fn main() {
     load_codecs.register_as::<Score>("score", &mut load_world_tmp);
 
     let (mut recovered, snap_seq) = snap.load(&snap_path, &load_codecs).unwrap();
-    let mut replay_wal = Wal::open(&wal_path, &load_codecs).unwrap();
+    let mut replay_wal = Wal::open(&wal_dir, &load_codecs, WalConfig::default()).unwrap();
     let last_seq = replay_wal
         .replay_from(snap_seq, &mut recovered, &load_codecs)
         .unwrap();

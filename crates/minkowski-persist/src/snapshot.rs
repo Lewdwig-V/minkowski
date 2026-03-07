@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn snapshot_plus_wal_recovery() {
-        use crate::wal::Wal;
+        use crate::wal::{Wal, WalConfig};
 
         let dir = tempfile::tempdir().unwrap();
         let snap_path = dir.path().join("recovery.snap");
@@ -522,7 +522,7 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.1, dy: 0.2 }));
         world.spawn((Pos { x: 3.0, y: 4.0 }, Vel { dx: 0.3, dy: 0.4 }));
 
-        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let snap = Snapshot::new();
         let _header = snap
             .save(&snap_path, &world, &codecs, wal.next_seq())

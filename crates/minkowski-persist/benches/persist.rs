@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use minkowski::World;
-use minkowski_persist::{CodecRegistry, Snapshot, Wal};
+use minkowski_persist::{CodecRegistry, Snapshot, Wal, WalConfig};
 use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
@@ -65,8 +65,8 @@ fn bench_snapshot_load(c: &mut Criterion) {
 fn bench_wal_append(c: &mut Criterion) {
     let (mut world, codecs) = setup();
     let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.path().join("bench.wal");
-    let mut wal = Wal::create(&wal_path, &codecs).unwrap();
+    let wal_dir = dir.path().join("bench.wal");
+    let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
 
     // Single-mutation changeset — WAL append cost scales with changeset size,
     // not world size, so this isolates serialization + I/O overhead.

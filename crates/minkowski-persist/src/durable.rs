@@ -88,7 +88,7 @@ impl<S: Transact> Transact for Durable<S> {
 mod tests {
     use super::*;
     use crate::codec::CodecRegistry;
-    use crate::wal::Wal;
+    use crate::wal::{Wal, WalConfig};
     use minkowski::{Optimistic, Pessimistic};
     use rkyv::{Archive, Deserialize, Serialize};
 
@@ -110,7 +110,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register::<Pos>(&mut world);
 
-        let wal = Wal::create(&wal_path, &codecs).unwrap();
+        let wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let strategy = Optimistic::new(&world);
         let durable = Durable::new(strategy, wal, codecs);
 
@@ -136,7 +136,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register::<Health>(&mut world);
 
-        let wal = Wal::create(&wal_path, &codecs).unwrap();
+        let wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let strategy = Pessimistic::new(&world);
         let durable = Durable::new(strategy, wal, codecs);
 
@@ -161,7 +161,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register::<Pos>(&mut world);
 
-        let wal = Wal::create(&wal_path, &codecs).unwrap();
+        let wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let strategy = Optimistic::with_retries(&world, 3);
         let durable = Durable::new(strategy, wal, codecs);
 

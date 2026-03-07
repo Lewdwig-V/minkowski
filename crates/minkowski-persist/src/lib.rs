@@ -10,4 +10,4 @@ pub use durable::Durable;
 pub use record::*;
 pub use replication::{apply_batch, ReplicationBatch, WalCursor};
 pub use snapshot::{Snapshot, SnapshotError};
-pub use wal::{Wal, WalError};
+pub use wal::{Wal, WalConfig, WalError};

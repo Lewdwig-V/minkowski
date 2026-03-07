@@ -11,7 +11,9 @@
 //! Run: cargo run -p minkowski-examples --example replicate --release
 
 use minkowski::{EnumChangeSet, World};
-use minkowski_persist::{apply_batch, CodecRegistry, ReplicationBatch, Snapshot, Wal, WalCursor};
+use minkowski_persist::{
+    apply_batch, CodecRegistry, ReplicationBatch, Snapshot, Wal, WalConfig, WalCursor,
+};
 use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
@@ -31,11 +33,11 @@ struct Vel {
 fn main() {
     let dir = std::env::temp_dir().join("minkowski-replicate-example");
     std::fs::create_dir_all(&dir).unwrap();
-    let wal_path = dir.join("source.wal");
+    let wal_dir = dir.join("source.wal");
     let snap_path = dir.join("source.snap");
 
     // Clean up from previous runs
-    let _ = std::fs::remove_file(&wal_path);
+    let _ = std::fs::remove_dir_all(&wal_dir);
     let _ = std::fs::remove_file(&snap_path);
 
     // -- Phase 1: Source world --
@@ -58,7 +60,7 @@ fn main() {
 
     // -- Phase 2: Snapshot --
     println!("Phase 2: Taking snapshot...");
-    let mut wal = Wal::create(&wal_path, &codecs).unwrap();
+    let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
     let snap = Snapshot::new();
     let header = snap
         .save(&snap_path, &world, &codecs, wal.next_seq())
@@ -109,7 +111,7 @@ fn main() {
         snap_seq
     );
 
-    let mut cursor = WalCursor::open(&wal_path, snap_seq).unwrap();
+    let mut cursor = WalCursor::open(&wal_dir, snap_seq).unwrap();
     let batch = cursor.next_batch(100).unwrap();
     println!(
         "  Pulled batch: {} records, schema has {} components",

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -8,54 +8,78 @@ use minkowski::{ComponentId, World};
 
 use crate::codec::CodecRegistry;
 use crate::record::{WalEntry, WalRecord, WalSchema};
-use crate::wal::{apply_record, read_next_frame, WalError};
+use crate::wal::{apply_record, list_segments, read_next_frame, WalError};
 
-/// Read-only cursor over a WAL file. Opens its own file handle so it
-/// can read concurrently with an active writer.
+/// Read-only cursor over a segmented WAL directory. Opens its own file
+/// handles so it can read concurrently with an active writer. Lazily
+/// advances across segment files.
 pub struct WalCursor {
+    dir: PathBuf,
     file: File,
     pos: u64,
     next_seq: u64,
     schema: Option<WalSchema>,
+    current_segment_start_seq: u64,
 }
 
 impl WalCursor {
-    /// Open a WAL file for reading, starting from `from_seq`.
-    /// Parses the schema preamble (if present) and scans forward to the
-    /// first record with `seq >= from_seq`.
-    pub fn open(path: &Path, from_seq: u64) -> Result<Self, WalError> {
-        let file = File::open(path)?;
+    /// Open a WAL directory for reading, starting from `from_seq`.
+    /// Finds the segment containing `from_seq`, parses its schema preamble,
+    /// and scans forward to the first record with `seq >= from_seq`.
+    /// Returns `Err(CursorBehind)` if all segments start after `from_seq`.
+    pub fn open(dir: &Path, from_seq: u64) -> Result<Self, WalError> {
+        let segments = list_segments(dir)?;
+        if segments.is_empty() {
+            return Err(WalError::Format("no WAL segments found".into()));
+        }
+
+        // Find segment containing from_seq: largest start_seq <= from_seq
+        let seg_idx = match segments.iter().rposition(|(start, _)| *start <= from_seq) {
+            Some(idx) => idx,
+            None => {
+                return Err(WalError::CursorBehind {
+                    requested: from_seq,
+                    oldest: segments[0].0,
+                });
+            }
+        };
+
+        let (start_seq, seg_path) = &segments[seg_idx];
+        let file = File::open(seg_path)?;
         let mut pos: u64 = 0;
         let mut schema = None;
 
+        // Scan forward to from_seq
         loop {
             match read_next_frame(&file, pos)? {
                 Some((WalEntry::Schema(s), next_pos)) => {
                     schema = Some(s);
                     pos = next_pos;
                 }
-                Some((WalEntry::Mutations(record), next_pos)) => {
+                Some((WalEntry::Mutations(record), _next_pos)) => {
                     if record.seq >= from_seq {
-                        // Don't advance past this record — next_batch will read it
-                        break;
+                        break; // Don't advance past this record
                     }
-                    pos = next_pos;
+                    pos = _next_pos;
                 }
                 None => break,
             }
         }
 
         Ok(Self {
+            dir: dir.to_path_buf(),
             file,
             pos,
             next_seq: from_seq,
             schema,
+            current_segment_start_seq: *start_seq,
         })
     }
 
     /// Read up to `limit` records from the current position.
     /// Returns a `ReplicationBatch` with the schema and records.
     /// An empty `records` vec means the cursor has caught up.
+    /// Lazily advances across segment boundaries.
     pub fn next_batch(&mut self, limit: usize) -> Result<ReplicationBatch, WalError> {
         let mut records = Vec::new();
 
@@ -70,7 +94,12 @@ impl WalCursor {
                     records.push(record);
                     self.pos = next_pos;
                 }
-                None => break,
+                None => {
+                    // Try to advance to next segment
+                    if !self.try_advance_segment()? {
+                        break; // No more segments — caught up
+                    }
+                }
             }
         }
 
@@ -79,6 +108,29 @@ impl WalCursor {
             .clone()
             .unwrap_or_else(|| WalSchema { components: vec![] });
         Ok(ReplicationBatch { schema, records })
+    }
+
+    /// Try to open the next segment file. Returns true if advanced.
+    fn try_advance_segment(&mut self) -> Result<bool, WalError> {
+        let segments = list_segments(&self.dir)?;
+        let next = segments
+            .iter()
+            .find(|(start, _)| *start > self.current_segment_start_seq);
+
+        match next {
+            Some((start_seq, path)) => {
+                self.file = File::open(path)?;
+                self.pos = 0;
+                self.current_segment_start_seq = *start_seq;
+                // Parse schema preamble of new segment
+                if let Some((WalEntry::Schema(s), next_pos)) = read_next_frame(&self.file, 0)? {
+                    self.schema = Some(s);
+                    self.pos = next_pos;
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// The schema parsed from the WAL preamble, if present.
@@ -149,7 +201,7 @@ mod tests {
     use super::*;
     use crate::codec::CodecRegistry;
     use crate::record::{ComponentSchema, SerializedMutation};
-    use crate::wal::Wal;
+    use crate::wal::{Wal, WalConfig};
     use minkowski::{EnumChangeSet, World};
 
     #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq, Debug)]
@@ -172,14 +224,14 @@ mod tests {
         }
     }
 
-    /// Helper: create a WAL with N spawn mutations and return the path + codecs.
+    /// Helper: create a WAL with N spawn mutations and return the dir + codecs.
     fn create_test_wal(dir: &std::path::Path, n: usize) -> (std::path::PathBuf, CodecRegistry) {
-        let wal_path = dir.join("test.wal");
+        let wal_dir = dir.join("test.wal");
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
         codecs.register_as::<Pos>("pos", &mut world);
 
-        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
+        let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
         for i in 0..n {
             let e = world.alloc_entity();
             let mut cs = EnumChangeSet::new();
@@ -194,7 +246,7 @@ mod tests {
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world);
         }
-        (wal_path, codecs)
+        (wal_dir, codecs)
     }
 
     // ── ReplicationBatch tests ──────────────────────────────────────
@@ -349,7 +401,7 @@ mod tests {
         codecs.register_as::<Pos>("pos", &mut world);
         codecs.register_as::<Health>("health", &mut world);
 
-        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
 
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
@@ -392,7 +444,7 @@ mod tests {
         codecs.register_as::<Pos>("pos", &mut world);
         codecs.register_as::<Health>("health", &mut world);
 
-        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 }, Health(50)));
@@ -427,7 +479,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register_as::<Pos>("pos", &mut world);
 
-        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
 
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
@@ -523,7 +575,7 @@ mod tests {
             },));
         }
 
-        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let snap = Snapshot::new();
         let header = snap
             .save(&snap_path, &world, &codecs, wal.next_seq())
