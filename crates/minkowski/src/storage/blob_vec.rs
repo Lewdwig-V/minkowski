@@ -185,6 +185,49 @@ impl BlobVec {
         self.len -= 1;
     }
 
+    /// Drop the element at `row` in place without moving anything.
+    /// The slot becomes logically uninitialized — caller must not read it
+    /// or must overwrite it before any future access.
+    ///
+    /// # Safety
+    /// `row` must be in bounds (`row < len`). Caller must ensure the slot
+    /// is not accessed again without being reinitialized.
+    pub unsafe fn drop_in_place(&mut self, row: usize) {
+        debug_assert!(row < self.len);
+        if let Some(drop_fn) = self.drop_fn {
+            drop_fn(self.ptr_at(row));
+        }
+    }
+
+    /// Copy element from `src_row` to `dst_row` without dropping either.
+    /// Bitwise copy — no drop on dst (must be uninitialized or already dropped),
+    /// no drop on src (caller ensures it won't be accessed again).
+    ///
+    /// # Safety
+    /// Both rows must be in bounds. `dst_row` must be uninitialized or already
+    /// dropped. `src_row` data becomes logically moved.
+    pub unsafe fn copy_unchecked(&mut self, src_row: usize, dst_row: usize) {
+        debug_assert!(src_row < self.len);
+        debug_assert!(dst_row < self.len);
+        let size = self.item_layout.size();
+        if size > 0 {
+            let src = self.ptr_at(src_row);
+            let dst = self.ptr_at(dst_row);
+            std::ptr::copy_nonoverlapping(src, dst, size);
+        }
+    }
+
+    /// Set the length directly. Caller must ensure all elements in
+    /// `new_len..old_len` have been dropped or moved out.
+    ///
+    /// # Safety
+    /// `new_len` must be <= current len. Elements beyond new_len must be
+    /// already dropped/moved.
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.len);
+        self.len = new_len;
+    }
+
     #[inline]
     fn ptr_at(&self, index: usize) -> *mut u8 {
         if self.item_layout.size() == 0 {
@@ -491,5 +534,68 @@ mod tests {
         assert_eq!(bv.changed_tick, Tick::default());
         bv.mark_changed(Tick::new(42));
         assert_eq!(bv.changed_tick, Tick::new(42));
+    }
+
+    #[test]
+    fn copy_unchecked_moves_data() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 10u32);
+            push_val(&mut bv, 20u32);
+            push_val(&mut bv, 30u32);
+            bv.copy_unchecked(2, 0); // copy row 2 into row 0
+            assert_eq!(read_val::<u32>(&bv, 0), 30);
+            assert_eq!(read_val::<u32>(&bv, 1), 20);
+            assert_eq!(read_val::<u32>(&bv, 2), 30); // src still has data
+        }
+    }
+
+    #[test]
+    fn set_len_truncates() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 10u32);
+            push_val(&mut bv, 20u32);
+            push_val(&mut bv, 30u32);
+            bv.set_len(1);
+        }
+        assert_eq!(bv.len(), 1);
+        unsafe {
+            assert_eq!(read_val::<u32>(&bv, 0), 10);
+        }
+    }
+
+    #[test]
+    fn drop_in_place_calls_drop_fn() {
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Tracked(u32);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        let mut bv = bv_for::<Tracked>();
+        unsafe {
+            push_val(&mut bv, Tracked(1));
+            push_val(&mut bv, Tracked(2));
+            push_val(&mut bv, Tracked(3));
+            bv.drop_in_place(1); // drop middle element only
+        }
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(bv.len(), 3); // len unchanged — caller manages it
+
+        // Prevent BlobVec::drop from double-dropping the already-dropped slot.
+        // In real usage the caller would copy_unchecked + set_len to skip it.
+        // For this test: copy last into slot 1, then set_len to 2.
+        unsafe {
+            bv.copy_unchecked(2, 1);
+            bv.set_len(2);
+        }
+        // BlobVec::drop will now drop 2 remaining Tracked values
     }
 }
