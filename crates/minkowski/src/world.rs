@@ -325,6 +325,9 @@ impl World {
             });
         }
 
+        // Clean sparse storage before dealloc bumps the generation
+        self.sparse.remove_all(entity);
+
         self.entity_locations[index] = None;
         self.entities.dealloc(entity);
         true
@@ -1977,6 +1980,18 @@ mod tests {
         let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
         world.insert_sparse(e, Health(42));
         let _results = world.get_batch_mut::<Health>(&[e, e]);
+    }
+
+    #[test]
+    fn despawn_cleans_sparse_components() {
+        let mut world = World::new();
+        world.components.register_sparse::<Health>();
+        let entity = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.insert_sparse(entity, Health(42));
+        let comp_id = world.components.id::<Health>().unwrap();
+        assert!(world.sparse.contains::<Health>(comp_id, entity));
+        world.despawn(entity);
+        assert!(!world.sparse.contains::<Health>(comp_id, entity));
     }
 
     #[test]
