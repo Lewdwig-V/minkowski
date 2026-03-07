@@ -427,8 +427,34 @@ impl EnumChangeSet {
 
         let mut reverse = EnumChangeSet::new();
 
+        // --- Phase 1: collect despawn entities and capture component data ---
+        // Despawn mutations are order-independent (each targets a distinct
+        // entity), so we pull them out and batch them via despawn_batch.
+        let despawn_entities: Vec<Entity> = self
+            .mutations
+            .iter()
+            .filter_map(|m| match m {
+                Mutation::Despawn { entity } => Some(*entity),
+                _ => None,
+            })
+            .collect();
+
+        // Capture component data for reverse BEFORE any mutations.
+        for &entity in &despawn_entities {
+            let comp_data = world.read_all_components(entity).unwrap_or_default();
+            reverse.record_spawn(entity, &comp_data);
+        }
+
+        // --- Phase 2: batch despawn ---
+        if !despawn_entities.is_empty() {
+            world.despawn_batch(&despawn_entities);
+        }
+
+        // --- Phase 3: process remaining mutations in original order ---
         for mutation in &self.mutations {
             match mutation {
+                Mutation::Despawn { .. } => {} // already handled above
+
                 Mutation::Spawn { entity, components } => {
                     // Ensure the entity allocator's generations vec covers
                     // reserved indices — reserve() is lock-free and doesn't
@@ -478,18 +504,6 @@ impl EnumChangeSet {
 
                     // --- Reverse: despawn this entity ---
                     reverse.record_despawn(*entity);
-                }
-
-                Mutation::Despawn { entity } => {
-                    // --- Capture: read all components before despawning ---
-                    let comp_data = world.read_all_components(*entity).unwrap_or_default();
-                    let captured: Vec<(ComponentId, *const u8, Layout)> = comp_data;
-
-                    // Record spawn as reverse (copies bytes into reverse arena)
-                    reverse.record_spawn(*entity, &captured);
-
-                    // --- Apply ---
-                    world.despawn(*entity);
                 }
 
                 Mutation::Insert {
@@ -1235,5 +1249,33 @@ mod tests {
         let _reverse = cs.apply(&mut world);
         assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
         assert_eq!(world.get::<Vel>(entity), Some(&Vel { dx: 3.0, dy: 4.0 }));
+    }
+
+    #[test]
+    fn apply_batch_despawns_and_reverse() {
+        let mut world = World::new();
+        let a = world.spawn((10u32,));
+        let b = world.spawn((20u32,));
+        let c = world.spawn((30u32,));
+
+        let mut cs = EnumChangeSet::new();
+        cs.record_despawn(a);
+        cs.record_despawn(c);
+
+        let reverse = cs.apply(&mut world);
+
+        assert!(!world.is_alive(a));
+        assert!(world.is_alive(b));
+        assert!(!world.is_alive(c));
+        assert_eq!(*world.get::<u32>(b).unwrap(), 20);
+
+        // Reverse re-spawns with correct component data
+        let _re_reverse = reverse.apply(&mut world);
+        let mut values: Vec<u32> = Vec::new();
+        world
+            .query::<(&u32,)>()
+            .for_each(|(val,)| values.push(*val));
+        values.sort();
+        assert_eq!(values, vec![10, 20, 30]);
     }
 }

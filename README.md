@@ -213,9 +213,21 @@ Minkowski was built with Claude Code from the first commit. The development work
 - **16 slash commands** — `/design-doc` for feature planning, `/soundness-audit` for concurrency review, `/self-audit` for mutation path and visibility checks, `/perf-shakedown` for automated performance analysis, `/validate-api` and `/validate-macro` for correctness checks, `/pr` for PR creation, plus 9 domain-specific commands (`/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize`, `/minkowski:python`)
 - **Pre-commit hooks** — `cargo fmt` and `cargo clippy -D warnings` run automatically on every commit
 
-The commands teach the paradigm, not just the API — they encode the design principles and invariants that emerged across 26 PRs of iterative development.
+The commands teach the paradigm, not just the API — they encode the design principles and invariants that emerged across iterative development.
 
 ## Architecture Decision Records
+
+- Filtering is replaced by Bitset ANDing.
+- Queries don't plan because the memory layout is the plan.
+- Joins don't exist because archetypes are pre-joined.
+- Defragmentation is constant via swap-remove.
+- Vectorization is guaranteed via 64-byte aligned slices.
+- Persistence is zero-copy via rkyv + mmap.
+- Safety is compile-time via the split-phase transaction model.
+- ACID-lite: Atomicity and isolation via ChangeSet and split-phase transactions.
+- Indices: O(1) Entity Mapping, O(log N) Range-based and O(1) Archetype Bitsets.
+- Storage: 64-byte aligned, dense SoA with Zero-copy Persistence.
+- Execution: Hardware-native SSE via slice-based auto-vectorization.
 
 Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each records what was decided, what alternatives were considered, and what trade-offs were accepted. Every feature was designed before implementation — the design conversation catches semantic bugs (concurrent state corruption, entity ID leaks, lock privilege errors) that compilation and tests miss.
 
