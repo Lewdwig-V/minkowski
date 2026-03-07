@@ -127,6 +127,15 @@ fn alive_count(world: &mut World) -> usize {
         .count()
 }
 
+/// Write neighbor counts directly via `query_table_mut` — demonstrates
+/// mixed read/write named field access on a single row (read `row.state`,
+/// write `row.neighbors`) without tuple destructuring or archetype matching.
+fn write_neighbors_via_table(world: &mut World, counts: &[u8]) {
+    for (i, row) in world.query_table_mut::<Cell>().enumerate() {
+        *row.neighbors = NeighborCount(counts[i]);
+    }
+}
+
 /// Register a QueryMut reducer that writes pre-computed neighbor counts
 /// into the NeighborCount column. Demonstrates Table + reducer integration.
 fn register_write_neighbors(registry: &mut ReducerRegistry, world: &mut World) -> QueryReducerId {
@@ -183,10 +192,15 @@ fn main() {
     for gen in 0..GENERATIONS {
         let frame_start = Instant::now();
 
-        // Snapshot states, recount neighbors via QueryMut reducer
+        // Snapshot states, recount neighbors
         let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
-        registry.run(&mut world, write_neighbors_id, counts.clone());
+        // Alternate between reducer and query_table_mut to exercise both paths
+        if gen % 2 == 0 {
+            registry.run(&mut world, write_neighbors_id, counts.clone());
+        } else {
+            write_neighbors_via_table(&mut world, &counts);
+        }
 
         // Apply Conway rules via EnumChangeSet — automatic undo capture.
         // Uses EnumChangeSet directly (not a reducer) to capture reverse

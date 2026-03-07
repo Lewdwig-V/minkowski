@@ -289,6 +289,9 @@ Each example demonstrates specific patterns. Read the source for concrete API us
 | `battle` | EntityMut reducers, rayon parallel snapshot computation, sequential dispatch, tunable conflict rates | `examples/examples/battle.rs` |
 | `persist` | QueryWriter + Durable, WAL, rkyv snapshots, zero-copy load, crash recovery | `examples/examples/persist.rs` |
 | `index` | BTreeIndex range queries, HashIndex exact lookups, incremental update, batch fetch | `examples/examples/index.rs` |
+| `flatworm` | SpatialIndex (FoodGrid), chemotaxis, CommandBuffer spawn/despawn, entity lifecycle (fission + starvation), query reducers | `examples/examples/flatworm.rs` |
+| `circuit` | Entity-based circuit topology (node connectivity), query reducers (QueryMut, QueryRef), symplectic Euler integration, ReducerRegistry scheduling | `examples/examples/circuit.rs` |
+| `tactical` | Sparse components (insert_sparse, iter_sparse), par_for_each, Optimistic Conflict inspection, Entity::to_bits/from_bits, world introspection, register_entity_despawn, HashIndex get_valid(), EnumChangeSet/MutationRef iteration, multi-threaded replication | `examples/examples/tactical.rs` |
 
 ### Pattern Quick-Find
 
@@ -298,16 +301,27 @@ Each example demonstrates specific patterns. Read the source for concrete API us
 - **Spawner reducer:** `reducer.rs` lines 82-89 (`register_spawner`)
 - **QueryWriter with WritableRef:** `reducer.rs` lines 141-149 (`register_query_writer`)
 - **Dynamic reducer with builder:** `reducer.rs` lines 185-215 (`registry.dynamic()`)
-- **Dynamic for_each + despawn:** `reducer.rs` lines 255-270 (reaper pattern)
+- **Dynamic for_each + despawn:** `reducer.rs` lines 253-270 (reaper pattern)
 - **Name-based reducer lookup:** `reducer.rs` lines 166-171 (`reducer_id_by_name`)
 - **Conflict detection:** `reducer.rs` lines 282-355 (`conflicts_with`)
 - **SpatialIndex trait impl:** `boids.rs` (SpatialGrid), `nbody.rs` (BarnesHutTree)
-- **Table derive + query_table:** `life.rs`
+- **Table derive + query_table / query_table_mut:** `life.rs` (named field access via CellRef/CellMut)
 - **Durable transactions:** `persist.rs`
 - **Parallel dispatch with rayon:** `battle.rs`
 - **BTreeIndex range + HashIndex exact:** `index.rs` lines 40-63
-- **Incremental index update (ChangeTick):** `index.rs` lines 65-89
-- **Index -> get_batch composition:** `index.rs` lines 110-137
+- **Incremental index update (ChangeTick):** `index.rs` lines 71-89
+- **Stale index validation (range_valid, get_valid):** `index.rs` lines 104-119
+- **Index -> get_batch / get_batch_mut composition:** `index.rs` lines 128-161
+- **SpatialIndex + CommandBuffer lifecycle:** `flatworm.rs` (FoodGrid, fission spawn, starvation despawn)
+- **Entity-based circuit connectivity:** `circuit.rs` (nodes as entities, elements reference node Entity handles)
+- **Sparse component lifecycle:** `tactical.rs` (insert_sparse for MoveOrder/IntelReport, iter_sparse for intel queries)
+- **Entity bit packing for serialization:** `tactical.rs` (to_bits in commands, from_bits in replication)
+- **EnumChangeSet as replication journal:** `tactical.rs` (iter_mutations + MutationRef pattern matching)
+- **Optimistic Conflict inspection:** `tactical.rs` (catch Err(Conflict), display_with)
+- **World introspection (archetype/component metadata):** `tactical.rs`
+- **HashIndex stale filtering:** `tactical.rs` (get_valid after despawns)
+- **par_for_each parallel iteration:** `tactical.rs` (position clamping pass)
+- **register_entity_despawn:** `tactical.rs` (combat cleanup reducer)
 
 ## Common Patterns
 

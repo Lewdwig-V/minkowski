@@ -25,4 +25,4 @@ Crash-safe persistence requires durability guarantees without serializing the en
 - Schema changes (new component types) require migration since codecs are registered per ComponentId
 - Snapshot + WAL sequence number enables point-in-time recovery
 - `EnumChangeSet` is the serialization unit — the same type used for transactions and undo/redo
-- `sync_reserved()` must be called after snapshot restore to prevent entity ID collisions with `reserve()`
+- `sync_reserved()` must be called after snapshot restore to prevent entity ID collisions with `reserve()

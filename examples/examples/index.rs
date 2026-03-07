@@ -101,8 +101,26 @@ fn main() {
     assert!(!world.is_alive(stale[0]));
     println!("  Stale entry present, is_alive = false");
 
-    // Rebuild cleans up
+    // range_valid / get_valid: filter stale entries without a full rebuild
+    let valid_range: Vec<_> = btree
+        .range_valid(Score(victim_score)..=Score(victim_score), &world)
+        .collect();
+    assert!(valid_range.is_empty());
+    println!(
+        "  range_valid filters stale entry (found {})",
+        valid_range.len()
+    );
+
+    let valid_hash: Vec<_> = hash.get_valid(&Score(victim_score), &world).collect();
+    assert!(valid_hash.is_empty());
+    println!(
+        "  hash get_valid filters stale entry (found {})",
+        valid_hash.len()
+    );
+
+    // Rebuild cleans up permanently
     btree.rebuild(&mut world);
+    hash.rebuild(&mut world);
     assert!(btree.get(&Score(victim_score)).is_empty());
     println!("  After rebuild: stale entry cleaned up");
     println!();
@@ -133,6 +151,18 @@ fn main() {
     println!(
         "  {} with Name component, {} without (different archetypes)",
         named, unnamed
+    );
+
+    // Batch mutable access — boost scores by 100 in one call
+    let mut scores_mut = world.get_batch_mut::<Score>(&low_scores);
+    for score in scores_mut.iter_mut().flatten() {
+        score.0 += 100;
+    }
+    drop(scores_mut);
+    let boosted = world.get::<Score>(low_scores[0]).unwrap().0;
+    println!(
+        "  After get_batch_mut boost: first entity score = {}",
+        boosted
     );
     println!();
 
