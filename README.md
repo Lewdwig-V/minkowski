@@ -10,7 +10,7 @@ The core insight: archetype-based column storage is already a columnar database.
 
 ## Quick start
 
-> 💡 **Working with Claude Code?** The auto-triggering skill (`minkowski-guide.md`) provides passive ECS expertise in every session. Use `/design-doc` to plan a new feature, `/soundness-audit` to review concurrency invariants, or `/validate-api` and `/validate-macro` for compile-time correctness checks. Eight domain commands — `/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize` — explain the paradigm in depth. See [AI-Assisted Development](#ai-assisted-development) for the full list.
+> 💡 **Working with Claude Code?** The auto-triggering skill (`minkowski-guide.md`) provides passive ECS expertise in every session. Use `/design-doc` to plan a new feature, `/soundness-audit` to review concurrency invariants, or `/validate-api` and `/validate-macro` for compile-time correctness checks. Nine domain commands — `/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize`, `/minkowski:python` — explain the paradigm in depth. See [AI-Assisted Development](#ai-assisted-development) for the full list.
 
 ```rust
 use minkowski::{World, ReducerRegistry, QueryMut};
@@ -174,12 +174,44 @@ Two implementations ship as examples: a [uniform grid][uniform-grid] for O(N*k) 
 | `circuit` | Analog circuit simulator: 555 astable oscillator → LCR bandpass filter → 741 voltage follower. Circuit nodes are entities with `Voltage` components; elements (resistors, inductors, op-amp) reference node entities for connectivity. Uses symplectic Euler integration for L/C elements, `QueryMut`/`QueryRef` reducers via `ReducerRegistry`, and prints an ASCII waveform of the filter output. 200K steps at 100 ns timestep. | `cargo run -p minkowski-examples --example circuit --release` |
 | `tactical` | Multi-operator tactical map with server-authoritative replication. Exercises 8 previously uncovered API gaps: sparse components (`insert_sparse`/`iter_sparse`), `par_for_each`, `Optimistic` transactions with `Conflict` inspection, `Entity::to_bits`/`from_bits` for wire serialization, world introspection (`archetype_count`, `component_name`), `register_entity_despawn`, `HashIndex::get_valid()` stale filtering, and `EnumChangeSet`/`MutationRef` iteration for replication packets. Two operator threads communicate with the server via `mpsc` channels. | `cargo run -p minkowski-examples --example tactical --release` |
 
+## Python / Jupyter Integration
+
+The `minkowski-py` crate exposes the ECS directly to Python via PyO3. Rust owns storage and computation; Python owns orchestration and analysis. Data crosses the boundary as Arrow RecordBatches — one `memcpy` from BlobVec into Arrow, then zero-copy into Polars DataFrames via `pyo3-arrow`.
+
+```python
+import minkowski_py as mk
+
+world = mk.World()
+registry = mk.ReducerRegistry(world)
+
+# Spawn entities with named components
+world.spawn("Position,Velocity", pos_x=1.0, pos_y=2.0, vel_x=0.5, vel_y=0.0)
+
+# Query → Polars DataFrame (one-copy + zero-copy)
+df = world.query("Position", "Velocity")
+
+# Call pre-compiled Rust reducers by name
+registry.run("boids_forces", world, world_size=500.0, sep_r=25.0)
+
+# Write modified data back into the ECS
+world.write_column("Position", entity_ids, pos_x=new_x, pos_y=new_y)
+```
+
+**Setup:**
+```bash
+cd crates/minkowski-py
+uv venv && uv pip install -e ".[dev]"
+maturin develop --release
+```
+
+9 registered component types and 5 Rust reducers (boids, gravity, life, movement) ship out of the box. Adding new components and reducers requires touching Rust code — see `/minkowski:python` for the step-by-step guide.
+
 ## AI-Assisted Development
 
 Minkowski was built with Claude Code from the first commit. The development workflow includes:
 
 - **Auto-triggering skill** (`minkowski-guide.md`) — provides passive expertise on the ECS paradigm whenever Claude Code works in this repo
-- **15 slash commands** — `/design-doc` for feature planning, `/soundness-audit` for concurrency review, `/self-audit` for mutation path and visibility checks, `/perf-shakedown` for automated performance analysis, `/validate-api` and `/validate-macro` for correctness checks, `/pr` for PR creation, plus 8 domain-specific commands (`/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize`)
+- **16 slash commands** — `/design-doc` for feature planning, `/soundness-audit` for concurrency review, `/self-audit` for mutation path and visibility checks, `/perf-shakedown` for automated performance analysis, `/validate-api` and `/validate-macro` for correctness checks, `/pr` for PR creation, plus 9 domain-specific commands (`/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize`, `/minkowski:python`)
 - **Pre-commit hooks** — `cargo fmt` and `cargo clippy -D warnings` run automatically on every commit
 
 The skills teach the paradigm, not just the API — they encode the design principles and invariants that emerged across 26 PRs of iterative development.

@@ -1,4 +1,5 @@
 /target
+**/target
 Cargo.lock
 .claude/settings.local.json
 .gitconfig
@@ -18,3 +19,11 @@ refs
 .bashrc
 .bash_profile
 .worktrees/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+crates/minkowski-py/**/*.so
+crates/minkowski-py/**/*.dylib
+.ipynb_checkpoints/
