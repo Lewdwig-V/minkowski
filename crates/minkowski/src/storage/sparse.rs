@@ -178,19 +178,22 @@ impl PagedSparseSet {
     }
 }
 
-// ── Legacy SparseStorage (Task 2 replaces this) ─────────────────────
+// ── SparseStorage: typed wrapper around PagedSparseSet ───────────────
 
-use std::any::Any;
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 
 use crate::component::{Component, ComponentId};
 
-/// Type-erased storage for sparse components. Each sparse ComponentId
-/// gets a `HashMap<Entity, T>` behind a `Box<dyn Any>`.
-///
-/// This will be replaced by a typed wrapper around `PagedSparseSet` in Task 2.
+unsafe fn drop_ptr<T>(ptr: *mut u8) {
+    std::ptr::drop_in_place(ptr as *mut T);
+}
+
+/// Typed sparse component storage backed by `PagedSparseSet`.
+/// Each `ComponentId` maps to a `PagedSparseSet` with the correct layout
+/// and drop function. No `dyn Any`, no `Box<HashMap>`.
 pub(crate) struct SparseStorage {
-    storages: HashMap<ComponentId, Box<dyn Any + Send + Sync>>,
+    storages: HashMap<ComponentId, PagedSparseSet>,
 }
 
 #[allow(dead_code)]
@@ -202,20 +205,24 @@ impl SparseStorage {
     }
 
     pub fn insert<T: Component>(&mut self, comp_id: ComponentId, entity: Entity, value: T) {
-        let map = self
-            .storages
-            .entry(comp_id)
-            .or_insert_with(|| Box::new(HashMap::<Entity, T>::new()))
-            .downcast_mut::<HashMap<Entity, T>>()
-            .expect("component type mismatch in sparse storage");
-        map.insert(entity, value);
+        let set = self.storages.entry(comp_id).or_insert_with(|| {
+            let drop_fn = if std::mem::needs_drop::<T>() {
+                Some(drop_ptr::<T> as unsafe fn(*mut u8))
+            } else {
+                None
+            };
+            PagedSparseSet::new(Layout::new::<T>(), drop_fn)
+        });
+        let mut value = ManuallyDrop::new(value);
+        unsafe {
+            set.insert(entity, &mut *value as *mut T as *const u8);
+        }
     }
 
     pub fn get<T: Component>(&self, comp_id: ComponentId, entity: Entity) -> Option<&T> {
-        self.storages
-            .get(&comp_id)?
-            .downcast_ref::<HashMap<Entity, T>>()?
-            .get(&entity)
+        let set = self.storages.get(&comp_id)?;
+        let ptr = set.get(entity)?;
+        Some(unsafe { &*(ptr as *const T) })
     }
 
     pub fn get_mut<T: Component>(
@@ -223,24 +230,24 @@ impl SparseStorage {
         comp_id: ComponentId,
         entity: Entity,
     ) -> Option<&mut T> {
-        self.storages
-            .get_mut(&comp_id)?
-            .downcast_mut::<HashMap<Entity, T>>()?
-            .get_mut(&entity)
+        let set = self.storages.get(&comp_id)?;
+        let ptr = set.get_mut(entity)?;
+        Some(unsafe { &mut *(ptr as *mut T) })
     }
 
+    #[allow(clippy::extra_unused_type_parameters)]
     pub fn contains<T: Component>(&self, comp_id: ComponentId, entity: Entity) -> bool {
         self.storages
             .get(&comp_id)
-            .and_then(|s| s.downcast_ref::<HashMap<Entity, T>>())
-            .is_some_and(|m| m.contains_key(&entity))
+            .is_some_and(|set| set.contains(entity))
     }
 
     pub fn remove<T: Component>(&mut self, comp_id: ComponentId, entity: Entity) -> Option<T> {
-        self.storages
-            .get_mut(&comp_id)?
-            .downcast_mut::<HashMap<Entity, T>>()?
-            .remove(&entity)
+        let set = self.storages.get_mut(&comp_id)?;
+        let ptr = set.get(entity)?;
+        let value = unsafe { std::ptr::read(ptr as *const T) };
+        set.remove_no_drop(entity);
+        Some(value)
     }
 
     /// Returns the ComponentIds that have sparse storage allocated.
@@ -253,11 +260,19 @@ impl SparseStorage {
         &self,
         comp_id: ComponentId,
     ) -> Option<impl Iterator<Item = (Entity, &T)>> {
-        let map = self
-            .storages
-            .get(&comp_id)?
-            .downcast_ref::<HashMap<Entity, T>>()?;
-        Some(map.iter().map(|(&e, v)| (e, v)))
+        let set = self.storages.get(&comp_id)?;
+        let mut items = Vec::with_capacity(set.len());
+        set.iter(|entity, ptr| {
+            items.push((entity, unsafe { &*(ptr as *const T) }));
+        });
+        Some(items.into_iter())
+    }
+
+    /// Removes the entity from all sparse component sets.
+    pub fn remove_all(&mut self, entity: Entity) {
+        for set in self.storages.values_mut() {
+            set.remove(entity);
+        }
     }
 }
 
@@ -395,5 +410,60 @@ mod tests {
             assert_eq!(collected[i].0, e);
             assert_eq!(collected[i].1, (i as u32) * 10);
         }
+    }
+
+    // ── SparseStorage tests ─────────────────────────────────────────
+
+    #[derive(Debug, PartialEq)]
+    struct Marker(u32);
+
+    #[test]
+    fn sparse_storage_insert_and_get() {
+        let mut storage = SparseStorage::new();
+        let e = Entity::new(0, 0);
+        storage.insert::<Marker>(0, e, Marker(42));
+        assert_eq!(storage.get::<Marker>(0, e), Some(&Marker(42)));
+    }
+
+    #[test]
+    fn sparse_storage_get_missing() {
+        let storage = SparseStorage::new();
+        let e = Entity::new(0, 0);
+        assert_eq!(storage.get::<Marker>(0, e), None);
+    }
+
+    #[test]
+    fn sparse_storage_remove() {
+        let mut storage = SparseStorage::new();
+        let e = Entity::new(0, 0);
+        storage.insert::<Marker>(0, e, Marker(42));
+        let removed = storage.remove::<Marker>(0, e);
+        assert_eq!(removed, Some(Marker(42)));
+        assert_eq!(storage.get::<Marker>(0, e), None);
+    }
+
+    #[test]
+    fn sparse_storage_component_ids_and_iter() {
+        let mut storage = SparseStorage::new();
+        let e1 = Entity::new(0, 0);
+        let e2 = Entity::new(1, 0);
+        storage.insert::<u32>(0, e1, 42u32);
+        storage.insert::<u32>(0, e2, 99u32);
+        let ids = storage.component_ids();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], 0);
+        let entries: Vec<_> = storage.iter::<u32>(0).unwrap().collect();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn sparse_storage_remove_all() {
+        let mut storage = SparseStorage::new();
+        let e = Entity::new(0, 0);
+        storage.insert::<u32>(0, e, 42u32);
+        storage.insert::<Marker>(1, e, Marker(99));
+        storage.remove_all(e);
+        assert_eq!(storage.get::<u32>(0, e), None);
+        assert_eq!(storage.get::<Marker>(1, e), None);
     }
 }
