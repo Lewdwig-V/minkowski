@@ -3516,4 +3516,92 @@ mod tests {
         }
         assert!(found);
     }
+
+    // ── Coverage tests ──────────────────────────────────────────────
+
+    #[test]
+    fn entity_ref_entity_accessor() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+
+        registry.register_entity::<(Pos,), (), _>(
+            &mut world,
+            "check_entity",
+            move |entity: EntityMut<'_, (Pos,)>, ()| {
+                assert_eq!(entity.entity(), e);
+                let _ = entity.get::<Pos, 0>();
+            },
+        );
+        let id = registry.reducer_id_by_name("check_entity").unwrap();
+        registry.call(&strategy, &mut world, id, (e, ())).unwrap();
+    }
+
+    #[test]
+    fn query_mut_for_each_chunk() {
+        let mut world = World::new();
+        for i in 0..5 {
+            world.spawn((Pos(i as f32),));
+        }
+        let mut registry = ReducerRegistry::new();
+        registry.register_query::<(&Pos,), (), _>(
+            &mut world,
+            "chunk_iter",
+            |mut query: QueryMut<'_, (&Pos,)>, ()| {
+                let mut count = 0;
+                query.for_each_chunk(|chunk| {
+                    count += chunk.0.len();
+                });
+                assert_eq!(count, 5);
+            },
+        );
+        let id = registry.query_reducer_id_by_name("chunk_iter").unwrap();
+        registry.run(&mut world, id, ());
+    }
+
+    #[test]
+    fn reducer_id_index() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry.register_entity::<(Pos,), (), _>(
+            &mut world,
+            "idx_test",
+            |_entity: EntityMut<'_, (Pos,)>, ()| {},
+        );
+        assert_eq!(id.index(), 0);
+
+        let qid = registry.register_query::<(&Pos,), (), _>(
+            &mut world,
+            "qidx_test",
+            |_query: QueryMut<'_, (&Pos,)>, ()| {},
+        );
+        assert_eq!(qid.index(), 1); // shares the reducers vec
+    }
+
+    #[test]
+    fn reducer_registry_access_methods() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry.register_entity::<(Pos,), (), _>(
+            &mut world,
+            "access_test",
+            |_entity: EntityMut<'_, (Pos,)>, ()| {},
+        );
+        let qid = registry.register_query::<(&mut Pos,), (), _>(
+            &mut world,
+            "qaccess_test",
+            |_query: QueryMut<'_, (&mut Pos,)>, ()| {},
+        );
+
+        let access = registry.access(id.index());
+        assert!(access.has_any_access());
+        let qaccess = registry.query_reducer_access(qid);
+        assert!(qaccess.has_any_access());
+    }
+
+    #[test]
+    fn reducer_registry_default() {
+        let _registry: ReducerRegistry = Default::default();
+    }
 }

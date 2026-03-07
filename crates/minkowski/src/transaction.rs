@@ -1193,4 +1193,135 @@ mod tests {
         // Verify Conflict implements std::error::Error (compiles = passes)
         let _: &dyn std::error::Error = &conflict;
     }
+
+    #[test]
+    fn conflict_display_with_empty_names() {
+        let world = World::new();
+        let conflict = Conflict {
+            component_ids: FixedBitSet::new(),
+        };
+        let msg = conflict.display_with(&world);
+        // No registered components → falls back to Display impl
+        assert!(
+            msg.contains("component columns"),
+            "should use Display fallback: {msg}"
+        );
+    }
+
+    // ── Tx method coverage ──────────────────────────────────────────
+
+    #[test]
+    fn tx_read_returns_component() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(42.0),));
+        let access = Access::of::<(&Pos,)>(&mut world);
+        let strategy = Optimistic::new(&world);
+        strategy
+            .transact(&mut world, &access, |tx, world| {
+                let p = tx.read::<Pos>(world, e);
+                assert_eq!(p.unwrap().0, 42.0);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn tx_remove_buffers_removal() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let access = Access::of::<(&mut Pos, &mut Vel)>(&mut world);
+        let strategy = Optimistic::new(&world);
+        strategy
+            .transact(&mut world, &access, |tx, world| {
+                tx.remove::<Vel>(world, e);
+            })
+            .unwrap();
+        assert!(world.get::<Vel>(e).is_none());
+        assert!(world.get::<Pos>(e).is_some());
+    }
+
+    #[test]
+    fn tx_has_locks_false_for_optimistic() {
+        let mut world = World::new();
+        let access = Access::of::<(&Pos,)>(&mut world);
+        let strategy = Optimistic::new(&world);
+        strategy
+            .transact(&mut world, &access, |tx, _world| {
+                assert!(!tx.has_locks());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn tx_has_locks_true_for_pessimistic() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+        let strategy = Pessimistic::new(&world);
+        strategy
+            .transact(&mut world, &access, |tx, _world| {
+                assert!(tx.has_locks());
+            })
+            .unwrap();
+    }
+
+    // ── SequentialTx method coverage ────────────────────────────────
+
+    #[test]
+    fn sequential_tx_insert_remove_get_mut() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos, &mut Vel)>(&mut world);
+
+        let strategy = Sequential;
+        let mut tx = strategy.begin(&mut world, &access);
+        tx.insert(&mut world, e, Vel(5.0));
+        assert!(world.get::<Vel>(e).is_some());
+
+        {
+            let p = tx.get_mut::<Pos>(&mut world, e).unwrap();
+            p.0 = 99.0;
+        }
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 99.0);
+
+        tx.remove::<Vel>(&mut world, e);
+        assert!(world.get::<Vel>(e).is_none());
+
+        assert!(tx.commit(&mut world).is_ok());
+    }
+
+    #[test]
+    fn sequential_tx_despawn() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+
+        let strategy = Sequential;
+        let mut tx = strategy.begin(&mut world, &access);
+        assert!(tx.despawn(&mut world, e));
+        assert!(!world.is_alive(e));
+        assert!(tx.commit(&mut world).is_ok());
+    }
+
+    // ── Pessimistic retry coverage ──────────────────────────────────
+
+    #[test]
+    fn pessimistic_exhausted_retries_returns_conflict() {
+        // Single retry with a failing lock scenario: two overlapping accesses
+        // on the same strategy instance. We simulate exhaustion by using
+        // max_retries=1 and forcing the lock to be held.
+        use std::sync::Arc;
+
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+        let strategy = Arc::new(Pessimistic::with_retries(&world, 1));
+
+        // Hold locks via begin(), then try to transact — should exhaust retries
+        let tx = strategy.begin(&mut world, &access);
+        assert!(tx.has_locks());
+
+        let result = strategy.transact(&mut world, &access, |_tx, _world| {});
+        assert!(result.is_err(), "should fail with locks held");
+        drop(tx);
+    }
 }
