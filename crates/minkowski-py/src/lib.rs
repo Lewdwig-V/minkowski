@@ -1,12 +1,19 @@
 //! Python bindings for the Minkowski ECS engine.
 //!
-//! Exposes a high-level `Simulation` API that manages a [`World`] internally
-//! and exports entity state as Apache Arrow arrays for zero-copy handoff to
-//! Polars / pandas / NumPy in Python.
+//! Exposes simulation classes (`BoidsSim`, `NBodySim`, `LifeSim`) that each
+//! manage a [`World`] internally and export entity state as Apache Arrow
+//! columnar tables for efficient handoff to Polars / pandas / NumPy in Python.
 //!
 //! Build with maturin: `cd crates/minkowski-py && maturin develop --release`
 
+// world.query() requires &mut World for cache mutation, so to_arrow/to_polars
+// must take &mut self despite being logically read-only.
+#![allow(clippy::wrong_self_convention)]
+// The 5-tuple history type is clear with its inline comment.
+#![allow(clippy::type_complexity)]
+
 use minkowski::{Entity, World};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 // ── Components ──────────────────────────────────────────────────────
@@ -34,9 +41,6 @@ struct Mass(f32);
 
 #[derive(Clone, Copy)]
 struct CellState(bool);
-
-#[derive(Clone, Copy)]
-struct NeighborCount(u8);
 
 // ── Vec2 helpers ────────────────────────────────────────────────────
 
@@ -76,6 +80,60 @@ fn wrapped_diff(a: f32, b: f32, world_size: f32) -> f32 {
     } else {
         d
     }
+}
+
+fn wrap_position(pos: &mut Position, world_size: f32) {
+    pos.x = pos.x.rem_euclid(world_size);
+    pos.y = pos.y.rem_euclid(world_size);
+}
+
+// ── Arrow / Polars helpers ─────────────────────────────────────────
+
+/// Build a PyArrow table from parallel column vectors.
+/// `columns` is a list of (name, pyarrow_array) pairs.
+fn build_arrow_table<'py>(
+    py: Python<'py>,
+    names: &[&str],
+    arrays: Vec<Bound<'py, PyAny>>,
+) -> PyResult<PyObject> {
+    let pyarrow = py.import("pyarrow")?;
+    let name_list: Vec<&str> = names.to_vec();
+    let table = pyarrow.call_method1("table", (arrays, name_list))?;
+    Ok(table.into())
+}
+
+/// Convert a PyArrow table to a Polars DataFrame.
+fn arrow_to_polars(py: Python<'_>, arrow_table: &PyObject) -> PyResult<PyObject> {
+    let polars = py.import("polars")?;
+    let df_class = polars.getattr("DataFrame")?;
+    let df = df_class.call1((arrow_table,))?;
+    Ok(df.into())
+}
+
+/// Create a pyarrow array from a Vec.
+fn pa_array<'py, T: IntoPyObject<'py>>(py: Python<'py>, data: T) -> PyResult<Bound<'py, PyAny>> {
+    let pyarrow = py.import("pyarrow")?;
+    pyarrow.call_method1("array", (data,))
+}
+
+// ── Input validation ───────────────────────────────────────────────
+
+fn validate_positive(name: &str, value: f32) -> PyResult<()> {
+    if value <= 0.0 || !value.is_finite() {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be a positive finite number (got {value})"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_non_negative(name: &str, value: f32) -> PyResult<()> {
+    if value < 0.0 || !value.is_finite() {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be a non-negative finite number (got {value})"
+        )));
+    }
+    Ok(())
 }
 
 // ── Boids Simulation ────────────────────────────────────────────────
@@ -147,7 +205,18 @@ impl BoidsSim {
         max_speed: f32,
         max_force: f32,
         dt: f32,
-    ) -> Self {
+    ) -> PyResult<Self> {
+        validate_positive("world_size", world_size)?;
+        validate_positive("separation_radius", separation_radius)?;
+        validate_positive("alignment_radius", alignment_radius)?;
+        validate_positive("cohesion_radius", cohesion_radius)?;
+        validate_non_negative("separation_weight", separation_weight)?;
+        validate_non_negative("alignment_weight", alignment_weight)?;
+        validate_non_negative("cohesion_weight", cohesion_weight)?;
+        validate_positive("max_speed", max_speed)?;
+        validate_positive("max_force", max_force)?;
+        validate_positive("dt", dt)?;
+
         let params = BoidsParams {
             separation_radius,
             alignment_radius,
@@ -168,10 +237,7 @@ impl BoidsSim {
             let angle = fastrand::f32() * std::f32::consts::TAU;
             let speed = fastrand::f32() * max_speed;
             world.spawn((
-                Position {
-                    x,
-                    y,
-                },
+                Position { x, y },
                 Velocity {
                     x: angle.cos() * speed,
                     y: angle.sin() * speed,
@@ -180,12 +246,12 @@ impl BoidsSim {
             ));
         }
 
-        BoidsSim {
+        Ok(BoidsSim {
             world,
             params,
             frame: 0,
             history: Vec::new(),
-        }
+        })
     }
 
     /// Advance the simulation by `steps` frames, optionally recording history.
@@ -213,59 +279,54 @@ impl BoidsSim {
     /// Export current state as a PyArrow table with columns:
     /// entity_id, pos_x, pos_y, vel_x, vel_y, acc_x, acc_y
     fn to_arrow(&mut self, py: Python<'_>) -> PyResult<PyObject> {
-        let data: Vec<(u64, f32, f32, f32, f32, f32, f32)> = self
+        let mut ids = Vec::new();
+        let mut px = Vec::new();
+        let mut py_vec = Vec::new();
+        let mut vx = Vec::new();
+        let mut vy = Vec::new();
+        let mut ax = Vec::new();
+        let mut ay = Vec::new();
+
+        for (e, p, v, a) in self
             .world
             .query::<(Entity, &Position, &Velocity, &Acceleration)>()
-            .map(|(e, p, v, a)| (e.to_bits(), p.x, p.y, v.x, v.y, a.x, a.y))
-            .collect();
-
-        let n = data.len();
-        let mut ids = Vec::with_capacity(n);
-        let mut px = Vec::with_capacity(n);
-        let mut py_vec = Vec::with_capacity(n);
-        let mut vx = Vec::with_capacity(n);
-        let mut vy = Vec::with_capacity(n);
-        let mut ax = Vec::with_capacity(n);
-        let mut ay = Vec::with_capacity(n);
-
-        for (id, x, y, velx, vely, accx, accy) in &data {
-            ids.push(*id);
-            px.push(*x);
-            py_vec.push(*y);
-            vx.push(*velx);
-            vy.push(*vely);
-            ax.push(*accx);
-            ay.push(*accy);
+        {
+            ids.push(e.to_bits());
+            px.push(p.x);
+            py_vec.push(p.y);
+            vx.push(v.x);
+            vy.push(v.y);
+            ax.push(a.x);
+            ay.push(a.y);
         }
 
-        let pyarrow = py.import("pyarrow")?;
-        let pa_ids = pyarrow.call_method1("array", (ids,))?;
-        let pa_px = pyarrow.call_method1("array", (px,))?;
-        let pa_py = pyarrow.call_method1("array", (py_vec,))?;
-        let pa_vx = pyarrow.call_method1("array", (vx,))?;
-        let pa_vy = pyarrow.call_method1("array", (vy,))?;
-        let pa_ax = pyarrow.call_method1("array", (ax,))?;
-        let pa_ay = pyarrow.call_method1("array", (ay,))?;
-
-        let table = pyarrow.call_method1(
-            "table",
-            (
-                vec![pa_ids, pa_px, pa_py, pa_vx, pa_vy, pa_ax, pa_ay],
-                vec![
-                    "entity_id", "pos_x", "pos_y", "vel_x", "vel_y", "acc_x", "acc_y",
-                ],
-            ),
-        )?;
-
-        Ok(table.into())
+        build_arrow_table(
+            py,
+            &[
+                "entity_id",
+                "pos_x",
+                "pos_y",
+                "vel_x",
+                "vel_y",
+                "acc_x",
+                "acc_y",
+            ],
+            vec![
+                pa_array(py, ids)?,
+                pa_array(py, px)?,
+                pa_array(py, py_vec)?,
+                pa_array(py, vx)?,
+                pa_array(py, vy)?,
+                pa_array(py, ax)?,
+                pa_array(py, ay)?,
+            ],
+        )
     }
 
     /// Export current state as a Polars DataFrame.
     fn to_polars(&mut self, py: Python<'_>) -> PyResult<PyObject> {
         let arrow_table = self.to_arrow(py)?;
-        let polars = py.import("polars")?;
-        let df = polars.call_method1("from_arrow", (arrow_table,))?;
-        Ok(df.into())
+        arrow_to_polars(py, &arrow_table)
     }
 
     /// Return recorded history as a Polars DataFrame with columns:
@@ -278,8 +339,9 @@ impl BoidsSim {
         let mut vy = Vec::new();
 
         for (frame_idx, snapshot) in self.history.iter().enumerate() {
+            let frame = frame_idx as u64;
             for &(x, y, velx, vely) in snapshot {
-                frames.push(frame_idx as u32);
+                frames.push(frame);
                 px.push(x);
                 py_vec.push(y);
                 vx.push(velx);
@@ -287,24 +349,18 @@ impl BoidsSim {
             }
         }
 
-        let pyarrow = py.import("pyarrow")?;
-        let pa_frames = pyarrow.call_method1("array", (frames,))?;
-        let pa_px = pyarrow.call_method1("array", (px,))?;
-        let pa_py = pyarrow.call_method1("array", (py_vec,))?;
-        let pa_vx = pyarrow.call_method1("array", (vx,))?;
-        let pa_vy = pyarrow.call_method1("array", (vy,))?;
-
-        let arrow_table = pyarrow.call_method1(
-            "table",
-            (
-                vec![pa_frames, pa_px, pa_py, pa_vx, pa_vy],
-                vec!["frame", "pos_x", "pos_y", "vel_x", "vel_y"],
-            ),
+        let arrow_table = build_arrow_table(
+            py,
+            &["frame", "pos_x", "pos_y", "vel_x", "vel_y"],
+            vec![
+                pa_array(py, frames)?,
+                pa_array(py, px)?,
+                pa_array(py, py_vec)?,
+                pa_array(py, vx)?,
+                pa_array(py, vy)?,
+            ],
         )?;
-
-        let polars = py.import("polars")?;
-        let df = polars.call_method1("from_arrow", (arrow_table,))?;
-        Ok(df.into())
+        arrow_to_polars(py, &arrow_table)
     }
 
     /// Clear recorded history to free memory.
@@ -413,13 +469,16 @@ impl BoidsSim {
             forces.push((fx, fy));
         }
 
-        // Apply forces
-        let mut i = 0usize;
-        for (acc, vel, pos) in
-            self.world
-                .query::<(&mut Acceleration, &mut Velocity, &mut Position)>()
+        // Apply forces — zip with forces to avoid index-out-of-bounds if
+        // snapshot and query iteration ever diverge.
+        let mut force_iter = forces.into_iter();
+        for (acc, vel, pos) in self
+            .world
+            .query::<(&mut Acceleration, &mut Velocity, &mut Position)>()
         {
-            let (fx, fy) = forces[i];
+            let (fx, fy) = force_iter
+                .next()
+                .expect("force count must match entity count");
             acc.x += fx;
             acc.y += fy;
 
@@ -431,18 +490,7 @@ impl BoidsSim {
 
             pos.x += vel.x * params.dt;
             pos.y += vel.y * params.dt;
-            let ws = params.world_size;
-            if pos.x >= ws {
-                pos.x -= ws;
-            } else if pos.x < 0.0 {
-                pos.x += ws;
-            }
-            if pos.y >= ws {
-                pos.y -= ws;
-            } else if pos.y < 0.0 {
-                pos.y += ws;
-            }
-            i += 1;
+            wrap_position(pos, params.world_size);
         }
     }
 
@@ -466,28 +514,29 @@ struct NBodySim {
     softening: f32,
     dt: f32,
     frame: usize,
-    history: Vec<Vec<(f32, f32, f32)>>, // (x, y, mass) per frame
+    history: Vec<Vec<(f32, f32, f32, f32, f32)>>, // (x, y, vx, vy, mass) per frame
 }
 
 #[pymethods]
 impl NBodySim {
     #[new]
     #[pyo3(signature = (n = 500, world_size = 500.0, g = 0.06674, softening = 1.0, dt = 0.001))]
-    fn new(n: usize, world_size: f32, g: f32, softening: f32, dt: f32) -> Self {
+    fn new(n: usize, world_size: f32, g: f32, softening: f32, dt: f32) -> PyResult<Self> {
+        validate_positive("world_size", world_size)?;
+        validate_positive("softening", softening)?;
+        validate_positive("dt", dt)?;
+        validate_non_negative("g", g)?;
+
         let mut world = World::new();
         for _ in 0..n {
             let x = fastrand::f32() * world_size;
             let y = fastrand::f32() * world_size;
             let vx = (fastrand::f32() - 0.5) * 10.0;
             let vy = (fastrand::f32() - 0.5) * 10.0;
-            world.spawn((
-                Position { x, y },
-                Velocity { x: vx, y: vy },
-                Mass(1.0),
-            ));
+            world.spawn((Position { x, y }, Velocity { x: vx, y: vy }, Mass(1.0)));
         }
 
-        NBodySim {
+        Ok(NBodySim {
             world,
             world_size,
             g,
@@ -495,9 +544,10 @@ impl NBodySim {
             dt,
             frame: 0,
             history: Vec::new(),
-        }
+        })
     }
 
+    /// Advance the simulation by `steps` frames, optionally recording history.
     #[pyo3(signature = (steps = 1, record = false))]
     fn step(&mut self, steps: usize, record: bool) {
         for _ in 0..steps {
@@ -509,98 +559,93 @@ impl NBodySim {
         }
     }
 
+    /// Return the current frame number.
     fn current_frame(&self) -> usize {
         self.frame
     }
 
+    /// Return the current entity count.
     fn entity_count(&mut self) -> usize {
         self.world.query::<&Position>().count()
     }
 
+    /// Export current state as a PyArrow table with columns:
+    /// entity_id, pos_x, pos_y, vel_x, vel_y, mass
     fn to_arrow(&mut self, py: Python<'_>) -> PyResult<PyObject> {
-        let data: Vec<(u64, f32, f32, f32, f32, f32)> = self
-            .world
-            .query::<(Entity, &Position, &Velocity, &Mass)>()
-            .map(|(e, p, v, m)| (e.to_bits(), p.x, p.y, v.x, v.y, m.0))
-            .collect();
+        let mut ids = Vec::new();
+        let mut px = Vec::new();
+        let mut py_vec = Vec::new();
+        let mut vx = Vec::new();
+        let mut vy = Vec::new();
+        let mut mass = Vec::new();
 
-        let n = data.len();
-        let mut ids = Vec::with_capacity(n);
-        let mut px = Vec::with_capacity(n);
-        let mut py_vec = Vec::with_capacity(n);
-        let mut vx = Vec::with_capacity(n);
-        let mut vy = Vec::with_capacity(n);
-        let mut mass = Vec::with_capacity(n);
-
-        for &(id, x, y, velx, vely, m) in &data {
-            ids.push(id);
-            px.push(x);
-            py_vec.push(y);
-            vx.push(velx);
-            vy.push(vely);
-            mass.push(m);
+        for (e, p, v, m) in self.world.query::<(Entity, &Position, &Velocity, &Mass)>() {
+            ids.push(e.to_bits());
+            px.push(p.x);
+            py_vec.push(p.y);
+            vx.push(v.x);
+            vy.push(v.y);
+            mass.push(m.0);
         }
 
-        let pyarrow = py.import("pyarrow")?;
-        let table = pyarrow.call_method1(
-            "table",
-            (
-                vec![
-                    pyarrow.call_method1("array", (ids,))?,
-                    pyarrow.call_method1("array", (px,))?,
-                    pyarrow.call_method1("array", (py_vec,))?,
-                    pyarrow.call_method1("array", (vx,))?,
-                    pyarrow.call_method1("array", (vy,))?,
-                    pyarrow.call_method1("array", (mass,))?,
-                ],
-                vec!["entity_id", "pos_x", "pos_y", "vel_x", "vel_y", "mass"],
-            ),
-        )?;
-
-        Ok(table.into())
+        build_arrow_table(
+            py,
+            &["entity_id", "pos_x", "pos_y", "vel_x", "vel_y", "mass"],
+            vec![
+                pa_array(py, ids)?,
+                pa_array(py, px)?,
+                pa_array(py, py_vec)?,
+                pa_array(py, vx)?,
+                pa_array(py, vy)?,
+                pa_array(py, mass)?,
+            ],
+        )
     }
 
+    /// Export current state as a Polars DataFrame.
     fn to_polars(&mut self, py: Python<'_>) -> PyResult<PyObject> {
         let arrow_table = self.to_arrow(py)?;
-        let polars = py.import("polars")?;
-        let df = polars.call_method1("from_arrow", (arrow_table,))?;
-        Ok(df.into())
+        arrow_to_polars(py, &arrow_table)
     }
 
+    /// Return recorded history as a Polars DataFrame with columns:
+    /// frame, pos_x, pos_y, vel_x, vel_y, mass
     fn history_to_polars(&self, py: Python<'_>) -> PyResult<PyObject> {
         let mut frames = Vec::new();
         let mut px = Vec::new();
         let mut py_vec = Vec::new();
+        let mut vx = Vec::new();
+        let mut vy = Vec::new();
         let mut mass_vec = Vec::new();
 
         for (frame_idx, snapshot) in self.history.iter().enumerate() {
-            for &(x, y, m) in snapshot {
-                frames.push(frame_idx as u32);
+            let frame = frame_idx as u64;
+            for &(x, y, velx, vely, m) in snapshot {
+                frames.push(frame);
                 px.push(x);
                 py_vec.push(y);
+                vx.push(velx);
+                vy.push(vely);
                 mass_vec.push(m);
             }
         }
 
-        let pyarrow = py.import("pyarrow")?;
-        let arrow_table = pyarrow.call_method1(
-            "table",
-            (
-                vec![
-                    pyarrow.call_method1("array", (frames,))?,
-                    pyarrow.call_method1("array", (px,))?,
-                    pyarrow.call_method1("array", (py_vec,))?,
-                    pyarrow.call_method1("array", (mass_vec,))?,
-                ],
-                vec!["frame", "pos_x", "pos_y", "mass"],
-            ),
+        let arrow_table = build_arrow_table(
+            py,
+            &["frame", "pos_x", "pos_y", "vel_x", "vel_y", "mass"],
+            vec![
+                pa_array(py, frames)?,
+                pa_array(py, px)?,
+                pa_array(py, py_vec)?,
+                pa_array(py, vx)?,
+                pa_array(py, vy)?,
+                pa_array(py, mass_vec)?,
+            ],
         )?;
-
-        let polars = py.import("polars")?;
-        let df = polars.call_method1("from_arrow", (arrow_table,))?;
-        Ok(df.into())
+        arrow_to_polars(py, &arrow_table)
     }
 
+    /// Clear recorded history to free memory.
     fn clear_history(&mut self) {
         self.history.clear();
     }
@@ -644,34 +689,27 @@ impl NBodySim {
 
         // Apply forces
         for &(entity, ax, ay) in &forces {
-            if let Some(vel) = self.world.get_mut::<Velocity>(entity) {
-                vel.x += ax * dt;
-                vel.y += ay * dt;
-            }
+            let vel = self
+                .world
+                .get_mut::<Velocity>(entity)
+                .expect("entity from snapshot must still exist");
+            vel.x += ax * dt;
+            vel.y += ay * dt;
         }
 
         // Integrate positions
         for (pos, vel) in self.world.query::<(&mut Position, &Velocity)>() {
             pos.x += vel.x * dt;
             pos.y += vel.y * dt;
-            if pos.x >= ws {
-                pos.x -= ws;
-            } else if pos.x < 0.0 {
-                pos.x += ws;
-            }
-            if pos.y >= ws {
-                pos.y -= ws;
-            } else if pos.y < 0.0 {
-                pos.y += ws;
-            }
+            wrap_position(pos, ws);
         }
     }
 
     fn record_snapshot(&mut self) {
-        let snap: Vec<(f32, f32, f32)> = self
+        let snap: Vec<(f32, f32, f32, f32, f32)> = self
             .world
-            .query::<(&Position, &Mass)>()
-            .map(|(p, m)| (p.x, p.y, m.0))
+            .query::<(&Position, &Velocity, &Mass)>()
+            .map(|(p, v, m)| (p.x, p.y, v.x, v.y, m.0))
             .collect();
         self.history.push(snap);
     }
@@ -693,27 +731,39 @@ struct LifeSim {
 impl LifeSim {
     #[new]
     #[pyo3(signature = (width = 64, height = 64, density = 0.45))]
-    fn new(width: usize, height: usize, density: f32) -> Self {
+    fn new(width: usize, height: usize, density: f32) -> PyResult<Self> {
+        if width == 0 || height == 0 {
+            return Err(PyValueError::new_err(
+                "width and height must be positive (got {width}x{height})",
+            ));
+        }
+        if !(0.0..=1.0).contains(&density) {
+            return Err(PyValueError::new_err(format!(
+                "density must be in [0.0, 1.0] (got {density})"
+            )));
+        }
+
         let mut world = World::new();
         let cell_count = width * height;
         let mut grid = Vec::with_capacity(cell_count);
 
         for _ in 0..cell_count {
             let alive = fastrand::f32() < density;
-            let e = world.spawn((CellState(alive), NeighborCount(0)));
+            let e = world.spawn((CellState(alive),));
             grid.push(e);
         }
 
-        LifeSim {
+        Ok(LifeSim {
             world,
             grid,
             width,
             height,
             generation: 0,
             history: Vec::new(),
-        }
+        })
     }
 
+    /// Advance by `steps` generations, optionally recording history.
     #[pyo3(signature = (steps = 1, record = false))]
     fn step(&mut self, steps: usize, record: bool) {
         for _ in 0..steps {
@@ -725,27 +775,31 @@ impl LifeSim {
         }
     }
 
+    /// Return the current generation number.
     fn current_generation(&self) -> usize {
         self.generation
     }
 
+    /// Return the number of alive cells.
     fn alive_count(&mut self) -> usize {
-        self.world
-            .query::<&CellState>()
-            .filter(|c| c.0)
-            .count()
+        self.world.query::<&CellState>().filter(|c| c.0).count()
     }
 
     /// Return the current grid as a flat list of booleans (row-major).
-    fn grid_state(&mut self) -> Vec<bool> {
+    fn grid_state(&self) -> Vec<bool> {
         self.grid
             .iter()
-            .map(|&e| self.world.get::<CellState>(e).map_or(false, |c| c.0))
+            .map(|&e| {
+                self.world
+                    .get::<CellState>(e)
+                    .expect("grid entity must be alive")
+                    .0
+            })
             .collect()
     }
 
-    /// Return grid as a Polars DataFrame with columns: row, col, alive
-    fn to_polars(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+    /// Export current grid as a PyArrow table with columns: row, col, alive
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<PyObject> {
         let mut rows = Vec::new();
         let mut cols = Vec::new();
         let mut alive = Vec::new();
@@ -753,29 +807,32 @@ impl LifeSim {
         for y in 0..self.height {
             for x in 0..self.width {
                 let e = self.grid[y * self.width + x];
-                let is_alive = self.world.get::<CellState>(e).map_or(false, |c| c.0);
+                let is_alive = self
+                    .world
+                    .get::<CellState>(e)
+                    .expect("grid entity must be alive")
+                    .0;
                 rows.push(y as u32);
                 cols.push(x as u32);
                 alive.push(is_alive);
             }
         }
 
-        let pyarrow = py.import("pyarrow")?;
-        let arrow_table = pyarrow.call_method1(
-            "table",
-            (
-                vec![
-                    pyarrow.call_method1("array", (rows,))?,
-                    pyarrow.call_method1("array", (cols,))?,
-                    pyarrow.call_method1("array", (alive,))?,
-                ],
-                vec!["row", "col", "alive"],
-            ),
-        )?;
+        build_arrow_table(
+            py,
+            &["row", "col", "alive"],
+            vec![
+                pa_array(py, rows)?,
+                pa_array(py, cols)?,
+                pa_array(py, alive)?,
+            ],
+        )
+    }
 
-        let polars = py.import("polars")?;
-        let df = polars.call_method1("from_arrow", (arrow_table,))?;
-        Ok(df.into())
+    /// Export current grid as a Polars DataFrame with columns: row, col, alive
+    fn to_polars(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let arrow_table = self.to_arrow(py)?;
+        arrow_to_polars(py, &arrow_table)
     }
 
     /// Return history as a Polars DataFrame with columns: generation, row, col, alive
@@ -786,9 +843,10 @@ impl LifeSim {
         let mut alive = Vec::new();
 
         for (gen_idx, snapshot) in self.history.iter().enumerate() {
+            let gen = gen_idx as u64;
             for y in 0..self.height {
                 for x in 0..self.width {
-                    gens.push(gen_idx as u32);
+                    gens.push(gen);
                     rows.push(y as u32);
                     cols.push(x as u32);
                     alive.push(snapshot[y * self.width + x]);
@@ -796,30 +854,25 @@ impl LifeSim {
             }
         }
 
-        let pyarrow = py.import("pyarrow")?;
-        let arrow_table = pyarrow.call_method1(
-            "table",
-            (
-                vec![
-                    pyarrow.call_method1("array", (gens,))?,
-                    pyarrow.call_method1("array", (rows,))?,
-                    pyarrow.call_method1("array", (cols,))?,
-                    pyarrow.call_method1("array", (alive,))?,
-                ],
-                vec!["generation", "row", "col", "alive"],
-            ),
+        let arrow_table = build_arrow_table(
+            py,
+            &["generation", "row", "col", "alive"],
+            vec![
+                pa_array(py, gens)?,
+                pa_array(py, rows)?,
+                pa_array(py, cols)?,
+                pa_array(py, alive)?,
+            ],
         )?;
-
-        let polars = py.import("polars")?;
-        let df = polars.call_method1("from_arrow", (arrow_table,))?;
-        Ok(df.into())
+        arrow_to_polars(py, &arrow_table)
     }
 
+    /// Clear recorded history to free memory.
     fn clear_history(&mut self) {
         self.history.clear();
     }
 
-    /// Dimensions.
+    /// Return (width, height).
     fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
     }
@@ -835,7 +888,12 @@ impl LifeSim {
         let states: Vec<bool> = self
             .grid
             .iter()
-            .map(|&e| self.world.get::<CellState>(e).map_or(false, |c| c.0))
+            .map(|&e| {
+                self.world
+                    .get::<CellState>(e)
+                    .expect("grid entity must be alive")
+                    .0
+            })
             .collect();
 
         // Count neighbors
@@ -872,9 +930,11 @@ impl LifeSim {
             let n = counts[i];
             let new_alive = matches!((alive, n), (true, 2) | (true, 3) | (false, 3));
             if new_alive != alive {
-                if let Some(cell) = self.world.get_mut::<CellState>(self.grid[i]) {
-                    cell.0 = new_alive;
-                }
+                let cell = self
+                    .world
+                    .get_mut::<CellState>(self.grid[i])
+                    .expect("grid entity must be alive");
+                cell.0 = new_alive;
             }
         }
     }
@@ -883,7 +943,12 @@ impl LifeSim {
         let states: Vec<bool> = self
             .grid
             .iter()
-            .map(|&e| self.world.get::<CellState>(e).map_or(false, |c| c.0))
+            .map(|&e| {
+                self.world
+                    .get::<CellState>(e)
+                    .expect("grid entity must be alive")
+                    .0
+            })
             .collect();
         self.history.push(states);
     }

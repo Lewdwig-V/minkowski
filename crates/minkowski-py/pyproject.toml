@@ -9,7 +9,7 @@ description = "Python bindings for the Minkowski ECS engine"
 requires-python = ">=3.9"
 dependencies = [
     "pyarrow>=14.0",
-    "polars>=0.20",
+    "polars>=1.0",
     "matplotlib>=3.7",
     "numpy>=1.24",
 ]

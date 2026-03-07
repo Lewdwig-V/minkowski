@@ -24,6 +24,6 @@ __pycache__/
 *.pyo
 *.egg-info/
 dist/
-*.so
-*.dylib
+crates/minkowski-py/**/*.so
+crates/minkowski-py/**/*.dylib
 .ipynb_checkpoints/
