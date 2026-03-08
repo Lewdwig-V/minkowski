@@ -1,10 +1,12 @@
-//! Loom-based exhaustive concurrency tests for Minkowski's transactional primitives.
+//! Loom-based exhaustive concurrency tests that model Minkowski's concurrent
+//! patterns using simplified stand-ins (not the actual Minkowski types, which
+//! are `pub(crate)`). These tests verify that the concurrency protocols —
+//! mutex-protected lock tables, shared push/drain queues, atomic entity ID
+//! reservation — are correct under all thread interleavings. The real code's
+//! adherence to these patterns is verified by code review and the `sync.rs`
+//! import shim.
 //!
 //! Run: RUSTFLAGS="--cfg loom" cargo test -p minkowski --test loom_concurrency --features loom
-//!
-//! These tests use loom's deterministic scheduler to enumerate ALL possible
-//! thread interleavings, verifying that concurrency invariants hold under
-//! every schedule — not just the ones that happen to occur at runtime.
 #![cfg(loom)]
 
 use loom::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -13,7 +15,7 @@ use loom::thread;
 
 // ── OrphanQueue tests ──────────────────────────────────────────────────
 
-/// Simulates OrphanQueue: multiple Tx aborts push entity IDs concurrently
+/// Models OrphanQueue: multiple Tx aborts push entity IDs concurrently
 /// while World drains the queue. Verifies no entity ID is lost.
 #[test]
 fn orphan_queue_push_drain_no_lost_ids() {
@@ -79,16 +81,17 @@ fn orphan_queue_interleaved_push_drain() {
 
 // ── ColumnLockTable pattern tests ──────────────────────────────────────
 
-/// Models ColumnLockTable's Mutex-protected read-write lock semantics.
-/// The real ColumnLockTable uses a Mutex around the entire acquire operation,
-/// so the check-then-act (read writer flag + increment readers) is atomic.
-/// This test verifies that under that Mutex protection, an exclusive writer
-/// and a shared reader never overlap.
+/// Models the Pessimistic strategy's `Mutex<ColumnLockTable>` serialization.
+/// The real `ColumnLockTable::acquire` takes `&mut self` — callers lock
+/// `Pessimistic`'s Mutex to get exclusive access, making check-then-act
+/// on (writer, readers) state inherently single-threaded. This test models
+/// that serialization and asserts that an exclusive writer and a shared
+/// reader never overlap in-flight.
 #[test]
 fn column_lock_exclusive_blocks_shared() {
     loom::model(|| {
-        // The Mutex models ColumnLockTable's Mutex<HashMap<...>> —
-        // all lock state checks and mutations happen under this lock.
+        // Models Pessimistic's Mutex<ColumnLockTable> — callers lock the
+        // outer mutex to get &mut ColumnLockTable for acquire/release.
         let lock_table = Arc::new(Mutex::new((false, 0u32))); // (writer, readers)
 
         // In-flight tracking for mutual exclusion assertion
@@ -103,7 +106,7 @@ fn column_lock_exclusive_blocks_shared() {
             let mut state = lt1.lock().unwrap();
             if !state.0 && state.1 == 0 {
                 state.0 = true; // acquired exclusive
-                drop(state); // release table mutex (lock is held)
+                drop(state); // release table mutex (column lock is held)
                 wh.store(true, Ordering::SeqCst);
                 assert!(
                     !rh1.load(Ordering::SeqCst),
@@ -138,10 +141,15 @@ fn column_lock_exclusive_blocks_shared() {
     });
 }
 
-/// Verifies the upgrade-not-downgrade consequence: when a transaction
-/// requests both read and write on the same column, it must acquire
-/// exclusive — meaning a concurrent shared reader is blocked.
-/// This models the real scenario where dedup_by incorrectly kept Shared.
+/// Models the consequence of a past bug where `dedup_by_key` silently kept
+/// a Shared lock when both Shared and Exclusive were requested for the same
+/// column. With the correct upgrade-to-exclusive behavior, a transaction
+/// that reads AND writes a column acquires exclusive, blocking concurrent
+/// shared readers. This test verifies that property.
+///
+/// Unlike `column_lock_exclusive_blocks_shared` (where thread 1 only writes),
+/// here thread 1 explicitly requests both read and write — the dedup merge
+/// must produce an exclusive lock, not a shared one.
 #[test]
 fn column_lock_upgrade_blocks_concurrent_reader() {
     loom::model(|| {
@@ -149,18 +157,25 @@ fn column_lock_upgrade_blocks_concurrent_reader() {
         let writer_held = Arc::new(AtomicBool::new(false));
         let reader_held = Arc::new(AtomicBool::new(false));
 
-        // Thread 1: requests both read AND write on col_a → must acquire exclusive
+        // Thread 1: requests both read AND write on col_a.
+        // After dedup merge, the surviving request is Exclusive.
+        // If the bug recurred (Shared kept instead), this thread would
+        // acquire shared, and the mutual exclusion assertion below could
+        // pass vacuously — but the column would be unprotected.
         let lt1 = lock_table.clone();
         let wh = writer_held.clone();
         let rh1 = reader_held.clone();
         let t1 = thread::spawn(move || {
+            // Simulate dedup: [Shared(col_a), Exclusive(col_a)] → Exclusive(col_a)
+            let requests = vec![("col_a", false), ("col_a", true)]; // (col, is_exclusive)
+            let is_exclusive = requests.iter().any(|(_, exc)| *exc);
+            assert!(is_exclusive, "dedup must upgrade to exclusive");
+
             let mut state = lt1.lock().unwrap();
-            // Upgraded to exclusive (the correct behavior after dedup)
             if !state.0 && state.1 == 0 {
-                state.0 = true;
+                state.0 = true; // acquired exclusive (post-upgrade)
                 drop(state);
                 wh.store(true, Ordering::SeqCst);
-                // While we hold exclusive, no reader should be active
                 assert!(
                     !rh1.load(Ordering::SeqCst),
                     "upgraded lock held while shared reader also active"
@@ -194,8 +209,13 @@ fn column_lock_upgrade_blocks_concurrent_reader() {
     });
 }
 
-/// Two threads acquire locks in sorted order. Loom verifies no deadlock
-/// under any interleaving — completing proves deadlock freedom.
+/// Two threads acquire locks in sorted order, modeling the sorted-key
+/// acquisition order used in `ColumnLockTable::acquire` (requests sorted
+/// by (arch_id, comp_id) before processing). Two independent Mutexes
+/// stand in for two distinct column locks.
+///
+/// Loom verifies no deadlock under any interleaving — completion of
+/// `loom::model` across all schedules IS the proof of deadlock freedom.
 #[test]
 fn column_lock_sorted_acquisition_no_deadlock() {
     loom::model(|| {

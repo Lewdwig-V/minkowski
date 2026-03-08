@@ -1,5 +1,7 @@
-//! Conditional sync primitives — routes to parking_lot/std in production,
-//! loom equivalents under `cfg(loom)` for deterministic schedule testing.
+//! Conditional sync primitives — routes to parking_lot (`Mutex`) and std
+//! (`Arc`, atomics, `yield_now`) in production, loom equivalents under
+//! `cfg(loom)` for deterministic schedule testing. The loom `Mutex` wrapper
+//! converts `Result`-returning `lock()` to match parking_lot's infallible API.
 
 #[cfg(not(loom))]
 pub(crate) use parking_lot::Mutex;
