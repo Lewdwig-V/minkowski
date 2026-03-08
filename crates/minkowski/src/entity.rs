@@ -62,6 +62,10 @@ pub(crate) struct EntityAllocator {
     _pad: [u8; 64],
     /// Atomic counter for lock-free entity index reservation.
     next_reserved: std::sync::atomic::AtomicU32,
+    /// Monotonic spawn counter for observability (not on a hot path).
+    pub(crate) total_spawns: u64,
+    /// Monotonic despawn counter for observability (not on a hot path).
+    pub(crate) total_despawns: u64,
 }
 
 impl EntityAllocator {
@@ -71,6 +75,8 @@ impl EntityAllocator {
             free_list: Vec::new(),
             _pad: [0; 64],
             next_reserved: std::sync::atomic::AtomicU32::new(0),
+            total_spawns: 0,
+            total_despawns: 0,
         }
     }
 
@@ -108,6 +114,7 @@ impl EntityAllocator {
 
     pub fn alloc(&mut self) -> Entity {
         self.materialize_reserved();
+        self.total_spawns += 1;
         if let Some(index) = self.free_list.pop() {
             let gen = self.generations[index as usize];
             Entity::new(index, gen)
@@ -125,6 +132,7 @@ impl EntityAllocator {
         if idx < self.generations.len() && self.generations[idx] == entity.generation() {
             self.generations[idx] = self.generations[idx].wrapping_add(1);
             self.free_list.push(entity.index());
+            self.total_despawns += 1;
             true
         } else {
             false

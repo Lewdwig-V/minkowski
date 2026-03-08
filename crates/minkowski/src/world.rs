@@ -82,6 +82,8 @@ pub struct WorldStats {
     pub free_list_len: usize,
     pub query_cache_len: usize,
     pub current_tick: u64,
+    pub total_spawns: u64,
+    pub total_despawns: u64,
 }
 
 /// The central data store. Holds all entities, components, archetype metadata,
@@ -1124,6 +1126,8 @@ impl World {
             free_list_len: self.entities.free_list.len(),
             query_cache_len: self.query_cache.len(),
             current_tick: self.current_tick.raw(),
+            total_spawns: self.entities.total_spawns,
+            total_despawns: self.entities.total_despawns,
         }
     }
 

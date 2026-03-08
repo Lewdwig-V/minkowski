@@ -23,15 +23,14 @@ impl MetricsDiff {
 
         let entity_delta = after.world.entity_count as i64 - before.world.entity_count as i64;
 
-        // Churn estimation:
-        // free_list_growth ≈ despawns (each despawn pushes to free list)
-        // spawns ≈ entity_delta + despawns
-        let free_list_growth = after
+        let spawns = after
             .world
-            .free_list_len
-            .saturating_sub(before.world.free_list_len);
-        let despawns = free_list_growth as u64;
-        let spawns = (entity_delta + despawns as i64).max(0) as u64;
+            .total_spawns
+            .saturating_sub(before.world.total_spawns);
+        let despawns = after
+            .world
+            .total_despawns
+            .saturating_sub(before.world.total_despawns);
         let entity_churn = spawns + despawns;
 
         let tick_delta = after
@@ -143,10 +142,8 @@ mod tests {
 
         let diff = MetricsDiff::compute(&before, &after);
         assert_eq!(diff.entity_delta, -1);
-        // Churn estimation undercounts when free list recycling happens
-        // in the same interval: 2 despawns + 1 spawn, but spawn recycles
-        // from the free list so free_list_growth is only 1.
-        assert!(diff.entity_churn >= 1);
+        // Exact: 2 despawns + 1 spawn = 3
+        assert_eq!(diff.entity_churn, 3);
     }
 
     #[test]
