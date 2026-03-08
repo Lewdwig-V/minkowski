@@ -101,4 +101,4 @@ pub use reducer::{
 };
 pub use tick::ChangeTick;
 pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
-pub use world::World;
+pub use world::{World, WorldStats};
