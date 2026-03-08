@@ -128,8 +128,7 @@ impl EntityAllocator {
         } else {
             let index = self.generations.len() as u32;
             self.generations.push(0);
-            self.next_reserved
-                .store(index + 1, std::sync::atomic::Ordering::Relaxed);
+            self.next_reserved.store(index + 1, Ordering::Relaxed);
             Entity::new(index, 0)
         }
     }
