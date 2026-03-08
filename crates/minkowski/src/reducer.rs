@@ -292,6 +292,10 @@ impl<'a> DynamicCtx<'a> {
     /// Iterate entities matching query `Q` using the typed query codepath.
     /// `Q` must be a `ReadOnlyWorldQuery` — writes go through `ctx.write()`.
     ///
+    /// Iteration visits archetypes in creation order and rows within each
+    /// archetype in insertion order. This is deterministic given identical
+    /// world state but is not a stability guarantee.
+    ///
     /// # Panics
     /// Panics if `Q` accesses any component not declared via `can_read`
     /// or `can_write` on the builder.
@@ -905,6 +909,10 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
     /// `&mut T` components produce `WritableRef<T>` — reads from the column,
     /// writes buffer into the changeset.
     ///
+    /// Iteration visits archetypes in creation order and rows within each
+    /// archetype in insertion order. This is deterministic given identical
+    /// world state but is not a stability guarantee.
+    ///
     /// Advances the change detection tick: entities matched here will NOT
     /// be matched again on the next call unless their columns are modified.
     ///
@@ -989,6 +997,11 @@ impl<'a, Q: ReadOnlyWorldQuery + 'static> QueryRef<'a, Q> {
         }
     }
 
+    /// Iterate all matching entities in read-only mode.
+    ///
+    /// Iteration visits archetypes in creation order and rows within each
+    /// archetype in insertion order. This is deterministic given identical
+    /// world state but is not a stability guarantee.
     pub fn for_each(&mut self, f: impl FnMut(Q::Item<'_>)) {
         self.world.query::<Q>().for_each(f);
     }
@@ -1020,10 +1033,18 @@ impl<'a, Q: WorldQuery + 'static> QueryMut<'a, Q> {
         }
     }
 
+    /// Iterate all matching entities with read-write access.
+    ///
+    /// Iteration visits archetypes in creation order and rows within each
+    /// archetype in insertion order. This is deterministic given identical
+    /// world state but is not a stability guarantee.
     pub fn for_each(&mut self, f: impl FnMut(Q::Item<'_>)) {
         self.world.query::<Q>().for_each(f);
     }
 
+    /// Iterate matching entities in contiguous typed slices per archetype.
+    ///
+    /// Same iteration order guarantees as [`for_each`](Self::for_each).
     pub fn for_each_chunk(&mut self, f: impl FnMut(Q::Slice<'_>)) {
         self.world.query::<Q>().for_each_chunk(f);
     }
