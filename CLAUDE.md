@@ -34,6 +34,9 @@ cargo run -p minkowski-examples --example observe --release   # Observability: M
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
 
+RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p minkowski --lib -Z build-std --target x86_64-unknown-linux-gnu -- --skip par_for_each  # TSan (data race detection)
+RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p minkowski --lib -Z build-std --target x86_64-unknown-linux-gnu par_for_each  # TSan rayon tests
+
 cargo +nightly fuzz run fuzz_world_ops -- -max_total_time=60     # fuzz: random World operations
 cargo +nightly fuzz run fuzz_reducers -- -max_total_time=60      # fuzz: query iteration paths
 cargo +nightly fuzz run fuzz_snapshot_load -- -max_total_time=60 -max_len=65536  # fuzz: snapshot deserialization
@@ -54,8 +57,9 @@ GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every PR and push t
 | clippy | stable | `cargo clippy --workspace --all-targets -- -D warnings` | fmt |
 | test | stable | `cargo test -p minkowski` | clippy |
 | miri | nightly | Two-step Miri run (see Build & Test Commands) | test |
+| tsan | nightly | Two-step TSan run with `-Z build-std` (see Build & Test Commands) | test |
 
-Sequential chain: fmt failure skips all downstream jobs. A `ci-pass` aggregator job (runs with `if: always()`) is the single required status check for branch protection — it explicitly verifies all four jobs succeeded, avoiding GitHub's "skipped = passed" loophole with chained `needs:`.
+Sequential chain: fmt failure skips all downstream jobs. Miri and TSan run in parallel after test. A `ci-pass` aggregator job (runs with `if: always()`) is the single required status check for branch protection — it explicitly verifies all five jobs succeeded, avoiding GitHub's "skipped = passed" loophole with chained `needs:`.
 
 ## Architecture
 

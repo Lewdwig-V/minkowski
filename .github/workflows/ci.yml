@@ -70,13 +70,34 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-ignore-leaks"
 
+  tsan:
+    name: ThreadSanitizer
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-tsan
+      - name: TSan tests (skip par_for_each)
+        run: cargo +nightly test -p minkowski --lib -Z build-std --target x86_64-unknown-linux-gnu -- --skip par_for_each
+        env:
+          RUSTFLAGS: "-Z sanitizer=thread"
+      - name: TSan par_for_each
+        run: cargo +nightly test -p minkowski --lib -Z build-std --target x86_64-unknown-linux-gnu par_for_each
+        env:
+          RUSTFLAGS: "-Z sanitizer=thread"
+
   # Aggregator job — the single required status check for branch protection.
   # Runs even when upstream jobs are skipped/failed and explicitly checks
   # that every dependency succeeded, avoiding the GitHub "skipped = passed"
   # loophole with required checks on chained jobs.
   ci-pass:
     name: CI
-    needs: [fmt, clippy, test, miri]
+    needs: [fmt, clippy, test, miri, tsan]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -85,11 +106,13 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ||
                 "${{ needs.clippy.result }}" != "success" ||
                 "${{ needs.test.result }}" != "success" ||
-                "${{ needs.miri.result }}" != "success" ]]; then
+                "${{ needs.miri.result }}" != "success" ||
+                "${{ needs.tsan.result }}" != "success" ]]; then
             echo "One or more CI jobs failed or were skipped."
             echo "  fmt:    ${{ needs.fmt.result }}"
             echo "  clippy: ${{ needs.clippy.result }}"
             echo "  test:   ${{ needs.test.result }}"
             echo "  miri:   ${{ needs.miri.result }}"
+            echo "  tsan:   ${{ needs.tsan.result }}"
             exit 1
           fi
