@@ -86,15 +86,6 @@ Initial stable release of the Minkowski column-oriented ECS storage engine.
 
 - `#[derive(Table)]` generates `Ref<'w>` / `Mut<'w>` row accessors, `TableDescriptor`, and `query_table` / `query_table_mut` methods
 
-### Python Bridge (`minkowski-py`)
-
-- PyO3 bindings exposing `World` and `ReducerRegistry` to Python
-- Arrow RecordBatch data transfer — loads directly into Polars DataFrames
-- `world.query()` for zero-copy reads, `world.write_column()` for bulk writes
-- `registry.run()` dispatches pre-compiled Rust reducers by name
-- 9 registered component types and 5 built-in reducers (boids, gravity, life, movement)
-- Jupyter notebook examples for boids, circuit simulation, and flatworm simulation
-
 ### Verification
 
 - 398 unit tests across all modules
