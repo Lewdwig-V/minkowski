@@ -16,7 +16,7 @@ pub struct ArchetypeInfo {
     pub estimated_bytes: usize,
 }
 
-/// Point-in-time capture of all engine metrics.
+/// Point-in-time capture of core engine metrics.
 #[derive(Clone, Debug)]
 pub struct MetricsSnapshot {
     pub world: WorldStats,

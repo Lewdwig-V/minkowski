@@ -153,7 +153,7 @@ for row in world.query_table::<Transform>() {
 
 ## Observability
 
-The `minkowski-observe` crate is a pure consumer companion that captures engine metrics without instrumenting hot paths. Two facade methods — `world.stats()` and `wal.stats()` — copy internal state into plain `Copy` structs (`WorldStats`, `WalStats`). The observe crate composes these into point-in-time snapshots, diffs consecutive captures, and computes rates.
+The `minkowski-observe` crate is a pure consumer companion that captures engine metrics without instrumenting hot paths. Two facade methods — `world.stats()` and `wal.stats()` — copy internal state into plain `Copy` structs (`WorldStats`, `WalStats`). The observe crate composes these into point-in-time snapshots, diffs consecutive captures, and computes deltas.
 
 ```rust
 use minkowski_observe::{MetricsSnapshot, MetricsDiff};
@@ -170,7 +170,7 @@ println!("{diff}");
 //   archetype delta: +1
 ```
 
-Entity churn is exact — monotonic counters on `EntityAllocator::alloc()`/`dealloc()` track every spawn and despawn. Per-archetype detail (entity count, component names, estimated byte footprint) is included in every snapshot. `Display` impls on both `MetricsSnapshot` and `MetricsDiff` produce human-readable tables suitable for logging or stderr.
+Entity churn is exact — monotonic counters in `EntityAllocator` track every spawn (including reserved entities on materialization) and despawn. Per-archetype detail (entity count, component names, estimated byte footprint) is included in every snapshot. `Display` impls on both `MetricsSnapshot` and `MetricsDiff` produce human-readable tables suitable for logging or stderr.
 
 ## Spatial Indexing
 
@@ -195,7 +195,7 @@ Two implementations ship as examples: a [uniform grid][uniform-grid] for O(N*k) 
 | `flatworm` | Planarian flatworm simulator with 200 worms over 1 000 frames. Implements chemotaxis (nutrition/distance² gradient via `FoodGrid` spatial index), binary fission when energy exceeds a threshold, starvation despawn below minimum energy, and food respawning. Demonstrates `SpatialIndex` trait, `CommandBuffer` for deferred spawn/despawn, and `QueryMut`/`QueryRef` reducers for movement, metabolism, and census. | `cargo run -p minkowski-examples --example flatworm --release` |
 | `circuit` | Analog circuit simulator: 555 astable oscillator → LCR bandpass filter → 741 voltage follower. Circuit nodes are entities with `Voltage` components; elements (resistors, inductors, op-amp) reference node entities for connectivity. Uses symplectic Euler integration for L/C elements, `QueryMut`/`QueryRef` reducers via `ReducerRegistry`, and prints an ASCII waveform of the filter output. 200K steps at 100 ns timestep. | `cargo run -p minkowski-examples --example circuit --release` |
 | `tactical` | Multi-operator tactical map with server-authoritative replication. Exercises 8 previously uncovered API gaps: sparse components (`insert_sparse`/`iter_sparse`), `par_for_each`, `Optimistic` transactions with `Conflict` inspection, `Entity::to_bits`/`from_bits` for wire serialization, world introspection (`archetype_count`, `component_name`), `register_entity_despawn`, `HashIndex::get_valid()` stale filtering, and `EnumChangeSet`/`MutationRef` iteration for replication packets. Two operator threads communicate with the server via `mpsc` channels. | `cargo run -p minkowski-examples --example tactical --release` |
-| `observe` | Observability companion demo. Captures `MetricsSnapshot` at two points in time (before and after entity churn: 20 despawns + 50 spawns across 2 archetypes), computes `MetricsDiff` with exact entity churn, tick velocity, WAL throughput, and archetype deltas. Displays human-readable output via `Display` impls. | `cargo run -p minkowski-examples --example observe --release` |
+| `observe` | Observability companion demo. Captures `MetricsSnapshot` at two points in time (before and after entity churn: 20 despawns + 50 spawns across 2 archetypes), computes `MetricsDiff` with exact entity churn, tick delta, WAL sequence delta, and archetype deltas. Displays human-readable output via `Display` impls. | `cargo run -p minkowski-examples --example observe --release` |
 
 ## Python / Jupyter Integration
 

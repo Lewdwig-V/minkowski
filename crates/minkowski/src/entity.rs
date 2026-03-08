@@ -62,9 +62,9 @@ pub(crate) struct EntityAllocator {
     _pad: [u8; 64],
     /// Atomic counter for lock-free entity index reservation.
     next_reserved: std::sync::atomic::AtomicU32,
-    /// Monotonic spawn counter for observability (not on a hot path).
+    /// Monotonic spawn counter for observability (single u64 increment, negligible overhead).
     pub(crate) total_spawns: u64,
-    /// Monotonic despawn counter for observability (not on a hot path).
+    /// Monotonic despawn counter for observability (single u64 increment, negligible overhead).
     pub(crate) total_despawns: u64,
 }
 
@@ -119,6 +119,8 @@ impl EntityAllocator {
 
     pub fn alloc(&mut self) -> Entity {
         self.materialize_reserved();
+        // +1 for the entity alloc() itself returns;
+        // materialize_reserved() already counted any prior reserve() calls.
         self.total_spawns += 1;
         if let Some(index) = self.free_list.pop() {
             let gen = self.generations[index as usize];
@@ -322,6 +324,9 @@ mod tests {
         let e1 = alloc.alloc();
         let _e2 = alloc.alloc();
         assert_eq!(alloc.total_despawns, 0);
+        alloc.dealloc(e1);
+        assert_eq!(alloc.total_despawns, 1);
+        // Failed dealloc (double-free) must NOT increment counter
         alloc.dealloc(e1);
         assert_eq!(alloc.total_despawns, 1);
     }

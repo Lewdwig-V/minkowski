@@ -1,25 +1,35 @@
-//! Rate computation from consecutive snapshots.
+//! Delta computation from consecutive snapshots.
 
 use std::time::Duration;
 
 use crate::snapshot::MetricsSnapshot;
 
-/// Rates computed from two consecutive snapshots.
+/// An archetype's ID and entity count, for the top-N list in [`MetricsDiff`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArchetypeSize {
+    pub id: usize,
+    pub entity_count: usize,
+}
+
+/// Deltas computed from two consecutive snapshots.
 #[derive(Clone, Debug)]
 pub struct MetricsDiff {
     pub elapsed: Duration,
     pub entity_delta: i64,
     pub entity_churn: u64,
     pub tick_delta: u64,
-    pub wal_seq_delta: u64,
+    pub wal_seq_delta: Option<u64>,
     pub archetype_delta: i64,
-    pub largest_archetypes: Vec<(usize, usize)>,
+    pub largest_archetypes: Vec<ArchetypeSize>,
 }
 
 impl MetricsDiff {
-    /// Compute rates and deltas from two consecutive snapshots.
+    /// Compute deltas from two consecutive snapshots.
     pub fn compute(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Self {
-        let elapsed = after.timestamp.duration_since(before.timestamp);
+        let elapsed = after
+            .timestamp
+            .checked_duration_since(before.timestamp)
+            .unwrap_or(Duration::ZERO);
 
         let entity_delta = after.world.entity_count as i64 - before.world.entity_count as i64;
 
@@ -39,21 +49,24 @@ impl MetricsDiff {
             .saturating_sub(before.world.current_tick);
 
         let wal_seq_delta = match (before.wal, after.wal) {
-            (Some(b), Some(a)) => a.next_seq.saturating_sub(b.next_seq),
-            _ => 0,
+            (Some(b), Some(a)) => Some(a.next_seq.saturating_sub(b.next_seq)),
+            _ => None,
         };
 
         let archetype_delta =
             after.world.archetype_count as i64 - before.world.archetype_count as i64;
 
         // Top 5 archetypes by entity count (from the `after` snapshot)
-        let mut sorted: Vec<(usize, usize)> = after
+        let mut sorted: Vec<ArchetypeSize> = after
             .archetypes
             .iter()
             .filter(|a| a.entity_count > 0)
-            .map(|a| (a.id, a.entity_count))
+            .map(|a| ArchetypeSize {
+                id: a.id,
+                entity_count: a.entity_count,
+            })
             .collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by(|a, b| b.entity_count.cmp(&a.entity_count));
         sorted.truncate(5);
 
         Self {
@@ -76,17 +89,16 @@ impl std::fmt::Display for MetricsDiff {
             "  entity delta: {:+}  churn: {}",
             self.entity_delta, self.entity_churn
         )?;
-        writeln!(
-            f,
-            "  tick delta: {}  WAL seq delta: {}",
-            self.tick_delta, self.wal_seq_delta
-        )?;
+        match self.wal_seq_delta {
+            Some(d) => writeln!(f, "  tick delta: {}  WAL seq delta: {}", self.tick_delta, d)?,
+            None => writeln!(f, "  tick delta: {}  WAL: n/a", self.tick_delta)?,
+        }
         writeln!(f, "  archetype delta: {:+}", self.archetype_delta)?;
 
         if !self.largest_archetypes.is_empty() {
             writeln!(f, "  largest archetypes:")?;
-            for (id, count) in &self.largest_archetypes {
-                writeln!(f, "    [{id}] {count} entities")?;
+            for a in &self.largest_archetypes {
+                writeln!(f, "    [{}] {} entities", a.id, a.entity_count)?;
             }
         }
 
@@ -125,7 +137,7 @@ mod tests {
         let diff = MetricsDiff::compute(&before, &after);
         assert_eq!(diff.entity_delta, 2);
         assert!(diff.tick_delta > 0);
-        assert_eq!(diff.wal_seq_delta, 0);
+        assert_eq!(diff.wal_seq_delta, None);
     }
 
     #[test]
@@ -157,7 +169,7 @@ mod tests {
 
         let diff = MetricsDiff::compute(&before, &after);
         assert!(!diff.largest_archetypes.is_empty());
-        assert_eq!(diff.largest_archetypes[0].1, 10);
+        assert_eq!(diff.largest_archetypes[0].entity_count, 10);
     }
 
     #[test]

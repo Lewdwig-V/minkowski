@@ -73,7 +73,7 @@ impl OrphanQueue {
 }
 
 /// Read-only snapshot of engine statistics. Plain data struct — no references
-/// to internal state, safe to store, serialize, or send across threads.
+/// to internal state, safe to store or send across threads.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorldStats {
     pub entity_count: usize,
@@ -2299,6 +2299,8 @@ mod tests {
         assert_eq!(s0.free_list_len, 0);
         assert_eq!(s0.query_cache_len, 0);
         assert_eq!(s0.current_tick, 0);
+        assert_eq!(s0.total_spawns, 0);
+        assert_eq!(s0.total_despawns, 0);
 
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
         let s1 = world.stats();
@@ -2306,11 +2308,15 @@ mod tests {
         assert!(s1.archetype_count >= 1);
         assert!(s1.component_count >= 1);
         assert!(s1.current_tick > s0.current_tick);
+        assert_eq!(s1.total_spawns, 1);
+        assert_eq!(s1.total_despawns, 0);
 
         world.despawn(e);
         let s2 = world.stats();
         assert_eq!(s2.entity_count, 0);
         assert_eq!(s2.free_list_len, 1);
+        assert_eq!(s2.total_spawns, 1);
+        assert_eq!(s2.total_despawns, 1);
     }
 
     #[test]
