@@ -23,6 +23,17 @@ pub enum SerializedMutation {
         entity: u64,
         component_id: ComponentId,
     },
+    /// Insert a component into sparse storage (not archetypes).
+    SparseInsert {
+        entity: u64,
+        component_id: ComponentId,
+        data: Vec<u8>,
+    },
+    /// Remove a component from sparse storage.
+    SparseRemove {
+        entity: u64,
+        component_id: ComponentId,
+    },
 }
 
 /// A single WAL record: one committed changeset with a sequence number.

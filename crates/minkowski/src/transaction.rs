@@ -282,6 +282,17 @@ impl<'a> Tx<'a> {
         self.changeset.remove::<T>(world, entity);
     }
 
+    /// Buffer a sparse component write. The mutation is recorded in the internal
+    /// changeset and will be applied when the strategy commits the transaction.
+    pub fn write_sparse<T: Component>(&mut self, world: &mut World, entity: Entity, value: T) {
+        self.changeset.insert_sparse::<T>(world, entity, value);
+    }
+
+    /// Buffer a sparse component removal.
+    pub fn remove_sparse<T: Component>(&mut self, world: &mut World, entity: Entity) {
+        self.changeset.remove_sparse::<T>(world, entity);
+    }
+
     /// Allocate a new entity and buffer its initial components. The entity ID
     /// is tracked so it can be reclaimed on abort (drop without commit).
     pub fn spawn<B: crate::bundle::Bundle>(&mut self, world: &mut World, bundle: B) -> Entity {
@@ -375,6 +386,23 @@ impl<'a> Tx<'a> {
     #[allow(dead_code)]
     pub(crate) fn remove_raw(&mut self, entity: Entity, comp_id: ComponentId) {
         self.changeset.record_remove(entity, comp_id);
+    }
+
+    /// Sparse write with a pre-resolved ComponentId.
+    #[allow(dead_code)]
+    pub(crate) fn write_sparse_raw<T: Component>(
+        &mut self,
+        entity: Entity,
+        comp_id: ComponentId,
+        value: T,
+    ) {
+        self.changeset.insert_sparse_raw(entity, comp_id, value);
+    }
+
+    /// Sparse remove with a pre-resolved ComponentId.
+    #[allow(dead_code)]
+    pub(crate) fn remove_sparse_raw(&mut self, entity: Entity, comp_id: ComponentId) {
+        self.changeset.remove_sparse_raw(entity, comp_id);
     }
 
     /// Spawn an entity with a bundle using pre-resolved ComponentIds.

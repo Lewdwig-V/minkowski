@@ -295,6 +295,41 @@ impl SparseStorage {
         Some(items.into_iter())
     }
 
+    /// Raw insert: copies bytes into sparse storage. Creates the
+    /// `PagedSparseSet` if it doesn't exist for this `ComponentId`.
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid, initialized value matching `layout`.
+    pub unsafe fn insert_raw(
+        &mut self,
+        comp_id: ComponentId,
+        entity: Entity,
+        ptr: *const u8,
+        layout: Layout,
+        drop_fn: Option<unsafe fn(*mut u8)>,
+    ) {
+        let set = self
+            .storages
+            .entry(comp_id)
+            .or_insert_with(|| PagedSparseSet::new(layout, drop_fn));
+        set.insert(entity, ptr);
+    }
+
+    /// Raw read: returns a pointer to the sparse component data, or `None`.
+    pub fn get_raw(&self, comp_id: ComponentId, entity: Entity) -> Option<*const u8> {
+        let set = self.storages.get(&comp_id)?;
+        set.get(entity).map(|p| p as *const u8)
+    }
+
+    /// Raw remove: removes and drops the sparse component. Returns `true`
+    /// if the entity had the component.
+    pub fn remove_raw(&mut self, comp_id: ComponentId, entity: Entity) -> bool {
+        match self.storages.get_mut(&comp_id) {
+            Some(set) => set.remove(entity),
+            None => false,
+        }
+    }
+
     /// Removes the entity from all sparse component sets.
     // PERF: O(sparse_types) per entity. Sparse types typically < 5; per-probe
     // cost is one page lookup (~3ns). Not worth per-entity tracking overhead.

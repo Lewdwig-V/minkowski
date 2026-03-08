@@ -103,6 +103,12 @@ impl ComponentRegistry {
         self.sparse_set.contains(id)
     }
 
+    /// Mark an already-registered component as sparse.
+    pub(crate) fn mark_sparse(&mut self, id: ComponentId) {
+        self.sparse_set.grow(id + 1);
+        self.sparse_set.insert(id);
+    }
+
     unsafe fn drop_ptr<T>(ptr: *mut u8) {
         std::ptr::drop_in_place(ptr as *mut T);
     }

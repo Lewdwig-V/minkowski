@@ -120,6 +120,18 @@ pub(crate) enum Mutation {
         entity: Entity,
         component_id: ComponentId,
     },
+    /// Insert a component into sparse storage (not archetypes).
+    SparseInsert {
+        entity: Entity,
+        component_id: ComponentId,
+        offset: usize,
+        layout: Layout,
+    },
+    /// Remove a component from sparse storage.
+    SparseRemove {
+        entity: Entity,
+        component_id: ComponentId,
+    },
 }
 
 /// Data-driven mutation buffer. Records structural mutations as an enum vec
@@ -223,6 +235,33 @@ impl EnumChangeSet {
             component_id,
         });
     }
+
+    /// Record inserting a sparse component on an entity. Returns the arena byte
+    /// offset where the component data was stored.
+    pub fn record_sparse_insert(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+        data: *const u8,
+        layout: Layout,
+    ) -> usize {
+        let offset = self.arena.alloc(data, layout);
+        self.mutations.push(Mutation::SparseInsert {
+            entity,
+            component_id,
+            offset,
+            layout,
+        });
+        offset
+    }
+
+    /// Record removing a sparse component from an entity.
+    pub fn record_sparse_remove(&mut self, entity: Entity, component_id: ComponentId) {
+        self.mutations.push(Mutation::SparseRemove {
+            entity,
+            component_id,
+        });
+    }
 }
 
 // ── Typed safe helpers ─────────────────────────────────────────
@@ -250,6 +289,31 @@ impl EnumChangeSet {
     pub fn remove<T: Component>(&mut self, world: &mut World, entity: Entity) {
         let comp_id = world.register_component::<T>();
         self.record_remove(entity, comp_id);
+    }
+
+    /// Record inserting a sparse component on an entity. Auto-registers the
+    /// component type.
+    ///
+    /// Takes ownership of `value` — the destructor will run either when the
+    /// changeset is applied (ownership transfers to the world) or when the
+    /// changeset is dropped without applying.
+    pub fn insert_sparse<T: Component>(&mut self, world: &mut World, entity: Entity, value: T) {
+        let comp_id = world.register_component::<T>();
+        let drop_fn = world.components.info(comp_id).drop_fn;
+        let layout = Layout::new::<T>();
+        let value = std::mem::ManuallyDrop::new(value);
+        let offset =
+            self.record_sparse_insert(entity, comp_id, &*value as *const T as *const u8, layout);
+        if let Some(drop_fn) = drop_fn {
+            self.drop_entries.push(DropEntry { offset, drop_fn });
+        }
+    }
+
+    /// Record removing a sparse component from an entity. Auto-registers the
+    /// component type.
+    pub fn remove_sparse<T: Component>(&mut self, world: &mut World, entity: Entity) {
+        let comp_id = world.register_component::<T>();
+        self.record_sparse_remove(entity, comp_id);
     }
 
     /// Record spawning an entity with a bundle of components. Auto-registers
@@ -306,6 +370,33 @@ impl EnumChangeSet {
         }
     }
 
+    /// Sparse insert with a pre-resolved ComponentId. Same as `insert_sparse()`
+    /// but skips `world.register_component::<T>()`. Used by typed reducer handles.
+    #[allow(dead_code)]
+    pub(crate) fn insert_sparse_raw<T: Component>(
+        &mut self,
+        entity: Entity,
+        comp_id: ComponentId,
+        value: T,
+    ) {
+        let layout = Layout::new::<T>();
+        let value = std::mem::ManuallyDrop::new(value);
+        let offset =
+            self.record_sparse_insert(entity, comp_id, &*value as *const T as *const u8, layout);
+        if std::mem::needs_drop::<T>() {
+            self.drop_entries.push(DropEntry {
+                offset,
+                drop_fn: crate::component::drop_ptr::<T>,
+            });
+        }
+    }
+
+    /// Sparse remove with a pre-resolved ComponentId.
+    #[allow(dead_code)]
+    pub(crate) fn remove_sparse_raw(&mut self, entity: Entity, comp_id: ComponentId) {
+        self.record_sparse_remove(entity, comp_id);
+    }
+
     /// Spawn a bundle with pre-resolved ComponentIds. Same as `spawn_bundle()`
     /// but takes `&ComponentRegistry` instead of `&mut World`. Used by Spawner.
     ///
@@ -352,6 +443,17 @@ pub enum MutationRef<'a> {
         entity: Entity,
         component_id: ComponentId,
     },
+    /// Sparse component insert (not stored in archetypes).
+    SparseInsert {
+        entity: Entity,
+        component_id: ComponentId,
+        data: &'a [u8],
+    },
+    /// Sparse component removal.
+    SparseRemove {
+        entity: Entity,
+        component_id: ComponentId,
+    },
 }
 
 impl EnumChangeSet {
@@ -389,6 +491,27 @@ impl EnumChangeSet {
                 entity,
                 component_id,
             } => MutationRef::Remove {
+                entity: *entity,
+                component_id: *component_id,
+            },
+            Mutation::SparseInsert {
+                entity,
+                component_id,
+                offset,
+                layout,
+            } => {
+                let ptr = self.arena.get(*offset);
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                MutationRef::SparseInsert {
+                    entity: *entity,
+                    component_id: *component_id,
+                    data: bytes,
+                }
+            }
+            Mutation::SparseRemove {
+                entity,
+                component_id,
+            } => MutationRef::SparseRemove {
                 entity: *entity,
                 component_id: *component_id,
             },
@@ -510,6 +633,70 @@ impl EnumChangeSet {
                     component_id,
                 } => {
                     changeset_remove_raw(world, &mut reverse, *entity, *component_id);
+                }
+
+                Mutation::SparseInsert {
+                    entity,
+                    component_id,
+                    offset,
+                    layout,
+                } => {
+                    assert!(world.is_alive(*entity), "entity is not alive");
+                    let data_ptr = self.arena.get(*offset);
+                    let info = world.components.info(*component_id);
+                    let drop_fn = info.drop_fn;
+
+                    // Ensure the component is marked as sparse in the registry
+                    // (needed for world.get/has routing after WAL replay).
+                    world.components.mark_sparse(*component_id);
+
+                    // Capture old value for reverse (if entity already has this sparse component).
+                    if let Some(old_ptr) = world.sparse.get_raw(*component_id, *entity) {
+                        // Old value exists — reverse is SparseInsert with old data.
+                        let rev_offset =
+                            reverse.record_sparse_insert(*entity, *component_id, old_ptr, *layout);
+                        if let Some(drop_fn) = drop_fn {
+                            reverse.drop_entries.push(DropEntry {
+                                offset: rev_offset,
+                                drop_fn,
+                            });
+                        }
+                    } else {
+                        // No old value — reverse is SparseRemove.
+                        reverse.record_sparse_remove(*entity, *component_id);
+                    }
+
+                    // Apply: insert raw bytes into sparse storage.
+                    unsafe {
+                        world
+                            .sparse
+                            .insert_raw(*component_id, *entity, data_ptr, *layout, drop_fn);
+                    }
+                }
+
+                Mutation::SparseRemove {
+                    entity,
+                    component_id,
+                } => {
+                    assert!(world.is_alive(*entity), "entity is not alive");
+                    let info = world.components.info(*component_id);
+                    let layout = info.layout;
+                    let drop_fn = info.drop_fn;
+
+                    // Capture old value for reverse before removing.
+                    if let Some(old_ptr) = world.sparse.get_raw(*component_id, *entity) {
+                        let rev_offset =
+                            reverse.record_sparse_insert(*entity, *component_id, old_ptr, layout);
+                        if let Some(drop_fn) = drop_fn {
+                            reverse.drop_entries.push(DropEntry {
+                                offset: rev_offset,
+                                drop_fn,
+                            });
+                        }
+                    }
+
+                    // Apply: remove from sparse storage (drops the value).
+                    world.sparse.remove_raw(*component_id, *entity);
                 }
             }
         }
@@ -1259,5 +1446,158 @@ mod tests {
             .for_each(|(val,)| values.push(*val));
         values.sort();
         assert_eq!(values, vec![10, 20, 30]);
+    }
+
+    // ── Sparse mutation tests ────────────────────────────────────────
+
+    #[test]
+    fn sparse_insert_and_reverse_removes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert_sparse::<Vel>(&mut world, e, Vel { dx: 5.0, dy: 6.0 });
+
+        let reverse = cs.apply(&mut world);
+
+        // Sparse component should be readable via world.get (routes through sparse).
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 5.0, dy: 6.0 }));
+        // Archetype component still intact.
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+
+        // Reverse should remove the sparse component.
+        let _ = reverse.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), None);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn sparse_insert_overwrite_and_reverse_restores() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        // Initial sparse insert.
+        world.insert_sparse::<Vel>(e, Vel { dx: 1.0, dy: 2.0 });
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 1.0, dy: 2.0 }));
+
+        // Overwrite via changeset.
+        let mut cs = EnumChangeSet::new();
+        cs.insert_sparse::<Vel>(&mut world, e, Vel { dx: 99.0, dy: 99.0 });
+
+        let reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 99.0, dy: 99.0 }));
+
+        // Reverse should restore old value.
+        let _ = reverse.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 1.0, dy: 2.0 }));
+    }
+
+    #[test]
+    fn sparse_remove_and_reverse_reinserts() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.insert_sparse::<Vel>(e, Vel { dx: 3.0, dy: 4.0 });
+
+        let mut cs = EnumChangeSet::new();
+        cs.remove_sparse::<Vel>(&mut world, e);
+
+        let reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), None);
+
+        // Reverse should reinsert.
+        let _ = reverse.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
+    }
+
+    #[test]
+    fn sparse_remove_absent_is_noop() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.register_component::<Vel>();
+
+        let mut cs = EnumChangeSet::new();
+        cs.remove_sparse::<Vel>(&mut world, e);
+
+        let reverse = cs.apply(&mut world);
+        assert!(reverse.is_empty());
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn sparse_insert_drop_on_abort() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.insert_sparse::<Tracked>(&mut world, e, Tracked::new(42, &drops));
+            // drop without apply
+        }
+
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "destructor should run on changeset drop"
+        );
+    }
+
+    #[test]
+    fn sparse_insert_no_double_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.insert_sparse::<Tracked>(&mut world, e, Tracked::new(42, &drops));
+            let _reverse = cs.apply(&mut world);
+        }
+
+        // Value owned by sparse storage, no spurious drops.
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        world.despawn(e);
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "one drop from despawn");
+    }
+
+    #[test]
+    fn sparse_iter_mutations_yields_correct_views() {
+        let mut world = World::new();
+        let e = world.alloc_entity();
+        world.register_component::<f32>();
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert_sparse::<f32>(&mut world, e, 42.0f32);
+        cs.remove_sparse::<u32>(&mut world, e);
+
+        let views: Vec<_> = cs.iter_mutations().collect();
+        assert_eq!(views.len(), 2);
+        assert!(matches!(views[0], MutationRef::SparseInsert { .. }));
+        assert!(matches!(views[1], MutationRef::SparseRemove { .. }));
+
+        if let MutationRef::SparseInsert { data, .. } = &views[0] {
+            assert_eq!(data.len(), std::mem::size_of::<f32>());
+            let val = unsafe { *(data.as_ptr() as *const f32) };
+            assert_eq!(val, 42.0);
+        }
+    }
+
+    #[test]
+    fn sparse_round_trip_forward_reverse_forward() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert_sparse::<Vel>(&mut world, e, Vel { dx: 10.0, dy: 20.0 });
+
+        let reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
+
+        let forward_again = reverse.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), None);
+
+        let _ = forward_again.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
     }
 }

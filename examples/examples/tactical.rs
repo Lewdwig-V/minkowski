@@ -236,6 +236,7 @@ fn changeset_to_events(changeset: &EnumChangeSet, world: &World) -> Vec<Replicat
             MutationRef::Remove { entity, .. } => {
                 let _ = entity;
             }
+            MutationRef::SparseInsert { .. } | MutationRef::SparseRemove { .. } => {}
         }
     }
     events
@@ -801,7 +802,10 @@ fn main() {
             match mutation {
                 MutationRef::Insert { .. } => insert_count += 1,
                 MutationRef::Despawn { .. } => despawn_count += 1,
-                MutationRef::Spawn { .. } | MutationRef::Remove { .. } => {}
+                MutationRef::Spawn { .. }
+                | MutationRef::Remove { .. }
+                | MutationRef::SparseInsert { .. }
+                | MutationRef::SparseRemove { .. } => {}
             }
         }
         if insert_count > 0 || despawn_count > 0 {

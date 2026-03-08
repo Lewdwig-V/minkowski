@@ -1226,10 +1226,11 @@ impl World {
         self.sparse.iter::<T>(comp_id)
     }
 
-    /// Insert a sparse component value. Used during snapshot restore.
+    /// Insert a sparse component value. Marks the component as sparse in the
+    /// registry so that `get`/`has` route through sparse storage.
     pub fn insert_sparse<T: Component>(&mut self, entity: Entity, value: T) {
         self.drain_orphans();
-        let comp_id = self.components.register::<T>();
+        let comp_id = self.components.register_sparse::<T>();
         self.sparse.insert(comp_id, entity, value);
     }
 }

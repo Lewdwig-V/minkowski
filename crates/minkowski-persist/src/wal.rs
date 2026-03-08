@@ -181,6 +181,30 @@ pub(crate) fn apply_record(
             } => {
                 changeset.record_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
             }
+            SerializedMutation::SparseInsert {
+                entity,
+                component_id,
+                data,
+            } => {
+                let local_id = remap_id(*component_id)?;
+                let raw = codecs.deserialize(local_id, data)?;
+                let layout = codecs
+                    .layout(local_id)
+                    .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                changeset.record_sparse_insert(
+                    Entity::from_bits(*entity),
+                    local_id,
+                    raw.as_ptr(),
+                    layout,
+                );
+            }
+            SerializedMutation::SparseRemove {
+                entity,
+                component_id,
+            } => {
+                changeset
+                    .record_sparse_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
+            }
         }
     }
     changeset.apply(world);
@@ -710,6 +734,27 @@ impl Wal {
                 entity,
                 component_id,
             } => Ok(SerializedMutation::Remove {
+                entity: entity.to_bits(),
+                component_id: *component_id,
+            }),
+            MutationRef::SparseInsert {
+                entity,
+                component_id,
+                data,
+            } => {
+                let mut buf = Vec::new();
+                // SAFETY: data points to a valid component value from the Arena.
+                unsafe { codecs.serialize(*component_id, data.as_ptr(), &mut buf)? };
+                Ok(SerializedMutation::SparseInsert {
+                    entity: entity.to_bits(),
+                    component_id: *component_id,
+                    data: buf,
+                })
+            }
+            MutationRef::SparseRemove {
+                entity,
+                component_id,
+            } => Ok(SerializedMutation::SparseRemove {
                 entity: entity.to_bits(),
                 component_id: *component_id,
             }),
@@ -1828,6 +1873,132 @@ mod tests {
         assert!(
             positions.contains(&(99.0, 99.0)),
             "post-recovery record should be replayable with remap"
+        );
+    }
+
+    // ── Sparse durability tests ──────────────────────────────────────
+
+    #[test]
+    fn sparse_insert_wal_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("sparse.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Health>(&mut world);
+
+        // Record spawn + sparse insert in one changeset.
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+        cs.insert_sparse::<Health>(&mut world, e, Health(100));
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        let seq = wal.append(&cs, &codecs).unwrap();
+        assert_eq!(seq, 0);
+        cs.apply(&mut world);
+
+        // Verify sparse component is present.
+        assert_eq!(world.get::<Health>(e), Some(&Health(100)));
+
+        // Replay into a fresh world.
+        let mut world2 = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register::<Pos>(&mut world2);
+        codecs2.register::<Health>(&mut world2);
+
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay(&mut world2, &codecs2).unwrap();
+
+        let e2 = Entity::from_bits(e.to_bits());
+        assert_eq!(
+            world2.get::<Health>(e2),
+            Some(&Health(100)),
+            "sparse component should survive WAL replay"
+        );
+    }
+
+    #[test]
+    fn sparse_remove_wal_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("sparse_rm.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Health>(&mut world);
+
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.insert_sparse::<Health>(e, Health(50));
+        assert_eq!(world.get::<Health>(e), Some(&Health(50)));
+
+        // Record sparse removal.
+        let mut cs = EnumChangeSet::new();
+        cs.remove_sparse::<Health>(&mut world, e);
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world);
+        assert_eq!(world.get::<Health>(e), None);
+
+        // Replay into fresh world that has the entity with sparse component.
+        let mut world2 = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register::<Pos>(&mut world2);
+        codecs2.register::<Health>(&mut world2);
+
+        let e2 = world2.spawn((Pos { x: 1.0, y: 2.0 },));
+        world2.insert_sparse::<Health>(e2, Health(50));
+
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay(&mut world2, &codecs2).unwrap();
+
+        assert_eq!(
+            world2.get::<Health>(e2),
+            None,
+            "sparse removal should survive WAL replay"
+        );
+    }
+
+    #[test]
+    fn sparse_insert_overwrite_wal_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("sparse_ow.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Health>(&mut world);
+
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.insert_sparse::<Health>(e, Health(10));
+
+        // Overwrite sparse component.
+        let mut cs = EnumChangeSet::new();
+        cs.insert_sparse::<Health>(&mut world, e, Health(999));
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world);
+        assert_eq!(world.get::<Health>(e), Some(&Health(999)));
+
+        // Replay into world with old sparse value.
+        let mut world2 = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register::<Pos>(&mut world2);
+        codecs2.register::<Health>(&mut world2);
+
+        let e2 = world2.spawn((Pos { x: 1.0, y: 2.0 },));
+        world2.insert_sparse::<Health>(e2, Health(10));
+
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay(&mut world2, &codecs2).unwrap();
+
+        assert_eq!(
+            world2.get::<Health>(e2),
+            Some(&Health(999)),
+            "sparse overwrite should survive WAL replay"
         );
     }
 }
