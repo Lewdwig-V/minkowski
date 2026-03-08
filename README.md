@@ -151,6 +151,27 @@ for row in world.query_table::<Transform>() {
 
 `EnumChangeSet` records mutations as data with component bytes in a contiguous arena. `apply()` returns a reverse changeset for automatic undo — applying the reverse restores the previous state. Typed helpers (`insert<T>`, `remove<T>`, `spawn_bundle<B>`) handle component registration and raw pointers internally. `CommandBuffer` provides deferred structural changes during iteration.
 
+## Observability
+
+The `minkowski-observe` crate is a pure consumer companion that captures engine metrics without instrumenting hot paths. Two facade methods — `world.stats()` and `wal.stats()` — copy internal state into plain `Copy` structs (`WorldStats`, `WalStats`). The observe crate composes these into point-in-time snapshots, diffs consecutive captures, and computes deltas.
+
+```rust
+use minkowski_observe::{MetricsSnapshot, MetricsDiff};
+
+let snap1 = MetricsSnapshot::capture(&world, Some(&wal));
+// ... run simulation ...
+let snap2 = MetricsSnapshot::capture(&world, Some(&wal));
+
+let diff = MetricsDiff::compute(&snap1, &snap2);
+println!("{diff}");
+// --- Diff (1.2ms) ---
+//   entity delta: +30  churn: 70
+//   tick delta: 51  WAL seq delta: 50
+//   archetype delta: +1
+```
+
+Entity churn is exact — monotonic counters in `EntityAllocator` track every spawn (including reserved entities on materialization) and despawn. Per-archetype detail (entity count, component names, estimated byte footprint) is included in every snapshot. `Display` impls on both `MetricsSnapshot` and `MetricsDiff` produce human-readable tables suitable for logging or stderr.
+
 ## Spatial Indexing
 
 `SpatialIndex` is a lifecycle trait for user-owned spatial data structures. Indexes are fully external to World — they compose from existing query primitives. The trait has two methods: `rebuild` (full construction) and `update` (optional, for incremental updates via `Changed<T>`). Stale entity references are caught by generational validation at query time.
@@ -174,6 +195,7 @@ Two implementations ship as examples: a [uniform grid][uniform-grid] for O(N*k) 
 | `flatworm` | Planarian flatworm simulator with 200 worms over 1 000 frames. Implements chemotaxis (nutrition/distance² gradient via `FoodGrid` spatial index), binary fission when energy exceeds a threshold, starvation despawn below minimum energy, and food respawning. Demonstrates `SpatialIndex` trait, `CommandBuffer` for deferred spawn/despawn, and `QueryMut`/`QueryRef` reducers for movement, metabolism, and census. | `cargo run -p minkowski-examples --example flatworm --release` |
 | `circuit` | Analog circuit simulator: 555 astable oscillator → LCR bandpass filter → 741 voltage follower. Circuit nodes are entities with `Voltage` components; elements (resistors, inductors, op-amp) reference node entities for connectivity. Uses symplectic Euler integration for L/C elements, `QueryMut`/`QueryRef` reducers via `ReducerRegistry`, and prints an ASCII waveform of the filter output. 200K steps at 100 ns timestep. | `cargo run -p minkowski-examples --example circuit --release` |
 | `tactical` | Multi-operator tactical map with server-authoritative replication. Exercises 8 previously uncovered API gaps: sparse components (`insert_sparse`/`iter_sparse`), `par_for_each`, `Optimistic` transactions with `Conflict` inspection, `Entity::to_bits`/`from_bits` for wire serialization, world introspection (`archetype_count`, `component_name`), `register_entity_despawn`, `HashIndex::get_valid()` stale filtering, and `EnumChangeSet`/`MutationRef` iteration for replication packets. Two operator threads communicate with the server via `mpsc` channels. | `cargo run -p minkowski-examples --example tactical --release` |
+| `observe` | Observability companion demo. Captures `MetricsSnapshot` at two points in time (before and after entity churn: 20 despawns + 50 spawns across 2 archetypes), computes `MetricsDiff` with exact entity churn, tick delta, WAL sequence delta, and archetype deltas. Displays human-readable output via `Display` impls. | `cargo run -p minkowski-examples --example observe --release` |
 
 ## Python / Jupyter Integration
 
@@ -224,6 +246,7 @@ The commands teach the paradigm, not just the API — they encode the design pri
 - Defragmentation is constant via swap-remove.
 - Vectorization is guaranteed via 64-byte aligned slices.
 - Persistence is zero-copy via rkyv + mmap.
+- Segmented WAL with user-managed rotation and auto-checkpoints provides reliable crash recovery
 - Safety is compile-time via the split-phase transaction model.
 - ACID-lite: Atomicity and isolation via ChangeSet and split-phase transactions.
 - Indices: O(1) Entity Mapping, O(log N) Range-based and O(1) Archetype Bitsets.
@@ -235,7 +258,7 @@ Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each record
 ## Building & Testing
 
 ```
-cargo test -p minkowski                # 368 tests
+cargo test -p minkowski                # 383 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
@@ -247,8 +270,7 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 
 | Feature | Rationale |
 |---|---|
-| Replication & sync | Filtered WAL replay for read replicas and client mirrors |
-| Observability companion crate | `minkowski-observe`: pure consumer that calls `world.snapshot_metrics()`, diffs consecutive snapshots, computes rates (entity churn, changeset throughput, cache hit rates), and exports. Stretch within stretch: [ratatui][ratatui] TUI dashboard for live archetype sizes and sync diagnostics. Placed after replication because replication adds the most interesting metrics — sync latency, conflict rate across clients, changeset sizes over the wire |
+| TUI dashboard | [ratatui][ratatui]-based live dashboard consuming `MetricsSnapshot` via channel. Archetype table, entity churn sparklines, WAL pressure bar. Stretch goal building on the `minkowski-observe` crate |
 
 ## Glossary
 

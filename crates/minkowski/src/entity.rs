@@ -62,6 +62,10 @@ pub(crate) struct EntityAllocator {
     _pad: [u8; 64],
     /// Atomic counter for lock-free entity index reservation.
     next_reserved: std::sync::atomic::AtomicU32,
+    /// Monotonic spawn counter for observability (single u64 increment, negligible overhead).
+    pub(crate) total_spawns: u64,
+    /// Monotonic despawn counter for observability (single u64 increment, negligible overhead).
+    pub(crate) total_despawns: u64,
 }
 
 impl EntityAllocator {
@@ -71,6 +75,8 @@ impl EntityAllocator {
             free_list: Vec::new(),
             _pad: [0; 64],
             next_reserved: std::sync::atomic::AtomicU32::new(0),
+            total_spawns: 0,
+            total_despawns: 0,
         }
     }
 
@@ -101,13 +107,21 @@ impl EntityAllocator {
     /// Called automatically by `alloc()`.
     pub fn materialize_reserved(&mut self) {
         let reserved = *self.next_reserved.get_mut();
+        let before = self.generations.len();
         while self.generations.len() < reserved as usize {
             self.generations.push(0);
         }
+        // Count reserved entities that were just materialized as spawns.
+        // reserve() is &self (lock-free), so it can't increment the counter;
+        // this is the first &mut self point where we know the count.
+        self.total_spawns += (self.generations.len() - before) as u64;
     }
 
     pub fn alloc(&mut self) -> Entity {
         self.materialize_reserved();
+        // +1 for the entity alloc() itself returns;
+        // materialize_reserved() already counted any prior reserve() calls.
+        self.total_spawns += 1;
         if let Some(index) = self.free_list.pop() {
             let gen = self.generations[index as usize];
             Entity::new(index, gen)
@@ -125,6 +139,7 @@ impl EntityAllocator {
         if idx < self.generations.len() && self.generations[idx] == entity.generation() {
             self.generations[idx] = self.generations[idx].wrapping_add(1);
             self.free_list.push(entity.index());
+            self.total_despawns += 1;
             true
         } else {
             false
@@ -267,5 +282,52 @@ mod tests {
         let a = alloc.alloc();
         assert_eq!(a.index(), 0);
         assert_eq!(a.generation(), 1);
+    }
+
+    #[test]
+    fn spawn_counter_counts_alloc() {
+        let mut alloc = EntityAllocator::new();
+        assert_eq!(alloc.total_spawns, 0);
+        alloc.alloc();
+        alloc.alloc();
+        assert_eq!(alloc.total_spawns, 2);
+    }
+
+    #[test]
+    fn spawn_counter_counts_reserve_on_materialize() {
+        let mut alloc = EntityAllocator::new();
+        alloc.reserve();
+        alloc.reserve();
+        alloc.reserve();
+        // reserve() is &self — counter not yet incremented
+        assert_eq!(alloc.total_spawns, 0);
+        // materialize_reserved() is the first &mut self point
+        alloc.materialize_reserved();
+        assert_eq!(alloc.total_spawns, 3);
+    }
+
+    #[test]
+    fn spawn_counter_no_double_count_alloc_after_reserve() {
+        let mut alloc = EntityAllocator::new();
+        alloc.reserve(); // index 0
+        alloc.reserve(); // index 1
+                         // alloc calls materialize_reserved internally, then allocates one more
+        let e = alloc.alloc();
+        // 2 from materialize + 1 from alloc = 3
+        assert_eq!(alloc.total_spawns, 3);
+        assert_eq!(e.index(), 2); // fresh index, not reserved
+    }
+
+    #[test]
+    fn despawn_counter_counts_dealloc() {
+        let mut alloc = EntityAllocator::new();
+        let e1 = alloc.alloc();
+        let _e2 = alloc.alloc();
+        assert_eq!(alloc.total_despawns, 0);
+        alloc.dealloc(e1);
+        assert_eq!(alloc.total_despawns, 1);
+        // Failed dealloc (double-free) must NOT increment counter
+        alloc.dealloc(e1);
+        assert_eq!(alloc.total_despawns, 1);
     }
 }

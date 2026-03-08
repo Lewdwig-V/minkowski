@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo test -p minkowski --lib          # Unit tests (368 tests, fast)
+cargo test -p minkowski --lib          # Unit tests (383 tests, fast)
 cargo test -p minkowski                # All tests including doc tests
 cargo test -p minkowski -- entity      # Run tests matching a filter
 
@@ -29,6 +29,7 @@ cargo run -p minkowski-examples --example index --release   # B-tree range queri
 cargo run -p minkowski-examples --example flatworm --release   # Flatworm (planarian) simulator: chemotaxis, fission, starvation, spatial grid (200 worms, 1K frames)
 cargo run -p minkowski-examples --example circuit --release   # Analog circuit sim: 555 astable → LCR bandpass → 741 follower, symplectic Euler (200K steps, ASCII waveform)
 cargo run -p minkowski-examples --example tactical --release   # Multi-operator tactical map: sparse components, par_for_each, Optimistic Conflict, entity bit packing, HashIndex stale validation, EnumChangeSet/MutationRef replication (100 units, 10 ticks, 2 threads)
+cargo run -p minkowski-examples --example observe --release   # Observability: MetricsSnapshot capture, diff, entity churn (100 entities, 2 archetypes)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -53,7 +54,7 @@ Sequential chain: fmt failure skips all downstream jobs. A `ci-pass` aggregator 
 
 ## Architecture
 
-Minkowski is a **column-oriented archetype ECS**. Four crates: `minkowski` (core), `minkowski-derive` (`#[derive(Table)]` proc macro), `minkowski-persist` (WAL, snapshots, durable transactions), and `minkowski-examples` (examples as external API consumers).
+Minkowski is a **column-oriented archetype ECS**. Five crates: `minkowski` (core), `minkowski-derive` (`#[derive(Table)]` proc macro), `minkowski-persist` (WAL, snapshots, durable transactions), `minkowski-observe` (metrics capture and display), and `minkowski-examples` (examples as external API consumers).
 
 ### Storage Model
 
@@ -162,7 +163,7 @@ Typed reducers narrow what a closure *can* touch so that conflict freedom is pro
 
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ChangeTick`, `ComponentId`, `SpatialIndex`, `Access`, `BTreeIndex`, `HashIndex`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `QueryWriter`, `WritableRef`, `WriterQuery`, `Spawner`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ChangeTick`, `ComponentId`, `SpatialIndex`, `Access`, `BTreeIndex`, `HashIndex`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `QueryWriter`, `WritableRef`, `WriterQuery`, `Spawner`, `WorldStats`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
@@ -211,6 +212,7 @@ The corollary is that forging an ID — constructing one from a raw integer with
 | `rayon` | `par_for_each` parallel iteration |
 | `minkowski-derive` | `#[derive(Table)]` proc macro (syn/quote/proc-macro2) |
 | `minkowski-persist` | WAL, snapshots, codec registry, `Durable<S>` wrapper |
+| `minkowski-observe` | Observability companion: metrics capture, diff, display |
 | `rkyv` (persist) | Zero-copy serialization for WAL records and snapshots |
 | `memmap2` (persist) | Memory-mapped file I/O for zero-copy snapshot loading |
 | `thiserror` (persist) | Derive macros for `std::error::Error` impls |

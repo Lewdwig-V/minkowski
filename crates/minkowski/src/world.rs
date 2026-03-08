@@ -72,6 +72,20 @@ impl OrphanQueue {
     }
 }
 
+/// Read-only snapshot of engine statistics. Plain data struct — no references
+/// to internal state, safe to store or send across threads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldStats {
+    pub entity_count: usize,
+    pub archetype_count: usize,
+    pub component_count: usize,
+    pub free_list_len: usize,
+    pub query_cache_len: usize,
+    pub current_tick: u64,
+    pub total_spawns: u64,
+    pub total_despawns: u64,
+}
+
 /// The central data store. Holds all entities, components, archetype metadata,
 /// and the query cache.
 ///
@@ -1101,6 +1115,20 @@ impl World {
             .iter()
             .map(|arch| arch.len())
             .sum()
+    }
+
+    /// Read-only snapshot of engine statistics for observability.
+    pub fn stats(&self) -> WorldStats {
+        WorldStats {
+            entity_count: self.entity_count(),
+            archetype_count: self.archetypes.archetypes.len(),
+            component_count: self.components.len(),
+            free_list_len: self.entities.free_list.len(),
+            query_cache_len: self.query_cache.len(),
+            current_tick: self.current_tick.raw(),
+            total_spawns: self.entities.total_spawns,
+            total_despawns: self.entities.total_despawns,
+        }
     }
 
     // ── Persistence accessors ────────────────────────────────────────
@@ -2259,5 +2287,45 @@ mod tests {
 
         world.despawn(a);
         assert_eq!(world.entity_count(), 1);
+    }
+
+    #[test]
+    fn world_stats_reflects_state() {
+        let mut world = World::new();
+        let s0 = world.stats();
+        assert_eq!(s0.entity_count, 0);
+        assert_eq!(s0.archetype_count, 0);
+        assert_eq!(s0.component_count, 0);
+        assert_eq!(s0.free_list_len, 0);
+        assert_eq!(s0.query_cache_len, 0);
+        assert_eq!(s0.current_tick, 0);
+        assert_eq!(s0.total_spawns, 0);
+        assert_eq!(s0.total_despawns, 0);
+
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let s1 = world.stats();
+        assert_eq!(s1.entity_count, 1);
+        assert!(s1.archetype_count >= 1);
+        assert!(s1.component_count >= 1);
+        assert!(s1.current_tick > s0.current_tick);
+        assert_eq!(s1.total_spawns, 1);
+        assert_eq!(s1.total_despawns, 0);
+
+        world.despawn(e);
+        let s2 = world.stats();
+        assert_eq!(s2.entity_count, 0);
+        assert_eq!(s2.free_list_len, 1);
+        assert_eq!(s2.total_spawns, 1);
+        assert_eq!(s2.total_despawns, 1);
+    }
+
+    #[test]
+    fn world_stats_query_cache_len() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        assert_eq!(world.stats().query_cache_len, 0);
+        let _: Vec<_> = world.query::<(&Pos,)>().collect();
+        assert_eq!(world.stats().query_cache_len, 1);
     }
 }

@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 minkowski = { path = "../crates/minkowski" }
 minkowski-persist = { path = "../crates/minkowski-persist" }
+minkowski-observe = { path = "../crates/minkowski-observe" }
 rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 fastrand = "2"
 rayon = "1"

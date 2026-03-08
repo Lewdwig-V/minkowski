@@ -187,6 +187,18 @@ pub(crate) fn apply_record(
     Ok(())
 }
 
+/// Read-only snapshot of WAL statistics. Plain data struct — no references
+/// to internal state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WalStats {
+    pub next_seq: u64,
+    pub segment_count: usize,
+    pub oldest_seq: Option<u64>,
+    pub bytes_since_checkpoint: u64,
+    pub last_checkpoint_seq: Option<u64>,
+    pub checkpoint_needed: bool,
+}
+
 /// Segmented append-only write-ahead log. Each segment is an rkyv-serialized
 /// stream of `WalEntry` frames with a schema preamble. Segments roll over
 /// when they exceed `WalConfig::max_segment_bytes`.
@@ -362,6 +374,18 @@ impl Wal {
     /// The sequence number of the last acknowledged snapshot, if any.
     pub fn last_checkpoint_seq(&self) -> Option<u64> {
         self.last_checkpoint_seq
+    }
+
+    /// Snapshot of WAL statistics for observability.
+    pub fn stats(&self) -> WalStats {
+        WalStats {
+            next_seq: self.next_seq(),
+            segment_count: self.segment_count(),
+            oldest_seq: self.oldest_seq(),
+            bytes_since_checkpoint: self.bytes_since_checkpoint,
+            last_checkpoint_seq: self.last_checkpoint_seq(),
+            checkpoint_needed: self.checkpoint_needed(),
+        }
     }
 
     /// Record that a snapshot was taken at the given seq.
@@ -1241,6 +1265,40 @@ mod tests {
     fn wal_config_checkpoint_default_disabled() {
         let config = WalConfig::default();
         assert!(config.max_bytes_between_checkpoints.is_none());
+    }
+
+    #[test]
+    fn wal_stats_reflects_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(1024),
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+
+        let s0 = wal.stats();
+        assert_eq!(s0.next_seq, 0);
+        assert_eq!(s0.segment_count, 1);
+        assert_eq!(s0.oldest_seq, Some(0));
+        assert_eq!(s0.bytes_since_checkpoint, 0);
+        assert_eq!(s0.last_checkpoint_seq, None);
+        assert!(!s0.checkpoint_needed);
+
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world);
+
+        let s1 = wal.stats();
+        assert_eq!(s1.next_seq, 1);
+        assert!(s1.bytes_since_checkpoint > 0);
     }
 
     #[test]

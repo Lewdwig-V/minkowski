@@ -1,0 +1,12 @@
+[package]
+name = "minkowski-observe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+minkowski = { path = "../minkowski" }
+minkowski-persist = { path = "../minkowski-persist" }
+
+[dev-dependencies]
+tempfile = "3"
+rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
