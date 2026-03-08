@@ -9,3 +9,4 @@ minkowski-persist = { path = "../minkowski-persist" }
 
 [dev-dependencies]
 tempfile = "3"
+rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
