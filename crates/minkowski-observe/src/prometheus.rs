@@ -164,6 +164,12 @@ impl PrometheusExporter {
             self.wal_bytes_since_checkpoint.set(0);
         }
 
+        // Clear stale archetype series before repopulating. Without this,
+        // archetypes that disappeared since the last update would retain
+        // their old gauge values in the rendered output.
+        self.archetype_entity_count.clear();
+        self.archetype_estimated_bytes.clear();
+
         for arch in &snapshot.archetypes {
             let labels = vec![("archetype_id".to_string(), arch.id.to_string())];
             self.archetype_entity_count
@@ -260,5 +266,31 @@ mod tests {
 
         assert!(output.contains("minkowski_archetype_entity_count"));
         assert!(output.contains("5"));
+    }
+
+    #[test]
+    fn update_clears_stale_archetype_series() {
+        let exporter = PrometheusExporter::new();
+
+        // First snapshot: two archetypes
+        let mut world1 = World::new();
+        world1.spawn((42_u32,));
+        world1.spawn((1.0_f32,));
+        let snap1 = MetricsSnapshot::capture(&world1, None);
+        exporter.update(&snap1);
+        let output1 = exporter.render();
+        // Both archetypes present
+        assert!(output1.contains("archetype_id=\"0\""));
+        assert!(output1.contains("archetype_id=\"1\""));
+
+        // Second snapshot: different world with only one archetype
+        let mut world2 = World::new();
+        world2.spawn((99_u32,));
+        let snap2 = MetricsSnapshot::capture(&world2, None);
+        exporter.update(&snap2);
+        let output2 = exporter.render();
+        // Only the one archetype should remain — stale series cleared
+        assert!(output2.contains("archetype_id=\"0\""));
+        assert!(!output2.contains("archetype_id=\"1\""));
     }
 }
