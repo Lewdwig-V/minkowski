@@ -96,6 +96,20 @@ pub enum WalEntry {
     Checkpoint { snapshot_seq: u64 },
 }
 
+/// Self-describing replication payload. Every batch carries its own schema
+/// so receivers can decode without prior handshake.
+///
+/// Serialize with [`to_bytes`](ReplicationBatch::to_bytes) for transport
+/// over any medium (network, channels, shared memory). Deserialize with
+/// [`from_bytes`](ReplicationBatch::from_bytes) on the receiving end.
+/// Apply to a target [`World`](minkowski::World) via
+/// [`apply_batch`](crate::replication::apply_batch).
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct ReplicationBatch {
+    pub schema: WalSchema,
+    pub records: Vec<WalRecord>,
+}
+
 /// Returned after a successful snapshot save.
 #[derive(Debug, Clone)]
 pub struct SnapshotHeader {

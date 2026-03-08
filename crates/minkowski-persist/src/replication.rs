@@ -1,175 +1,56 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::path::{Path, PathBuf};
+//! Transport-agnostic replication primitives.
+//!
+//! [`ReplicationBatch`] is a self-describing mutation payload that can be
+//! serialized to bytes (`to_bytes`) and deserialized (`from_bytes`) for
+//! transport over any medium — network, channels, files, shared memory.
+//! [`apply_batch`] consumes a batch and applies it to a target [`World`].
+//!
+//! How you produce and transport batches is up to you. For local-filesystem
+//! scenarios, [`WalCursor`](crate::WalCursor) reads batches directly from
+//! WAL segment files.
 
-use rkyv::{Archive, Deserialize, Serialize};
+use std::collections::HashMap;
 
 use minkowski::{ComponentId, World};
 
-use crate::codec::CodecRegistry;
-use crate::record::{WalEntry, WalRecord, WalSchema};
-use crate::wal::{apply_record, list_segments, read_next_frame, WalError};
+use crate::codec::{CodecError, CodecRegistry};
+use crate::record::ReplicationBatch;
+use crate::wal::{apply_record, WalError};
 
-/// Read-only cursor over a segmented WAL directory. Opens its own file
-/// handles so it can read concurrently with an active writer. Lazily
-/// advances across segment files.
-pub struct WalCursor {
-    dir: PathBuf,
-    file: File,
-    pos: u64,
-    next_seq: u64,
-    schema: Option<WalSchema>,
-    current_segment_start_seq: u64,
+/// Errors from transport-agnostic replication operations.
+///
+/// Deliberately independent of [`WalError`](crate::WalError) — a replica
+/// server that only deserializes and applies batches should not need to
+/// know about WAL file I/O.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplicationError {
+    #[error("replication format error: {0}")]
+    Format(String),
+    #[error("replication codec error: {0}")]
+    Codec(#[from] CodecError),
 }
 
-impl WalCursor {
-    /// Open a WAL directory for reading, starting from `from_seq`.
-    /// Finds the segment containing `from_seq`, parses its schema preamble,
-    /// and scans forward to the first record with `seq >= from_seq`.
-    /// Returns `Err(CursorBehind)` if all segments start after `from_seq`.
-    pub fn open(dir: &Path, from_seq: u64) -> Result<Self, WalError> {
-        let segments = list_segments(dir)?;
-        if segments.is_empty() {
-            return Err(WalError::Format("no WAL segments found".into()));
-        }
-
-        // Find segment containing from_seq: largest start_seq <= from_seq
-        let seg_idx = match segments.iter().rposition(|(start, _)| *start <= from_seq) {
-            Some(idx) => idx,
-            None => {
-                return Err(WalError::CursorBehind {
-                    requested: from_seq,
-                    oldest: segments[0].0,
-                });
-            }
-        };
-
-        let (start_seq, seg_path) = &segments[seg_idx];
-        let file = File::open(seg_path)?;
-        let mut pos: u64 = 0;
-        let mut schema = None;
-
-        // Scan forward to from_seq
-        loop {
-            match read_next_frame(&file, pos)? {
-                Some((WalEntry::Schema(s), next_pos)) => {
-                    schema = Some(s);
-                    pos = next_pos;
-                }
-                Some((WalEntry::Mutations(record), next_pos)) => {
-                    if record.seq >= from_seq {
-                        break; // Don't advance past this record
-                    }
-                    pos = next_pos;
-                }
-                Some((WalEntry::Checkpoint { .. }, next_pos)) => {
-                    pos = next_pos;
-                }
-                None => break,
-            }
-        }
-
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            file,
-            pos,
-            next_seq: from_seq,
-            schema,
-            current_segment_start_seq: *start_seq,
-        })
-    }
-
-    /// Read up to `limit` records from the current position.
-    /// Returns a `ReplicationBatch` with the schema and records.
-    /// An empty `records` vec means the cursor has caught up.
-    /// Lazily advances across segment boundaries.
-    pub fn next_batch(&mut self, limit: usize) -> Result<ReplicationBatch, WalError> {
-        let mut records = Vec::new();
-
-        while records.len() < limit {
-            match read_next_frame(&self.file, self.pos)? {
-                Some((WalEntry::Schema(s), next_pos)) => {
-                    self.schema = Some(s);
-                    self.pos = next_pos;
-                }
-                Some((WalEntry::Mutations(record), next_pos)) => {
-                    self.next_seq = record.seq + 1;
-                    records.push(record);
-                    self.pos = next_pos;
-                }
-                Some((WalEntry::Checkpoint { .. }, next_pos)) => {
-                    self.pos = next_pos;
-                }
-                None => {
-                    // Try to advance to next segment
-                    if !self.try_advance_segment()? {
-                        break; // No more segments — caught up
-                    }
-                }
-            }
-        }
-
-        let schema = self
-            .schema
-            .clone()
-            .unwrap_or_else(|| WalSchema { components: vec![] });
-        Ok(ReplicationBatch { schema, records })
-    }
-
-    /// Try to open the next segment file. Returns true if advanced.
-    fn try_advance_segment(&mut self) -> Result<bool, WalError> {
-        let segments = list_segments(&self.dir)?;
-        let next = segments
-            .iter()
-            .find(|(start, _)| *start > self.current_segment_start_seq);
-
-        match next {
-            Some((start_seq, path)) => {
-                self.file = File::open(path)?;
-                self.pos = 0;
-                self.current_segment_start_seq = *start_seq;
-                // Parse schema preamble of new segment
-                if let Some((WalEntry::Schema(s), next_pos)) = read_next_frame(&self.file, 0)? {
-                    self.schema = Some(s);
-                    self.pos = next_pos;
-                }
-                Ok(true)
-            }
-            None => Ok(false),
+impl From<WalError> for ReplicationError {
+    fn from(e: WalError) -> Self {
+        match e {
+            WalError::Codec(c) => ReplicationError::Codec(c),
+            other => ReplicationError::Format(other.to_string()),
         }
     }
-
-    /// The schema parsed from the WAL preamble, if present.
-    pub fn schema(&self) -> Option<&WalSchema> {
-        self.schema.as_ref()
-    }
-
-    /// Next expected sequence number. Useful for persisting cursor position.
-    pub fn next_seq(&self) -> u64 {
-        self.next_seq
-    }
-}
-
-/// Self-describing replication payload. Every batch carries its own schema
-/// so receivers can decode without prior handshake.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct ReplicationBatch {
-    pub schema: WalSchema,
-    pub records: Vec<WalRecord>,
 }
 
 impl ReplicationBatch {
     /// Serialize to bytes via rkyv.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, WalError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ReplicationError> {
         rkyv::to_bytes::<rkyv::rancor::Error>(self)
             .map(|v| v.to_vec())
-            .map_err(|e| WalError::Format(e.to_string()))
+            .map_err(|e| ReplicationError::Format(e.to_string()))
     }
 
     /// Deserialize from bytes via rkyv.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, WalError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ReplicationError> {
         rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
-            .map_err(|e| WalError::Format(e.to_string()))
+            .map_err(|e| ReplicationError::Format(e.to_string()))
     }
 }
 
@@ -186,7 +67,7 @@ pub fn apply_batch(
     batch: &ReplicationBatch,
     world: &mut World,
     codecs: &CodecRegistry,
-) -> Result<Option<u64>, WalError> {
+) -> Result<Option<u64>, ReplicationError> {
     let remap: Option<HashMap<ComponentId, ComponentId>> = if batch.schema.components.is_empty() {
         None
     } else {
@@ -206,8 +87,8 @@ pub fn apply_batch(
 mod tests {
     use super::*;
     use crate::codec::CodecRegistry;
-    use crate::record::{ComponentSchema, SerializedMutation};
-    use crate::wal::{Wal, WalConfig};
+    use crate::record::{ComponentSchema, SerializedMutation, WalRecord, WalSchema};
+    use crate::wal::{Wal, WalConfig, WalCursor, WalError};
     use minkowski::{EnumChangeSet, World};
 
     #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq, Debug)]
@@ -665,7 +546,7 @@ mod tests {
     #[test]
     fn from_bytes_corrupt_returns_error() {
         let result = ReplicationBatch::from_bytes(&[0xFF; 32]);
-        assert!(matches!(result, Err(WalError::Format(_))));
+        assert!(matches!(result, Err(ReplicationError::Format(_))));
     }
 
     #[test]

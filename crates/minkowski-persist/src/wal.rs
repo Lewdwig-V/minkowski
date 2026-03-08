@@ -717,6 +717,155 @@ impl Wal {
     }
 }
 
+// ── WalCursor ─────────────────────────────────────────────────────────
+
+use crate::record::ReplicationBatch;
+
+/// Read-only cursor over a segmented WAL directory. Opens its own file
+/// handles so it can read concurrently with an active writer. Lazily
+/// advances across segment files.
+///
+/// This is a **filesystem-specific** utility for reading WAL records from
+/// local segment files. For network replication, serialize
+/// [`ReplicationBatch`] on the source and transport it yourself —
+/// `WalCursor` is one way to produce batches, not the only way.
+pub struct WalCursor {
+    dir: PathBuf,
+    file: File,
+    pos: u64,
+    next_seq: u64,
+    schema: Option<WalSchema>,
+    current_segment_start_seq: u64,
+}
+
+impl WalCursor {
+    /// Open a WAL directory for reading, starting from `from_seq`.
+    /// Finds the segment containing `from_seq`, parses its schema preamble,
+    /// and scans forward to the first record with `seq >= from_seq`.
+    /// Returns `Err(CursorBehind)` if all segments start after `from_seq`.
+    pub fn open(dir: &Path, from_seq: u64) -> Result<Self, WalError> {
+        let segments = list_segments(dir)?;
+        if segments.is_empty() {
+            return Err(WalError::Format("no WAL segments found".into()));
+        }
+
+        // Find segment containing from_seq: largest start_seq <= from_seq
+        let seg_idx = match segments.iter().rposition(|(start, _)| *start <= from_seq) {
+            Some(idx) => idx,
+            None => {
+                return Err(WalError::CursorBehind {
+                    requested: from_seq,
+                    oldest: segments[0].0,
+                });
+            }
+        };
+
+        let (start_seq, seg_path) = &segments[seg_idx];
+        let file = File::open(seg_path)?;
+        let mut pos: u64 = 0;
+        let mut schema = None;
+
+        // Scan forward to from_seq
+        loop {
+            match read_next_frame(&file, pos)? {
+                Some((WalEntry::Schema(s), next_pos)) => {
+                    schema = Some(s);
+                    pos = next_pos;
+                }
+                Some((WalEntry::Mutations(record), next_pos)) => {
+                    if record.seq >= from_seq {
+                        break; // Don't advance past this record
+                    }
+                    pos = next_pos;
+                }
+                Some((WalEntry::Checkpoint { .. }, next_pos)) => {
+                    pos = next_pos;
+                }
+                None => break,
+            }
+        }
+
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            file,
+            pos,
+            next_seq: from_seq,
+            schema,
+            current_segment_start_seq: *start_seq,
+        })
+    }
+
+    /// Read up to `limit` records from the current position.
+    /// Returns a `ReplicationBatch` with the schema and records.
+    /// An empty `records` vec means the cursor has caught up.
+    /// Lazily advances across segment boundaries.
+    pub fn next_batch(&mut self, limit: usize) -> Result<ReplicationBatch, WalError> {
+        let mut records = Vec::new();
+
+        while records.len() < limit {
+            match read_next_frame(&self.file, self.pos)? {
+                Some((WalEntry::Schema(s), next_pos)) => {
+                    self.schema = Some(s);
+                    self.pos = next_pos;
+                }
+                Some((WalEntry::Mutations(record), next_pos)) => {
+                    self.next_seq = record.seq + 1;
+                    records.push(record);
+                    self.pos = next_pos;
+                }
+                Some((WalEntry::Checkpoint { .. }, next_pos)) => {
+                    self.pos = next_pos;
+                }
+                None => {
+                    // Try to advance to next segment
+                    if !self.try_advance_segment()? {
+                        break; // No more segments — caught up
+                    }
+                }
+            }
+        }
+
+        let schema = self
+            .schema
+            .clone()
+            .unwrap_or_else(|| WalSchema { components: vec![] });
+        Ok(ReplicationBatch { schema, records })
+    }
+
+    /// Try to open the next segment file. Returns true if advanced.
+    fn try_advance_segment(&mut self) -> Result<bool, WalError> {
+        let segments = list_segments(&self.dir)?;
+        let next = segments
+            .iter()
+            .find(|(start, _)| *start > self.current_segment_start_seq);
+
+        match next {
+            Some((start_seq, path)) => {
+                self.file = File::open(path)?;
+                self.pos = 0;
+                self.current_segment_start_seq = *start_seq;
+                // Parse schema preamble of new segment
+                if let Some((WalEntry::Schema(s), next_pos)) = read_next_frame(&self.file, 0)? {
+                    self.schema = Some(s);
+                    self.pos = next_pos;
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// The schema parsed from the WAL preamble, if present.
+    pub fn schema(&self) -> Option<&WalSchema> {
+        self.schema.as_ref()
+    }
+
+    /// Next expected sequence number. Useful for persisting cursor position.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

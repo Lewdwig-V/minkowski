@@ -142,7 +142,7 @@ All strategies handle entity ID cleanup automatically — no IDs leak on abort, 
 
 The `minkowski-persist` crate adds crash-safe durability. `Durable<S>` wraps any transaction strategy — every committed mutation is [WAL][wal]-logged before the caller sees the result. Recovery loads the latest snapshot and replays subsequent WAL entries.
 
-Snapshots serialize the full world state via [rkyv][rkyv] and can be saved to disk or transferred as bytes (`save_to_bytes` / `load_from_bytes`) for network replication. `WalCursor` and `ReplicationBatch` provide incremental catch-up for read replicas.
+Snapshots serialize the full world state via [rkyv][rkyv] and can be saved to disk or transferred as bytes (`save_to_bytes` / `load_from_bytes`). `ReplicationBatch` is the transport-agnostic wire format for incremental replication — serialize it, send it over any medium (network, channels, shared memory), and `apply_batch` on the receiving end. `WalCursor` reads batches from local WAL files for same-server scenarios.
 
 ```rust
 // Durable wraps any strategy — Optimistic, Pessimistic, or Sequential

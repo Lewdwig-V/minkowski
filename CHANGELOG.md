@@ -69,7 +69,8 @@ Initial stable release of the Minkowski column-oriented ECS storage engine.
 - Segmented WAL with append, replay, rotation, truncation, and crash recovery
 - `Durable<S>` wraps any `Transact` strategy for WAL-backed durability
 - rkyv zero-copy snapshots via mmap (`save_to_bytes` / `load_from_bytes`)
-- `WalCursor` + `ReplicationBatch` for pull-based incremental replication
+- `ReplicationBatch` — transport-agnostic wire format for incremental replication (`to_bytes`/`from_bytes`/`apply_batch`)
+- `WalCursor` — filesystem-specific WAL reader for producing batches from local segment files
 - `CodecRegistry` for stable cross-process component identity
 - `CheckpointHandler` trait with `AutoCheckpoint` default
 - WAL checkpoint markers for coordinated snapshot + truncation
