@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 minkowski = { path = "../minkowski" }
 minkowski-persist = { path = "../minkowski-persist" }
+prometheus-client = "0.24"
 
 [dev-dependencies]
 tempfile = "3"

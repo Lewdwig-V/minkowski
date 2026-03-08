@@ -6,7 +6,7 @@
 //! Run: cargo run -p minkowski-examples --example observe --release
 
 use minkowski::{EnumChangeSet, World};
-use minkowski_observe::{MetricsDiff, MetricsSnapshot};
+use minkowski_observe::{MetricsDiff, MetricsSnapshot, PrometheusExporter};
 use minkowski_persist::{CodecRegistry, Wal, WalConfig};
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -92,6 +92,12 @@ fn main() {
     let diff = MetricsDiff::compute(&snap1, &snap2);
     println!("=== Diff ===");
     println!("{diff}");
+
+    // Prometheus export
+    let exporter = PrometheusExporter::new();
+    exporter.update(&snap2);
+    println!("=== Prometheus Metrics ===");
+    println!("{}", exporter.render());
 
     let _ = std::fs::remove_dir_all(&dir);
     println!("Done.");

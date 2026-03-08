@@ -5,7 +5,9 @@
 //! semantics.
 
 pub mod diff;
+pub mod prometheus;
 pub mod snapshot;
 
 pub use diff::{ArchetypeSize, MetricsDiff};
+pub use prometheus::PrometheusExporter;
 pub use snapshot::{ArchetypeInfo, MetricsSnapshot};
