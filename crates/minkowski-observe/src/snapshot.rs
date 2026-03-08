@@ -66,6 +66,47 @@ impl MetricsSnapshot {
     }
 }
 
+impl std::fmt::Display for MetricsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "--- World ---\n  entities: {}  archetypes: {}  components: {}",
+            self.world.entity_count, self.world.archetype_count, self.world.component_count
+        )?;
+        writeln!(
+            f,
+            "  free list: {}  query cache: {}  tick: {}",
+            self.world.free_list_len, self.world.query_cache_len, self.world.current_tick
+        )?;
+
+        if let Some(ref wal) = self.wal {
+            writeln!(
+                f,
+                "--- WAL ---\n  seq: {}  segments: {}  oldest: {:?}",
+                wal.next_seq, wal.segment_count, wal.oldest_seq
+            )?;
+            writeln!(
+                f,
+                "  checkpoint: needed={}  last={:?}  bytes_since={}",
+                wal.checkpoint_needed, wal.last_checkpoint_seq, wal.bytes_since_checkpoint
+            )?;
+        }
+
+        if !self.archetypes.is_empty() {
+            writeln!(f, "--- Archetypes ---")?;
+            for arch in self.archetypes.iter().filter(|a| a.entity_count > 0) {
+                writeln!(
+                    f,
+                    "  [{}] {} entities, ~{} bytes — {:?}",
+                    arch.id, arch.entity_count, arch.estimated_bytes, arch.component_names
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +172,18 @@ mod tests {
 
         // Pos is 8 bytes (2 x f32), 10 entities = 80 bytes
         assert_eq!(pos_arch.estimated_bytes, 80);
+    }
+
+    #[test]
+    fn snapshot_display_includes_key_info() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let snap = MetricsSnapshot::capture(&world, None);
+        let output = format!("{snap}");
+
+        assert!(output.contains("entities: 1"));
+        assert!(output.contains("archetypes:"));
+        assert!(output.contains("tick:"));
     }
 }

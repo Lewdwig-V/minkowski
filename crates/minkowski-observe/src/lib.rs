@@ -6,3 +6,6 @@
 
 pub mod diff;
 pub mod snapshot;
+
+pub use diff::MetricsDiff;
+pub use snapshot::{ArchetypeInfo, MetricsSnapshot};

@@ -69,6 +69,32 @@ impl MetricsDiff {
     }
 }
 
+impl std::fmt::Display for MetricsDiff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "--- Diff ({:.1?}) ---", self.elapsed)?;
+        writeln!(
+            f,
+            "  entity delta: {:+}  churn: {}",
+            self.entity_delta, self.entity_churn
+        )?;
+        writeln!(
+            f,
+            "  tick delta: {}  WAL seq delta: {}",
+            self.tick_delta, self.wal_seq_delta
+        )?;
+        writeln!(f, "  archetype delta: {:+}", self.archetype_delta)?;
+
+        if !self.largest_archetypes.is_empty() {
+            writeln!(f, "  largest archetypes:")?;
+            for (id, count) in &self.largest_archetypes {
+                writeln!(f, "    [{id}] {count} entities")?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +173,19 @@ mod tests {
 
         let diff = MetricsDiff::compute(&before, &after);
         assert!(diff.archetype_delta >= 1);
+    }
+
+    #[test]
+    fn diff_display_includes_key_info() {
+        let mut world = World::new();
+        let before = MetricsSnapshot::capture(&world, None);
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let after = MetricsSnapshot::capture(&world, None);
+
+        let diff = MetricsDiff::compute(&before, &after);
+        let output = format!("{diff}");
+
+        assert!(output.contains("entity delta:"));
+        assert!(output.contains("tick delta:"));
     }
 }
