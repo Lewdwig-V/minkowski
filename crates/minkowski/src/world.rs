@@ -5,15 +5,13 @@ use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
+use crate::sync::{Arc, AtomicU64, Mutex, Ordering};
 use crate::table::TableCache;
 use crate::tick::Tick;
 use fixedbitset::FixedBitSet;
-use parking_lot::Mutex;
 use std::alloc::Layout;
 use std::any::TypeId;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Unique identity for a World instance. Strategies capture this at
 /// construction and assert it matches in begin/commit to prevent
@@ -21,7 +19,13 @@ use std::sync::Arc;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct WorldId(u64);
 
+#[cfg(not(loom))]
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
+}
 
 impl WorldId {
     fn next() -> Self {

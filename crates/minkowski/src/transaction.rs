@@ -55,10 +55,9 @@
 //! created from world A being used with world B, which would push aborted
 //! entity IDs into the wrong orphan queue and corrupt unrelated live entities.
 
-use std::sync::atomic::AtomicU64;
+use crate::sync::{AtomicU64, Mutex};
 
 use fixedbitset::FixedBitSet;
-use parking_lot::Mutex;
 
 use crate::access::Access;
 use crate::changeset::EnumChangeSet;
@@ -542,7 +541,7 @@ fn backoff(attempt: usize) {
             std::hint::spin_loop();
         }
     } else {
-        std::thread::yield_now();
+        crate::sync::yield_now();
     }
 }
 

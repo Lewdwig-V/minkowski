@@ -1,9 +1,6 @@
 //! Conditional sync primitives — routes to parking_lot/std in production,
 //! loom equivalents under `cfg(loom)` for deterministic schedule testing.
 
-// Nothing imports from this module yet — Task 2 rewires imports. Suppress until then.
-#![allow(unused_imports, dead_code)]
-
 #[cfg(not(loom))]
 pub(crate) use parking_lot::Mutex;
 

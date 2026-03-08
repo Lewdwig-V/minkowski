@@ -1,3 +1,5 @@
+use crate::sync::{AtomicU32, Ordering};
+
 /// A unique entity identifier: 32-bit index + 32-bit generation packed into a u64.
 ///
 /// The low 32 bits store the index (slot in the entity allocator), and the
@@ -61,7 +63,7 @@ pub(crate) struct EntityAllocator {
     // contend with sequential alloc()/materialize() which mutate the Vecs.
     _pad: [u8; 64],
     /// Atomic counter for lock-free entity index reservation.
-    next_reserved: std::sync::atomic::AtomicU32,
+    next_reserved: AtomicU32,
     /// Monotonic spawn counter for observability (single u64 increment, negligible overhead).
     pub(crate) total_spawns: u64,
     /// Monotonic despawn counter for observability (single u64 increment, negligible overhead).
@@ -74,7 +76,7 @@ impl EntityAllocator {
             generations: Vec::new(),
             free_list: Vec::new(),
             _pad: [0; 64],
-            next_reserved: std::sync::atomic::AtomicU32::new(0),
+            next_reserved: AtomicU32::new(0),
             total_spawns: 0,
             total_despawns: 0,
         }
@@ -86,9 +88,7 @@ impl EntityAllocator {
     /// before using `alloc()` or `is_alive()` on reserved indices.
     #[allow(dead_code)]
     pub fn reserve(&self) -> Entity {
-        let index = self
-            .next_reserved
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let index = self.next_reserved.fetch_add(1, Ordering::Relaxed);
         Entity::new(index, 0)
     }
 
@@ -97,16 +97,16 @@ impl EntityAllocator {
     /// handing out already-used indices.
     pub fn sync_reserved(&mut self) {
         let len = self.generations.len() as u32;
-        let current = *self.next_reserved.get_mut();
+        let current = self.next_reserved.load(Ordering::Relaxed);
         if current < len {
-            *self.next_reserved.get_mut() = len;
+            self.next_reserved.store(len, Ordering::Relaxed);
         }
     }
 
     /// Backfill the generations vec to cover all reserved indices.
     /// Called automatically by `alloc()`.
     pub fn materialize_reserved(&mut self) {
-        let reserved = *self.next_reserved.get_mut();
+        let reserved = self.next_reserved.load(Ordering::Relaxed);
         let before = self.generations.len();
         while self.generations.len() < reserved as usize {
             self.generations.push(0);

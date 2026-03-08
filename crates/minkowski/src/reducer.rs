@@ -1,8 +1,8 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+
+use crate::sync::{Arc, AtomicBool, AtomicU64, Ordering};
 
 use crate::access::Access;
 use crate::bundle::Bundle;
