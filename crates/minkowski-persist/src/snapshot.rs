@@ -30,6 +30,10 @@ impl Snapshot {
     }
 
     /// Save a full world snapshot to disk.
+    ///
+    /// Writes the rkyv payload directly to the file without copying it into
+    /// a second framed buffer. Use `save_to_bytes` when you need the framed
+    /// bytes as a `Vec<u8>` (e.g. for network transfer).
     pub fn save(
         &self,
         path: &Path,
@@ -37,11 +41,21 @@ impl Snapshot {
         codecs: &CodecRegistry,
         wal_seq: u64,
     ) -> Result<SnapshotHeader, SnapshotError> {
-        let (header, bytes) = self.save_to_bytes(world, codecs, wal_seq)?;
+        let data = self.build_snapshot_data(world, codecs, wal_seq)?;
+        let header = SnapshotHeader {
+            wal_seq,
+            archetype_count: data.archetypes.len(),
+            entity_count: data.archetypes.iter().map(|a| a.entities.len()).sum(),
+        };
+
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
+            .map_err(|e| SnapshotError::Format(e.to_string()))?;
 
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        writer.write_all(&bytes)?;
+        let len = payload.len() as u64;
+        writer.write_all(&len.to_le_bytes())?;
+        writer.write_all(&payload)?;
         writer.flush()?;
 
         Ok(header)
