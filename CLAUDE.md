@@ -37,6 +37,8 @@ MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p 
 RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p minkowski --lib --tests -Z build-std --target x86_64-unknown-linux-gnu -- --skip par_for_each  # TSan (data race detection)
 RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p minkowski --lib --tests -Z build-std --target x86_64-unknown-linux-gnu par_for_each  # TSan rayon tests
 
+RUSTFLAGS="--cfg loom" cargo test -p minkowski --lib --features loom -- loom_tests  # loom: exhaustive concurrency verification
+
 cargo +nightly fuzz run fuzz_world_ops -- -max_total_time=60     # fuzz: random World operations
 cargo +nightly fuzz run fuzz_reducers -- -max_total_time=60      # fuzz: query iteration paths
 cargo +nightly fuzz run fuzz_snapshot_load -- -max_total_time=60 -max_len=65536  # fuzz: snapshot deserialization
@@ -58,8 +60,9 @@ GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every PR and push t
 | test | stable | `cargo test -p minkowski` | clippy |
 | miri | nightly | Two-step Miri run (see Build & Test Commands) | test |
 | tsan | nightly | Two-step TSan run with `-Z build-std` (see Build & Test Commands) | test |
+| loom | stable | Exhaustive concurrency verification (see Build & Test Commands) | test |
 
-Sequential chain: fmt failure skips all downstream jobs. Miri and TSan run in parallel after test. A `ci-pass` aggregator job (runs with `if: always()`) is the single required status check for branch protection — it explicitly verifies all five jobs succeeded, avoiding GitHub's "skipped = passed" loophole with chained `needs:`.
+Sequential chain: fmt failure skips all downstream jobs. Miri, TSan, and Loom run in parallel after test. A `ci-pass` aggregator job (runs with `if: always()`) is the single required status check for branch protection — it explicitly verifies all six jobs succeeded, avoiding GitHub's "skipped = passed" loophole with chained `needs:`.
 
 ## Architecture
 

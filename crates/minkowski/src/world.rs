@@ -5,15 +5,13 @@ use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
+use crate::sync::{Arc, AtomicU64, Mutex, Ordering};
 use crate::table::TableCache;
 use crate::tick::Tick;
 use fixedbitset::FixedBitSet;
-use parking_lot::Mutex;
 use std::alloc::Layout;
 use std::any::TypeId;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Unique identity for a World instance. Strategies capture this at
 /// construction and assert it matches in begin/commit to prevent
@@ -21,7 +19,13 @@ use std::sync::Arc;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct WorldId(u64);
 
+#[cfg(not(loom))]
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
+}
 
 impl WorldId {
     fn next() -> Self {
@@ -2471,5 +2475,81 @@ mod tests {
         assert_eq!(count, 1);
         assert!(!world.is_alive(b));
         assert_eq!(world.get::<Pos>(_a).unwrap().x, 1.0);
+    }
+}
+
+#[cfg(loom)]
+mod loom_tests {
+    use crate::entity::Entity;
+    use crate::sync::{Arc, Mutex};
+    use loom::thread;
+
+    use super::OrphanQueue;
+
+    /// Two transactions abort concurrently, pushing orphaned entity IDs to
+    /// the shared OrphanQueue. Main thread drains. All IDs must be present.
+    #[test]
+    fn loom_orphan_queue_push_drain_no_lost_ids() {
+        loom::model(|| {
+            let queue = OrphanQueue::new();
+
+            let q1 = queue.clone();
+            let t1 = thread::spawn(move || {
+                let mut guard = q1.0.lock();
+                guard.push(Entity::new(10, 0));
+                guard.push(Entity::new(11, 0));
+            });
+
+            let q2 = queue.clone();
+            let t2 = thread::spawn(move || {
+                let mut guard = q2.0.lock();
+                guard.push(Entity::new(20, 0));
+                guard.push(Entity::new(21, 0));
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let mut drained: Vec<u32> = queue.0.lock().drain(..).map(|e| e.index()).collect();
+            drained.sort();
+            assert_eq!(drained, vec![10, 11, 20, 21]);
+        });
+    }
+
+    /// Interleaved push and drain: one thread pushes individual IDs while
+    /// another drains. All IDs must appear exactly once across batches.
+    #[test]
+    fn loom_orphan_queue_interleaved_push_drain() {
+        loom::model(|| {
+            let queue = OrphanQueue::new();
+            let results: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let q1 = queue.clone();
+            let pusher = thread::spawn(move || {
+                q1.0.lock().push(Entity::new(1, 0));
+                q1.0.lock().push(Entity::new(2, 0));
+            });
+
+            let q2 = queue.clone();
+            let r = results.clone();
+            let drainer = thread::spawn(move || {
+                let batch: Vec<u32> = q2.0.lock().drain(..).map(|e| e.index()).collect();
+                r.lock().push(batch);
+            });
+
+            pusher.join().unwrap();
+            drainer.join().unwrap();
+
+            let remainder: Vec<u32> = queue.0.lock().drain(..).map(|e| e.index()).collect();
+            results.lock().push(remainder);
+
+            let mut all: Vec<u32> = results
+                .lock()
+                .iter()
+                .flat_map(|v| v.iter().copied())
+                .collect();
+            all.sort();
+            assert_eq!(all, vec![1, 2]);
+        });
     }
 }

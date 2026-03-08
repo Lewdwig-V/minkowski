@@ -81,6 +81,7 @@ pub(crate) mod lock_table;
 pub mod query;
 pub mod reducer;
 pub mod storage;
+pub(crate) mod sync;
 pub mod table;
 pub mod tick;
 pub mod transaction;

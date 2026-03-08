@@ -63,7 +63,7 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 
 ## Soundness
 
-Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration — the performance-critical paths that make an ECS fast. Five layers of verification ensure these paths are correct:
+Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration — the performance-critical paths that make an ECS fast. Six layers of verification ensure these paths are correct:
 
 | Layer | What it catches | When it runs |
 |---|---|---|
@@ -71,6 +71,7 @@ Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration
 | **398 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
 | **[Miri][miri] + [Tree Borrows][tree-borrows]** | Undefined behavior: use-after-free, uninitialized reads, aliasing violations in `unsafe` blocks. Full test suite passes under the strict Tree Borrows model. | Every PR (CI) |
 | **[ThreadSanitizer][tsan]** | Data races: unsynchronized concurrent memory accesses. Full test suite including rayon `par_for_each` passes under TSan instrumentation. | Every PR (CI) |
+| **[Loom][loom]** | Concurrency invariant violations: exhaustive thread interleaving enumeration over OrphanQueue push/drain, column lock acquire/upgrade/deadlock-freedom, and entity ID reservation contention. | Every PR (CI) |
 | **[Fuzz testing][cargo-fuzz]** | Edge cases that structured tests miss: random operation sequences against World, query iteration across varied archetype shapes, malformed snapshot/WAL input. Coverage-guided mutation explores millions of paths. | Manual, pre-release |
 
 ## Storage
@@ -298,4 +299,5 @@ This project is licensed under the [Mozilla Public License 2.0](https://www.mozi
 [uniform-grid]: https://en.wikipedia.org/wiki/Grid_(spatial_index)
 [cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
 [tsan]: https://clang.llvm.org/docs/ThreadSanitizer.html
+[loom]: https://github.com/tokio-rs/loom
 [wal]: https://en.wikipedia.org/wiki/Write-ahead_logging

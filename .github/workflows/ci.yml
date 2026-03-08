@@ -91,13 +91,28 @@ jobs:
         env:
           RUSTFLAGS: "-Z sanitizer=thread"
 
+  loom:
+    name: Loom
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+      - name: Loom concurrency tests
+        run: cargo test -p minkowski --lib --features loom -- loom_tests
+        env:
+          RUSTFLAGS: "--cfg loom"
+
   # Aggregator job — the single required status check for branch protection.
   # Runs even when upstream jobs are skipped/failed and explicitly checks
   # that every dependency succeeded, avoiding the GitHub "skipped = passed"
   # loophole with required checks on chained jobs.
   ci-pass:
     name: CI
-    needs: [fmt, clippy, test, miri, tsan]
+    needs: [fmt, clippy, test, miri, tsan, loom]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -107,12 +122,14 @@ jobs:
                 "${{ needs.clippy.result }}" != "success" ||
                 "${{ needs.test.result }}" != "success" ||
                 "${{ needs.miri.result }}" != "success" ||
-                "${{ needs.tsan.result }}" != "success" ]]; then
+                "${{ needs.tsan.result }}" != "success" ||
+                "${{ needs.loom.result }}" != "success" ]]; then
             echo "One or more CI jobs failed or were skipped."
             echo "  fmt:    ${{ needs.fmt.result }}"
             echo "  clippy: ${{ needs.clippy.result }}"
             echo "  test:   ${{ needs.test.result }}"
             echo "  miri:   ${{ needs.miri.result }}"
             echo "  tsan:   ${{ needs.tsan.result }}"
+            echo "  loom:   ${{ needs.loom.result }}"
             exit 1
           fi

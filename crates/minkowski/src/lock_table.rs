@@ -287,3 +287,206 @@ mod tests {
         table.release(lock4.unwrap());
     }
 }
+
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+    use crate::component::ComponentRegistry;
+    use crate::storage::archetype::ArchetypeId;
+    use crate::sync::Mutex;
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    // Archetype doesn't impl Clone, so each thread builds its own.
+    // Component IDs are deterministic (sequential registration), so
+    // archetypes built with the same registration order are equivalent.
+    fn setup() -> (Vec<Archetype>, ComponentId, ComponentId) {
+        let mut reg = ComponentRegistry::new();
+        let pos_id = reg.register::<f32>();
+        let vel_id = reg.register::<u32>();
+        let arch = Archetype::new(ArchetypeId(0), &[pos_id, vel_id], &reg);
+        (vec![arch], pos_id, vel_id)
+    }
+
+    /// Two threads contend on the real ColumnLockTable behind a Mutex
+    /// (modeling Pessimistic's `Mutex<ColumnLockTable>`). One acquires
+    /// exclusive, the other acquires shared on the same column. Verifies
+    /// mutual exclusion: the two never overlap in-flight.
+    #[test]
+    fn loom_exclusive_blocks_shared() {
+        loom::model(|| {
+            let table = Arc::new(Mutex::new(ColumnLockTable::new()));
+            let writer_held = Arc::new(AtomicBool::new(false));
+            let reader_held = Arc::new(AtomicBool::new(false));
+
+            let t1 = table.clone();
+            let wh = writer_held.clone();
+            let rh1 = reader_held.clone();
+            let exclusive = thread::spawn(move || {
+                let (archs, pos_id, _) = setup();
+                let mut writes = FixedBitSet::with_capacity(pos_id + 1);
+                writes.insert(pos_id);
+                let empty = FixedBitSet::new();
+
+                let lock_set = {
+                    let mut tbl = t1.lock();
+                    tbl.acquire(&archs, &empty, &writes)
+                };
+                if let Ok(lock_set) = lock_set {
+                    wh.store(true, Ordering::SeqCst);
+                    assert!(
+                        !rh1.load(Ordering::SeqCst),
+                        "exclusive held while shared also held"
+                    );
+                    wh.store(false, Ordering::SeqCst);
+                    t1.lock().release(lock_set);
+                }
+            });
+
+            let t2 = table.clone();
+            let rh = reader_held.clone();
+            let wh2 = writer_held.clone();
+            let shared = thread::spawn(move || {
+                let (archs, pos_id, _) = setup();
+                let mut reads = FixedBitSet::with_capacity(pos_id + 1);
+                reads.insert(pos_id);
+                let empty = FixedBitSet::new();
+
+                let lock_set = {
+                    let mut tbl = t2.lock();
+                    tbl.acquire(&archs, &reads, &empty)
+                };
+                if let Ok(lock_set) = lock_set {
+                    rh.store(true, Ordering::SeqCst);
+                    assert!(
+                        !wh2.load(Ordering::SeqCst),
+                        "shared held while exclusive also held"
+                    );
+                    rh.store(false, Ordering::SeqCst);
+                    t2.lock().release(lock_set);
+                }
+            });
+
+            exclusive.join().unwrap();
+            shared.join().unwrap();
+        });
+    }
+
+    /// Verifies the upgrade-not-downgrade invariant using the real
+    /// ColumnLockTable::acquire. When a component appears in both reads
+    /// and writes, acquire must treat it as exclusive — blocking a
+    /// concurrent shared reader on the same column.
+    #[test]
+    fn loom_upgrade_blocks_concurrent_reader() {
+        loom::model(|| {
+            let table = Arc::new(Mutex::new(ColumnLockTable::new()));
+            let writer_held = Arc::new(AtomicBool::new(false));
+            let reader_held = Arc::new(AtomicBool::new(false));
+
+            let t1 = table.clone();
+            let wh = writer_held.clone();
+            let rh1 = reader_held.clone();
+            // Thread 1: requests both read AND write on pos_id
+            let upgraded = thread::spawn(move || {
+                let (archs, pos_id, _) = setup();
+                let mut reads = FixedBitSet::with_capacity(pos_id + 1);
+                reads.insert(pos_id);
+                let mut writes = FixedBitSet::with_capacity(pos_id + 1);
+                writes.insert(pos_id);
+
+                let lock_set = {
+                    let mut tbl = t1.lock();
+                    tbl.acquire(&archs, &reads, &writes)
+                };
+                if let Ok(lock_set) = lock_set {
+                    wh.store(true, Ordering::SeqCst);
+                    assert!(
+                        !rh1.load(Ordering::SeqCst),
+                        "upgraded exclusive held while shared reader also active"
+                    );
+                    wh.store(false, Ordering::SeqCst);
+                    t1.lock().release(lock_set);
+                }
+            });
+
+            let t2 = table.clone();
+            let rh = reader_held.clone();
+            let wh2 = writer_held.clone();
+            // Thread 2: requests read-only on the same column
+            let reader = thread::spawn(move || {
+                let (archs, pos_id, _) = setup();
+                let mut reads = FixedBitSet::with_capacity(pos_id + 1);
+                reads.insert(pos_id);
+                let empty = FixedBitSet::new();
+
+                let lock_set = {
+                    let mut tbl = t2.lock();
+                    tbl.acquire(&archs, &reads, &empty)
+                };
+                if let Ok(lock_set) = lock_set {
+                    rh.store(true, Ordering::SeqCst);
+                    assert!(
+                        !wh2.load(Ordering::SeqCst),
+                        "shared reader active while upgraded exclusive also held"
+                    );
+                    rh.store(false, Ordering::SeqCst);
+                    t2.lock().release(lock_set);
+                }
+            });
+
+            upgraded.join().unwrap();
+            reader.join().unwrap();
+        });
+    }
+
+    /// Two threads acquire column locks via the Mutex-protected table.
+    /// Each thread retries on LockConflict (modeling Pessimistic's retry
+    /// loop). Completion under all loom interleavings proves no deadlock.
+    #[test]
+    fn loom_sorted_acquisition_no_deadlock() {
+        loom::model(|| {
+            let table = Arc::new(Mutex::new(ColumnLockTable::new()));
+
+            let t1 = table.clone();
+            let thread1 = thread::spawn(move || {
+                let (archs, pos_id, vel_id) = setup();
+                let mut writes = FixedBitSet::with_capacity(vel_id + 1);
+                writes.insert(pos_id);
+                writes.insert(vel_id);
+                let empty = FixedBitSet::new();
+
+                // Retry loop (models Pessimistic::begin's retry)
+                loop {
+                    let result = t1.lock().acquire(&archs, &empty, &writes);
+                    if let Ok(lock_set) = result {
+                        t1.lock().release(lock_set);
+                        break;
+                    }
+                    loom::thread::yield_now();
+                }
+            });
+
+            let t2 = table.clone();
+            let thread2 = thread::spawn(move || {
+                let (archs, pos_id, vel_id) = setup();
+                let mut writes = FixedBitSet::with_capacity(vel_id + 1);
+                writes.insert(pos_id);
+                writes.insert(vel_id);
+                let empty = FixedBitSet::new();
+
+                loop {
+                    let result = t2.lock().acquire(&archs, &empty, &writes);
+                    if let Ok(lock_set) = result {
+                        t2.lock().release(lock_set);
+                        break;
+                    }
+                    loom::thread::yield_now();
+                }
+            });
+
+            thread1.join().unwrap();
+            thread2.join().unwrap();
+        });
+    }
+}
