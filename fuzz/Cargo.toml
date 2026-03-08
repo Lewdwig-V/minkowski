@@ -1,0 +1,36 @@
+[package]
+name = "minkowski-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+minkowski = { path = "../crates/minkowski" }
+minkowski-persist = { path = "../crates/minkowski-persist" }
+rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
+tempfile = "3"
+
+[[bin]]
+name = "fuzz_world_ops"
+path = "fuzz_targets/fuzz_world_ops.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_reducers"
+path = "fuzz_targets/fuzz_reducers.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_snapshot_load"
+path = "fuzz_targets/fuzz_snapshot_load.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wal_replay"
+path = "fuzz_targets/fuzz_wal_replay.rs"
+doc = false

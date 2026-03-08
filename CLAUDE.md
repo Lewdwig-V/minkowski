@@ -33,6 +33,11 @@ cargo run -p minkowski-examples --example observe --release   # Observability: M
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
+
+cargo +nightly fuzz run fuzz_world_ops -- -max_total_time=60     # fuzz: random World operations
+cargo +nightly fuzz run fuzz_reducers -- -max_total_time=60      # fuzz: query iteration paths
+cargo +nightly fuzz run fuzz_snapshot_load -- -max_total_time=60 -max_len=65536  # fuzz: snapshot deserialization
+cargo +nightly fuzz run fuzz_wal_replay -- -max_total_time=60 -max_len=65536    # fuzz: WAL replay
 ```
 
 Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows; `-Zmiri-ignore-leaks` only for the two `par_for_each` tests because rayon's thread pool intentionally outlives main. All other tests run without leak suppression to catch real leaks.

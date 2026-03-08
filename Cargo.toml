@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
 members = ["crates/minkowski", "crates/minkowski-derive", "crates/minkowski-persist", "crates/minkowski-observe", "crates/minkowski-py", "examples"]
-exclude = []
+exclude = ["fuzz"]
