@@ -240,7 +240,7 @@ The commands teach the paradigm, not just the API — they encode the design pri
 
 ## Architecture Decision Records
 
-Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each records what was decided, what alternatives were considered, and what trade-offs were accepted.
+Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each records what was decided, what alternatives were considered, and what trade-offs were accepted. For a comprehensive walkthrough of the internals — storage model, query engine, transaction system, persistence layer — see the [DeepWiki](https://deepwiki.com/Lewdwig-V/minkowski).
 
 ## Glossary
 
