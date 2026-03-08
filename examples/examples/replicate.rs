@@ -66,9 +66,7 @@ fn source_side(tx: mpsc::Sender<WireMessage>) {
     // Take snapshot and send bytes over the wire
     let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
     let snap = Snapshot::new();
-    let (header, snap_bytes) = snap
-        .save_to_bytes(&world, &codecs, wal.next_seq())
-        .unwrap();
+    let (header, snap_bytes) = snap.save_to_bytes(&world, &codecs, wal.next_seq()).unwrap();
     println!(
         "[source] Snapshot: {} entities, {} bytes, WAL seq {}",
         header.entity_count,
