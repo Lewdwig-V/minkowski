@@ -277,17 +277,19 @@ fn main() {
     // ── Register query reducers ─────────────────────────────────────
 
     // Step 1: Zero accelerations (chunk — enables vectorization)
-    let zero_accel_id = registry.register_query::<(&mut Acceleration,), (), _>(
-        &mut world,
-        "zero_accel",
-        |mut query: QueryMut<'_, (&mut Acceleration,)>, ()| {
-            query.for_each_chunk(|(accs,)| {
-                for acc in accs.iter_mut() {
-                    acc.0 = Vec2::ZERO;
-                }
-            });
-        },
-    );
+    let zero_accel_id = registry
+        .register_query::<(&mut Acceleration,), (), _>(
+            &mut world,
+            "zero_accel",
+            |mut query: QueryMut<'_, (&mut Acceleration,)>, ()| {
+                query.for_each_chunk(|(accs,)| {
+                    for acc in accs.iter_mut() {
+                        acc.0 = Vec2::ZERO;
+                    }
+                });
+            },
+        )
+        .unwrap();
 
     // Step 2: Integrate — Euler step + velocity clamping + world wrapping
     let max_speed = params.max_speed;
@@ -323,13 +325,14 @@ fn main() {
                     }
                 });
             },
-        );
+        )
+        .unwrap();
 
     for frame in 0..FRAME_COUNT {
         let frame_start = Instant::now();
 
         // Step 1: Zero accelerations via reducer
-        registry.run(&mut world, zero_accel_id, ());
+        registry.run(&mut world, zero_accel_id, ()).unwrap();
 
         // Step 2: Rebuild spatial grid
         grid.rebuild(&mut world);
@@ -393,7 +396,7 @@ fn main() {
         }
 
         // Step 4: Integrate via reducer
-        registry.run(&mut world, integrate_id, DT);
+        registry.run(&mut world, integrate_id, DT).unwrap();
 
         // Step 5: Spawn/despawn churn
         if frame > 0 && frame % CHURN_INTERVAL == 0 {

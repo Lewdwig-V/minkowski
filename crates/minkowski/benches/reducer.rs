@@ -30,20 +30,22 @@ fn bench_query_mut(c: &mut Criterion) {
     let mut world = setup_world();
     let strategy = Optimistic::new(&world);
     let mut registry = ReducerRegistry::new();
-    let id = registry.register_query::<(&mut Position, &Velocity), (), _>(
-        &mut world,
-        "integrate",
-        |mut query: QueryMut<'_, (&mut Position, &Velocity)>, _: ()| {
-            query.for_each(|(pos, vel)| {
-                pos.x += vel.dx;
-                pos.y += vel.dy;
-            });
-        },
-    );
+    let id = registry
+        .register_query::<(&mut Position, &Velocity), (), _>(
+            &mut world,
+            "integrate",
+            |mut query: QueryMut<'_, (&mut Position, &Velocity)>, _: ()| {
+                query.for_each(|(pos, vel)| {
+                    pos.x += vel.dx;
+                    pos.y += vel.dy;
+                });
+            },
+        )
+        .unwrap();
 
     c.bench_function("minkowski/query_mut_10k", |b| {
         b.iter(|| {
-            registry.run(&mut world, id, ());
+            registry.run(&mut world, id, ()).unwrap();
         });
     });
     drop(strategy);
@@ -53,22 +55,24 @@ fn bench_query_mut_chunk(c: &mut Criterion) {
     let mut world = setup_world();
     let strategy = Optimistic::new(&world);
     let mut registry = ReducerRegistry::new();
-    let id = registry.register_query::<(&mut Position, &Velocity), (), _>(
-        &mut world,
-        "integrate_chunk",
-        |mut query: QueryMut<'_, (&mut Position, &Velocity)>, _: ()| {
-            query.for_each_chunk(|(positions, velocities)| {
-                for i in 0..positions.len() {
-                    positions[i].x += velocities[i].dx;
-                    positions[i].y += velocities[i].dy;
-                }
-            });
-        },
-    );
+    let id = registry
+        .register_query::<(&mut Position, &Velocity), (), _>(
+            &mut world,
+            "integrate_chunk",
+            |mut query: QueryMut<'_, (&mut Position, &Velocity)>, _: ()| {
+                query.for_each_chunk(|(positions, velocities)| {
+                    for i in 0..positions.len() {
+                        positions[i].x += velocities[i].dx;
+                        positions[i].y += velocities[i].dy;
+                    }
+                });
+            },
+        )
+        .unwrap();
 
     c.bench_function("minkowski/query_mut_chunk_10k", |b| {
         b.iter(|| {
-            registry.run(&mut world, id, ());
+            registry.run(&mut world, id, ()).unwrap();
         });
     });
     drop(strategy);
@@ -78,18 +82,20 @@ fn bench_query_writer(c: &mut Criterion) {
     let mut world = setup_world();
     let strategy = Optimistic::new(&world);
     let mut registry = ReducerRegistry::new();
-    let id = registry.register_query_writer::<(&mut Position, &Velocity), (), _>(
-        &mut world,
-        "integrate_writer",
-        |mut query: QueryWriter<'_, (&mut Position, &Velocity)>, _: ()| {
-            query.for_each(|(mut pos, vel)| {
-                pos.modify(|p| {
-                    p.x += vel.dx;
-                    p.y += vel.dy;
+    let id = registry
+        .register_query_writer::<(&mut Position, &Velocity), (), _>(
+            &mut world,
+            "integrate_writer",
+            |mut query: QueryWriter<'_, (&mut Position, &Velocity)>, _: ()| {
+                query.for_each(|(mut pos, vel)| {
+                    pos.modify(|p| {
+                        p.x += vel.dx;
+                        p.y += vel.dy;
+                    });
                 });
-            });
-        },
-    );
+            },
+        )
+        .unwrap();
 
     c.bench_function("minkowski/query_writer_10k", |b| {
         b.iter(|| {
@@ -121,7 +127,8 @@ fn bench_dynamic_for_each(c: &mut Criterion) {
             for (entity, pos) in updates {
                 ctx.write(entity, pos);
             }
-        });
+        })
+        .unwrap();
 
     c.bench_function("minkowski/dynamic_for_each_10k", |b| {
         b.iter(|| {
@@ -159,7 +166,8 @@ fn bench_dynamic_for_each_chunk(c: &mut Criterion) {
             for (entity, pos) in updates {
                 ctx.write(entity, pos);
             }
-        });
+        })
+        .unwrap();
 
     c.bench_function("minkowski/dynamic_for_each_chunk_10k", |b| {
         b.iter(|| {

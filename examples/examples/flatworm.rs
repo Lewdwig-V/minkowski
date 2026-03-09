@@ -270,55 +270,61 @@ fn main() {
     // Movement: advance worms along their heading
     let worm_speed = params.worm_speed;
     let ws = params.world_size;
-    let move_id = registry.register_query::<(&mut Position, &Heading, &Worm), f32, _>(
-        &mut world,
-        "worm_move",
-        move |mut query: QueryMut<'_, (&mut Position, &Heading, &Worm)>, dt: f32| {
-            query.for_each_chunk(|(poss, headings, _worms)| {
-                for i in 0..poss.len() {
-                    let h = headings[i].0;
-                    poss[i].0.x = wrap(poss[i].0.x + h.cos() * worm_speed * dt, ws);
-                    poss[i].0.y = wrap(poss[i].0.y + h.sin() * worm_speed * dt, ws);
-                }
-            });
-        },
-    );
+    let move_id = registry
+        .register_query::<(&mut Position, &Heading, &Worm), f32, _>(
+            &mut world,
+            "worm_move",
+            move |mut query: QueryMut<'_, (&mut Position, &Heading, &Worm)>, dt: f32| {
+                query.for_each_chunk(|(poss, headings, _worms)| {
+                    for i in 0..poss.len() {
+                        let h = headings[i].0;
+                        poss[i].0.x = wrap(poss[i].0.x + h.cos() * worm_speed * dt, ws);
+                        poss[i].0.y = wrap(poss[i].0.y + h.sin() * worm_speed * dt, ws);
+                    }
+                });
+            },
+        )
+        .unwrap();
 
     // Metabolism: drain energy, update size
     let energy_drain = params.energy_drain;
     let min_size = params.min_worm_size;
     let max_size = params.max_worm_size;
     let fission_thr = params.fission_threshold;
-    let metabolism_id = registry.register_query::<(&mut Energy, &mut WormSize, &Worm), f32, _>(
-        &mut world,
-        "metabolism",
-        move |mut query: QueryMut<'_, (&mut Energy, &mut WormSize, &Worm)>, dt: f32| {
-            query.for_each(|(energy, size, _)| {
-                energy.0 -= energy_drain * dt;
-                // Size scales linearly with energy, clamped
-                let target = min_size + (energy.0 / fission_thr) * (max_size - min_size);
-                size.0 = target.clamp(min_size, max_size);
-            });
-        },
-    );
+    let metabolism_id = registry
+        .register_query::<(&mut Energy, &mut WormSize, &Worm), f32, _>(
+            &mut world,
+            "metabolism",
+            move |mut query: QueryMut<'_, (&mut Energy, &mut WormSize, &Worm)>, dt: f32| {
+                query.for_each(|(energy, size, _)| {
+                    energy.0 -= energy_drain * dt;
+                    // Size scales linearly with energy, clamped
+                    let target = min_size + (energy.0 / fission_thr) * (max_size - min_size);
+                    size.0 = target.clamp(min_size, max_size);
+                });
+            },
+        )
+        .unwrap();
 
     // Census: count worms (read-only)
-    let census_id = registry.register_query_ref::<(&Energy, &Worm), (), _>(
-        &mut world,
-        "census",
-        |mut query: QueryRef<'_, (&Energy, &Worm)>, ()| {
-            let mut total_energy = 0.0f32;
-            let mut count = 0usize;
-            query.for_each(|(energy, _)| {
-                total_energy += energy.0;
-                count += 1;
-            });
-            if count > 0 {
-                let avg = total_energy / count as f32;
-                println!("  census: {} worms, avg energy {:.1}", count, avg);
-            }
-        },
-    );
+    let census_id = registry
+        .register_query_ref::<(&Energy, &Worm), (), _>(
+            &mut world,
+            "census",
+            |mut query: QueryRef<'_, (&Energy, &Worm)>, ()| {
+                let mut total_energy = 0.0f32;
+                let mut count = 0usize;
+                query.for_each(|(energy, _)| {
+                    total_energy += energy.0;
+                    count += 1;
+                });
+                if count > 0 {
+                    let avg = total_energy / count as f32;
+                    println!("  census: {} worms, avg energy {:.1}", count, avg);
+                }
+            },
+        )
+        .unwrap();
 
     // ── Simulation loop ─────────────────────────────────────────────
 
@@ -329,10 +335,10 @@ fn main() {
         let frame_start = Instant::now();
 
         // Step 1: Move worms
-        registry.run(&mut world, move_id, DT);
+        registry.run(&mut world, move_id, DT).unwrap();
 
         // Step 2: Metabolism
-        registry.run(&mut world, metabolism_id, DT);
+        registry.run(&mut world, metabolism_id, DT).unwrap();
 
         // Step 3: Rebuild food grid
         food_grid.rebuild(&mut world);
@@ -490,7 +496,7 @@ fn main() {
                 "frame {:04} | worms: {:>4} | food: {:>4} | fissions: {} | deaths: {} | dt: {:.1}ms",
                 frame, worm_count, food_count, total_fissions, total_deaths, dt_ms,
             );
-            registry.run(&mut world, census_id, ());
+            registry.run(&mut world, census_id, ()).unwrap();
         }
     }
 

@@ -113,18 +113,20 @@ fn main() {
     let durable = Durable::new(strategy, wal, codecs);
 
     let mut registry = ReducerRegistry::new();
-    let writer_id = registry.register_query_writer::<(&mut Pos, &Vel), f32, _>(
-        &mut world,
-        "apply_velocity",
-        |mut query: QueryWriter<'_, (&mut Pos, &Vel)>, dt: f32| {
-            query.for_each(|(mut pos, vel)| {
-                pos.modify(|p| {
-                    p.x += vel.dx * dt;
-                    p.y += vel.dy * dt;
+    let writer_id = registry
+        .register_query_writer::<(&mut Pos, &Vel), f32, _>(
+            &mut world,
+            "apply_velocity",
+            |mut query: QueryWriter<'_, (&mut Pos, &Vel)>, dt: f32| {
+                query.for_each(|(mut pos, vel)| {
+                    pos.modify(|p| {
+                        p.x += vel.dx * dt;
+                        p.y += vel.dy * dt;
+                    });
                 });
-            });
-        },
-    );
+            },
+        )
+        .unwrap();
 
     for frame in 0..10 {
         registry

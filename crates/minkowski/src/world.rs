@@ -5,7 +5,7 @@ use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
-use crate::sync::{Arc, AtomicU64, Mutex, Ordering};
+use crate::sync::{Arc, AtomicBool, AtomicU64, Mutex, Ordering};
 use crate::table::TableCache;
 use crate::tick::Tick;
 use fixedbitset::FixedBitSet;
@@ -63,6 +63,16 @@ pub(crate) struct QueryCacheEntry {
     last_archetype_count: usize,
     /// Tick at which this query last read data (used by Changed<T> filter).
     last_read_tick: Tick,
+    /// Tick that was deferred for this query. Committed only when the
+    /// previous iterator was actually iterated (lazy advancement).
+    pending_read_tick: Option<Tick>,
+    /// Shared flag set by `QueryIter` when iteration actually occurs.
+    /// Checked on the next `query()` call to decide whether to commit
+    /// `pending_read_tick`.
+    iterated: Arc<AtomicBool>,
+    /// ComponentRegistry version when `required` was last computed.
+    /// Avoids recomputing the FixedBitSet on every query() call.
+    registry_version: u64,
 }
 
 /// Shared queue for entity IDs orphaned by aborted transactions.
@@ -88,6 +98,25 @@ pub struct WorldStats {
     pub current_tick: u64,
     pub total_spawns: u64,
     pub total_despawns: u64,
+}
+
+/// Debug information about the tick state of a cached query type.
+///
+/// Returned by [`World::query_tick_info`]. Helps diagnose unexpected
+/// `Changed<T>` behavior by exposing the internal tick bookkeeping.
+#[derive(Debug, Clone)]
+pub struct QueryTickInfo {
+    /// The committed read tick — changes older than this are invisible
+    /// to `Changed<T>` filters.
+    pub last_read_tick: u64,
+    /// The current world tick (monotonic counter).
+    pub current_world_tick: u64,
+    /// Number of archetypes matched by this query type.
+    pub matched_archetype_count: usize,
+    /// Whether a deferred tick is pending (iterator was created but not
+    /// yet committed). `true` means `query()` was called but the iterator
+    /// hasn't been iterated yet, so the change window is still open.
+    pub has_pending_tick: bool,
 }
 
 /// The central data store. Holds all entities, components, archetype metadata,
@@ -673,6 +702,27 @@ impl World {
         results
     }
 
+    /// Iterate entities matching the query type `Q`.
+    ///
+    /// # Tick advancement (lazy)
+    ///
+    /// This method uses **lazy tick advancement**: the `Changed<T>` read
+    /// baseline is only updated when the returned iterator is actually
+    /// iterated. If you create a query and drop the iterator without
+    /// consuming it, the change window is preserved — subsequent queries
+    /// will still see those changes.
+    ///
+    /// **Mutable columns** (`&mut T` in `Q`) are still marked as changed
+    /// eagerly (required for soundness — the pointers are already valid).
+    ///
+    /// This matches the behavior of [`QueryWriter`](crate::QueryWriter) in
+    /// the reducer system, which uses a `queried` flag to defer tick
+    /// advancement until `for_each` or `count` is called.
+    ///
+    /// See also:
+    /// - [`has_changed`](Self::has_changed) — peek without consuming changes
+    /// - [`advance_query_tick`](Self::advance_query_tick) — explicitly consume
+    ///   the change window without iterating
     pub fn query<Q: WorldQuery + 'static>(&mut self) -> QueryIter<'_, Q> {
         self.drain_orphans();
         let type_id = TypeId::of::<Q>();
@@ -686,16 +736,36 @@ impl World {
                 required: Q::required_ids(&self.components),
                 last_archetype_count: 0,
                 last_read_tick: Tick::default(),
+                pending_read_tick: None,
+                iterated: Arc::new(AtomicBool::new(false)),
+                registry_version: self.components.version(),
             });
 
-        // Refresh required bitset in case new components were registered since
-        // the cache entry was created. If the bitset changed, rescan from scratch.
-        let fresh_required = Q::required_ids(&self.components);
-        if fresh_required != entry.required {
-            entry.required = fresh_required;
-            entry.matched_ids.clear();
-            entry.last_archetype_count = 0;
-            entry.last_read_tick = Tick::default();
+        // Commit deferred tick from previous iterator, if it was iterated.
+        if entry.iterated.load(Ordering::Relaxed) {
+            if let Some(pending) = entry.pending_read_tick.take() {
+                entry.last_read_tick = pending;
+            }
+            entry.iterated.store(false, Ordering::Relaxed);
+        } else {
+            // Previous iterator was not iterated — discard pending tick,
+            // preserving the change window.
+            entry.pending_read_tick = None;
+        }
+
+        // Refresh required bitset if new components were registered since the
+        // cache entry was created. Version check avoids recomputing the FixedBitSet
+        // on every query() call — only recomputes when the registry actually grew.
+        let current_version = self.components.version();
+        if entry.registry_version != current_version {
+            let fresh_required = Q::required_ids(&self.components);
+            if fresh_required != entry.required {
+                entry.required = fresh_required;
+                entry.matched_ids.clear();
+                entry.last_archetype_count = 0;
+                entry.last_read_tick = Tick::default();
+            }
+            entry.registry_version = current_version;
         }
 
         // Incremental scan: only check archetypes added since last cache update
@@ -741,12 +811,18 @@ impl World {
             }
         }
 
-        // Update last_read_tick and restore the matched_ids Vec to the cache.
+        // Defer read tick — only committed on next query() if iterator is iterated.
         let read_tick = self.next_tick();
-        if let Some(entry) = self.query_cache.get_mut(&type_id) {
-            entry.last_read_tick = read_tick;
+        let iterated_flag = if let Some(entry) = self.query_cache.get_mut(&type_id) {
+            entry.pending_read_tick = Some(read_tick);
             entry.matched_ids = matched_ids;
-        }
+            // PERF: Arc::clone is one atomic increment per query() call.
+            // Could use raw pointer since &mut self guarantees single-threaded,
+            // but correctness-first — the atomic cost is negligible vs archetype scan.
+            entry.iterated.clone()
+        } else {
+            unreachable!("cache entry was just inserted")
+        };
 
         // Pass 2: build fetches (only immutable borrows of archetypes from here)
         let fetches: Vec<_> = filtered_ids
@@ -757,7 +833,7 @@ impl World {
             })
             .collect();
 
-        QueryIter::new(fetches)
+        QueryIter::with_tick_flag(fetches, iterated_flag)
     }
 
     /// Resolve column pointers for a table's archetype.
@@ -826,35 +902,43 @@ impl World {
         }
     }
 
-    pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
+    pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) {
         self.drain_orphans();
         assert!(self.is_alive(entity), "entity is not alive");
         let index = entity.index() as usize;
         let location = self.entity_locations[index].unwrap();
-        let comp_id = self.components.register::<T>();
+        let new_ids = B::component_ids(&mut self.components);
 
-        // If entity already has this component, overwrite in-place
-        {
-            let has_component = self.archetypes.archetypes[location.archetype_id.0]
-                .component_ids
-                .contains(comp_id);
-            if has_component {
-                let tick = self.next_tick();
-                let src_arch = &mut self.archetypes.archetypes[location.archetype_id.0];
-                let col_idx = src_arch.column_index(comp_id).unwrap();
-                unsafe {
-                    let ptr = src_arch.columns[col_idx].get_ptr_mut(location.row, tick) as *mut T;
-                    std::ptr::drop_in_place(ptr);
-                    std::ptr::write(ptr, component);
-                }
-                return;
+        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
+        let all_existing = new_ids
+            .iter()
+            .all(|&id| src_arch.component_ids.contains(id));
+
+        if all_existing {
+            // All bundle components already exist — overwrite in-place
+            let tick = self.next_tick();
+            let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
+            let row = location.row;
+            unsafe {
+                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                    let col_idx = arch.column_index(comp_id).unwrap();
+                    let dst = arch.columns[col_idx].get_ptr_mut(row, tick);
+                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
+                        drop_fn(dst);
+                    }
+                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                });
             }
+            return;
         }
 
-        // Compute target archetype: source components + new component
-        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
+        // Compute target archetype: source components ∪ new components
         let mut target_ids = src_arch.sorted_ids.clone();
-        target_ids.push(comp_id);
+        for &id in &new_ids {
+            if !src_arch.component_ids.contains(id) {
+                target_ids.push(id);
+            }
+        }
         target_ids.sort_unstable();
         let src_arch_id = location.archetype_id;
         let src_row = location.row;
@@ -862,15 +946,51 @@ impl World {
         let target_arch_id = self.archetypes.get_or_create(&target_ids, &self.components);
         let tick = self.next_tick();
 
+        // Check if source and target are the same archetype (all components
+        // already existed but we took the migration path due to a race-free
+        // logic flow — can't happen currently, but guard defensively).
+        if src_arch_id == target_arch_id {
+            let arch = &mut self.archetypes.archetypes[src_arch_id.0];
+            unsafe {
+                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                    let col_idx = arch.column_index(comp_id).unwrap();
+                    let dst = arch.columns[col_idx].get_ptr_mut(src_row, tick);
+                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
+                        drop_fn(dst);
+                    }
+                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                });
+            }
+            return;
+        }
+
         let (src_arch, target_arch) = get_pair_mut(
             &mut self.archetypes.archetypes,
             src_arch_id.0,
             target_arch_id.0,
         );
 
-        // Move shared columns: read ptr from source, push to target, swap_remove_no_drop source
+        // Collect which source columns have overwrites from the bundle,
+        // so we know to skip copying them (the bundle value wins).
+        let overwrite_src_cols: Vec<bool> = src_arch
+            .sorted_ids
+            .iter()
+            .map(|&cid| new_ids.contains(&cid))
+            .collect();
+
+        // Move non-overwritten columns from source to target
         for (src_col, &cid) in src_arch.sorted_ids.iter().enumerate() {
-            if let Some(tgt_col) = target_arch.column_index(cid) {
+            if overwrite_src_cols[src_col] {
+                // This column is being overwritten by the bundle — drop the
+                // old value and skip the copy; the bundle.put below writes it.
+                unsafe {
+                    let ptr = src_arch.columns[src_col].get_ptr(src_row);
+                    if let Some(drop_fn) = self.components.info(cid).drop_fn {
+                        drop_fn(ptr);
+                    }
+                    src_arch.columns[src_col].swap_remove_no_drop(src_row);
+                }
+            } else if let Some(tgt_col) = target_arch.column_index(cid) {
                 unsafe {
                     let ptr = src_arch.columns[src_col].get_ptr(src_row);
                     target_arch.columns[tgt_col].push(ptr);
@@ -879,11 +999,12 @@ impl World {
             }
         }
 
-        // Write the new component into target
-        let tgt_col = target_arch.column_index(comp_id).unwrap();
+        // Write all bundle components into target
         unsafe {
-            let comp = std::mem::ManuallyDrop::new(component);
-            target_arch.columns[tgt_col].push(&*comp as *const T as *mut u8);
+            bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
+                let tgt_col = target_arch.column_index(comp_id).unwrap();
+                target_arch.columns[tgt_col].push(ptr as *mut u8);
+            });
         }
         for col in &mut target_arch.columns {
             col.mark_changed(tick);
@@ -1110,6 +1231,139 @@ impl World {
         QueryIter::new(fetches)
     }
 
+    // ── Tick control ──────────────────────────────────────────────────
+
+    /// Check whether any archetype has `Changed<T>` data for query type `Q`
+    /// **without** advancing the read tick or marking mutable columns.
+    ///
+    /// This is a non-consuming peek: calling `has_changed` repeatedly returns
+    /// the same result until a mutation actually occurs. Use this to decide
+    /// whether to run an expensive query without losing the change window.
+    ///
+    /// Returns `false` if `Q` has never been queried (no cache entry exists).
+    /// This means `has_changed` is not suitable as a guard before the *first*
+    /// query — use `query().count() > 0` instead if you need to detect
+    /// initial data. After the first `query::<Q>()` call establishes a
+    /// baseline tick, `has_changed` accurately reports subsequent mutations.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Establish baseline with first query.
+    /// world.query::<(Changed<Pos>, &Pos)>().for_each(|_| {});
+    ///
+    /// // Now has_changed accurately reports mutations since the baseline.
+    /// if world.has_changed::<(Changed<Pos>, &Pos)>() {
+    ///     for pos in world.query::<(Changed<Pos>, &Pos)>() { /* ... */ }
+    /// }
+    /// ```
+    #[inline]
+    pub fn has_changed<Q: WorldQuery + 'static>(&self) -> bool {
+        let type_id = TypeId::of::<Q>();
+        let entry = match self.query_cache.get(&type_id) {
+            Some(entry) => entry,
+            // No cache entry means never queried — first query will see everything.
+            None => return false,
+        };
+
+        // If the previous iterator was iterated, the pending tick
+        // represents the most recent baseline (not yet committed to
+        // last_read_tick — that happens on the next query() call).
+        // Use it so has_changed doesn't report stale true results.
+        let last_read_tick = if entry.iterated.load(Ordering::Relaxed) {
+            entry.pending_read_tick.unwrap_or(entry.last_read_tick)
+        } else {
+            entry.last_read_tick
+        };
+
+        // Use cached matched_ids to skip non-matching archetypes.
+        // Archetypes added after the last query() call are not in the cache,
+        // but they will be picked up on the next query() call. This is
+        // consistent with has_changed requiring a prior query() for baseline.
+        entry.matched_ids.iter().any(|arch_id| {
+            let arch = &self.archetypes.archetypes[arch_id.0];
+            !arch.is_empty() && Q::matches_filters(arch, &self.components, last_read_tick)
+        })
+    }
+
+    /// Advance the read tick for query type `Q` without iterating.
+    ///
+    /// This "acknowledges" all current changes so that subsequent
+    /// `Changed<T>` queries of the same type start from the new baseline.
+    /// Unlike [`query`](Self::query), this does **not** mark mutable columns
+    /// as changed — it only moves the read tick forward.
+    ///
+    /// Use this when you know changes occurred but want to skip processing
+    /// them (e.g., during a loading phase where you don't want stale change
+    /// detection after initialization).
+    #[inline]
+    pub fn advance_query_tick<Q: WorldQuery + 'static>(&mut self) {
+        self.drain_orphans();
+        let type_id = TypeId::of::<Q>();
+        let total = self.archetypes.archetypes.len();
+
+        // Ensure cache entry exists and update archetype scan.
+        {
+            let entry = self
+                .query_cache
+                .entry(type_id)
+                .or_insert_with(|| QueryCacheEntry {
+                    matched_ids: Vec::new(),
+                    required: Q::required_ids(&self.components),
+                    last_archetype_count: 0,
+                    last_read_tick: Tick::default(),
+                    pending_read_tick: None,
+                    iterated: Arc::new(AtomicBool::new(false)),
+                    registry_version: self.components.version(),
+                });
+
+            let current_version = self.components.version();
+            if entry.registry_version != current_version {
+                let fresh_required = Q::required_ids(&self.components);
+                if fresh_required != entry.required {
+                    entry.required = fresh_required;
+                    entry.matched_ids.clear();
+                    entry.last_archetype_count = 0;
+                    entry.last_read_tick = Tick::default();
+                }
+                entry.registry_version = current_version;
+            }
+
+            if entry.last_archetype_count < total {
+                for arch in &self.archetypes.archetypes[entry.last_archetype_count..total] {
+                    if entry.required.is_subset(&arch.component_ids) {
+                        entry.matched_ids.push(arch.id);
+                    }
+                }
+                entry.last_archetype_count = total;
+            }
+        }
+
+        // Advance read tick directly — this is an explicit "acknowledge changes" call.
+        let read_tick = self.next_tick();
+        if let Some(entry) = self.query_cache.get_mut(&type_id) {
+            entry.last_read_tick = read_tick;
+            entry.pending_read_tick = None;
+            entry.iterated.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Debug information about the tick state of a cached query type.
+    ///
+    /// Returns `None` if `Q` has never been queried. The returned struct
+    /// contains the last read tick and current world tick, which can help
+    /// diagnose unexpected `Changed<T>` behavior.
+    pub fn query_tick_info<Q: WorldQuery + 'static>(&self) -> Option<QueryTickInfo> {
+        let type_id = TypeId::of::<Q>();
+        let entry = self.query_cache.get(&type_id)?;
+        Some(QueryTickInfo {
+            last_read_tick: entry.last_read_tick.raw(),
+            current_world_tick: self.current_tick.raw(),
+            matched_archetype_count: entry.matched_ids.len(),
+            has_pending_tick: entry.pending_read_tick.is_some(),
+        })
+    }
+
     // ── Introspection ─────────────────────────────────────────────────
 
     /// Number of live (placed) entities across all archetypes.
@@ -1311,7 +1565,7 @@ mod tests {
     fn insert_new_component() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        world.insert(e, Vel { dx: 3.0, dy: 4.0 });
+        world.insert(e, (Vel { dx: 3.0, dy: 4.0 },));
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
@@ -1320,8 +1574,41 @@ mod tests {
     fn insert_overwrites_existing() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        world.insert(e, Pos { x: 10.0, y: 20.0 });
+        world.insert(e, (Pos { x: 10.0, y: 20.0 },));
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 10.0, y: 20.0 }));
+    }
+
+    #[test]
+    fn insert_multi_component_bundle() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.insert(e, (Vel { dx: 3.0, dy: 4.0 }, Health(100u32)));
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
+        assert_eq!(world.get::<Health>(e), Some(&Health(100u32)));
+    }
+
+    #[test]
+    fn insert_bundle_partial_overwrite() {
+        // Some bundle components exist, some are new — mixed migration + overwrite
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        // Vel already exists, Health is new
+        world.insert(e, (Vel { dx: 9.0, dy: 8.0 }, Health(50u32)));
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 9.0, dy: 8.0 }));
+        assert_eq!(world.get::<Health>(e), Some(&Health(50u32)));
+    }
+
+    #[test]
+    fn insert_tuple_unpacks_correctly() {
+        // Regression: insert((T,)) must store T, not the 1-tuple (T,).
+        // Before the Bundle-based insert, this was a silent footgun.
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.insert(e, (Vel { dx: 1.0, dy: 2.0 },));
+        // If the tuple were stored as-is, get::<Vel> would return None
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 1.0, dy: 2.0 }));
     }
 
     #[test]
@@ -1342,7 +1629,7 @@ mod tests {
         let e3 = world.spawn((Pos { x: 3.0, y: 0.0 },));
 
         // Migrate e1 — e3 should swap into e1's old row
-        world.insert(e1, Vel { dx: 1.0, dy: 0.0 });
+        world.insert(e1, (Vel { dx: 1.0, dy: 0.0 },));
 
         // All entities still accessible with correct data
         assert_eq!(world.get::<Pos>(e1), Some(&Pos { x: 1.0, y: 0.0 }));
@@ -1410,7 +1697,7 @@ mod tests {
         assert_eq!(world.query::<&Pos>().count(), 1);
         assert_eq!(world.query::<(&Pos, &Vel)>().count(), 0);
 
-        world.insert(e, Vel { dx: 1.0, dy: 0.0 });
+        world.insert(e, (Vel { dx: 1.0, dy: 0.0 },));
         assert_eq!(world.query::<&Pos>().count(), 1);
         assert_eq!(world.query::<(&Pos, &Vel)>().count(), 1);
     }
@@ -2476,6 +2763,212 @@ mod tests {
         assert_eq!(count, 1);
         assert!(!world.is_alive(b));
         assert_eq!(world.get::<Pos>(_a).unwrap().x, 1.0);
+    }
+
+    // ── Lazy tick advancement tests ────────────────────────────────
+
+    #[test]
+    fn dropped_query_preserves_change_window() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // First query — iterates, consuming the initial "changed" state.
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 1);
+
+        // Mutate to create a new change.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Create a query but DROP it without iterating.
+        let _dropped = world.query::<(Changed<Pos>,)>();
+        drop(_dropped);
+
+        // The change window should be preserved — we should still see the change.
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn iterated_query_consumes_change_window() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // First query — iterates, consuming initial changes.
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 1);
+
+        // Mutate.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Iterate the Changed query (consumes the change window).
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 1);
+
+        // Now the window should be consumed — no more changes visible.
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn has_changed_does_not_consume_window() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Initial query to set baseline.
+        let _ = world.query::<(Changed<Pos>,)>().count();
+
+        // Mutate.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // has_changed should detect the change.
+        assert!(world.has_changed::<(Changed<Pos>,)>());
+
+        // Calling has_changed again should still see it (non-consuming).
+        assert!(world.has_changed::<(Changed<Pos>,)>());
+
+        // Now iterate to consume.
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 1);
+
+        // After iteration, no more changes.
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn has_changed_uses_pending_tick_after_iteration() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Baseline.
+        let _ = world.query::<(Changed<Pos>,)>().count();
+
+        // Mutate.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Iterate to consume the change.
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 1);
+
+        // has_changed BEFORE the next query() call — the pending tick
+        // hasn't been committed yet, but has_changed should use it
+        // so it doesn't report stale true.
+        assert!(
+            !world.has_changed::<(Changed<Pos>,)>(),
+            "has_changed should use pending tick after iteration"
+        );
+    }
+
+    #[test]
+    fn advance_query_tick_consumes_without_iterating() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Initial query to set baseline.
+        let _ = world.query::<(Changed<Pos>,)>().count();
+
+        // Mutate.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Advance tick without iterating.
+        world.advance_query_tick::<(Changed<Pos>,)>();
+
+        // Change window should be consumed.
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn for_each_chunk_consumes_change_window() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Baseline — establish cache entry for this query type.
+        world.query::<(Changed<Pos>, &Pos)>().for_each_chunk(|_| {});
+
+        // Mutate.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Consume via for_each_chunk.
+        world.query::<(Changed<Pos>, &Pos)>().for_each_chunk(|_| {});
+
+        // Window should be consumed — same query type sees no changes.
+        let count = world.query::<(Changed<Pos>, &Pos)>().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn par_for_each_consumes_change_window() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Baseline — establish cache entry.
+        world.query::<(Changed<Pos>, &Pos)>().par_for_each(|_| {});
+
+        // Mutate.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Consume via par_for_each.
+        world.query::<(Changed<Pos>, &Pos)>().par_for_each(|_| {});
+
+        // Window should be consumed — same query type sees no changes.
+        let count = world.query::<(Changed<Pos>, &Pos)>().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn has_changed_returns_false_for_uncached_query() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        // Never queried — has_changed returns false even though data exists.
+        assert!(!world.has_changed::<(Changed<Pos>,)>());
+    }
+
+    #[test]
+    fn query_tick_info_returns_none_for_uncached() {
+        let world = World::new();
+        assert!(world.query_tick_info::<(&Pos,)>().is_none());
+    }
+
+    #[test]
+    fn query_tick_info_reflects_state() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // After first query, cache entry exists with a pending tick
+        // (lazy advancement: committed on next query() call).
+        let _ = world.query::<(&Pos,)>().count();
+        let info = world.query_tick_info::<(&Pos,)>().unwrap();
+        assert_eq!(info.matched_archetype_count, 1);
+        assert!(info.has_pending_tick); // pending because iterator was iterated
+
+        // Second query commits the pending tick.
+        let _ = world.query::<(&Pos,)>().count();
+        let info = world.query_tick_info::<(&Pos,)>().unwrap();
+        assert!(info.last_read_tick > 0); // now committed
+    }
+
+    #[test]
+    fn query_tick_info_shows_pending_after_dropped_iter() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // First query to establish cache.
+        let _ = world.query::<(&Pos,)>().count();
+
+        // Create and drop without iterating.
+        let _dropped = world.query::<(&Pos,)>();
+        drop(_dropped);
+
+        let info = world.query_tick_info::<(&Pos,)>().unwrap();
+        assert!(info.has_pending_tick);
     }
 }
 

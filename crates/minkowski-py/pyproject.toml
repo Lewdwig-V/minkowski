@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "minkowski-py"
-version = "0.2.0"
+version = "1.0.1"
 description = "Python bindings for the Minkowski ECS engine"
 requires-python = ">=3.14"
 dependencies = [

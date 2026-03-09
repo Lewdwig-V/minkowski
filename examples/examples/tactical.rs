@@ -409,69 +409,76 @@ fn main() {
     let mut registry = ReducerRegistry::new();
 
     // Combat cleanup: despawn dead units via register_entity_despawn
-    let combat_cleanup_id =
-        registry.register_entity_despawn::<(Health,), (), _>(&mut world, "combat_cleanup", {
+    let combat_cleanup_id = registry
+        .register_entity_despawn::<(Health,), (), _>(&mut world, "combat_cleanup", {
             |mut entity: minkowski::EntityMut<'_, (Health,)>, ()| {
                 let hp = entity.get::<Health, 0>().0;
                 if hp == 0 {
                     entity.despawn();
                 }
             }
-        });
+        })
+        .unwrap();
 
     // Movement reducer: parallel position update
-    let movement_id = registry.register_query::<(&mut Position, &mut Heading, &Speed), (), _>(
-        &mut world,
-        "movement",
-        |mut query: minkowski::QueryMut<'_, (&mut Position, &mut Heading, &Speed)>, ()| {
-            query.for_each(|(pos, heading, speed)| {
-                // Random drift
-                let drift = (fastrand::f32() - 0.5) * 0.3;
-                heading.0 += drift;
-                pos.0 += heading.0.cos() * speed.0 * 0.1;
-                pos.1 += heading.0.sin() * speed.0 * 0.1;
-                // Wrap around map
-                pos.0 = pos.0.rem_euclid(MAP_SIZE);
-                pos.1 = pos.1.rem_euclid(MAP_SIZE);
-            });
-        },
-    );
+    let movement_id = registry
+        .register_query::<(&mut Position, &mut Heading, &Speed), (), _>(
+            &mut world,
+            "movement",
+            |mut query: minkowski::QueryMut<'_, (&mut Position, &mut Heading, &Speed)>, ()| {
+                query.for_each(|(pos, heading, speed)| {
+                    // Random drift
+                    let drift = (fastrand::f32() - 0.5) * 0.3;
+                    heading.0 += drift;
+                    pos.0 += heading.0.cos() * speed.0 * 0.1;
+                    pos.1 += heading.0.sin() * speed.0 * 0.1;
+                    // Wrap around map
+                    pos.0 = pos.0.rem_euclid(MAP_SIZE);
+                    pos.1 = pos.1.rem_euclid(MAP_SIZE);
+                });
+            },
+        )
+        .unwrap();
 
     // Recon: read-only query to spot enemies
-    let recon_id = registry.register_query_ref::<(Entity, &Position, &Faction, &UnitType), (), _>(
-        &mut world,
-        "recon",
-        |mut query: minkowski::QueryRef<'_, (Entity, &Position, &Faction, &UnitType)>, ()| {
-            let count = query.count();
-            let recon_count = count / 3; // rough estimate, every 3rd is recon
-            println!("    [recon] scanning with ~{} recon units", recon_count);
-        },
-    );
+    let recon_id = registry
+        .register_query_ref::<(Entity, &Position, &Faction, &UnitType), (), _>(
+            &mut world,
+            "recon",
+            |mut query: minkowski::QueryRef<'_, (Entity, &Position, &Faction, &UnitType)>, ()| {
+                let count = query.count();
+                let recon_count = count / 3; // rough estimate, every 3rd is recon
+                println!("    [recon] scanning with ~{} recon units", recon_count);
+            },
+        )
+        .unwrap();
 
     // Census: read-only faction/health tally
-    let census_id = registry.register_query_ref::<(&Faction, &Health), (), _>(
-        &mut world,
-        "census",
-        |mut query: minkowski::QueryRef<'_, (&Faction, &Health)>, ()| {
-            let mut blue_count = 0u32;
-            let mut red_count = 0u32;
-            let mut blue_hp = 0u32;
-            let mut red_hp = 0u32;
-            query.for_each(|(f, h)| {
-                if f.0 == BLUE {
-                    blue_count += 1;
-                    blue_hp += h.0;
-                } else {
-                    red_count += 1;
-                    red_hp += h.0;
-                }
-            });
-            println!(
-                "    [census] blue: {} units ({}hp) | red: {} units ({}hp)",
-                blue_count, blue_hp, red_count, red_hp
-            );
-        },
-    );
+    let census_id = registry
+        .register_query_ref::<(&Faction, &Health), (), _>(
+            &mut world,
+            "census",
+            |mut query: minkowski::QueryRef<'_, (&Faction, &Health)>, ()| {
+                let mut blue_count = 0u32;
+                let mut red_count = 0u32;
+                let mut blue_hp = 0u32;
+                let mut red_hp = 0u32;
+                query.for_each(|(f, h)| {
+                    if f.0 == BLUE {
+                        blue_count += 1;
+                        blue_hp += h.0;
+                    } else {
+                        red_count += 1;
+                        red_hp += h.0;
+                    }
+                });
+                println!(
+                    "    [census] blue: {} units ({}hp) | red: {} units ({}hp)",
+                    blue_count, blue_hp, red_count, red_hp
+                );
+            },
+        )
+        .unwrap();
 
     // -- HashIndex for faction lookups --
     let mut faction_index = HashIndex::<Faction>::new();
@@ -641,7 +648,7 @@ fn main() {
 
         // Phase 3: Simulation
         // Movement reducer (uses query internally)
-        registry.run(&mut world, movement_id, ());
+        registry.run(&mut world, movement_id, ()).unwrap();
 
         // par_for_each demo: parallel position clamping pass
         world.query::<(&mut Position,)>().par_for_each(|(pos,)| {
@@ -710,8 +717,8 @@ fn main() {
                     frame_changeset.record_despawn(*target);
                     println!("    kill: entity {:?} despawned", target);
                 }
-                Err(conflict) => {
-                    println!("    despawn conflict: {}", conflict.display_with(&world));
+                Err(err) => {
+                    println!("    despawn error: {err}");
                 }
             }
         }
@@ -760,8 +767,8 @@ fn main() {
         }
 
         // Run registered recon + census reducers
-        registry.run(&mut world, recon_id, ());
-        registry.run(&mut world, census_id, ());
+        registry.run(&mut world, recon_id, ()).unwrap();
+        registry.run(&mut world, census_id, ()).unwrap();
 
         // Phase 4: HashIndex with stale validation
         faction_index.rebuild(&mut world);

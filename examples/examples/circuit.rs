@@ -244,28 +244,32 @@ fn main() {
     // ── Register query reducers ──────────────────────────────────────
 
     // Phase 1: Reset current accumulators on all nodes
-    let reset_currents_id = registry.register_query::<(&mut CurrentSum,), (), _>(
-        &mut world,
-        "reset_currents",
-        |mut query: QueryMut<'_, (&mut CurrentSum,)>, ()| {
-            query.for_each(|(cs,)| {
-                cs.0 = 0.0;
-            });
-        },
-    );
+    let reset_currents_id = registry
+        .register_query::<(&mut CurrentSum,), (), _>(
+            &mut world,
+            "reset_currents",
+            |mut query: QueryMut<'_, (&mut CurrentSum,)>, ()| {
+                query.for_each(|(cs,)| {
+                    cs.0 = 0.0;
+                });
+            },
+        )
+        .unwrap();
 
     // Phases 2-6 (555 timer, resistors, inductors, voltage update, op-amp)
     // are done manually in the loop since they need cross-entity node access.
 
     // Census — count entities and report (read-only)
-    let census_id = registry.register_query_ref::<(&Voltage,), (), _>(
-        &mut world,
-        "node_census",
-        |mut query: QueryRef<'_, (&Voltage,)>, ()| {
-            let count = query.count();
-            println!("  circuit has {} voltage nodes", count);
-        },
-    );
+    let census_id = registry
+        .register_query_ref::<(&Voltage,), (), _>(
+            &mut world,
+            "node_census",
+            |mut query: QueryRef<'_, (&Voltage,)>, ()| {
+                let count = query.count();
+                println!("  circuit has {} voltage nodes", count);
+            },
+        )
+        .unwrap();
 
     // ── Waveform storage ─────────────────────────────────────────────
 
@@ -296,11 +300,11 @@ fn main() {
     );
     println!();
 
-    registry.run(&mut world, census_id, ());
+    registry.run(&mut world, census_id, ()).unwrap();
 
     for step in 0..STEPS {
         // ── Phase 1: Reset current sums ──────────────────────────────
-        registry.run(&mut world, reset_currents_id, ());
+        registry.run(&mut world, reset_currents_id, ()).unwrap();
 
         // ── Phase 2: 555 timer step ──────────────────────────────────
         {
@@ -522,7 +526,7 @@ fn main() {
     print_ascii_waveform(&waveform, 1, 2e-3);
 
     // Print final entity count
-    registry.run(&mut world, census_id, ());
+    registry.run(&mut world, census_id, ()).unwrap();
 }
 
 // ── ASCII waveform plotter ───────────────────────────────────────────

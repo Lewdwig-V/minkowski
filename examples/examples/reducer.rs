@@ -34,59 +34,69 @@ fn main() {
     let mut registry = ReducerRegistry::new();
 
     // ── 1. Entity reducer: heal ──────────────────────────────────────
-    let heal_id = registry.register_entity::<(Health,), u32, _>(
-        &mut world,
-        "heal",
-        |mut entity: EntityMut<'_, (Health,)>, amount: u32| {
-            let hp = entity.get::<Health, 0>().0;
-            entity.set::<Health, 0>(Health(hp + amount));
-        },
-    );
+    let heal_id = registry
+        .register_entity::<(Health,), u32, _>(
+            &mut world,
+            "heal",
+            |mut entity: EntityMut<'_, (Health,)>, amount: u32| {
+                let hp = entity.get::<Health, 0>().0;
+                entity.set::<Health, 0>(Health(hp + amount));
+            },
+        )
+        .unwrap();
     println!("Registered 'heal' reducer (id={:?})", heal_id);
 
     // ── 2. Entity reducer: damage ────────────────────────────────────
-    let damage_id = registry.register_entity::<(Health,), u32, _>(
-        &mut world,
-        "damage",
-        |mut entity: EntityMut<'_, (Health,)>, amount: u32| {
-            let hp = entity.get::<Health, 0>().0;
-            entity.set::<Health, 0>(Health(hp.saturating_sub(amount)));
-        },
-    );
+    let damage_id = registry
+        .register_entity::<(Health,), u32, _>(
+            &mut world,
+            "damage",
+            |mut entity: EntityMut<'_, (Health,)>, amount: u32| {
+                let hp = entity.get::<Health, 0>().0;
+                entity.set::<Health, 0>(Health(hp.saturating_sub(amount)));
+            },
+        )
+        .unwrap();
     println!("Registered 'damage' reducer (id={:?})", damage_id);
 
     // ── 3. Query reducer: gravity ────────────────────────────────────
-    let gravity_id = registry.register_query::<(&mut Velocity,), f32, _>(
-        &mut world,
-        "gravity",
-        |mut query: QueryMut<'_, (&mut Velocity,)>, dt: f32| {
-            query.for_each(|(vel,)| {
-                vel.0 -= 9.81 * dt;
-            });
-        },
-    );
+    let gravity_id = registry
+        .register_query::<(&mut Velocity,), f32, _>(
+            &mut world,
+            "gravity",
+            |mut query: QueryMut<'_, (&mut Velocity,)>, dt: f32| {
+                query.for_each(|(vel,)| {
+                    vel.0 -= 9.81 * dt;
+                });
+            },
+        )
+        .unwrap();
     println!("Registered 'gravity' query reducer (id={:?})", gravity_id);
 
     // ── 4. Read-only query reducer: logger ───────────────────────────
-    let logger_id = registry.register_query_ref::<(&Health, &Velocity), (), _>(
-        &mut world,
-        "logger",
-        |mut query: QueryRef<'_, (&Health, &Velocity)>, ()| {
-            let count = query.count();
-            println!("  [logger] {} entities with Health + Velocity", count);
-        },
-    );
+    let logger_id = registry
+        .register_query_ref::<(&Health, &Velocity), (), _>(
+            &mut world,
+            "logger",
+            |mut query: QueryRef<'_, (&Health, &Velocity)>, ()| {
+                let count = query.count();
+                println!("  [logger] {} entities with Health + Velocity", count);
+            },
+        )
+        .unwrap();
     println!("Registered 'logger' query_ref reducer (id={:?})", logger_id);
 
     // ── 5. Spawner reducer ───────────────────────────────────────────
-    let spawn_id = registry.register_spawner::<(Health, Velocity), u32, _>(
-        &mut world,
-        "spawn_unit",
-        |mut spawner: Spawner<'_, (Health, Velocity)>, hp: u32| {
-            let e = spawner.spawn((Health(hp), Velocity(0.0)));
-            println!("  [spawner] created entity {:?} with {}hp", e, hp);
-        },
-    );
+    let spawn_id = registry
+        .register_spawner::<(Health, Velocity), u32, _>(
+            &mut world,
+            "spawn_unit",
+            |mut spawner: Spawner<'_, (Health, Velocity)>, hp: u32| {
+                let e = spawner.spawn((Health(hp), Velocity(0.0)));
+                println!("  [spawner] created entity {:?} with {}hp", e, hp);
+            },
+        )
+        .unwrap();
     println!(
         "Registered 'spawn_unit' spawner reducer (id={:?})",
         spawn_id
@@ -123,14 +133,14 @@ fn main() {
     );
 
     // Apply gravity
-    registry.run(&mut world, gravity_id, 0.1f32);
+    registry.run(&mut world, gravity_id, 0.1f32).unwrap();
     println!(
         "After gravity: hero vel={:.2}",
         world.get::<Velocity>(hero).unwrap().0
     );
 
     // Log state
-    registry.run(&mut world, logger_id, ());
+    registry.run(&mut world, logger_id, ()).unwrap();
 
     // Spawn a new unit via spawner reducer
     registry
@@ -138,15 +148,17 @@ fn main() {
         .unwrap();
 
     // ── 6. Query writer reducer: persistent bulk update ────────────
-    let drag_id = registry.register_query_writer::<(&mut Velocity,), f32, _>(
-        &mut world,
-        "apply_drag",
-        |mut query: QueryWriter<'_, (&mut Velocity,)>, drag: f32| {
-            query.for_each(|(mut vel,)| {
-                vel.modify(|v| v.0 *= drag);
-            });
-        },
-    );
+    let drag_id = registry
+        .register_query_writer::<(&mut Velocity,), f32, _>(
+            &mut world,
+            "apply_drag",
+            |mut query: QueryWriter<'_, (&mut Velocity,)>, drag: f32| {
+                query.for_each(|(mut vel,)| {
+                    vel.modify(|v| v.0 *= drag);
+                });
+            },
+        )
+        .unwrap();
     println!(
         "Registered 'apply_drag' query writer reducer (id={:?})",
         drag_id
@@ -174,10 +186,10 @@ fn main() {
     println!("\n--- Dynamic reducers ---");
 
     // Give hero and enemy Energy + Shield components for dynamic reducer demo
-    world.insert(hero, Energy(80.0));
-    world.insert(hero, Shield(0.0));
-    world.insert(enemy, Energy(30.0));
-    world.insert(enemy, Shield(0.0));
+    world.insert(hero, (Energy(80.0),));
+    world.insert(hero, (Shield(0.0),));
+    world.insert(enemy, (Energy(30.0),));
+    world.insert(enemy, (Shield(0.0),));
 
     // Register a dynamic reducer that conditionally applies a shield
     // based on HP and Energy — can't express this with static types
@@ -212,7 +224,8 @@ fn main() {
                     entity, energy
                 );
             }
-        });
+        })
+        .unwrap();
     println!(
         "Registered 'conditional_shield' dynamic reducer (id={:?})",
         shield_id
@@ -267,7 +280,8 @@ fn main() {
                 ctx.despawn(entity);
                 println!("  [reaper] despawned {:?}", entity);
             }
-        });
+        })
+        .unwrap();
     println!("Registered 'reaper' dynamic reducer (id={:?})", reaper_id);
 
     registry

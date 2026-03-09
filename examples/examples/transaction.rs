@@ -120,26 +120,30 @@ fn register_reducers(
     registry: &mut ReducerRegistry,
     world: &mut World,
 ) -> (QueryReducerId, QueryReducerId) {
-    let move_id = registry.register_query::<(&mut Pos, &Vel), f32, _>(
-        world,
-        "move_entities",
-        |mut query: QueryMut<'_, (&mut Pos, &Vel)>, dt: f32| {
-            query.for_each(|(pos, vel)| {
-                pos.x += vel.dx * dt;
-                pos.y += vel.dy * dt;
-            });
-        },
-    );
+    let move_id = registry
+        .register_query::<(&mut Pos, &Vel), f32, _>(
+            world,
+            "move_entities",
+            |mut query: QueryMut<'_, (&mut Pos, &Vel)>, dt: f32| {
+                query.for_each(|(pos, vel)| {
+                    pos.x += vel.dx * dt;
+                    pos.y += vel.dy * dt;
+                });
+            },
+        )
+        .unwrap();
 
-    let decay_id = registry.register_query::<(&mut Health,), u32, _>(
-        world,
-        "decay_health",
-        |mut query: QueryMut<'_, (&mut Health,)>, amount: u32| {
-            query.for_each(|(health,)| {
-                health.0 = health.0.saturating_sub(amount);
-            });
-        },
-    );
+    let decay_id = registry
+        .register_query::<(&mut Health,), u32, _>(
+            world,
+            "decay_health",
+            |mut query: QueryMut<'_, (&mut Health,)>, amount: u32| {
+                query.for_each(|(health,)| {
+                    health.0 = health.0.saturating_sub(amount);
+                });
+            },
+        )
+        .unwrap();
 
     (move_id, decay_id)
 }
@@ -154,8 +158,8 @@ fn run_reducer_demo(
     // The same reducer IDs work regardless of which strategy you'd use
     // for transactional reducers; query reducers are always scheduled.
     for _ in 0..10 {
-        registry.run(world, move_id, 1.0f32);
-        registry.run(world, decay_id, 3u32);
+        registry.run(world, move_id, 1.0f32).unwrap();
+        registry.run(world, decay_id, 3u32).unwrap();
     }
 
     let (ax, ay) = avg_pos(world);

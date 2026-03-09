@@ -83,67 +83,79 @@ fn main() {
 
     // -- Register the 6 systems as query reducers -----------------------------
 
-    let movement_id = registry.register_query::<(&mut Pos, &Vel), (), _>(
-        &mut world,
-        "movement",
-        |mut query: QueryMut<'_, (&mut Pos, &Vel)>, ()| {
-            query.for_each(|(pos, vel)| {
-                pos.x += vel.dx;
-                pos.y += vel.dy;
-            });
-        },
-    );
+    let movement_id = registry
+        .register_query::<(&mut Pos, &Vel), (), _>(
+            &mut world,
+            "movement",
+            |mut query: QueryMut<'_, (&mut Pos, &Vel)>, ()| {
+                query.for_each(|(pos, vel)| {
+                    pos.x += vel.dx;
+                    pos.y += vel.dy;
+                });
+            },
+        )
+        .unwrap();
 
-    let gravity_id = registry.register_query::<(&mut Vel,), (), _>(
-        &mut world,
-        "gravity",
-        |mut query: QueryMut<'_, (&mut Vel,)>, ()| {
-            query.for_each(|(vel,)| {
-                vel.dy -= 9.8;
-            });
-        },
-    );
+    let gravity_id = registry
+        .register_query::<(&mut Vel,), (), _>(
+            &mut world,
+            "gravity",
+            |mut query: QueryMut<'_, (&mut Vel,)>, ()| {
+                query.for_each(|(vel,)| {
+                    vel.dy -= 9.8;
+                });
+            },
+        )
+        .unwrap();
 
-    let health_regen_id = registry.register_query::<(&mut Health,), (), _>(
-        &mut world,
-        "health_regen",
-        |mut query: QueryMut<'_, (&mut Health,)>, ()| {
-            query.for_each(|(hp,)| {
-                hp.0 = hp.0.saturating_add(1);
-            });
-        },
-    );
+    let health_regen_id = registry
+        .register_query::<(&mut Health,), (), _>(
+            &mut world,
+            "health_regen",
+            |mut query: QueryMut<'_, (&mut Health,)>, ()| {
+                query.for_each(|(hp,)| {
+                    hp.0 = hp.0.saturating_add(1);
+                });
+            },
+        )
+        .unwrap();
 
-    let apply_damage_id = registry.register_query::<(&mut Health,), (), _>(
-        &mut world,
-        "apply_damage",
-        |mut query: QueryMut<'_, (&mut Health,)>, ()| {
-            query.for_each(|(hp,)| {
-                hp.0 = hp.0.saturating_sub(5);
-            });
-        },
-    );
+    let apply_damage_id = registry
+        .register_query::<(&mut Health,), (), _>(
+            &mut world,
+            "apply_damage",
+            |mut query: QueryMut<'_, (&mut Health,)>, ()| {
+                query.for_each(|(hp,)| {
+                    hp.0 = hp.0.saturating_sub(5);
+                });
+            },
+        )
+        .unwrap();
 
-    let log_positions_id = registry.register_query_ref::<(&Pos,), (), _>(
-        &mut world,
-        "log_positions",
-        |mut query: QueryRef<'_, (&Pos,)>, ()| {
-            let count = query.count();
-            println!("    log_positions: {count} entities");
-        },
-    );
+    let log_positions_id = registry
+        .register_query_ref::<(&Pos,), (), _>(
+            &mut world,
+            "log_positions",
+            |mut query: QueryRef<'_, (&Pos,)>, ()| {
+                let count = query.count();
+                println!("    log_positions: {count} entities");
+            },
+        )
+        .unwrap();
 
-    let log_health_id = registry.register_query_ref::<(&Health,), (), _>(
-        &mut world,
-        "log_health",
-        |mut query: QueryRef<'_, (&Health,)>, ()| {
-            let mut total: u32 = 0;
-            query.for_each(|(h,)| {
-                total += h.0;
-            });
-            println!("    log_health: total HP = {total}");
-        },
-    );
+    let log_health_id = registry
+        .register_query_ref::<(&Health,), (), _>(
+            &mut world,
+            "log_health",
+            |mut query: QueryRef<'_, (&Health,)>, ()| {
+                let mut total: u32 = 0;
+                query.for_each(|(h,)| {
+                    total += h.0;
+                });
+                println!("    log_health: total HP = {total}");
+            },
+        )
+        .unwrap();
 
     // Ordered list of system IDs (names retrieved via registry for display)
     let system_names = [
@@ -209,7 +221,7 @@ fn main() {
             // scoped threads here. We run sequentially to keep the example
             // focused on ReducerRegistry, not unsafe parallel execution.
             for &i in batch {
-                registry.run(&mut world, system_ids[i], ());
+                registry.run(&mut world, system_ids[i], ()).unwrap();
             }
 
             if frame == 0 {

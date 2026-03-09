@@ -3,34 +3,75 @@
 //! ([`for_each_chunk`](QueryIter::for_each_chunk)) iteration over matched archetypes.
 
 use super::fetch::WorldQuery;
+use crate::sync::{Arc, AtomicBool, Ordering};
 use rayon::prelude::*;
 use std::marker::PhantomData;
 
 /// Iterator over entities matching a query.
+///
+/// When created by [`World::query`](crate::World::query), carries a shared
+/// flag that is set on first iteration. The world uses this flag to decide
+/// whether to commit a deferred read-tick advancement — if the iterator is
+/// dropped without being iterated, the `Changed<T>` window is preserved.
 pub struct QueryIter<'w, Q: WorldQuery> {
     fetches: Vec<(Q::Fetch<'w>, usize)>, // (fetch_state, archetype_len)
     current_arch: usize,
     current_row: usize,
+    /// Whether we've already set the iterated flag (avoids repeated atomics).
+    marked: bool,
+    /// Shared flag set on first iteration. `None` for iterators created
+    /// without tick tracking (e.g., via `query_raw`).
+    iterated: Option<Arc<AtomicBool>>,
     _marker: PhantomData<&'w Q>,
 }
 
 impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
+    /// Create an iterator without tick tracking (used by `query_raw`).
     pub(crate) fn new(fetches: Vec<(Q::Fetch<'w>, usize)>) -> Self {
         Self {
             fetches,
             current_arch: 0,
             current_row: 0,
+            iterated: None,
+            marked: false,
             _marker: PhantomData,
+        }
+    }
+
+    /// Create an iterator with a shared flag for lazy tick advancement.
+    pub(crate) fn with_tick_flag(
+        fetches: Vec<(Q::Fetch<'w>, usize)>,
+        iterated: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            fetches,
+            current_arch: 0,
+            current_row: 0,
+            iterated: Some(iterated),
+            marked: false,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Mark the iterator as having been iterated (sets the shared flag once).
+    #[inline]
+    fn mark_iterated(&mut self) {
+        if !self.marked {
+            if let Some(ref flag) = self.iterated {
+                flag.store(true, Ordering::Relaxed);
+            }
+            self.marked = true;
         }
     }
 
     /// Iterate archetypes, yielding typed column slices per archetype.
     /// Each invocation of `f` receives all matched rows in one archetype
     /// as contiguous slices — enabling SIMD auto-vectorization.
-    pub fn for_each_chunk<F>(self, mut f: F)
+    pub fn for_each_chunk<F>(mut self, mut f: F)
     where
         F: FnMut(Q::Slice<'w>),
     {
+        self.mark_iterated();
         for (fetch, len) in &self.fetches {
             if *len > 0 {
                 let slices = unsafe { Q::as_slice(fetch, *len) };
@@ -41,10 +82,11 @@ impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
 
     /// Execute `f` for each matched entity in parallel using rayon.
     /// Parallelizes across rows within each archetype.
-    pub fn par_for_each<F>(self, f: F)
+    pub fn par_for_each<F>(mut self, f: F)
     where
         F: Fn(Q::Item<'_>) + Send + Sync,
     {
+        self.mark_iterated();
         for (fetch, len) in &self.fetches {
             (0..*len).into_par_iter().for_each(|row| {
                 let item = unsafe { Q::fetch(fetch, row) };
@@ -66,6 +108,7 @@ impl<'w, Q: WorldQuery> Iterator for QueryIter<'w, Q> {
             if self.current_row < len {
                 let item = unsafe { Q::fetch(fetch, self.current_row) };
                 self.current_row += 1;
+                self.mark_iterated();
                 return Some(item);
             }
             self.current_arch += 1;

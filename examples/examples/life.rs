@@ -139,17 +139,19 @@ fn write_neighbors_via_table(world: &mut World, counts: &[u8]) {
 /// Register a QueryMut reducer that writes pre-computed neighbor counts
 /// into the NeighborCount column. Demonstrates Table + reducer integration.
 fn register_write_neighbors(registry: &mut ReducerRegistry, world: &mut World) -> QueryReducerId {
-    registry.register_query::<(&mut NeighborCount,), Vec<u8>, _>(
-        world,
-        "write_neighbor_counts",
-        |mut query: QueryMut<'_, (&mut NeighborCount,)>, counts: Vec<u8>| {
-            let mut i = 0;
-            query.for_each(|(nc,)| {
-                nc.0 = counts[i];
-                i += 1;
-            });
-        },
-    )
+    registry
+        .register_query::<(&mut NeighborCount,), Vec<u8>, _>(
+            world,
+            "write_neighbor_counts",
+            |mut query: QueryMut<'_, (&mut NeighborCount,)>, counts: Vec<u8>| {
+                let mut i = 0;
+                query.for_each(|(nc,)| {
+                    nc.0 = counts[i];
+                    i += 1;
+                });
+            },
+        )
+        .unwrap()
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -176,7 +178,9 @@ fn main() {
     {
         let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
-        registry.run(&mut world, write_neighbors_id, counts);
+        registry
+            .run(&mut world, write_neighbors_id, counts)
+            .unwrap();
     }
 
     println!(
@@ -197,7 +201,9 @@ fn main() {
         let counts = count_neighbors(&states);
         // Alternate between reducer and query_table_mut to exercise both paths
         if gen % 2 == 0 {
-            registry.run(&mut world, write_neighbors_id, counts.clone());
+            registry
+                .run(&mut world, write_neighbors_id, counts.clone())
+                .unwrap();
         } else {
             write_neighbors_via_table(&mut world, &counts);
         }
@@ -269,7 +275,9 @@ fn main() {
     for i in 0..REWIND_GENS {
         let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
-        registry.run(&mut world, write_neighbors_id, counts.clone());
+        registry
+            .run(&mut world, write_neighbors_id, counts.clone())
+            .unwrap();
 
         let updates = apply_rules(&states, &counts);
         let _ = apply_updates(&mut world, &grid, &updates);

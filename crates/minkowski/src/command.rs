@@ -36,9 +36,9 @@ impl CommandBuffer {
         }));
     }
 
-    pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
+    pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) {
         self.commands.push(Box::new(move |world| {
-            world.insert(entity, component);
+            world.insert(entity, bundle);
         }));
     }
 
@@ -109,7 +109,7 @@ mod tests {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
         let mut cmds = CommandBuffer::new();
-        cmds.insert(e, Vel { dx: 5.0, dy: 0.0 });
+        cmds.insert(e, (Vel { dx: 5.0, dy: 0.0 },));
         cmds.apply(&mut world);
 
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 5.0, dy: 0.0 }));

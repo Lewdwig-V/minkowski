@@ -2,6 +2,22 @@
 
 ## 1.0.1
 
+### Reducer Error Handling
+
+- **`ReducerError` enum** replaces panics for API misuse in `ReducerRegistry`. Variants: `WrongKind`, `DuplicateName`, `TransactionConflict`, `InvalidId`. Args type mismatches remain panics (static programming errors, consistent with the assert boundary rule).
+- All registration methods (`register_entity`, `register_spawner`, `register_query`, `register_query_writer`, `DynamicReducerBuilder::build`, etc.) now return `Result<_, ReducerError>`.
+- Dispatch methods (`call`, `run`, `dynamic_call`) return `Result<(), ReducerError>` with bounds checking on reducer IDs.
+- **`ReducerInfo`** struct for runtime introspection: `reducer_info()`, `query_reducer_info()`, `dynamic_reducer_info()` return name, kind, access pattern, change tracking, and despawn capability.
+- **`DynamicCtx` introspection**: `is_declared<T>()`, `is_writable<T>()`, `is_removable<T>()`, `can_despawn()` for runtime capability checking.
+- Registry introspection: `reducer_count()`, `dynamic_reducer_count()`, `registered_names()`.
+
+### Lazy Tick Advancement for `Changed<T>`
+
+- **`world.query()` now defers read-tick updates** until the `QueryIter` is actually iterated (via `next()`, `for_each_chunk()`, or `par_for_each()`). Dropping an iterator without consuming it preserves the `Changed<T>` window — subsequent queries still see those changes. This matches `QueryWriter`'s existing `queried` flag pattern.
+- **`World::has_changed::<Q>()`** — peek at whether any archetype has changes for a query type without consuming the change window.
+- **`World::advance_query_tick::<Q>()`** — explicitly consume the change window without iterating (e.g., during loading phases).
+- **`World::query_tick_info::<Q>()`** — returns `QueryTickInfo` with debug visibility into tick state (last read tick, current world tick, pending status, matched archetype count).
+
 ### Sparse Data Durability (`minkowski` + `minkowski-persist`)
 
 - **Sparse component mutations now survive WAL crash recovery.** `SparseInsert` and `SparseRemove` variants added to `Mutation`/`MutationRef` enums in `EnumChangeSet`, with full reverse changeset support for undo/redo.

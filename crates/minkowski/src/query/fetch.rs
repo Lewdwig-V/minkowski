@@ -248,6 +248,17 @@ unsafe impl<T: Component> WorldQuery for Option<&T> {
 /// (stored in the query cache) and advances automatically on each mutable access.
 /// Marking is pessimistic: any mutable access path marks the column, even if
 /// no bytes actually changed.
+///
+/// # Lazy tick advancement
+///
+/// The read tick is only committed when the [`QueryIter`](crate::QueryIter) is
+/// actually iterated. Creating a query with `world.query::<(Changed<T>,)>()`
+/// and dropping the iterator without consuming it preserves the change window —
+/// subsequent queries will still see those changes.
+///
+/// Use [`World::has_changed`](crate::World::has_changed) to peek without
+/// consuming, or [`World::advance_query_tick`](crate::World::advance_query_tick)
+/// to explicitly consume without iterating.
 pub struct Changed<T: Component>(std::marker::PhantomData<T>);
 
 unsafe impl<T: Component> WorldQuery for Changed<T> {

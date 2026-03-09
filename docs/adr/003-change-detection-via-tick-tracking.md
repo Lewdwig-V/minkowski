@@ -26,3 +26,15 @@ Each `BlobVec` column stores a `changed_tick: Tick` (monotonic u64) that auto-ad
 - Three distinct meanings of "component set" in WorldQuery: `required_ids` (archetype matching), `accessed_ids` (conflict detection), `mutable_ids` (change detection)
 - `Tick` is `pub(crate)` — implementation detail not exposed to users
 - False positives possible (mutable access without actual value change) but no false negatives
+
+## Lazy Tick Advancement (updated 2026-03-09)
+
+The read tick (`last_read_tick`) uses **lazy advancement**: `world.query()` defers the tick update until the iterator is actually iterated (via `next()`, `for_each_chunk()`, or `par_for_each()`). If the iterator is dropped without being consumed, the change window is preserved — subsequent queries still see those changes.
+
+This mirrors `QueryWriter` in the reducer system, which uses an `AtomicBool` `queried` flag to defer tick advancement until `for_each` or `count` is called.
+
+**Mechanism**: `QueryCacheEntry` stores a `pending_read_tick` and a shared `Arc<AtomicBool>` `iterated` flag. `QueryIter` sets the flag on first iteration. On the next `query()` call, if the flag is set, the pending tick is committed to `last_read_tick`; otherwise it's discarded.
+
+**Mutable column marking** remains eager: `&mut T` columns are marked as changed before the iterator is returned (required for soundness since the raw pointers are already valid).
+
+**Explicit tick control**: `World::has_changed::<Q>()` peeks without consuming; `World::advance_query_tick::<Q>()` consumes without iterating; `World::query_tick_info::<Q>()` exposes tick state for debugging.

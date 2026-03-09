@@ -142,7 +142,7 @@ fn apply_effects(world: &mut World) {
         .collect();
 
     for (e, new_hp) in effects {
-        world.insert(e, Health(new_hp));
+        world.insert(e, (Health(new_hp),));
     }
 }
 
@@ -227,42 +227,50 @@ fn avg_health(world: &mut World) -> f32 {
 
 fn register_reducers(world: &mut World, registry: &mut ReducerRegistry) -> ReducerIds {
     // Low-conflict: attack writes Damage (disjoint from Healing)
-    let attack_low = registry.register_entity::<(Damage,), u32, _>(
-        world,
-        "attack_low",
-        |mut entity: EntityMut<'_, (Damage,)>, dmg: u32| {
-            entity.set::<Damage, 0>(Damage(dmg));
-        },
-    );
+    let attack_low = registry
+        .register_entity::<(Damage,), u32, _>(
+            world,
+            "attack_low",
+            |mut entity: EntityMut<'_, (Damage,)>, dmg: u32| {
+                entity.set::<Damage, 0>(Damage(dmg));
+            },
+        )
+        .unwrap();
 
     // Low-conflict: heal writes Healing (disjoint from Damage)
-    let heal_low = registry.register_entity::<(Healing,), u32, _>(
-        world,
-        "heal_low",
-        |mut entity: EntityMut<'_, (Healing,)>, heal: u32| {
-            entity.set::<Healing, 0>(Healing(heal));
-        },
-    );
+    let heal_low = registry
+        .register_entity::<(Healing,), u32, _>(
+            world,
+            "heal_low",
+            |mut entity: EntityMut<'_, (Healing,)>, heal: u32| {
+                entity.set::<Healing, 0>(Healing(heal));
+            },
+        )
+        .unwrap();
 
     // High-conflict: attack reads + writes Health (read-modify-write)
-    let attack_high = registry.register_entity::<(Health,), u32, _>(
-        world,
-        "attack_high",
-        |mut entity: EntityMut<'_, (Health,)>, dmg: u32| {
-            let hp = entity.get::<Health, 0>().0;
-            entity.set::<Health, 0>(Health(hp.saturating_sub(dmg)));
-        },
-    );
+    let attack_high = registry
+        .register_entity::<(Health,), u32, _>(
+            world,
+            "attack_high",
+            |mut entity: EntityMut<'_, (Health,)>, dmg: u32| {
+                let hp = entity.get::<Health, 0>().0;
+                entity.set::<Health, 0>(Health(hp.saturating_sub(dmg)));
+            },
+        )
+        .unwrap();
 
     // High-conflict: heal reads + writes Health (read-modify-write)
-    let heal_high = registry.register_entity::<(Health,), u32, _>(
-        world,
-        "heal_high",
-        |mut entity: EntityMut<'_, (Health,)>, heal: u32| {
-            let hp = entity.get::<Health, 0>().0;
-            entity.set::<Health, 0>(Health(hp.saturating_add(heal).min(100)));
-        },
-    );
+    let heal_high = registry
+        .register_entity::<(Health,), u32, _>(
+            world,
+            "heal_high",
+            |mut entity: EntityMut<'_, (Health,)>, heal: u32| {
+                let hp = entity.get::<Health, 0>().0;
+                entity.set::<Health, 0>(Health(hp.saturating_add(heal).min(100)));
+            },
+        )
+        .unwrap();
 
     // Verify access conflicts match expectations
     let attack_low_access = registry.reducer_access(attack_low);

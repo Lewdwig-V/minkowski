@@ -470,31 +470,33 @@ fn main() {
 
     // Integration reducer: applies velocity to position with toroidal wrapping.
     // Receives DT as argument so the timestep can vary per call.
-    let integrate_id = registry.register_query::<(&mut Position, &Velocity), f32, _>(
-        &mut world,
-        "integrate",
-        |mut query: QueryMut<'_, (&mut Position, &Velocity)>, dt: f32| {
-            let ws = WORLD_SIZE;
-            query.for_each_chunk(|(poss, vels)| {
-                for i in 0..poss.len() {
-                    let mut x = poss[i].0.x + vels[i].0.x * dt;
-                    let mut y = poss[i].0.y + vels[i].0.y * dt;
-                    if x >= ws {
-                        x -= ws;
-                    } else if x < 0.0 {
-                        x += ws;
+    let integrate_id = registry
+        .register_query::<(&mut Position, &Velocity), f32, _>(
+            &mut world,
+            "integrate",
+            |mut query: QueryMut<'_, (&mut Position, &Velocity)>, dt: f32| {
+                let ws = WORLD_SIZE;
+                query.for_each_chunk(|(poss, vels)| {
+                    for i in 0..poss.len() {
+                        let mut x = poss[i].0.x + vels[i].0.x * dt;
+                        let mut y = poss[i].0.y + vels[i].0.y * dt;
+                        if x >= ws {
+                            x -= ws;
+                        } else if x < 0.0 {
+                            x += ws;
+                        }
+                        if y >= ws {
+                            y -= ws;
+                        } else if y < 0.0 {
+                            y += ws;
+                        }
+                        poss[i].0.x = x;
+                        poss[i].0.y = y;
                     }
-                    if y >= ws {
-                        y -= ws;
-                    } else if y < 0.0 {
-                        y += ws;
-                    }
-                    poss[i].0.x = x;
-                    poss[i].0.y = y;
-                }
-            });
-        },
-    );
+                });
+            },
+        )
+        .unwrap();
 
     // Spawn initial bodies
     for _ in 0..ENTITY_COUNT {
@@ -536,7 +538,7 @@ fn main() {
         }
 
         // Step 5: Integration — update positions via query reducer
-        registry.run(&mut world, integrate_id, DT);
+        registry.run(&mut world, integrate_id, DT).unwrap();
 
         // Step 6: Spawn/despawn churn
         if frame > 0 && frame % CHURN_INTERVAL == 0 {

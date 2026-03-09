@@ -1,5 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::marker::PhantomData;
 
 use crate::sync::{Arc, AtomicBool, AtomicU64, Ordering};
@@ -14,6 +15,110 @@ use crate::storage::archetype::Archetype;
 use crate::tick::Tick;
 use crate::transaction::{Conflict, Transact};
 use crate::world::World;
+
+// ── ReducerError ─────────────────────────────────────────────────────
+
+/// Error type for reducer dispatch and registration failures.
+///
+/// These are API-misuse errors that can be checked at the call site without
+/// panicking. Access-boundary violations inside reducer closures (e.g.
+/// reading an undeclared component in `DynamicCtx`) still panic per the
+/// assert boundary rule — they indicate broken invariants, not recoverable
+/// conditions.
+#[derive(Debug)]
+pub enum ReducerError {
+    /// Attempted to call a scheduled reducer with `call()`, or a
+    /// transactional reducer with `run()`.
+    WrongKind {
+        /// `"transactional"` or `"scheduled"`.
+        expected: &'static str,
+        /// `"transactional"` or `"scheduled"`.
+        actual: &'static str,
+    },
+    /// A reducer with this name was already registered.
+    DuplicateName {
+        name: &'static str,
+        existing_kind: &'static str,
+        existing_index: usize,
+    },
+    /// Transaction conflict (wraps [`Conflict`]).
+    TransactionConflict(Conflict),
+    /// The reducer ID does not refer to a valid entry in this registry.
+    /// Caused by using an ID from a different registry or after the
+    /// registry has been rebuilt.
+    InvalidId {
+        /// `"reducer"` or `"dynamic"`.
+        kind: &'static str,
+        index: usize,
+        max: usize,
+    },
+}
+
+impl fmt::Display for ReducerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReducerError::WrongKind { expected, actual } => {
+                write!(
+                    f,
+                    "reducer kind mismatch: expected {expected}, got {actual}"
+                )
+            }
+            ReducerError::DuplicateName {
+                name,
+                existing_kind,
+                existing_index,
+            } => {
+                write!(
+                    f,
+                    "duplicate reducer name '{name}' \
+                     (already registered as {existing_kind} reducer at index {existing_index})"
+                )
+            }
+            ReducerError::TransactionConflict(c) => {
+                write!(f, "transaction conflict: {c}")
+            }
+            ReducerError::InvalidId { kind, index, max } => {
+                write!(
+                    f,
+                    "invalid {kind} reducer ID (index {index}, registry has {max})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReducerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReducerError::TransactionConflict(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+impl From<Conflict> for ReducerError {
+    fn from(c: Conflict) -> Self {
+        ReducerError::TransactionConflict(c)
+    }
+}
+
+/// Introspection descriptor for a registered reducer.
+///
+/// Returned by [`ReducerRegistry::reducer_info`], [`query_reducer_info`](ReducerRegistry::query_reducer_info),
+/// and [`dynamic_reducer_info`](ReducerRegistry::dynamic_reducer_info).
+#[derive(Debug, Clone)]
+pub struct ReducerInfo {
+    /// Registration name.
+    pub name: &'static str,
+    /// `"transactional"`, `"scheduled"`, or `"dynamic"`.
+    pub kind: &'static str,
+    /// Component-level access bitsets.
+    pub access: Access,
+    /// Whether this reducer has `Changed<T>` tick tracking.
+    pub has_change_tracking: bool,
+    /// Whether this reducer declares despawn capability.
+    pub can_despawn: bool,
+}
 
 // ── ComponentSet & Contains ──────────────────────────────────────────
 
@@ -333,6 +438,37 @@ impl<'a> DynamicCtx<'a> {
         }
         // last_read_tick is updated by dynamic_call() AFTER the changeset
         // is applied, ensuring it's newer than any column tick set during commit.
+    }
+
+    /// Debug-only validation: check that a component type is declared on
+    /// this context without performing any read or write. Returns `true`
+    /// if the type was declared via `can_read` or `can_write`.
+    ///
+    /// This is useful for debug assertions in reducer closures:
+    /// ```ignore
+    /// debug_assert!(ctx.is_declared::<Pos>(), "Pos not declared");
+    /// ```
+    pub fn is_declared<T: 'static>(&self) -> bool {
+        self.resolved.lookup::<T>().is_some()
+    }
+
+    /// Debug-only validation: check that a component type is declared
+    /// as writable. Returns `true` if the type was declared via `can_write`.
+    pub fn is_writable<T: crate::component::Component>(&self) -> bool {
+        self.resolved
+            .lookup::<T>()
+            .is_some_and(|comp_id| self.resolved.access().writes().contains(comp_id))
+    }
+
+    /// Debug-only validation: check that a component type is declared
+    /// as removable. Returns `true` if the type was declared via `can_remove`.
+    pub fn is_removable<T: crate::component::Component>(&self) -> bool {
+        self.resolved.has_remove::<T>()
+    }
+
+    /// Debug-only validation: check that despawn is declared.
+    pub fn can_despawn(&self) -> bool {
+        self.resolved.access().despawns()
     }
 
     /// Chunk iteration: yields typed slices per archetype for SIMD-friendly
@@ -978,8 +1114,9 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
 ///
 /// Uses the full [`World::query`] path with tick management and filter
 /// support (including `Changed<T>`). The [`ReadOnlyWorldQuery`] bound
-/// guarantees no `&mut T` access through the query. Provides [`for_each`](QueryRef::for_each)
-/// and [`count`](QueryRef::count). For read-write iteration, see [`QueryMut`].
+/// guarantees no `&mut T` access through the query. Provides [`for_each`](QueryRef::for_each),
+/// [`for_each_chunk`](QueryRef::for_each_chunk), and [`count`](QueryRef::count).
+/// For read-write iteration, see [`QueryMut`].
 ///
 /// Registered via [`ReducerRegistry::register_query_ref`], dispatched
 /// via [`ReducerRegistry::run`].
@@ -1004,6 +1141,15 @@ impl<'a, Q: ReadOnlyWorldQuery + 'static> QueryRef<'a, Q> {
     /// world state but is not a stability guarantee.
     pub fn for_each(&mut self, f: impl FnMut(Q::Item<'_>)) {
         self.world.query::<Q>().for_each(f);
+    }
+
+    /// Iterate matching entities in contiguous typed slices per archetype.
+    ///
+    /// Same iteration order guarantees as [`for_each`](Self::for_each).
+    /// Yields typed slices that LLVM can auto-vectorize — prefer this over
+    /// `for_each` for numeric/math workloads.
+    pub fn for_each_chunk(&mut self, f: impl FnMut(Q::Slice<'_>)) {
+        self.world.query::<Q>().for_each_chunk(f);
     }
 
     pub fn count(&mut self) -> usize {
@@ -1227,12 +1373,14 @@ impl ReducerRegistry {
 
     /// Register an entity reducer: `f(EntityMut<C>, args)`.
     /// At dispatch, call with `(entity, args)` as the args tuple.
+    ///
+    /// Returns `Err(ReducerError::DuplicateName)` if the name is already registered.
     pub fn register_entity<C, Args, F>(
         &mut self,
         world: &mut World,
         name: &'static str,
         f: F,
-    ) -> ReducerId
+    ) -> Result<ReducerId, ReducerError>
     where
         C: ComponentSet,
         Args: Clone + 'static,
@@ -1272,12 +1420,14 @@ impl ReducerRegistry {
     /// Register an entity reducer with despawn capability.
     /// Same as `register_entity`, but `EntityMut::despawn()` is enabled
     /// and the Access includes the despawn flag.
+    ///
+    /// Returns `Err(ReducerError::DuplicateName)` if the name is already registered.
     pub fn register_entity_despawn<C, Args, F>(
         &mut self,
         world: &mut World,
         name: &'static str,
         f: F,
-    ) -> ReducerId
+    ) -> Result<ReducerId, ReducerError>
     where
         C: ComponentSet,
         Args: Clone + 'static,
@@ -1315,12 +1465,14 @@ impl ReducerRegistry {
     }
 
     /// Register a spawner reducer: `f(Spawner<B>, args)`.
+    ///
+    /// Returns `Err(ReducerError::DuplicateName)` if the name is already registered.
     pub fn register_spawner<B, Args, F>(
         &mut self,
         world: &mut World,
         name: &'static str,
         f: F,
-    ) -> ReducerId
+    ) -> Result<ReducerId, ReducerError>
     where
         B: Bundle,
         Args: Clone + 'static,
@@ -1361,12 +1513,14 @@ impl ReducerRegistry {
     /// transaction's changeset. Column ticks are NOT advanced during iteration
     /// (avoiding self-conflict with optimistic validation). Changes are applied
     /// atomically on commit.
+    ///
+    /// Returns `Err(ReducerError::DuplicateName)` if the name is already registered.
     pub fn register_query_writer<Q, Args, F>(
         &mut self,
         world: &mut World,
         name: &'static str,
         f: F,
-    ) -> ReducerId
+    ) -> Result<ReducerId, ReducerError>
     where
         Q: WriterQuery + 'static,
         Args: Clone + 'static,
@@ -1409,12 +1563,14 @@ impl ReducerRegistry {
     // ── Scheduled registration ───────────────────────────────────
 
     /// Register a mutable query reducer: `f(QueryMut<Q>, args)`.
+    ///
+    /// Returns `Err(ReducerError::DuplicateName)` if the name is already registered.
     pub fn register_query<Q, Args, F>(
         &mut self,
         world: &mut World,
         name: &'static str,
         f: F,
-    ) -> QueryReducerId
+    ) -> Result<QueryReducerId, ReducerError>
     where
         Q: WorldQuery + 'static,
         Args: Clone + 'static,
@@ -1444,20 +1600,22 @@ impl ReducerRegistry {
             ReducerKind::Scheduled(adapter),
             None,
             None,
-        );
-        QueryReducerId(id.0)
+        )?;
+        Ok(QueryReducerId(id.0))
     }
 
     /// Register a read-only query reducer: `f(QueryRef<Q>, args)`.
     ///
     /// Uses the full query path with filter support (`Changed<T>` works).
     /// The `ReadOnlyWorldQuery` bound prevents `&mut T` access.
+    ///
+    /// Returns `Err(ReducerError::DuplicateName)` if the name is already registered.
     pub fn register_query_ref<Q, Args, F>(
         &mut self,
         world: &mut World,
         name: &'static str,
         f: F,
-    ) -> QueryReducerId
+    ) -> Result<QueryReducerId, ReducerError>
     where
         Q: ReadOnlyWorldQuery + 'static,
         Args: Clone + 'static,
@@ -1487,8 +1645,8 @@ impl ReducerRegistry {
             ReducerKind::Scheduled(adapter),
             None,
             None,
-        );
-        QueryReducerId(id.0)
+        )?;
+        Ok(QueryReducerId(id.0))
     }
 
     // ── Dynamic registration ────────────────────────────────────
@@ -1514,18 +1672,26 @@ impl ReducerRegistry {
     // ── Dispatch ─────────────────────────────────────────────────
 
     /// Call a transactional reducer (entity, spawner, or query writer).
+    ///
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds,
+    /// `Err(ReducerError::WrongKind)` if the ID points to a scheduled
+    /// reducer, or `Err(ReducerError::TransactionConflict)` if the
+    /// transaction strategy detects a conflict.
     pub fn call<S: Transact, Args: Clone + 'static>(
         &self,
         strategy: &S,
         world: &mut World,
         id: ReducerId,
         args: Args,
-    ) -> Result<(), Conflict> {
-        let entry = &self.reducers[id.0];
+    ) -> Result<(), ReducerError> {
+        let entry = self.get_entry(id.0)?;
         let adapter = match &entry.kind {
             ReducerKind::Transactional(f) => f,
             ReducerKind::Scheduled(_) => {
-                panic!("call() on scheduled reducer — use run() instead")
+                return Err(ReducerError::WrongKind {
+                    expected: "transactional",
+                    actual: "scheduled",
+                });
             }
         };
         let access = &entry.access;
@@ -1556,17 +1722,30 @@ impl ReducerRegistry {
                 }
             }
         }
-        result
+        result.map_err(ReducerError::from)
     }
 
     /// Run a scheduled query reducer directly. Caller guarantees exclusivity.
-    pub fn run<Args: Clone + 'static>(&self, world: &mut World, id: QueryReducerId, args: Args) {
-        let entry = &self.reducers[id.0];
+    ///
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds,
+    /// or `Err(ReducerError::WrongKind)` if the ID points to a
+    /// transactional reducer.
+    pub fn run<Args: Clone + 'static>(
+        &self,
+        world: &mut World,
+        id: QueryReducerId,
+        args: Args,
+    ) -> Result<(), ReducerError> {
+        let entry = self.get_entry(id.0)?;
         match &entry.kind {
-            ReducerKind::Scheduled(f) => f(world, &args),
-            ReducerKind::Transactional(_) => {
-                panic!("run() called on transactional reducer — use call() instead")
+            ReducerKind::Scheduled(f) => {
+                f(world, &args);
+                Ok(())
             }
+            ReducerKind::Transactional(_) => Err(ReducerError::WrongKind {
+                expected: "scheduled",
+                actual: "transactional",
+            }),
         }
     }
 
@@ -1597,16 +1776,26 @@ impl ReducerRegistry {
     }
 
     /// Access metadata for a transactional reducer.
+    ///
+    /// # Panics
+    /// Panics if the ID is out of bounds. Use [`reducer_info`](Self::reducer_info)
+    /// for a fallible alternative.
     pub fn reducer_access(&self, id: ReducerId) -> &Access {
         &self.reducers[id.0].access
     }
 
     /// Access metadata for a scheduled query reducer.
+    ///
+    /// # Panics
+    /// Panics if the ID is out of bounds.
     pub fn query_reducer_access(&self, id: QueryReducerId) -> &Access {
         &self.reducers[id.0].access
     }
 
     /// Access metadata by raw index.
+    ///
+    /// # Panics
+    /// Panics if the index is out of bounds.
     pub fn access(&self, idx: usize) -> &Access {
         &self.reducers[idx].access
     }
@@ -1614,14 +1803,18 @@ impl ReducerRegistry {
     // ── Dynamic dispatch ────────────────────────────────────────
 
     /// Call a dynamic reducer with a chosen transaction strategy.
+    ///
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds,
+    /// or `Err(ReducerError::TransactionConflict)` if the transaction
+    /// strategy detects a conflict.
     pub fn dynamic_call<S: Transact, Args: 'static>(
         &self,
         strategy: &S,
         world: &mut World,
         id: DynamicReducerId,
         args: &Args,
-    ) -> Result<(), Conflict> {
-        let entry = &self.dynamic_reducers[id.0];
+    ) -> Result<(), ReducerError> {
+        let entry = self.get_dynamic_entry(id.0)?;
         let closure = &entry.closure;
         let resolved = &entry.resolved;
         let access = resolved.access();
@@ -1644,7 +1837,7 @@ impl ReducerRegistry {
                 .last_read_tick
                 .store(new_tick.raw(), Ordering::Relaxed);
         }
-        result
+        result.map_err(ReducerError::from)
     }
 
     /// Look up a dynamic reducer by name.
@@ -1657,11 +1850,90 @@ impl ReducerRegistry {
     }
 
     /// Access metadata for a dynamic reducer.
+    ///
+    /// # Panics
+    /// Panics if the ID is out of bounds.
     pub fn dynamic_access(&self, id: DynamicReducerId) -> &Access {
         self.dynamic_reducers[id.0].resolved.access()
     }
 
+    // ── Introspection ─────────────────────────────────────────────
+
+    /// Introspection for a transactional reducer.
+    ///
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds.
+    pub fn reducer_info(&self, id: ReducerId) -> Result<ReducerInfo, ReducerError> {
+        let entry = self.get_entry(id.0)?;
+        let kind = match &entry.kind {
+            ReducerKind::Transactional(_) => "transactional",
+            ReducerKind::Scheduled(_) => "scheduled",
+        };
+        Ok(ReducerInfo {
+            name: entry.name,
+            kind,
+            access: entry.access.clone(),
+            has_change_tracking: entry.last_read_tick.is_some(),
+            can_despawn: entry.access.despawns(),
+        })
+    }
+
+    /// Introspection for a scheduled query reducer.
+    ///
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds.
+    pub fn query_reducer_info(&self, id: QueryReducerId) -> Result<ReducerInfo, ReducerError> {
+        self.reducer_info(ReducerId(id.0))
+    }
+
+    /// Introspection for a dynamic reducer.
+    ///
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds.
+    pub fn dynamic_reducer_info(&self, id: DynamicReducerId) -> Result<ReducerInfo, ReducerError> {
+        let entry = self.get_dynamic_entry(id.0)?;
+        let access = entry.resolved.access().clone();
+        let can_despawn = access.despawns();
+        Ok(ReducerInfo {
+            name: entry.name,
+            kind: "dynamic",
+            access,
+            has_change_tracking: true, // dynamic reducers always have tick tracking
+            can_despawn,
+        })
+    }
+
+    /// Number of registered unified reducers (transactional + scheduled).
+    pub fn reducer_count(&self) -> usize {
+        self.reducers.len()
+    }
+
+    /// Number of registered dynamic reducers.
+    pub fn dynamic_reducer_count(&self) -> usize {
+        self.dynamic_reducers.len()
+    }
+
+    /// Iterate all registered reducer names and their slot kinds.
+    pub fn registered_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.by_name.keys().copied()
+    }
+
     // ── Internal ─────────────────────────────────────────────────
+
+    fn get_entry(&self, index: usize) -> Result<&ReducerEntry, ReducerError> {
+        self.reducers.get(index).ok_or(ReducerError::InvalidId {
+            kind: "reducer",
+            index,
+            max: self.reducers.len(),
+        })
+    }
+
+    fn get_dynamic_entry(&self, index: usize) -> Result<&DynamicReducerEntry, ReducerError> {
+        self.dynamic_reducers
+            .get(index)
+            .ok_or(ReducerError::InvalidId {
+                kind: "dynamic",
+                index,
+                max: self.dynamic_reducers.len(),
+            })
+    }
 
     fn push_entry(
         &mut self,
@@ -1671,18 +1943,18 @@ impl ReducerRegistry {
         kind: ReducerKind,
         last_read_tick: Option<Arc<AtomicU64>>,
         queried: Option<Arc<AtomicBool>>,
-    ) -> ReducerId {
+    ) -> Result<ReducerId, ReducerError> {
         let id = self.reducers.len();
         if let Some(slot) = self.by_name.get(name) {
-            let (kind, existing) = match slot {
+            let (existing_kind, existing_index) = match slot {
                 ReducerSlot::Unified(idx) => ("unified", *idx),
                 ReducerSlot::Dynamic(idx) => ("dynamic", *idx),
             };
-            panic!(
-                "ReducerRegistry: duplicate reducer name '{}' \
-                 (already registered as {} reducer at index {})",
-                name, kind, existing
-            );
+            return Err(ReducerError::DuplicateName {
+                name,
+                existing_kind,
+                existing_index,
+            });
         }
         self.by_name.insert(name, ReducerSlot::Unified(id));
         self.reducers.push(ReducerEntry {
@@ -1693,7 +1965,7 @@ impl ReducerRegistry {
             last_read_tick,
             queried,
         });
-        ReducerId(id)
+        Ok(ReducerId(id))
     }
 }
 
@@ -1779,7 +2051,9 @@ impl<'a> DynamicReducerBuilder<'a> {
 
     /// Finalize registration. The closure receives `&mut DynamicCtx` and
     /// type-erased `&Args`. Returns the opaque `DynamicReducerId`.
-    pub fn build<Args, F>(self, f: F) -> DynamicReducerId
+    ///
+    /// Returns `Err(ReducerError::DuplicateName)` if the name is already registered.
+    pub fn build<Args, F>(self, f: F) -> Result<DynamicReducerId, ReducerError>
     where
         Args: 'static,
         F: Fn(&mut DynamicCtx, &Args) + Send + Sync + 'static,
@@ -1803,15 +2077,15 @@ impl<'a> DynamicReducerBuilder<'a> {
 
         let id = self.registry.dynamic_reducers.len();
         if let Some(slot) = self.registry.by_name.get(self.name) {
-            let (kind, existing) = match slot {
+            let (existing_kind, existing_index) = match slot {
                 ReducerSlot::Unified(idx) => ("unified", *idx),
                 ReducerSlot::Dynamic(idx) => ("dynamic", *idx),
             };
-            panic!(
-                "ReducerRegistry: duplicate reducer name '{}' \
-                 (already registered as {} reducer at index {})",
-                self.name, kind, existing
-            );
+            return Err(ReducerError::DuplicateName {
+                name: self.name,
+                existing_kind,
+                existing_index,
+            });
         }
         self.registry
             .by_name
@@ -1822,7 +2096,7 @@ impl<'a> DynamicReducerBuilder<'a> {
             closure,
             last_read_tick: Arc::new(AtomicU64::new(0)),
         });
-        DynamicReducerId(id)
+        Ok(DynamicReducerId(id))
     }
 }
 
@@ -2021,8 +2295,8 @@ mod tests {
             .dynamic("test_dyn", &mut world)
             .can_read::<Pos>()
             .can_write::<Vel>()
-            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
-
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
         assert_eq!(id.index(), 0);
 
         // Verify access: Pos is read, Vel is read+write
@@ -2042,8 +2316,8 @@ mod tests {
         let id = reducers
             .dynamic("spawner", &mut world)
             .can_spawn::<(Pos, Vel)>()
-            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
-
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
         let pos_id = world.components.id::<Pos>().unwrap();
         let vel_id = world.components.id::<Vel>().unwrap();
         let entry = &reducers.dynamic_reducers[id.0];
@@ -2053,27 +2327,39 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate reducer name")]
-    fn dynamic_builder_duplicate_name_panics() {
+    fn dynamic_builder_duplicate_name_returns_err() {
         let mut world = World::new();
         let mut reducers = ReducerRegistry::new();
         reducers
             .dynamic("dup", &mut world)
-            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
-        reducers
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
+        let result = reducers
             .dynamic("dup", &mut world)
             .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+        assert!(matches!(
+            result,
+            Err(ReducerError::DuplicateName { name: "dup", .. })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "duplicate reducer name")]
-    fn dynamic_name_conflicts_with_unified() {
+    fn dynamic_name_conflicts_with_unified_returns_err() {
         let mut world = World::new();
         let mut reducers = ReducerRegistry::new();
-        reducers.register_entity::<(Health,), (), _>(&mut world, "shared_name", |_e, ()| {});
         reducers
+            .register_entity::<(Health,), (), _>(&mut world, "shared_name", |_e, ()| {})
+            .unwrap();
+        let result = reducers
             .dynamic("shared_name", &mut world)
             .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+        assert!(matches!(
+            result,
+            Err(ReducerError::DuplicateName {
+                name: "shared_name",
+                ..
+            })
+        ));
     }
 
     // ── Dynamic dispatch tests ────────────────────────────────────
@@ -2093,7 +2379,8 @@ mod tests {
                 let vel = ctx.read::<Vel>(*entity).0;
                 let pos = ctx.read::<Pos>(*entity).0;
                 ctx.write(*entity, Pos(pos + vel));
-            });
+            })
+            .unwrap();
 
         reducers
             .dynamic_call(&strategy, &mut world, id, &e)
@@ -2108,8 +2395,11 @@ mod tests {
         let dyn_id = reducers
             .dynamic("my_dyn", &mut world)
             .can_read::<Pos>()
-            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
-        reducers.register_entity::<(Health,), (), _>(&mut world, "entity_one", |_e, ()| {});
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
+        reducers
+            .register_entity::<(Health,), (), _>(&mut world, "entity_one", |_e, ()| {})
+            .unwrap();
 
         // Dynamic lookup finds dynamic reducer
         assert_eq!(reducers.dynamic_id_by_name("my_dyn"), Some(dyn_id));
@@ -2129,8 +2419,8 @@ mod tests {
             .dynamic("test_access", &mut world)
             .can_read::<Pos>()
             .can_write::<Vel>()
-            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
-
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
         let pos_id = world.components.id::<Pos>().unwrap();
         let vel_id = world.components.id::<Vel>().unwrap();
         let access = reducers.dynamic_access(id);
@@ -2148,7 +2438,8 @@ mod tests {
             .dynamic("remover", &mut world)
             .can_read::<Health>()
             .can_remove::<Vel>()
-            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
         let access = registry.dynamic_access(id);
         let vel_id = world.components.id::<Vel>().unwrap();
         assert!(access.writes().contains(vel_id));
@@ -2162,7 +2453,8 @@ mod tests {
             .dynamic("despawner", &mut world)
             .can_read::<Health>()
             .can_despawn()
-            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
         let access = registry.dynamic_access(id);
         assert!(access.despawns());
     }
@@ -2175,9 +2467,11 @@ mod tests {
             .dynamic("despawner", &mut world)
             .can_read::<Health>()
             .can_despawn()
-            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
-        let entity_id =
-            registry.register_entity::<(Vel,), (), _>(&mut world, "set_vel", |_e, ()| {});
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
+        let entity_id = registry
+            .register_entity::<(Vel,), (), _>(&mut world, "set_vel", |_e, ()| {})
+            .unwrap();
         let dyn_access = registry.dynamic_access(dyn_id);
         let entity_access = registry.reducer_access(entity_id);
         assert!(dyn_access.conflicts_with(entity_access));
@@ -2197,7 +2491,8 @@ mod tests {
             .can_remove::<Vel>()
             .build(|ctx: &mut DynamicCtx, entity: &Entity| {
                 ctx.remove::<Vel>(*entity);
-            });
+            })
+            .unwrap();
         registry
             .dynamic_call(&strategy, &mut world, id, &e)
             .unwrap();
@@ -2219,7 +2514,8 @@ mod tests {
             .build(move |ctx: &mut DynamicCtx, entity: &Entity| {
                 let removed = ctx.try_remove::<Vel>(*entity);
                 result_clone.store(removed, std::sync::atomic::Ordering::Relaxed);
-            });
+            })
+            .unwrap();
         registry
             .dynamic_call(&strategy, &mut world, id, &e)
             .unwrap();
@@ -2238,7 +2534,8 @@ mod tests {
             .can_read::<Pos>()
             .build(|ctx: &mut DynamicCtx, entity: &Entity| {
                 ctx.remove::<Vel>(*entity);
-            });
+            })
+            .unwrap();
         let _ = registry.dynamic_call(&strategy, &mut world, id, &e);
     }
 
@@ -2255,7 +2552,8 @@ mod tests {
             .can_write::<Vel>()
             .build(|ctx: &mut DynamicCtx, entity: &Entity| {
                 ctx.remove::<Vel>(*entity);
-            });
+            })
+            .unwrap();
         let _ = registry.dynamic_call(&strategy, &mut world, id, &e);
     }
 
@@ -2273,7 +2571,8 @@ mod tests {
             .build(move |ctx: &mut DynamicCtx, entity: &Entity| {
                 let removed = ctx.try_remove::<Vel>(*entity);
                 result_clone.store(removed, std::sync::atomic::Ordering::Relaxed);
-            });
+            })
+            .unwrap();
         registry
             .dynamic_call(&strategy, &mut world, id, &e)
             .unwrap();
@@ -2294,7 +2593,8 @@ mod tests {
             .can_despawn()
             .build(|ctx: &mut DynamicCtx, entity: &Entity| {
                 ctx.despawn(*entity);
-            });
+            })
+            .unwrap();
         registry
             .dynamic_call(&strategy, &mut world, id, &e)
             .unwrap();
@@ -2313,7 +2613,8 @@ mod tests {
             .can_read::<Pos>()
             .build(|ctx: &mut DynamicCtx, entity: &Entity| {
                 ctx.despawn(*entity);
-            });
+            })
+            .unwrap();
         let _ = registry.dynamic_call(&strategy, &mut world, id, &e);
     }
 
@@ -2325,13 +2626,15 @@ mod tests {
         let e = world.spawn((Pos(1.0), Vel(2.0)));
         let strategy = Optimistic::new(&world);
         let mut registry = ReducerRegistry::new();
-        let id = registry.register_entity::<(Pos, Vel), (), _>(
-            &mut world,
-            "strip_vel",
-            |mut entity: EntityMut<'_, (Pos, Vel)>, ()| {
-                entity.remove::<Vel, 1>();
-            },
-        );
+        let id = registry
+            .register_entity::<(Pos, Vel), (), _>(
+                &mut world,
+                "strip_vel",
+                |mut entity: EntityMut<'_, (Pos, Vel)>, ()| {
+                    entity.remove::<Vel, 1>();
+                },
+            )
+            .unwrap();
         registry.call(&strategy, &mut world, id, (e, ())).unwrap();
         assert!(world.get::<Vel>(e).is_none());
         assert!(world.get::<Pos>(e).is_some());
@@ -2343,13 +2646,15 @@ mod tests {
         let e = world.spawn((Pos(1.0), Vel(2.0)));
         let strategy = Optimistic::new(&world);
         let mut registry = ReducerRegistry::new();
-        let id = registry.register_entity_despawn::<(Pos,), (), _>(
-            &mut world,
-            "killer",
-            |mut entity: EntityMut<'_, (Pos,)>, ()| {
-                entity.despawn();
-            },
-        );
+        let id = registry
+            .register_entity_despawn::<(Pos,), (), _>(
+                &mut world,
+                "killer",
+                |mut entity: EntityMut<'_, (Pos,)>, ()| {
+                    entity.despawn();
+                },
+            )
+            .unwrap();
         registry.call(&strategy, &mut world, id, (e, ())).unwrap();
         assert!(!world.is_alive(e));
     }
@@ -2361,13 +2666,15 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         let strategy = Optimistic::new(&world);
         let mut registry = ReducerRegistry::new();
-        let id = registry.register_entity::<(Pos,), (), _>(
-            &mut world,
-            "bad_killer",
-            |mut entity: EntityMut<'_, (Pos,)>, ()| {
-                entity.despawn();
-            },
-        );
+        let id = registry
+            .register_entity::<(Pos,), (), _>(
+                &mut world,
+                "bad_killer",
+                |mut entity: EntityMut<'_, (Pos,)>, ()| {
+                    entity.despawn();
+                },
+            )
+            .unwrap();
         let _ = registry.call(&strategy, &mut world, id, (e, ()));
     }
 
@@ -2390,7 +2697,8 @@ mod tests {
                 ctx.for_each::<(&Pos,)>(|(_pos,)| {
                     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 });
-            });
+            })
+            .unwrap();
         registry
             .dynamic_call(&strategy, &mut world, id, &())
             .unwrap();
@@ -2409,7 +2717,8 @@ mod tests {
             .can_read::<Pos>()
             .build(|ctx: &mut DynamicCtx, _args: &()| {
                 ctx.for_each::<(&Pos, &Vel)>(|(_p, _v)| {});
-            });
+            })
+            .unwrap();
         let _ = registry.dynamic_call(&strategy, &mut world, id, &());
     }
 
@@ -2432,7 +2741,8 @@ mod tests {
                 for (entity, new_vel) in updates {
                     ctx.write(entity, Vel(new_vel));
                 }
-            });
+            })
+            .unwrap();
         registry
             .dynamic_call(&strategy, &mut world, id, &())
             .unwrap();
@@ -2461,7 +2771,8 @@ mod tests {
                 for (entity, val) in updates {
                     ctx.write(entity, val);
                 }
-            });
+            })
+            .unwrap();
 
         // First call: column was never read by this reducer, Changed matches
         registry
@@ -2508,7 +2819,8 @@ mod tests {
                 ctx.for_each_chunk::<(&Pos,)>(|(positions,)| {
                     counter.fetch_add(positions.len(), std::sync::atomic::Ordering::Relaxed);
                 });
-            });
+            })
+            .unwrap();
         registry
             .dynamic_call(&strategy, &mut world, id, &())
             .unwrap();
@@ -2527,7 +2839,8 @@ mod tests {
             .can_read::<Pos>()
             .build(|ctx: &mut DynamicCtx, _args: &()| {
                 ctx.for_each_chunk::<(&Pos, &Vel)>(|(_p, _v)| {});
-            });
+            })
+            .unwrap();
         let _ = registry.dynamic_call(&strategy, &mut world, id, &());
     }
 
@@ -2777,14 +3090,12 @@ mod tests {
         let strategy = Optimistic::new(&world);
 
         let mut registry = ReducerRegistry::new();
-        let heal_id = registry.register_entity::<(Health,), u32, _>(
-            &mut world,
-            "heal",
-            |mut entity, amount: u32| {
+        let heal_id = registry
+            .register_entity::<(Health,), u32, _>(&mut world, "heal", |mut entity, amount: u32| {
                 let hp = entity.get::<Health, 0>().0;
                 entity.set::<Health, 0>(Health(hp + amount));
-            },
-        );
+            })
+            .unwrap();
 
         registry
             .call(&strategy, &mut world, heal_id, (e, 25u32))
@@ -2799,15 +3110,13 @@ mod tests {
         world.spawn((Vel(2.0),));
 
         let mut registry = ReducerRegistry::new();
-        let gravity_id = registry.register_query::<(&mut Vel,), f32, _>(
-            &mut world,
-            "gravity",
-            |mut query, dt: f32| {
+        let gravity_id = registry
+            .register_query::<(&mut Vel,), f32, _>(&mut world, "gravity", |mut query, dt: f32| {
                 query.for_each(|(vel,)| vel.0 -= 9.81 * dt);
-            },
-        );
+            })
+            .unwrap();
 
-        registry.run(&mut world, gravity_id, 0.1f32);
+        registry.run(&mut world, gravity_id, 0.1f32).unwrap();
 
         let mut sum = 0.0;
         for (vel,) in world.query::<(&Vel,)>() {
@@ -2824,22 +3133,25 @@ mod tests {
         world.spawn((Pos(20.0),));
 
         let mut registry = ReducerRegistry::new();
-        let count_id =
-            registry.register_query_ref::<(&Pos,), (), _>(&mut world, "count", |mut query, ()| {
+        let count_id = registry
+            .register_query_ref::<(&Pos,), (), _>(&mut world, "count", |mut query, ()| {
                 assert_eq!(query.count(), 2);
-            });
+            })
+            .unwrap();
 
-        registry.run(&mut world, count_id, ());
+        registry.run(&mut world, count_id, ()).unwrap();
     }
 
     #[test]
     fn typed_id_by_name_lookup() {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
-        let heal_id =
-            registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
-        let _gravity_id =
-            registry.register_query::<(&mut Vel,), (), _>(&mut world, "gravity", |_query, ()| {});
+        let heal_id = registry
+            .register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {})
+            .unwrap();
+        let _gravity_id = registry
+            .register_query::<(&mut Vel,), (), _>(&mut world, "gravity", |_query, ()| {})
+            .unwrap();
 
         // Typed lookups return the correct variant
         assert_eq!(registry.reducer_id_by_name("heal"), Some(heal_id));
@@ -2854,8 +3166,9 @@ mod tests {
     fn access_metadata_matches() {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
-        let heal_id =
-            registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
+        let heal_id = registry
+            .register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {})
+            .unwrap();
         let health_id = world.components.id::<Health>().unwrap();
         let access = registry.reducer_access(heal_id);
         // Entity reducers declare both reads and writes
@@ -2868,11 +3181,13 @@ mod tests {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
 
-        let heal_id =
-            registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
+        let heal_id = registry
+            .register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {})
+            .unwrap();
 
-        let damage_id =
-            registry.register_entity::<(Health,), (), _>(&mut world, "damage", |_entity, ()| {});
+        let damage_id = registry
+            .register_entity::<(Health,), (), _>(&mut world, "damage", |_entity, ()| {})
+            .unwrap();
 
         let heal_access = registry.reducer_access(heal_id);
         let damage_access = registry.reducer_access(damage_id);
@@ -2889,13 +3204,15 @@ mod tests {
         let mut world = World::new();
         let strategy = Optimistic::new(&world);
         let mut registry = ReducerRegistry::new();
-        let spawn_id = registry.register_spawner::<(Health,), u32, _>(
-            &mut world,
-            "spawn_unit",
-            |mut spawner, hp: u32| {
-                spawner.spawn((Health(hp),));
-            },
-        );
+        let spawn_id = registry
+            .register_spawner::<(Health,), u32, _>(
+                &mut world,
+                "spawn_unit",
+                |mut spawner, hp: u32| {
+                    spawner.spawn((Health(hp),));
+                },
+            )
+            .unwrap();
 
         registry
             .call(&strategy, &mut world, spawn_id, 50u32)
@@ -2917,13 +3234,15 @@ mod tests {
         let mut registry = ReducerRegistry::new();
 
         // Register a spawner that also reads Pos to create a conflict surface
-        let _spawn_id = registry.register_spawner::<(Health,), (), _>(
-            &mut world,
-            "spawn_and_conflict",
-            |mut spawner, ()| {
-                spawner.spawn((Health(1),));
-            },
-        );
+        let _spawn_id = registry
+            .register_spawner::<(Health,), (), _>(
+                &mut world,
+                "spawn_and_conflict",
+                |mut spawner, ()| {
+                    spawner.spawn((Health(1),));
+                },
+            )
+            .unwrap();
 
         // Force a conflict: mutate Pos column between begin and commit
         // by using a strategy with max 1 retry and always-conflicting access
@@ -2955,12 +3274,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate reducer name")]
-    fn duplicate_name_panics() {
+    fn duplicate_name_returns_err() {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
-        registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
-        registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
+        registry
+            .register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {})
+            .unwrap();
+        let result =
+            registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
+        assert!(matches!(
+            result,
+            Err(ReducerError::DuplicateName { name: "heal", .. })
+        ));
     }
 
     #[test]
@@ -3038,7 +3363,8 @@ mod tests {
             .build(|ctx: &mut DynamicCtx, _args: &()| {
                 let e = ctx.spawn((42u32, std::f64::consts::PI));
                 let _ = e;
-            });
+            })
+            .unwrap();
 
         let strategy = Optimistic::new(&world);
         reducers
@@ -3127,21 +3453,25 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate reducer name")]
-    fn unified_name_conflicts_with_dynamic() {
+    fn unified_name_conflicts_with_dynamic_returns_err() {
         let mut world = World::new();
         let mut reducers = ReducerRegistry::new();
         // Register dynamic first
         reducers
             .dynamic("clash", &mut world)
             .can_read::<u32>()
-            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
-        // Then unified — should panic
-        reducers.register_entity::<(u32,), (), _>(
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
+        // Then unified — should return Err
+        let result = reducers.register_entity::<(u32,), (), _>(
             &mut world,
             "clash",
             |_entity: EntityMut<'_, (u32,)>, ()| {},
         );
+        assert!(matches!(
+            result,
+            Err(ReducerError::DuplicateName { name: "clash", .. })
+        ));
     }
 
     // ── WritableRef tests ──────────────────────────────────────────
@@ -3286,7 +3616,8 @@ mod tests {
                 attempt_count_clone.fetch_add(1, Ordering::SeqCst);
                 // Write to u32 column — will conflict if another writer touched it
                 ctx.write(sentinel, 0u32);
-            });
+            })
+            .unwrap();
 
         // Mutate the u32 column to cause an optimistic conflict on first attempt
         // by advancing the column tick between begin and commit.
@@ -3318,16 +3649,18 @@ mod tests {
         let strategy = Optimistic::new(&world);
         let mut registry = ReducerRegistry::new();
 
-        let id = registry.register_query_writer::<(&Pos, &mut Vel), f32, _>(
-            &mut world,
-            "apply_drag",
-            |mut query, drag: f32| {
-                query.for_each(|(pos, mut vel)| {
-                    let _ = pos; // read Pos (passthrough)
-                    vel.modify(|v| v.0 *= drag);
-                });
-            },
-        );
+        let id = registry
+            .register_query_writer::<(&Pos, &mut Vel), f32, _>(
+                &mut world,
+                "apply_drag",
+                |mut query, drag: f32| {
+                    query.for_each(|(pos, mut vel)| {
+                        let _ = pos; // read Pos (passthrough)
+                        vel.modify(|v| v.0 *= drag);
+                    });
+                },
+            )
+            .unwrap();
 
         registry.call(&strategy, &mut world, id, 0.5f32).unwrap();
 
@@ -3345,13 +3678,11 @@ mod tests {
         let strategy = Optimistic::new(&world);
         let mut registry = ReducerRegistry::new();
 
-        let id = registry.register_query_writer::<(&mut Pos,), (), _>(
-            &mut world,
-            "counter",
-            |mut query, ()| {
+        let id = registry
+            .register_query_writer::<(&mut Pos,), (), _>(&mut world, "counter", |mut query, ()| {
                 assert_eq!(query.count(), 2);
-            },
-        );
+            })
+            .unwrap();
 
         registry.call(&strategy, &mut world, id, ()).unwrap();
     }
@@ -3361,13 +3692,12 @@ mod tests {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
 
-        let entity_id =
-            registry.register_entity::<(Vel,), (), _>(&mut world, "set_vel", |_e, ()| {});
-        let writer_id = registry.register_query_writer::<(&mut Vel,), (), _>(
-            &mut world,
-            "bulk_vel",
-            |_q, ()| {},
-        );
+        let entity_id = registry
+            .register_entity::<(Vel,), (), _>(&mut world, "set_vel", |_e, ()| {})
+            .unwrap();
+        let writer_id = registry
+            .register_query_writer::<(&mut Vel,), (), _>(&mut world, "bulk_vel", |_q, ()| {})
+            .unwrap();
 
         let entity_access = registry.reducer_access(entity_id);
         let writer_access = registry.reducer_access(writer_id);
@@ -3379,13 +3709,12 @@ mod tests {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
 
-        let entity_id =
-            registry.register_entity::<(Pos,), (), _>(&mut world, "set_pos", |_e, ()| {});
-        let writer_id = registry.register_query_writer::<(&mut Vel,), (), _>(
-            &mut world,
-            "bulk_vel",
-            |_q, ()| {},
-        );
+        let entity_id = registry
+            .register_entity::<(Pos,), (), _>(&mut world, "set_pos", |_e, ()| {})
+            .unwrap();
+        let writer_id = registry
+            .register_query_writer::<(&mut Vel,), (), _>(&mut world, "bulk_vel", |_q, ()| {})
+            .unwrap();
 
         let entity_access = registry.reducer_access(entity_id);
         let writer_access = registry.reducer_access(writer_id);
@@ -3395,25 +3724,41 @@ mod tests {
     // ── API boundary panic tests ─────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "call() on scheduled reducer")]
-    fn call_on_scheduled_panics() {
+    fn call_on_scheduled_returns_wrong_kind() {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
-        let qid = registry.register_query::<(&Pos,), (), _>(&mut world, "read_pos", |_q, ()| {});
+        let qid = registry
+            .register_query::<(&Pos,), (), _>(&mut world, "read_pos", |_q, ()| {})
+            .unwrap();
         let strategy = Optimistic::new(&world);
         // QueryReducerId and ReducerId share the same index space —
         // passing ReducerId(qid.0) should hit the Scheduled arm.
-        let _ = registry.call(&strategy, &mut world, ReducerId(qid.0), ());
+        let result = registry.call(&strategy, &mut world, ReducerId(qid.0), ());
+        assert!(matches!(
+            result,
+            Err(ReducerError::WrongKind {
+                expected: "transactional",
+                actual: "scheduled"
+            })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "run() called on transactional reducer")]
-    fn run_on_transactional_panics() {
+    fn run_on_transactional_returns_wrong_kind() {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
-        let rid = registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_e, ()| {});
+        let rid = registry
+            .register_entity::<(Health,), (), _>(&mut world, "heal", |_e, ()| {})
+            .unwrap();
         // ReducerId and QueryReducerId share the same index space.
-        registry.run(&mut world, QueryReducerId(rid.0), ());
+        let result = registry.run(&mut world, QueryReducerId(rid.0), ());
+        assert!(matches!(
+            result,
+            Err(ReducerError::WrongKind {
+                expected: "scheduled",
+                actual: "transactional"
+            })
+        ));
     }
 
     // ── Multi-archetype QueryWriter test ─────────────────────────
@@ -3427,15 +3772,17 @@ mod tests {
         let strategy = Optimistic::new(&world);
         let mut registry = ReducerRegistry::new();
 
-        let id = registry.register_query_writer::<(&mut Vel,), f32, _>(
-            &mut world,
-            "scale_vel",
-            |mut query, factor: f32| {
-                query.for_each(|(mut vel,)| {
-                    vel.modify(|v| v.0 *= factor);
-                });
-            },
-        );
+        let id = registry
+            .register_query_writer::<(&mut Vel,), f32, _>(
+                &mut world,
+                "scale_vel",
+                |mut query, factor: f32| {
+                    query.for_each(|(mut vel,)| {
+                        vel.modify(|v| v.0 *= factor);
+                    });
+                },
+            )
+            .unwrap();
 
         registry.call(&strategy, &mut world, id, 0.5f32).unwrap();
 
@@ -3456,16 +3803,18 @@ mod tests {
         let visit_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = visit_count.clone();
 
-        let id = registry.register_query_writer::<(Changed<Pos>, &mut Pos), (), _>(
-            &mut world,
-            "changed_pos",
-            move |mut query, ()| {
-                query.for_each(|((), mut pos)| {
-                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    pos.modify(|p| p.0 += 1.0);
-                });
-            },
-        );
+        let id = registry
+            .register_query_writer::<(Changed<Pos>, &mut Pos), (), _>(
+                &mut world,
+                "changed_pos",
+                move |mut query, ()| {
+                    query.for_each(|((), mut pos)| {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        pos.modify(|p| p.0 += 1.0);
+                    });
+                },
+            )
+            .unwrap();
 
         // First call: column was never read by this reducer, so Changed matches
         registry.call(&strategy, &mut world, id, ()).unwrap();
@@ -3497,23 +3846,23 @@ mod tests {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
 
-        let spawn_id = registry.register_spawner::<(Vel,), f32, _>(
-            &mut world,
-            "spawn",
-            |mut spawner, vel: f32| {
+        let spawn_id = registry
+            .register_spawner::<(Vel,), f32, _>(&mut world, "spawn", |mut spawner, vel: f32| {
                 spawner.spawn((Vel(vel),));
-            },
-        );
+            })
+            .unwrap();
 
-        let writer_id = registry.register_query_writer::<(&mut Vel,), f32, _>(
-            &mut world,
-            "scale",
-            |mut query, factor: f32| {
-                query.for_each(|(mut vel,)| {
-                    vel.modify(|v| v.0 *= factor);
-                });
-            },
-        );
+        let writer_id = registry
+            .register_query_writer::<(&mut Vel,), f32, _>(
+                &mut world,
+                "scale",
+                |mut query, factor: f32| {
+                    query.for_each(|(mut vel,)| {
+                        vel.modify(|v| v.0 *= factor);
+                    });
+                },
+            )
+            .unwrap();
 
         let strategy = Optimistic::new(&world);
 
@@ -3547,14 +3896,16 @@ mod tests {
         let strategy = Optimistic::new(&world);
         let mut registry = ReducerRegistry::new();
 
-        registry.register_entity::<(Pos,), (), _>(
-            &mut world,
-            "check_entity",
-            move |entity: EntityMut<'_, (Pos,)>, ()| {
-                assert_eq!(entity.entity(), e);
-                let _ = entity.get::<Pos, 0>();
-            },
-        );
+        registry
+            .register_entity::<(Pos,), (), _>(
+                &mut world,
+                "check_entity",
+                move |entity: EntityMut<'_, (Pos,)>, ()| {
+                    assert_eq!(entity.entity(), e);
+                    let _ = entity.get::<Pos, 0>();
+                },
+            )
+            .unwrap();
         let id = registry.reducer_id_by_name("check_entity").unwrap();
         registry.call(&strategy, &mut world, id, (e, ())).unwrap();
     }
@@ -3566,37 +3917,43 @@ mod tests {
             world.spawn((Pos(i as f32),));
         }
         let mut registry = ReducerRegistry::new();
-        registry.register_query::<(&Pos,), (), _>(
-            &mut world,
-            "chunk_iter",
-            |mut query: QueryMut<'_, (&Pos,)>, ()| {
-                let mut count = 0;
-                query.for_each_chunk(|chunk| {
-                    count += chunk.0.len();
-                });
-                assert_eq!(count, 5);
-            },
-        );
+        registry
+            .register_query::<(&Pos,), (), _>(
+                &mut world,
+                "chunk_iter",
+                |mut query: QueryMut<'_, (&Pos,)>, ()| {
+                    let mut count = 0;
+                    query.for_each_chunk(|chunk| {
+                        count += chunk.0.len();
+                    });
+                    assert_eq!(count, 5);
+                },
+            )
+            .unwrap();
         let id = registry.query_reducer_id_by_name("chunk_iter").unwrap();
-        registry.run(&mut world, id, ());
+        registry.run(&mut world, id, ()).unwrap();
     }
 
     #[test]
     fn reducer_id_index() {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
-        let id = registry.register_entity::<(Pos,), (), _>(
-            &mut world,
-            "idx_test",
-            |_entity: EntityMut<'_, (Pos,)>, ()| {},
-        );
+        let id = registry
+            .register_entity::<(Pos,), (), _>(
+                &mut world,
+                "idx_test",
+                |_entity: EntityMut<'_, (Pos,)>, ()| {},
+            )
+            .unwrap();
         assert_eq!(id.index(), 0);
 
-        let qid = registry.register_query::<(&Pos,), (), _>(
-            &mut world,
-            "qidx_test",
-            |_query: QueryMut<'_, (&Pos,)>, ()| {},
-        );
+        let qid = registry
+            .register_query::<(&Pos,), (), _>(
+                &mut world,
+                "qidx_test",
+                |_query: QueryMut<'_, (&Pos,)>, ()| {},
+            )
+            .unwrap();
         assert_eq!(qid.index(), 1); // shares the reducers vec
     }
 
@@ -3604,16 +3961,20 @@ mod tests {
     fn reducer_registry_access_methods() {
         let mut world = World::new();
         let mut registry = ReducerRegistry::new();
-        let id = registry.register_entity::<(Pos,), (), _>(
-            &mut world,
-            "access_test",
-            |_entity: EntityMut<'_, (Pos,)>, ()| {},
-        );
-        let qid = registry.register_query::<(&mut Pos,), (), _>(
-            &mut world,
-            "qaccess_test",
-            |_query: QueryMut<'_, (&mut Pos,)>, ()| {},
-        );
+        let id = registry
+            .register_entity::<(Pos,), (), _>(
+                &mut world,
+                "access_test",
+                |_entity: EntityMut<'_, (Pos,)>, ()| {},
+            )
+            .unwrap();
+        let qid = registry
+            .register_query::<(&mut Pos,), (), _>(
+                &mut world,
+                "qaccess_test",
+                |_query: QueryMut<'_, (&mut Pos,)>, ()| {},
+            )
+            .unwrap();
 
         let access = registry.access(id.index());
         assert!(access.has_any_access());
@@ -3624,5 +3985,276 @@ mod tests {
     #[test]
     fn reducer_registry_default() {
         let _registry: ReducerRegistry = Default::default();
+    }
+
+    // ── ReducerError tests ──────────────────────────────────────────
+
+    #[test]
+    fn reducer_error_display() {
+        let err = ReducerError::WrongKind {
+            expected: "transactional",
+            actual: "scheduled",
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("transactional"));
+        assert!(msg.contains("scheduled"));
+
+        let err = ReducerError::DuplicateName {
+            name: "foo",
+            existing_kind: "unified",
+            existing_index: 0,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("foo"));
+        assert!(msg.contains("unified"));
+    }
+
+    #[test]
+    fn reducer_error_from_conflict() {
+        let conflict = Conflict {
+            component_ids: fixedbitset::FixedBitSet::new(),
+        };
+        let err: ReducerError = conflict.into();
+        assert!(matches!(err, ReducerError::TransactionConflict(_)));
+    }
+
+    // ── Introspection tests ──────────────────────────────────────────
+
+    #[test]
+    fn reducer_info_entity() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .register_entity::<(Health,), (), _>(&mut world, "heal", |_e, ()| {})
+            .unwrap();
+        let info = registry.reducer_info(id).unwrap();
+        assert_eq!(info.name, "heal");
+        assert_eq!(info.kind, "transactional");
+        assert!(!info.can_despawn);
+        assert!(!info.has_change_tracking);
+    }
+
+    #[test]
+    fn reducer_info_entity_despawn() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .register_entity_despawn::<(Health,), (), _>(&mut world, "kill", |_e, ()| {})
+            .unwrap();
+        let info = registry.reducer_info(id).unwrap();
+        assert_eq!(info.name, "kill");
+        assert!(info.can_despawn);
+    }
+
+    #[test]
+    fn reducer_info_query_writer() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .register_query_writer::<(&mut Pos,), (), _>(&mut world, "move", |_qw, ()| {})
+            .unwrap();
+        let info = registry.reducer_info(id).unwrap();
+        assert_eq!(info.name, "move");
+        assert!(info.has_change_tracking);
+    }
+
+    #[test]
+    fn query_reducer_info() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .register_query::<(&mut Pos,), (), _>(&mut world, "move", |_q, ()| {})
+            .unwrap();
+        let info = registry.query_reducer_info(id).unwrap();
+        assert_eq!(info.name, "move");
+        assert_eq!(info.kind, "scheduled");
+    }
+
+    #[test]
+    fn dynamic_reducer_info() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("dyn_test", &mut world)
+            .can_read::<Pos>()
+            .can_write::<Vel>()
+            .can_despawn()
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
+        let info = registry.dynamic_reducer_info(id).unwrap();
+        assert_eq!(info.name, "dyn_test");
+        assert_eq!(info.kind, "dynamic");
+        assert!(info.can_despawn);
+        assert!(info.has_change_tracking);
+    }
+
+    #[test]
+    fn reducer_count_and_names() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        registry
+            .register_entity::<(Health,), (), _>(&mut world, "heal", |_e, ()| {})
+            .unwrap();
+        registry
+            .register_query::<(&Pos,), (), _>(&mut world, "read", |_q, ()| {})
+            .unwrap();
+        registry
+            .dynamic("dyn", &mut world)
+            .can_read::<Vel>()
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {})
+            .unwrap();
+
+        assert_eq!(registry.reducer_count(), 2);
+        assert_eq!(registry.dynamic_reducer_count(), 1);
+        let names: Vec<_> = registry.registered_names().collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"heal"));
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"dyn"));
+    }
+
+    // ── DynamicCtx introspection tests ──────────────────────────────
+
+    #[test]
+    fn dynamic_ctx_is_declared() {
+        use std::any::TypeId;
+        let mut world = World::new();
+        let pos_id = world.register_component::<Pos>();
+        let vel_id = world.register_component::<Vel>();
+
+        let entries = vec![(TypeId::of::<Pos>(), pos_id), (TypeId::of::<Vel>(), vel_id)];
+        let mut access = Access::empty();
+        access.add_read(pos_id);
+        access.add_write(vel_id);
+        let resolved =
+            DynamicResolved::new(entries, access, Default::default(), Default::default());
+
+        let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        let ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
+
+        assert!(ctx.is_declared::<Pos>());
+        assert!(ctx.is_declared::<Vel>());
+        assert!(!ctx.is_declared::<Health>());
+
+        assert!(!ctx.is_writable::<Pos>());
+        assert!(ctx.is_writable::<Vel>());
+
+        assert!(!ctx.is_removable::<Pos>());
+        assert!(!ctx.can_despawn());
+    }
+
+    #[test]
+    fn dynamic_ctx_despawn_introspection() {
+        use std::any::TypeId;
+        let mut world = World::new();
+        let pos_id = world.register_component::<Pos>();
+
+        let entries = vec![(TypeId::of::<Pos>(), pos_id)];
+        let mut access = Access::empty();
+        access.add_read(pos_id);
+        access.set_despawns();
+        let resolved =
+            DynamicResolved::new(entries, access, Default::default(), Default::default());
+
+        let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        let ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
+
+        assert!(ctx.can_despawn());
+    }
+
+    // ── InvalidId bounds-check tests ─────────────────────────────────
+
+    #[test]
+    fn call_with_invalid_reducer_id() {
+        let mut world = World::new();
+        let strategy = crate::Optimistic::new(&world);
+        let registry = ReducerRegistry::new();
+        let bogus = ReducerId(999);
+        let result = registry.call(&strategy, &mut world, bogus, ());
+        assert!(matches!(
+            result,
+            Err(ReducerError::InvalidId {
+                kind: "reducer",
+                index: 999,
+                max: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn run_with_invalid_query_reducer_id() {
+        let mut world = World::new();
+        let registry = ReducerRegistry::new();
+        let bogus = QueryReducerId(42);
+        let result = registry.run(&mut world, bogus, ());
+        assert!(matches!(
+            result,
+            Err(ReducerError::InvalidId {
+                kind: "reducer",
+                index: 42,
+                max: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn dynamic_call_with_invalid_id() {
+        let mut world = World::new();
+        let strategy = crate::Optimistic::new(&world);
+        let registry = ReducerRegistry::new();
+        let bogus = DynamicReducerId(7);
+        let result = registry.dynamic_call(&strategy, &mut world, bogus, &());
+        assert!(matches!(
+            result,
+            Err(ReducerError::InvalidId {
+                kind: "dynamic",
+                index: 7,
+                max: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn reducer_info_with_invalid_id() {
+        let registry = ReducerRegistry::new();
+        let bogus = ReducerId(0);
+        let result = registry.reducer_info(bogus);
+        assert!(matches!(result, Err(ReducerError::InvalidId { .. })));
+    }
+
+    #[test]
+    fn query_reducer_info_with_invalid_id() {
+        let registry = ReducerRegistry::new();
+        let bogus = QueryReducerId(0);
+        let result = registry.query_reducer_info(bogus);
+        assert!(matches!(result, Err(ReducerError::InvalidId { .. })));
+    }
+
+    #[test]
+    fn dynamic_reducer_info_with_invalid_id() {
+        let registry = ReducerRegistry::new();
+        let bogus = DynamicReducerId(0);
+        let result = registry.dynamic_reducer_info(bogus);
+        assert!(matches!(result, Err(ReducerError::InvalidId { .. })));
     }
 }

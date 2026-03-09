@@ -220,7 +220,8 @@ pub fn register_all(
                     i += 1;
                 });
             },
-        );
+        )
+        .unwrap();
     map.insert("boids_forces".to_string(), id);
 
     // ── boids_integrate ──
@@ -250,7 +251,8 @@ pub fn register_all(
                     }
                 });
             },
-        );
+        )
+        .unwrap();
     map.insert("boids_integrate".to_string(), id);
 
     // ── gravity ──
@@ -306,94 +308,99 @@ pub fn register_all(
                     i += 1;
                 });
             },
-        );
+        )
+        .unwrap();
     map.insert("gravity".to_string(), id);
 
     // ── life_step ──
     // One generation of Conway's Game of Life.
     // Assumes all CellState entities are spawned in row-major order.
-    let id = registry.register_query::<(&mut CellState, Entity), LifeStepParams, _>(
-        world,
-        "life_step",
-        |mut query: QueryMut<'_, (&mut CellState, Entity)>, params: LifeStepParams| {
-            let w = params.width;
-            let h = params.height;
+    let id = registry
+        .register_query::<(&mut CellState, Entity), LifeStepParams, _>(
+            world,
+            "life_step",
+            |mut query: QueryMut<'_, (&mut CellState, Entity)>, params: LifeStepParams| {
+                let w = params.width;
+                let h = params.height;
 
-            // Snapshot current cell states in entity order.
-            let mut cells: Vec<bool> = Vec::new();
-            query.for_each(|(cs, _entity)| {
-                cells.push(cs.0);
-            });
+                // Snapshot current cell states in entity order.
+                let mut cells: Vec<bool> = Vec::new();
+                query.for_each(|(cs, _entity)| {
+                    cells.push(cs.0);
+                });
 
-            let n = cells.len();
-            assert_eq!(
-                n,
-                w * h,
-                "life_step: entity count ({n}) != grid dimensions ({w}x{h} = {}). \
+                let n = cells.len();
+                assert_eq!(
+                    n,
+                    w * h,
+                    "life_step: entity count ({n}) != grid dimensions ({w}x{h} = {}). \
                  Ensure exactly width*height CellState entities exist.",
-                w * h
-            );
+                    w * h
+                );
 
-            // Compute neighbor counts.
-            let mut new_states: Vec<bool> = Vec::with_capacity(n);
-            for idx in 0..n {
-                let x = idx % w;
-                let y = idx / w;
-                let left = if x == 0 { w - 1 } else { x - 1 };
-                let right = if x == w - 1 { 0 } else { x + 1 };
-                let up = if y == 0 { h - 1 } else { y - 1 };
-                let down = if y == h - 1 { 0 } else { y + 1 };
+                // Compute neighbor counts.
+                let mut new_states: Vec<bool> = Vec::with_capacity(n);
+                for idx in 0..n {
+                    let x = idx % w;
+                    let y = idx / w;
+                    let left = if x == 0 { w - 1 } else { x - 1 };
+                    let right = if x == w - 1 { 0 } else { x + 1 };
+                    let up = if y == 0 { h - 1 } else { y - 1 };
+                    let down = if y == h - 1 { 0 } else { y + 1 };
 
-                let neighbors = [
-                    up * w + left,
-                    up * w + x,
-                    up * w + right,
-                    y * w + left,
-                    y * w + right,
-                    down * w + left,
-                    down * w + x,
-                    down * w + right,
-                ];
+                    let neighbors = [
+                        up * w + left,
+                        up * w + x,
+                        up * w + right,
+                        y * w + left,
+                        y * w + right,
+                        down * w + left,
+                        down * w + x,
+                        down * w + right,
+                    ];
 
-                let mut count = 0u8;
-                for &ni in &neighbors {
-                    if cells[ni] {
-                        count += 1;
+                    let mut count = 0u8;
+                    for &ni in &neighbors {
+                        if cells[ni] {
+                            count += 1;
+                        }
                     }
+
+                    let alive = cells[idx];
+                    let new_alive = matches!((alive, count), (true, 2) | (true, 3) | (false, 3));
+                    new_states.push(new_alive);
                 }
 
-                let alive = cells[idx];
-                let new_alive = matches!((alive, count), (true, 2) | (true, 3) | (false, 3));
-                new_states.push(new_alive);
-            }
-
-            // Write back. Iteration order is stable between passes.
-            let mut i = 0;
-            query.for_each(|(cs, _entity)| {
-                cs.0 = new_states[i];
-                i += 1;
-            });
-        },
-    );
+                // Write back. Iteration order is stable between passes.
+                let mut i = 0;
+                query.for_each(|(cs, _entity)| {
+                    cs.0 = new_states[i];
+                    i += 1;
+                });
+            },
+        )
+        .unwrap();
     map.insert("life_step".to_string(), id);
 
     // ── movement ──
     // Heading-based movement with toroidal wrapping.
-    let id = registry.register_query::<(&mut Position, &Heading), MovementParams, _>(
-        world,
-        "movement",
-        |mut query: QueryMut<'_, (&mut Position, &Heading)>, params: MovementParams| {
-            let ws = params.world_size;
-            let dt = params.dt;
-            query.for_each_chunk(|(poss, headings)| {
-                for i in 0..poss.len() {
-                    let h = headings[i].0;
-                    poss[i].x = wrap(poss[i].x + h.cos() * dt, ws);
-                    poss[i].y = wrap(poss[i].y + h.sin() * dt, ws);
-                }
-            });
-        },
-    );
+    let id = registry
+        .register_query::<(&mut Position, &Heading), MovementParams, _>(
+            world,
+            "movement",
+            |mut query: QueryMut<'_, (&mut Position, &Heading)>, params: MovementParams| {
+                let ws = params.world_size;
+                let dt = params.dt;
+                query.for_each_chunk(|(poss, headings)| {
+                    for i in 0..poss.len() {
+                        let h = headings[i].0;
+                        poss[i].x = wrap(poss[i].x + h.cos() * dt, ws);
+                        poss[i].y = wrap(poss[i].y + h.sin() * dt, ws);
+                    }
+                });
+            },
+        )
+        .unwrap();
     map.insert("movement".to_string(), id);
 
     // ── Worm constants ──
@@ -405,37 +412,43 @@ pub fn register_all(
 
     // ── worm_move ──
     // Heading-based movement scaled by energy (low energy = slower).
-    let id = registry.register_query::<(&mut Position, &Heading, &Energy), WormMoveParams, _>(
-        world,
-        "worm_move",
-        |mut query: QueryMut<'_, (&mut Position, &Heading, &Energy)>, params: WormMoveParams| {
-            let ws = params.world_size;
-            let dt = params.dt;
-            let speed = params.speed;
-            query.for_each(|(pos, heading, energy)| {
-                let e_factor = (energy.0 / FULL_ENERGY).clamp(MIN_SPEED_FACTOR, 1.0);
-                let h = heading.0;
-                pos.x = wrap(pos.x + h.cos() * speed * e_factor * dt, ws);
-                pos.y = wrap(pos.y + h.sin() * speed * e_factor * dt, ws);
-            });
-        },
-    );
+    let id = registry
+        .register_query::<(&mut Position, &Heading, &Energy), WormMoveParams, _>(
+            world,
+            "worm_move",
+            |mut query: QueryMut<'_, (&mut Position, &Heading, &Energy)>,
+             params: WormMoveParams| {
+                let ws = params.world_size;
+                let dt = params.dt;
+                let speed = params.speed;
+                query.for_each(|(pos, heading, energy)| {
+                    let e_factor = (energy.0 / FULL_ENERGY).clamp(MIN_SPEED_FACTOR, 1.0);
+                    let h = heading.0;
+                    pos.x = wrap(pos.x + h.cos() * speed * e_factor * dt, ws);
+                    pos.y = wrap(pos.y + h.sin() * speed * e_factor * dt, ws);
+                });
+            },
+        )
+        .unwrap();
     map.insert("worm_move".to_string(), id);
 
     // ── worm_metabolism ──
     // Drain energy over time. WormSize shrinks when energy is low.
-    let id = registry.register_query::<(&mut Energy, &mut WormSize), WormMetabolismParams, _>(
-        world,
-        "worm_metabolism",
-        |mut query: QueryMut<'_, (&mut Energy, &mut WormSize)>, params: WormMetabolismParams| {
-            query.for_each(|(energy, size)| {
-                energy.0 = (energy.0 - params.drain_rate * params.dt).max(0.0);
-                if energy.0 < SHRINK_THRESHOLD {
-                    size.0 = (size.0 - SHRINK_RATE * params.dt).max(MIN_SIZE);
-                }
-            });
-        },
-    );
+    let id = registry
+        .register_query::<(&mut Energy, &mut WormSize), WormMetabolismParams, _>(
+            world,
+            "worm_metabolism",
+            |mut query: QueryMut<'_, (&mut Energy, &mut WormSize)>,
+             params: WormMetabolismParams| {
+                query.for_each(|(energy, size)| {
+                    energy.0 = (energy.0 - params.drain_rate * params.dt).max(0.0);
+                    if energy.0 < SHRINK_THRESHOLD {
+                        size.0 = (size.0 - SHRINK_RATE * params.dt).max(MIN_SIZE);
+                    }
+                });
+            },
+        )
+        .unwrap();
     map.insert("worm_metabolism".to_string(), id);
 
     map
@@ -506,7 +519,9 @@ pub fn dispatch(
             validate_positive("ali_r", params.ali_r)?;
             validate_positive("coh_r", params.coh_r)?;
             validate_positive("max_force", params.max_force)?;
-            registry.run(world, id, params);
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "boids_integrate" => {
             let params = BoidsIntegrateParams {
@@ -516,7 +531,9 @@ pub fn dispatch(
             };
             validate_positive("world_size", params.world_size)?;
             validate_positive("dt", params.dt)?;
-            registry.run(world, id, params);
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "gravity" => {
             let params = GravityParams {
@@ -528,14 +545,18 @@ pub fn dispatch(
             validate_positive("world_size", params.world_size)?;
             validate_positive("dt", params.dt)?;
             validate_positive("softening", params.softening)?;
-            registry.run(world, id, params);
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "life_step" => {
             let params = LifeStepParams {
                 width: kwarg_usize(kwargs, "width")?,
                 height: kwarg_usize(kwargs, "height")?,
             };
-            registry.run(world, id, params);
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "movement" => {
             let params = MovementParams {
@@ -544,7 +565,9 @@ pub fn dispatch(
             };
             validate_positive("world_size", params.world_size)?;
             validate_positive("dt", params.dt)?;
-            registry.run(world, id, params);
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "worm_move" => {
             let params = WormMoveParams {
@@ -555,7 +578,9 @@ pub fn dispatch(
             validate_positive("world_size", params.world_size)?;
             validate_positive("dt", params.dt)?;
             validate_positive("speed", params.speed)?;
-            registry.run(world, id, params);
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "worm_metabolism" => {
             let params = WormMetabolismParams {
@@ -564,7 +589,9 @@ pub fn dispatch(
             };
             validate_positive("dt", params.dt)?;
             validate_positive("drain_rate", params.drain_rate)?;
-            registry.run(world, id, params);
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         _ => {
             return Err(PyValueError::new_err(format!("unknown reducer: {name}")));
