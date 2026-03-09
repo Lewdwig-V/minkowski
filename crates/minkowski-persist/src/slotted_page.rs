@@ -301,6 +301,18 @@ impl SlottedPage {
         header_buf.copy_from_slice(&data[0..PAGE_HEADER_SIZE]);
         let header = PageHeader::from_bytes(&header_buf);
 
+        // Validate page magic before trusting any other header fields.
+        if header.magic != PAGE_MAGIC && header.magic != OVERFLOW_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid page magic: expected {PAGE_MAGIC:#010x} (MKWP) or \
+                     {OVERFLOW_MAGIC:#010x} (MKWO), got {:#010x}",
+                    header.magic
+                ),
+            ));
+        }
+
         // Validate structural invariants against page_size.
         let slot_dir_end = PAGE_HEADER_SIZE + (header.slot_count as usize) * SLOT_ENTRY_SIZE;
         if slot_dir_end > page_size {
@@ -887,5 +899,29 @@ mod tests {
         assert!(result.is_err());
         let msg = result.err().expect("should be Err").to_string();
         assert!(msg.contains("too small"), "{msg}");
+    }
+
+    #[test]
+    fn read_from_bad_magic_returns_error() {
+        let page_size = 64;
+        let data = vec![0u8; page_size]; // all zeros — magic is 0x00000000
+        let result = SlottedPage::read_from(&mut data.as_slice(), page_size);
+        assert!(result.is_err());
+        let msg = result.err().expect("should be Err").to_string();
+        assert!(msg.contains("invalid page magic"), "{msg}");
+    }
+
+    #[test]
+    fn read_from_accepts_overflow_magic() {
+        let page_size = 64;
+        let mut page = SlottedPage::new(0, page_size);
+        // Overwrite magic with OVERFLOW_MAGIC.
+        page.data[0..4].copy_from_slice(&OVERFLOW_MAGIC.to_le_bytes());
+        // Re-parse header so it's consistent.
+        page.header.magic = OVERFLOW_MAGIC;
+        // Update free_offset/data_offset in raw bytes to match header.
+        page.seal();
+        let result = SlottedPage::read_from(&mut page.data.as_slice(), page_size);
+        assert!(result.is_ok(), "overflow magic should be accepted");
     }
 }
