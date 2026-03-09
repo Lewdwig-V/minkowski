@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.2
+
+### Integrity Checking (`minkowski-persist`)
+
+- **CRC32 WAL frame checksums** — every WAL frame is now `[len: u32 LE][crc32: u32 LE][payload]`. CRC32 (IEEE via `crc32fast`, hardware-accelerated) covers the rkyv payload bytes. Checksum mismatches during replay are treated as torn writes and truncated during crash recovery.
+- **CRC32 snapshot checksums** — v2 snapshot format `[magic: 8B "MK2SNAPK"][crc32: 4B LE][reserved: 4B][len: u64 LE][payload]`. Mismatches return `SnapshotError::Format`. Legacy v1 snapshots (no CRC) are still loadable.
+- **WAL segment format versioning** — 4-byte magic `"MKW2"` identifies v2 segments. Legacy v1 segments produce a hard `WalError::Format` error with a migration message.
+- **Entity generation consistency check on snapshot restore** — after restoring allocator state, validates that every archetype entity's generation matches the allocator. Returns `SnapshotError::Format` on mismatch (corrupt snapshot), consistent with all other corruption detection paths.
+
+### Robustness (`minkowski`)
+
+- **Archetype column-length consistency** — `debug_assert_consistent()` after `despawn`, `despawn_batch`, and all `EnumChangeSet::apply` structural mutations (Spawn, Insert migration, Remove migration). Catches column/entity count desync during development at zero release cost.
+- **Arena bounds check** — `Arena::get` debug_assert validates offset bounds.
+- **BlobVec pointer bounds** — `ptr_at` debug_assert validates index bounds.
+- **EntityAllocator::reserve overflow** — CAS loop prevents atomic wraparound past `u32::MAX`.
+- **ColumnLockTable release assertions** — validates lock state matches expectations on release.
+- **EntityLocation row validity** — debug_assert in get_mut, insert, remove, despawn.
+
+### Cleanup
+
+- Removed unused slotted page infrastructure (append-only WAL has no use for page-level space management).
+
 ## 1.0.1
 
 ### Reducer Error Handling
