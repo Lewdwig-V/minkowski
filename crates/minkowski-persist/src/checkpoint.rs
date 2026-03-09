@@ -68,9 +68,13 @@ impl CheckpointHandler for AutoCheckpoint {
         let snap = Snapshot::new();
         snap.save(&path, world, codecs, seq)?;
 
-        // Save registered indexes (non-fatal on failure).
+        // Sync and save registered indexes (non-fatal on failure).
+        // update() ensures the index reflects all mutations up to this
+        // checkpoint — without it, the saved index could be stale.
         for (idx_path, index) in &self.indexes {
-            if let Err(e) = index.lock().save(idx_path) {
+            let mut guard = index.lock();
+            guard.update(world);
+            if let Err(e) = guard.save(idx_path) {
                 eprintln!("warning: index save failed for {}: {e}", idx_path.display());
             }
         }

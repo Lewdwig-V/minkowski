@@ -190,8 +190,9 @@ fn main() {
     let idx_len = idx.len();
     println!("  rebuild():   {} entries in {:?}", idx_len, rebuild_time);
 
-    // Save index
+    // Save index and capture the tick at save time
     idx.save(&idx_path).unwrap();
+    let save_tick = recovered.change_tick();
     println!("  Saved index to {}", idx_path.display());
 
     // Simulate: mutate world after index save (WAL tail equivalent)
@@ -199,9 +200,10 @@ fn main() {
         recovered.spawn((Pos { x: 999.0, y: 999.0 }, Score(9000 + i)));
     }
 
-    // Load + update (recovery path)
+    // Load + update (recovery path) — use save-time tick so update()
+    // catches up with the post-save mutations
     let t1 = std::time::Instant::now();
-    let mut loaded_idx = load_btree_index::<Score>(&idx_path, recovered.change_tick()).unwrap();
+    let mut loaded_idx = load_btree_index::<Score>(&idx_path, save_tick).unwrap();
     loaded_idx.update(&mut recovered);
     let load_time = t1.elapsed();
     println!(
