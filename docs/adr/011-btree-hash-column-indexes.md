@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-03-06
+**Updated:** 2026-03-09 — persistent index support via `PersistentIndex` trait
 
 ## Context
 
@@ -27,5 +28,5 @@ Two independent index types — `BTreeIndex<T: Ord>` for range queries and `Hash
 - Reverse map costs one `HashMap` entry per indexed entity
 - Stale entries from despawns and component removals handled lazily — `get_valid`/`range_valid` filter at query time, `rebuild` reclaims memory
 - Components must implement `Ord` (B-tree) or `Hash + Eq` (hash) plus `Clone`
-- Not persisted — rebuilt from world state after crash recovery
+- Optionally persistent via `PersistentIndex` trait (`minkowski-persist`). Indexes whose key type supports rkyv can be saved to disk with CRC32 integrity and atomic rename. On recovery, `load` + `update()` catches up from the saved `last_sync` tick — recovery time proportional to WAL tail, not world size. `AutoCheckpoint` can save registered indexes alongside snapshots. Indexes without rkyv key types fall back to `rebuild()` after recovery
 - Concurrency is user-managed — indexes are external data structures like `SpatialIndex`

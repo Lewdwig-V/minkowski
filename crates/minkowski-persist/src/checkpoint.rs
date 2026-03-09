@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use minkowski::World;
+use parking_lot::Mutex;
 
 use crate::codec::CodecRegistry;
+use crate::index::PersistentIndex;
 use crate::snapshot::Snapshot;
 use crate::wal::Wal;
 
@@ -31,13 +34,25 @@ pub trait CheckpointHandler: Send {
 /// Snapshots are written to `snap_dir/checkpoint-{seq:06}.snap`.
 pub struct AutoCheckpoint {
     snap_dir: PathBuf,
+    indexes: Vec<(PathBuf, Arc<Mutex<dyn PersistentIndex>>)>,
 }
 
 impl AutoCheckpoint {
     pub fn new(snap_dir: &Path) -> Self {
         Self {
             snap_dir: snap_dir.to_path_buf(),
+            indexes: Vec::new(),
         }
+    }
+
+    /// Register a persistent index to be saved on each checkpoint.
+    ///
+    /// Index save failures are non-fatal — they are logged to stderr
+    /// but do not fail the checkpoint. The snapshot and WAL are the
+    /// source of truth; indexes are a performance optimization that
+    /// can always be rebuilt.
+    pub fn register_index(&mut self, path: PathBuf, index: Arc<Mutex<dyn PersistentIndex>>) {
+        self.indexes.push((path, index));
     }
 }
 
@@ -52,6 +67,14 @@ impl CheckpointHandler for AutoCheckpoint {
         let path = self.snap_dir.join(format!("checkpoint-{seq:06}.snap"));
         let snap = Snapshot::new();
         snap.save(&path, world, codecs, seq)?;
+
+        // Save registered indexes (non-fatal on failure).
+        for (idx_path, index) in &self.indexes {
+            if let Err(e) = index.lock().save(idx_path) {
+                eprintln!("warning: index save failed for {}: {e}", idx_path.display());
+            }
+        }
+
         wal.acknowledge_snapshot(seq)?;
         Ok(())
     }
@@ -121,5 +144,87 @@ mod tests {
             .filter(|e| e.path().extension().map(|x| x == "snap").unwrap_or(false))
             .collect();
         assert_eq!(snaps.len(), 1);
+    }
+
+    #[test]
+    fn auto_checkpoint_saves_registered_index() {
+        use crate::index::load_btree_index;
+        use minkowski::{BTreeIndex, SpatialIndex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            rkyv::Archive,
+            rkyv::Serialize,
+            rkyv::Deserialize,
+        )]
+        #[repr(C)]
+        struct Score(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("idx_ckpt.wal");
+        let snap_dir = dir.path().join("snaps");
+        let idx_path = dir.path().join("score.idx");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Score>("score", &mut world);
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(128),
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+
+        // Spawn entities with Pos (for WAL) and Score (for index)
+        for i in 0..10 {
+            let e = world.alloc_entity();
+            let mut cs = minkowski::EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+
+        // Also spawn some Score entities (not in WAL, just in world)
+        world.spawn((Score(100),));
+        world.spawn((Score(200),));
+
+        // Build and register index
+        let idx = {
+            let mut idx = BTreeIndex::<Score>::new();
+            idx.rebuild(&mut world);
+            Arc::new(Mutex::new(idx))
+        };
+
+        let mut handler = AutoCheckpoint::new(&snap_dir);
+        handler.register_index(idx_path.clone(), idx.clone());
+
+        assert!(wal.checkpoint_needed());
+        handler
+            .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+            .unwrap();
+
+        // Verify index file was created and is loadable
+        assert!(idx_path.exists());
+        let loaded = load_btree_index::<Score>(&idx_path).unwrap();
+        assert_eq!(loaded.get(&Score(100)).len(), 1);
+        assert_eq!(loaded.get(&Score(200)).len(), 1);
     }
 }
