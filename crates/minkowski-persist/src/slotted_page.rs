@@ -7,13 +7,14 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────┐
-//! │ PageHeader (16 bytes)                       │
+//! │ PageHeader (20 bytes)                       │
 //! │   magic: u32    = 0x4D4B5750 ("MKWP")       │
 //! │   page_seq: u32 = monotonic page number      │
 //! │   slot_count: u16                            │
 //! │   free_offset: u16 = end of slot directory    │
 //! │   data_offset: u16 = start of record data     │
-//! │   _reserved: u16 = 0                          │
+//! │   _padding: u16 = 0                           │
+//! │   checksum: u32 = CRC32 of full page          │
 //! ├─────────────────────────────────────────────┤
 //! │ Slot Directory (slot_count × 4 bytes)       │
 //! │   slot[0]: offset: u16, length: u16          │
@@ -47,7 +48,7 @@ pub const PAGE_MAGIC: u32 = 0x4D4B5750;
 pub const OVERFLOW_MAGIC: u32 = 0x4D4B574F;
 
 /// Page header size in bytes.
-pub const PAGE_HEADER_SIZE: usize = 16;
+pub const PAGE_HEADER_SIZE: usize = 20;
 
 /// Slot directory entry size in bytes (offset: u16 + length: u16).
 pub const SLOT_ENTRY_SIZE: usize = 4;
@@ -71,9 +72,15 @@ pub struct PageHeader {
     pub free_offset: u16,
     /// Byte offset of the start of record data (end of free space).
     pub data_offset: u16,
-    /// Reserved for future use; must be zero.
-    pub _reserved: u16,
+    /// Padding for alignment; must be zero.
+    pub _padding: u16,
+    /// CRC32 of the full page content (with this field zeroed during computation).
+    pub checksum: u32,
 }
+
+/// Byte range of the checksum field within the page header.
+const CHECKSUM_OFFSET: usize = 16;
+const CHECKSUM_SIZE: usize = 4;
 
 impl PageHeader {
     fn to_bytes(self) -> [u8; PAGE_HEADER_SIZE] {
@@ -83,7 +90,8 @@ impl PageHeader {
         buf[8..10].copy_from_slice(&self.slot_count.to_le_bytes());
         buf[10..12].copy_from_slice(&self.free_offset.to_le_bytes());
         buf[12..14].copy_from_slice(&self.data_offset.to_le_bytes());
-        buf[14..16].copy_from_slice(&self._reserved.to_le_bytes());
+        buf[14..16].copy_from_slice(&self._padding.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.checksum.to_le_bytes());
         buf
     }
 
@@ -94,7 +102,8 @@ impl PageHeader {
             slot_count: u16::from_le_bytes([buf[8], buf[9]]),
             free_offset: u16::from_le_bytes([buf[10], buf[11]]),
             data_offset: u16::from_le_bytes([buf[12], buf[13]]),
-            _reserved: u16::from_le_bytes([buf[14], buf[15]]),
+            _padding: u16::from_le_bytes([buf[14], buf[15]]),
+            checksum: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
         }
     }
 }
@@ -156,7 +165,8 @@ impl SlottedPage {
             slot_count: 0,
             free_offset: PAGE_HEADER_SIZE as u16,
             data_offset: page_size as u16,
-            _reserved: 0,
+            _padding: 0,
+            checksum: 0,
         };
 
         let mut data = vec![0u8; page_size];
@@ -235,40 +245,31 @@ impl SlottedPage {
         self.header.page_seq
     }
 
-    /// Compute the CRC32 of the full page content (with the reserved field
-    /// used as the checksum position — zeroed during computation).
+    /// Compute the CRC32 of the full page content (with the checksum field
+    /// zeroed during computation).
     pub fn compute_checksum(&self) -> u32 {
         let mut buf = self.data.clone();
-        // Zero out the _reserved field (bytes 14..16) for checksum computation.
-        buf[14] = 0;
-        buf[15] = 0;
+        // Zero out the checksum field (bytes 16..20) for computation.
+        buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + CHECKSUM_SIZE].fill(0);
         crc32fast::hash(&buf)
     }
 
-    /// Write the page checksum into the reserved header field.
+    /// Compute and store the full CRC32 checksum into the page header.
     pub fn seal(&mut self) {
-        // Zero reserved before computing.
-        self.header._reserved = 0;
+        self.header.checksum = 0;
         self.flush_header();
         let crc = self.compute_checksum();
-        self.header._reserved = crc as u16; // Lower 16 bits
-                                            // Store full 32-bit CRC by repurposing reserved as u16 pair
-                                            // Actually, we only have 16 bits of reserved space. Let's store
-                                            // the CRC in the page data at a known location instead.
-                                            // DESIGN: We use a full CRC32 stored in the _reserved field as
-                                            // a truncated 16-bit checksum. For full 32-bit integrity, the
-                                            // per-frame CRC32 in each WAL record provides complete coverage.
-                                            // The page-level checksum is a lightweight structural check.
-        self.data[14..16].copy_from_slice(&(crc as u16).to_le_bytes());
+        self.header.checksum = crc;
+        self.data[CHECKSUM_OFFSET..CHECKSUM_OFFSET + CHECKSUM_SIZE]
+            .copy_from_slice(&crc.to_le_bytes());
     }
 
-    /// Validate the page-level checksum. Returns true if valid.
+    /// Validate the page-level CRC32 checksum. Returns true if valid.
     pub fn validate_checksum(&self) -> bool {
-        let stored = self.header._reserved;
-        let mut page = self.clone();
-        page.header._reserved = 0;
-        page.flush_header();
-        let computed = crc32fast::hash(&page.data) as u16;
+        let stored = self.header.checksum;
+        let mut buf = self.data.clone();
+        buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + CHECKSUM_SIZE].fill(0);
+        let computed = crc32fast::hash(&buf);
         stored == computed
     }
 
@@ -485,12 +486,12 @@ mod tests {
         // Use a small page to test fill behavior.
         let page_size = 64;
         let mut page = SlottedPage::new(0, page_size);
-        // Available: 64 - 16 (header) = 48 bytes for slots + data.
+        // Available: 64 - 20 (header) = 44 bytes for slots + data.
         // Each record needs SLOT_ENTRY_SIZE (4) + payload_len bytes.
 
-        // 48 / (4 + 8) = 4 records of 8 bytes
+        // 44 / (4 + 7) = 4 records of 7 bytes
         for _ in 0..4 {
-            assert!(page.try_insert(&[0xAA; 8]).is_some());
+            assert!(page.try_insert(&[0xAA; 7]).is_some());
         }
         // Page should be full now.
         assert!(page.try_insert(&[0xBB; 1]).is_none());
@@ -517,13 +518,13 @@ mod tests {
     #[test]
     fn can_fit_checks_correctly() {
         let mut page = SlottedPage::new(0, 64);
-        // 48 bytes total free.
-        assert!(page.can_fit(44)); // 4 (slot) + 44 = 48
-        assert!(!page.can_fit(45)); // 4 + 45 = 49 > 48
+        // 44 bytes total free (64 - 20 header).
+        assert!(page.can_fit(40)); // 4 (slot) + 40 = 44
+        assert!(!page.can_fit(41)); // 4 + 41 = 45 > 44
 
         page.try_insert(&[0u8; 20]).unwrap(); // Uses 4 + 20 = 24
-        assert!(page.can_fit(20)); // 4 + 20 = 24 remaining
-        assert!(!page.can_fit(21));
+        assert!(page.can_fit(16)); // 4 + 16 = 20 remaining
+        assert!(!page.can_fit(17));
     }
 
     #[test]
@@ -579,7 +580,8 @@ mod tests {
             slot_count: 42,
             free_offset: 200,
             data_offset: 3000,
-            _reserved: 0xABCD,
+            _padding: 0,
+            checksum: 0xDEADBEEF,
         };
         let bytes = header.to_bytes();
         let restored = PageHeader::from_bytes(&bytes);
