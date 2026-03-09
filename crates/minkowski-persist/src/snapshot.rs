@@ -45,9 +45,11 @@ impl Snapshot {
 
     /// Save a full world snapshot to disk.
     ///
-    /// Writes the v2 envelope (magic, CRC32, length) and rkyv payload directly
-    /// to disk without allocating an intermediate `Vec<u8>`. Use `save_to_bytes`
-    /// when you need the framed bytes in memory (e.g. for network transfer).
+    /// Writes the v2 envelope (magic, CRC32, length) and rkyv payload to a
+    /// temporary file, then atomically renames to the final path. A crash
+    /// during the write cannot corrupt an existing snapshot at `path`.
+    /// Use `save_to_bytes` when you need the framed bytes in memory
+    /// (e.g. for network transfer).
     pub fn save(
         &self,
         path: &Path,
@@ -65,7 +67,8 @@ impl Snapshot {
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
 
-        let file = File::create(path)?;
+        let tmp_path = path.with_extension("snap.tmp");
+        let file = File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
         let crc = crc32fast::hash(&payload);
         let len = payload.len() as u64;
@@ -75,6 +78,9 @@ impl Snapshot {
         writer.write_all(&len.to_le_bytes())?;
         writer.write_all(&payload)?;
         writer.flush()?;
+        drop(writer);
+
+        std::fs::rename(&tmp_path, path)?;
 
         Ok(header)
     }
