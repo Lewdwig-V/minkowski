@@ -25,7 +25,6 @@ jobs:
 
   clippy:
     name: Clippy
-    needs: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,7 +38,7 @@ jobs:
 
   test:
     name: Test
-    needs: clippy
+    needs: [fmt, clippy]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +51,7 @@ jobs:
   miri:
     name: Miri
     needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,9 +107,8 @@ jobs:
           RUSTFLAGS: "--cfg loom"
 
   # Aggregator job — the single required status check for branch protection.
-  # Runs even when upstream jobs are skipped/failed and explicitly checks
-  # that every dependency succeeded, avoiding the GitHub "skipped = passed"
-  # loophole with required checks on chained jobs.
+  # fmt and clippy run in parallel. test runs after both. TSan, Loom run on
+  # every PR. Miri runs only on push to main — "skipped" on PRs is expected.
   ci-pass:
     name: CI
     needs: [fmt, clippy, test, miri, tsan, loom]
@@ -121,15 +120,19 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ||
                 "${{ needs.clippy.result }}" != "success" ||
                 "${{ needs.test.result }}" != "success" ||
-                "${{ needs.miri.result }}" != "success" ||
                 "${{ needs.tsan.result }}" != "success" ||
                 "${{ needs.loom.result }}" != "success" ]]; then
             echo "One or more CI jobs failed or were skipped."
             echo "  fmt:    ${{ needs.fmt.result }}"
             echo "  clippy: ${{ needs.clippy.result }}"
             echo "  test:   ${{ needs.test.result }}"
-            echo "  miri:   ${{ needs.miri.result }}"
             echo "  tsan:   ${{ needs.tsan.result }}"
             echo "  loom:   ${{ needs.loom.result }}"
+            exit 1
+          fi
+          # Miri only runs on push to main — "skipped" on PRs is expected.
+          if [[ "${{ needs.miri.result }}" != "success" &&
+                "${{ needs.miri.result }}" != "skipped" ]]; then
+            echo "miri failed: ${{ needs.miri.result }}"
             exit 1
           fi
