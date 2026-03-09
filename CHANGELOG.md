@@ -8,7 +8,7 @@
 - **`BTreeIndex::save/load`** and **`HashIndex::save/load`** — rkyv-based serialization with CRC32 integrity and atomic rename (write to `.tmp`, then rename). Conditional on key type supporting rkyv.
 - **`load_btree_index<T>`** and **`load_hash_index<T>`** — free functions to load persisted indexes from disk.
 - **`AutoCheckpoint::register_index`** — optionally saves persistent indexes alongside snapshots on checkpoint. Index save failures are non-fatal.
-- **Index file format** — `[magic: 8B "MK2INDXK"][crc32: 4B LE][reserved: 4B][len: u64 LE][rkyv payload]`. Same envelope pattern as WAL segments and snapshots.
+- **Index file format** — `[magic: 8B "MK2INDXK"][crc32: 4B LE][version: u32 LE][len: u64 LE][rkyv payload]`. Same envelope pattern as WAL segments and snapshots. Type discriminator in payload catches wrong-type loads.
 - **`ChangeTick::to_raw/from_raw`** — public serialization surface for tick values, enabling the persist crate to save/restore index synchronization state.
 - **`BTreeIndex::as_raw_parts/from_raw_parts`** and **`HashIndex::as_raw_parts/from_raw_parts`** — controlled access to internal state for serialization without exposing private fields.
 - **`IndexPersistError`** — `Io` and `Format` variants, consistent with `SnapshotError` and `WalError`.
@@ -16,13 +16,21 @@
 ### Recovery flow
 
 ```rust
-let mut index = match BTreeIndex::<Score>::load("score.idx") {
-    Ok(idx) => { idx.update(&mut world); idx }
+let post_restore_tick = world.change_tick(); // after snapshot restore, before WAL replay
+wal.replay(&mut world, &codecs)?;
+
+let mut index = match load_btree_index::<Score>("score.idx", post_restore_tick) {
+    Ok(idx) => { idx.update(&mut world); idx }  // O(WAL tail)
     Err(_) => { let mut idx = BTreeIndex::new(); idx.rebuild(&mut world); idx }
 };
 ```
 
 `rebuild()` remains as fallback for missing or corrupt index files.
+
+### Durability
+
+- **`Snapshot::save` uses atomic rename + fsync** — writes to `.snap.tmp`, calls `sync_data()`, then renames. A crash during write cannot corrupt an existing snapshot.
+- **`write_index_file` uses atomic rename + fsync** — same pattern. Best-effort cleanup of `.tmp` file on write failure.
 
 ## 1.0.2
 

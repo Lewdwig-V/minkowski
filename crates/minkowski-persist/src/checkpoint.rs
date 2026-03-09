@@ -223,7 +223,7 @@ mod tests {
 
         // Verify index file was created and is loadable
         assert!(idx_path.exists());
-        let loaded = load_btree_index::<Score>(&idx_path).unwrap();
+        let loaded = load_btree_index::<Score>(&idx_path, world.change_tick()).unwrap();
         assert_eq!(loaded.get(&Score(100)).len(), 1);
         assert_eq!(loaded.get(&Score(200)).len(), 1);
     }

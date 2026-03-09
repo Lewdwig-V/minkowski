@@ -13,12 +13,13 @@ use rkyv::ser::allocator::ArenaHandle;
 use rkyv::{rancor, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 /// Index file magic identifying the persistent index format.
-#[allow(dead_code)]
 const INDEX_MAGIC: [u8; 8] = *b"MK2INDXK";
 
-/// Header size: magic (8) + CRC32 (4) + reserved (4) + length (8) = 24.
-#[allow(dead_code)]
+/// Header size: magic (8) + CRC32 (4) + version (4) + length (8) = 24.
 pub(crate) const INDEX_HEADER_SIZE: usize = 24;
+
+/// Current index file format version.
+const INDEX_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexPersistError {
@@ -45,25 +46,37 @@ pub trait PersistentIndex: SpatialIndex + Send {
 }
 
 /// Write an index envelope: `[magic 8B][crc32 4B][reserved 4B][len u64][payload]`.
-/// Uses atomic rename — writes to `{path}.tmp`, then renames to `path`.
-#[allow(dead_code)]
+///
+/// Uses write-to-tmp + fsync + atomic rename: data is flushed to stable
+/// storage before the rename, so a crash at any point cannot corrupt the
+/// previous file at `path`.
 pub(crate) fn write_index_file(path: &Path, payload: &[u8]) -> Result<(), IndexPersistError> {
     let tmp_path = path.with_extension("idx.tmp");
     let crc = crc32fast::hash(payload);
     let len = payload.len() as u64;
 
-    let file = File::create(&tmp_path)?;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(&INDEX_MAGIC)?;
-    writer.write_all(&crc.to_le_bytes())?;
-    writer.write_all(&[0u8; 4])?;
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(payload)?;
-    writer.flush()?;
-    drop(writer);
+    let result = (|| -> Result<(), IndexPersistError> {
+        let file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&INDEX_MAGIC)?;
+        writer.write_all(&crc.to_le_bytes())?;
+        writer.write_all(&INDEX_VERSION.to_le_bytes())?;
+        writer.write_all(&len.to_le_bytes())?;
+        writer.write_all(payload)?;
+        writer.flush()?;
+        let file = writer.into_inner().map_err(|e| {
+            IndexPersistError::Io(std::io::Error::other(format!("flush failed: {e}")))
+        })?;
+        file.sync_data()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
 
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 /// Read and validate an index file. Returns the verified payload bytes.
@@ -77,6 +90,12 @@ pub(crate) fn read_index_file(path: &Path) -> Result<Vec<u8>, IndexPersistError>
         return Err(IndexPersistError::Format("invalid index file magic".into()));
     }
     let stored_crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let version = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    if version != INDEX_VERSION {
+        return Err(IndexPersistError::Format(format!(
+            "unsupported index format version {version}, expected {INDEX_VERSION}"
+        )));
+    }
     let len = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
     let end = INDEX_HEADER_SIZE
         .checked_add(len)
@@ -105,11 +124,17 @@ pub(crate) fn read_index_file(path: &Path) -> Result<Vec<u8>, IndexPersistError>
 /// as byte blobs to avoid propagating rkyv generic bounds through the trait.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct IndexPayload {
+    /// Key type name from `std::any::type_name::<T>()`. Validated on load
+    /// to catch wrong-type loads (e.g. loading a Score index as Health).
+    key_type_name: String,
     /// Forward map: serialized key bytes → entity bits.
     entries: Vec<(Vec<u8>, Vec<u64>)>,
     /// Reverse map: entity bits → serialized key bytes.
     reverse: Vec<(u64, Vec<u8>)>,
-    /// Last sync tick (raw u64).
+    /// Last sync tick (raw u64). Stored for diagnostics only —
+    /// `load_*` functions require the caller to supply the actual
+    /// sync tick, because the original tick timeline does not survive
+    /// crash recovery.
     last_sync_tick: u64,
 }
 
@@ -142,7 +167,6 @@ where
     T: Component
         + Ord
         + Clone
-        + Hash
         + Archive
         + for<'a> RkyvSerialize<
             rkyv::api::high::HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, rancor::Error>,
@@ -165,6 +189,7 @@ where
         }
 
         let payload = IndexPayload {
+            key_type_name: std::any::type_name::<T>().to_owned(),
             entries,
             reverse: rev,
             last_sync_tick: last_sync.to_raw(),
@@ -179,15 +204,32 @@ where
 
 /// Load a `BTreeIndex<T>` from a file previously written by
 /// [`PersistentIndex::save`].
-pub fn load_btree_index<T>(path: &Path) -> Result<BTreeIndex<T>, IndexPersistError>
+///
+/// `sync_tick` overrides the stored last-sync tick. After crash recovery,
+/// the original world's tick timeline no longer exists — pass
+/// `world.change_tick()` captured immediately after snapshot restore
+/// (before WAL replay) so that a subsequent `update()` catches up with
+/// exactly the WAL tail.
+pub fn load_btree_index<T>(
+    path: &Path,
+    sync_tick: ChangeTick,
+) -> Result<BTreeIndex<T>, IndexPersistError>
 where
-    T: Component + Ord + Clone + Hash + Archive,
+    T: Component + Ord + Clone + Archive,
     T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
         + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
 {
     let bytes = read_index_file(path)?;
     let payload = rkyv::from_bytes::<IndexPayload, rancor::Error>(&bytes)
         .map_err(|e| IndexPersistError::Format(format!("payload deserialization failed: {e}")))?;
+
+    let expected_type = std::any::type_name::<T>();
+    if payload.key_type_name != expected_type {
+        return Err(IndexPersistError::Format(format!(
+            "index key type mismatch: file has '{}', expected '{}'",
+            payload.key_type_name, expected_type
+        )));
+    }
 
     let mut tree = std::collections::BTreeMap::new();
     for (key_bytes, entity_bits) in &payload.entries {
@@ -202,8 +244,7 @@ where
         reverse.insert(Entity::from_bits(entity_bits), key);
     }
 
-    let last_sync = ChangeTick::from_raw(payload.last_sync_tick);
-    Ok(BTreeIndex::from_raw_parts(tree, reverse, last_sync))
+    Ok(BTreeIndex::from_raw_parts(tree, reverse, sync_tick))
 }
 
 impl<T> PersistentIndex for HashIndex<T>
@@ -234,6 +275,7 @@ where
         }
 
         let payload = IndexPayload {
+            key_type_name: std::any::type_name::<T>().to_owned(),
             entries,
             reverse: rev,
             last_sync_tick: last_sync.to_raw(),
@@ -248,7 +290,13 @@ where
 
 /// Load a `HashIndex<T>` from a file previously written by
 /// [`PersistentIndex::save`].
-pub fn load_hash_index<T>(path: &Path) -> Result<HashIndex<T>, IndexPersistError>
+///
+/// `sync_tick` overrides the stored last-sync tick. See
+/// [`load_btree_index`] for rationale.
+pub fn load_hash_index<T>(
+    path: &Path,
+    sync_tick: ChangeTick,
+) -> Result<HashIndex<T>, IndexPersistError>
 where
     T: Component + Hash + Eq + Clone + Archive,
     T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
@@ -257,6 +305,14 @@ where
     let bytes = read_index_file(path)?;
     let payload = rkyv::from_bytes::<IndexPayload, rancor::Error>(&bytes)
         .map_err(|e| IndexPersistError::Format(format!("payload deserialization failed: {e}")))?;
+
+    let expected_type = std::any::type_name::<T>();
+    if payload.key_type_name != expected_type {
+        return Err(IndexPersistError::Format(format!(
+            "index key type mismatch: file has '{}', expected '{}'",
+            payload.key_type_name, expected_type
+        )));
+    }
 
     let mut map = HashMap::new();
     for (key_bytes, entity_bits) in &payload.entries {
@@ -271,8 +327,7 @@ where
         reverse.insert(Entity::from_bits(entity_bits), key);
     }
 
-    let last_sync = ChangeTick::from_raw(payload.last_sync_tick);
-    Ok(HashIndex::from_raw_parts(map, reverse, last_sync))
+    Ok(HashIndex::from_raw_parts(map, reverse, sync_tick))
 }
 
 #[cfg(test)]
@@ -310,7 +365,7 @@ mod tests {
         idx.rebuild(&mut world);
         idx.save(&path).unwrap();
 
-        let loaded = load_btree_index::<Score>(&path).unwrap();
+        let loaded = load_btree_index::<Score>(&path, world.change_tick()).unwrap();
         assert_eq!(loaded.get(&Score(10)).len(), 2);
         assert!(loaded.get(&Score(10)).contains(&e1));
         assert!(loaded.get(&Score(10)).contains(&e3));
@@ -328,7 +383,7 @@ mod tests {
         idx.rebuild(&mut world);
         idx.save(&path).unwrap();
 
-        let loaded = load_btree_index::<Score>(&path).unwrap();
+        let loaded = load_btree_index::<Score>(&path, world.change_tick()).unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -345,7 +400,7 @@ mod tests {
         idx.rebuild(&mut world);
         idx.save(&path).unwrap();
 
-        let loaded = load_hash_index::<Score>(&path).unwrap();
+        let loaded = load_hash_index::<Score>(&path, world.change_tick()).unwrap();
         assert_eq!(loaded.get(&Score(10)).len(), 1);
         assert!(loaded.get(&Score(10)).contains(&e1));
         assert_eq!(loaded.get(&Score(20)).len(), 1);
@@ -418,12 +473,16 @@ mod tests {
         idx.rebuild(&mut world);
         idx.save(&path).unwrap();
 
+        // Capture tick at save time — this is what the caller would
+        // pass after snapshot restore in a real recovery scenario.
+        let saved_tick = world.change_tick();
+
         // Mutate after save
         *world.get_mut::<Score>(e2).unwrap() = Score(30);
         world.spawn((Score(40),));
 
-        // Load stale index, catch up
-        let mut loaded = load_btree_index::<Score>(&path).unwrap();
+        // Load stale index with the save-time tick, catch up
+        let mut loaded = load_btree_index::<Score>(&path, saved_tick).unwrap();
         loaded.update(&mut world);
 
         // Verify: Score(20) gone, Score(30) and Score(40) present
@@ -508,13 +567,20 @@ mod tests {
             let snap = Snapshot::new();
             let (mut world, _snap_seq) = snap.load(&snap_path, &codecs).unwrap();
 
+            // Capture tick AFTER snapshot restore, BEFORE WAL replay.
+            // This is the sync point for the persistent index — the index
+            // was saved alongside the snapshot, so it's consistent with
+            // post-restore state. WAL replay will advance ticks beyond
+            // this point, and update() will catch exactly that delta.
+            let post_restore_tick = world.change_tick();
+
             // Replay WAL from checkpoint onwards
             let mut wal = Wal::open(&wal_dir, &codecs, config.clone()).unwrap();
             wal.replay_from(checkpoint_seq, &mut world, &codecs)
                 .unwrap();
 
-            // Load persistent index and catch up
-            let mut idx = load_btree_index::<Score>(&idx_path).unwrap();
+            // Load persistent index and catch up from post-restore tick
+            let mut idx = load_btree_index::<Score>(&idx_path, post_restore_tick).unwrap();
             idx.update(&mut world);
 
             // Verify: all 12 entities present (10 original + Score(99) + Score(88))

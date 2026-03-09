@@ -164,6 +164,11 @@ impl<T: Component + Ord + Clone> BTreeIndex<T> {
         reverse: HashMap<Entity, T>,
         last_sync: ChangeTick,
     ) -> Self {
+        debug_assert_eq!(
+            tree.values().map(|v| v.len()).sum::<usize>(),
+            reverse.len(),
+            "BTreeIndex::from_raw_parts: forward/reverse map size mismatch"
+        );
         Self {
             tree,
             reverse,
@@ -299,6 +304,11 @@ impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
         reverse: HashMap<Entity, T>,
         last_sync: ChangeTick,
     ) -> Self {
+        debug_assert_eq!(
+            map.values().map(|v| v.len()).sum::<usize>(),
+            reverse.len(),
+            "HashIndex::from_raw_parts: forward/reverse map size mismatch"
+        );
         Self {
             map,
             reverse,

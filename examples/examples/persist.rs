@@ -201,7 +201,7 @@ fn main() {
 
     // Load + update (recovery path)
     let t1 = std::time::Instant::now();
-    let mut loaded_idx = load_btree_index::<Score>(&idx_path).unwrap();
+    let mut loaded_idx = load_btree_index::<Score>(&idx_path, recovered.change_tick()).unwrap();
     loaded_idx.update(&mut recovered);
     let load_time = t1.elapsed();
     println!(
