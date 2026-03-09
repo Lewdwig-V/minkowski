@@ -26,16 +26,16 @@ Determine which files to analyze:
 - `storage/sparse.rs` — `PagedSparseSet::dense_index` (page lookup + generation check), `insert`, `get`, `remove`, `remove_internal`, `iter`; `SparseStorage::remove_all` (per-despawn)
 
 **Query (per-entity iteration)** — `crates/minkowski/src/`
-- `query/iter.rs` — `QueryIter::next`, `for_each`, `for_each_chunk`, `par_for_each`
+- `query/iter.rs` — `QueryIter::next`, `for_each`, `for_each_chunk`, `par_for_each`, `mark_iterated`
 - `query/fetch.rs` — `init_fetch`, `fetch`, `as_slice`
 
 **Mutation (spawn, migrate, changeset apply)** — `crates/minkowski/src/`
-- `world.rs` — `spawn`, `insert`, `remove`, `despawn`, `despawn_batch` (group-sort-sweep), `get_mut`, `get_batch_mut`, `query`, `query_table_mut`
+- `world.rs` — `spawn`, `insert`, `remove`, `despawn`, `despawn_batch` (group-sort-sweep), `get_mut`, `get_batch_mut`, `query`, `query_table_mut`, `has_changed` (archetype scan per call)
 - `bundle.rs` — `Bundle::put`, `component_ids`
 - `changeset.rs` — `EnumChangeSet::apply`, `record_insert`, arena allocation
 
 **Reducer (per-entity iteration through handles)** — `crates/minkowski/src/`
-- `reducer.rs` — `QueryWriter::for_each` (manual archetype scan), `QueryMut::for_each`/`for_each_chunk`, `QueryRef::for_each`, `DynamicCtx::for_each`, `EntityMut::get`/`set`/`remove`, `Spawner::spawn`
+- `reducer.rs` — `QueryWriter::for_each` (manual archetype scan), `QueryMut::for_each`/`for_each_chunk`, `QueryRef::for_each`/`for_each_chunk`, `DynamicCtx::for_each`, `EntityMut::get`/`set`/`remove`, `Spawner::spawn`
 
 **Persistence (I/O hot paths)** — `crates/minkowski-persist/src/`
 - `wal.rs` — `append`, `replay_from`, `scan_last_seq`
