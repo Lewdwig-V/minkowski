@@ -56,13 +56,13 @@ GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every PR and push t
 | Job | Toolchain | Command | `needs` |
 |---|---|---|---|
 | fmt | stable | `cargo fmt --all -- --check` | — |
-| clippy | stable | `cargo clippy --workspace --all-targets -- -D warnings` | fmt |
-| test | stable | `cargo test -p minkowski` | clippy |
-| miri | nightly | Two-step Miri run (see Build & Test Commands) | test |
+| clippy | stable | `cargo clippy --workspace --all-targets -- -D warnings` | — |
+| test | stable | `cargo test -p minkowski` | fmt, clippy |
+| miri | nightly | Full Miri run including rayon (push to main only) | test |
 | tsan | nightly | Two-step TSan run with `-Z build-std` (see Build & Test Commands) | test |
 | loom | stable | Exhaustive concurrency verification (see Build & Test Commands) | test |
 
-Sequential chain: fmt failure skips all downstream jobs. Miri, TSan, and Loom run in parallel after test. A `ci-pass` aggregator job (runs with `if: always()`) is the single required status check for branch protection — it explicitly verifies all six jobs succeeded, avoiding GitHub's "skipped = passed" loophole with chained `needs:`.
+Format and clippy run in parallel. Test runs after both pass. TSan and Loom run in parallel after test on every PR. Miri runs only on push to main (full test suite including rayon). A `ci-pass` aggregator job (runs with `if: always()`) is the single required status check for branch protection — it verifies all required jobs succeeded and allows Miri to be skipped on PRs without failing the gate.
 
 ## Architecture
 
