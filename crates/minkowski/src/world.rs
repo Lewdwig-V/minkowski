@@ -333,6 +333,7 @@ impl World {
         }
         let row = archetype.entities.len();
         archetype.entities.push(entity);
+        archetype.debug_assert_consistent();
 
         self.entity_locations[index] = Some(EntityLocation {
             archetype_id: arch_id,
@@ -354,6 +355,12 @@ impl World {
 
         let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
         let row = location.row;
+        debug_assert!(
+            row < archetype.len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            row,
+            archetype.len()
+        );
 
         for col in &mut archetype.columns {
             unsafe {
@@ -549,6 +556,12 @@ impl World {
 
         let tick = self.next_tick();
         let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
+        debug_assert!(
+            location.row < archetype.len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            location.row,
+            archetype.len()
+        );
         let col_idx = archetype.column_index(comp_id)?;
         unsafe {
             let ptr = archetype.columns[col_idx].get_ptr_mut(location.row, tick) as *mut T;
@@ -907,6 +920,12 @@ impl World {
         assert!(self.is_alive(entity), "entity is not alive");
         let index = entity.index() as usize;
         let location = self.entity_locations[index].unwrap();
+        debug_assert!(
+            location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            location.row,
+            self.archetypes.archetypes[location.archetype_id.0].len()
+        );
         let new_ids = B::component_ids(&mut self.components);
 
         let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
@@ -1028,6 +1047,10 @@ impl World {
             archetype_id: target_arch_id,
             row: target_row,
         });
+
+        // Verify column/entity invariant after migration.
+        src_arch.debug_assert_consistent();
+        target_arch.debug_assert_consistent();
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
@@ -1037,6 +1060,12 @@ impl World {
         }
         let index = entity.index() as usize;
         let location = self.entity_locations[index]?;
+        debug_assert!(
+            location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            location.row,
+            self.archetypes.archetypes[location.archetype_id.0].len()
+        );
         let comp_id = self.components.id::<T>()?;
 
         let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
@@ -1085,6 +1114,7 @@ impl World {
                     row: src_row,
                 });
             }
+            arch.debug_assert_consistent();
             let empty_arch_id = self.archetypes.get_or_create(&[], &self.components);
             let empty_arch = &mut self.archetypes.archetypes[empty_arch_id.0];
             empty_arch.entities.push(entity);
@@ -1135,6 +1165,10 @@ impl World {
             archetype_id: target_arch_id,
             row: target_row,
         });
+
+        // Verify column/entity invariant after migration.
+        src_arch.debug_assert_consistent();
+        target_arch.debug_assert_consistent();
 
         Some(removed)
     }

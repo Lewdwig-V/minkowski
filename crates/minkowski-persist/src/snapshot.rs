@@ -8,6 +8,20 @@ use minkowski::{ComponentId, Entity, EnumChangeSet, World};
 use crate::codec::{CodecError, CodecRegistry};
 use crate::record::*;
 
+/// Snapshot file magic identifying the v2 format with CRC32 checksums.
+///
+/// 8 bytes long so that format detection is unambiguous against legacy v1
+/// snapshots whose first 8 bytes are a u64 LE payload length.  For this
+/// magic to collide with a valid v1 length, the payload would have to be
+/// ~3.6 exabytes (`0x4B53_4E41_5032_4B4D` LE), which is not a real file.
+/// A 4-byte magic (`b"MKS1"`) was insufficient: payload length
+/// `0x31534B4D` (~790 MB) is plausible and would misclassify v1 as v2.
+const SNAPSHOT_MAGIC: [u8; 8] = *b"MK2SNAPK";
+
+/// Size of the snapshot envelope header: magic (8) + CRC32 (4) + reserved (4) + length (8).
+/// Padded to 24 bytes so the rkyv payload starts at 8-byte alignment.
+const SNAPSHOT_HEADER_SIZE: usize = 24;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
     #[error("snapshot I/O error: {0}")]
@@ -53,7 +67,11 @@ impl Snapshot {
 
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
+        let crc = crc32fast::hash(&payload);
         let len = payload.len() as u64;
+        writer.write_all(&SNAPSHOT_MAGIC)?;
+        writer.write_all(&crc.to_le_bytes())?;
+        writer.write_all(&[0u8; 4])?; // reserved padding for 8-byte alignment
         writer.write_all(&len.to_le_bytes())?;
         writer.write_all(&payload)?;
         writer.flush()?;
@@ -82,8 +100,12 @@ impl Snapshot {
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
 
+        let crc = crc32fast::hash(&payload);
         let len = payload.len() as u64;
-        let mut bytes = Vec::with_capacity(8 + payload.len());
+        let mut bytes = Vec::with_capacity(SNAPSHOT_HEADER_SIZE + payload.len());
+        bytes.extend_from_slice(&SNAPSHOT_MAGIC);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]); // reserved padding for 8-byte alignment
         bytes.extend_from_slice(&len.to_le_bytes());
         bytes.extend_from_slice(&payload);
 
@@ -119,22 +141,51 @@ impl Snapshot {
         bytes: &[u8],
         codecs: &CodecRegistry,
     ) -> Result<(World, u64), SnapshotError> {
-        if bytes.len() < 8 {
+        if bytes.len() < SNAPSHOT_HEADER_SIZE {
             return Err(SnapshotError::Format("snapshot too small".to_string()));
         }
 
-        let len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-        let end = 8usize
+        // Detect format: v2 starts with 8-byte SNAPSHOT_MAGIC, v1 starts with a u64 length.
+        // The 8-byte magic is unambiguous: interpreting it as a u64 LE yields ~3.6 EB,
+        // which is not a valid v1 payload length.
+        let (payload_offset, stored_crc) =
+            if bytes.len() >= SNAPSHOT_HEADER_SIZE && bytes[..8] == SNAPSHOT_MAGIC {
+                let stored_crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                // bytes[12..16] are reserved padding
+                (SNAPSHOT_HEADER_SIZE, Some(stored_crc))
+            } else {
+                // Legacy v1 format (length-only, no magic/CRC). Accept for
+                // backward compatibility but skip checksum verification.
+                (8, None)
+            };
+
+        let len_bytes = if stored_crc.is_some() {
+            &bytes[16..24]
+        } else {
+            &bytes[..8]
+        };
+        let len = u64::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        let end = payload_offset
             .checked_add(len)
             .ok_or_else(|| SnapshotError::Format(format!("invalid payload length: {len}")))?;
         if bytes.len() < end {
             return Err(SnapshotError::Format(format!(
                 "snapshot truncated: expected {} payload bytes, got {}",
                 len,
-                bytes.len() - 8
+                bytes.len() - payload_offset
             )));
         }
-        let payload = &bytes[8..end];
+        let payload = &bytes[payload_offset..end];
+
+        // Verify CRC32 if present (v2 format).
+        if let Some(stored_crc) = stored_crc {
+            let actual_crc = crc32fast::hash(payload);
+            if actual_crc != stored_crc {
+                return Err(SnapshotError::Format(format!(
+                    "snapshot checksum mismatch: expected {stored_crc:#010x}, got {actual_crc:#010x}"
+                )));
+            }
+        }
 
         let archived = rkyv::access::<ArchivedSnapshotData, rkyv::rancor::Error>(payload)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
@@ -307,6 +358,17 @@ impl Snapshot {
         // For components where the archived layout matches native (raw_copy_size is
         // Some), copy archived bytes directly — no rkyv::from_bytes.
         for arch_data in data.archetypes.iter() {
+            let entity_count = arch_data.entities.len();
+            for col in arch_data.columns.iter() {
+                if col.values.len() != entity_count {
+                    return Err(SnapshotError::Format(format!(
+                        "archetype column/entity count mismatch: column has {} values but archetype has {} entities",
+                        col.values.len(),
+                        entity_count,
+                    )));
+                }
+            }
+
             let mut changeset = EnumChangeSet::new();
 
             for (row, entity_bits) in arch_data.entities.iter().enumerate() {
@@ -704,9 +766,9 @@ mod tests {
         let snap = Snapshot::new();
         snap.save(&snap_path, &world, &codecs, 0).unwrap();
 
-        // Corrupt the payload (flip bytes after the length prefix)
+        // Corrupt the payload (flip bytes after the envelope header)
         let mut data = std::fs::read(&snap_path).unwrap();
-        for byte in data[8..].iter_mut().take(16) {
+        for byte in data[SNAPSHOT_HEADER_SIZE..].iter_mut().take(16) {
             *byte ^= 0xFF;
         }
         std::fs::write(&snap_path, &data).unwrap();
@@ -825,5 +887,132 @@ mod tests {
             .map(|(_, v)| (v.dx, v.dy))
             .collect();
         assert_eq!(sparse, vec![(10.0, 20.0)]);
+    }
+
+    // ── v2 format / CRC tests ───────────────────────────────────────
+
+    #[test]
+    fn snapshot_v2_has_magic_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("magic.snap");
+
+        let world = World::new();
+        let codecs = CodecRegistry::new();
+
+        let snap = Snapshot::new();
+        snap.save(&snap_path, &world, &codecs, 0).unwrap();
+
+        let data = std::fs::read(&snap_path).unwrap();
+        assert_eq!(
+            &data[..8],
+            b"MK2SNAPK",
+            "snapshot must start with MK2SNAPK magic"
+        );
+    }
+
+    #[test]
+    fn snapshot_crc_mismatch_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("crc_bad.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let snap = Snapshot::new();
+        snap.save(&snap_path, &world, &codecs, 0).unwrap();
+
+        // Flip a byte in the CRC field (bytes 8..12) to force mismatch
+        let mut data = std::fs::read(&snap_path).unwrap();
+        data[8] ^= 0xFF;
+        std::fs::write(&snap_path, &data).unwrap();
+
+        let result = snap.load(&snap_path, &codecs);
+        let err = result.err().expect("should fail with CRC mismatch");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("checksum mismatch"),
+            "error should mention checksum: {msg}"
+        );
+    }
+
+    #[test]
+    fn snapshot_bytes_crc_mismatch_detected() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let snap = Snapshot::new();
+        let (_, mut bytes) = snap.save_to_bytes(&world, &codecs, 0).unwrap();
+
+        // Corrupt the payload (after SNAPSHOT_HEADER_SIZE)
+        bytes[SNAPSHOT_HEADER_SIZE] ^= 0xFF;
+
+        let result = snap.load_from_bytes(&bytes, &codecs);
+        let err = result.err().expect("should fail with CRC mismatch");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("checksum mismatch"),
+            "error should mention checksum: {msg}"
+        );
+    }
+
+    #[test]
+    fn snapshot_v1_legacy_still_loads() {
+        // Construct a v1-format snapshot (no magic, no CRC — just len+payload)
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        world.spawn((Pos { x: 42.0, y: 99.0 },));
+
+        let snap = Snapshot::new();
+        let (_, v2_bytes) = snap.save_to_bytes(&world, &codecs, 7).unwrap();
+
+        // Strip the v2 envelope and rebuild v1 format
+        let payload = &v2_bytes[SNAPSHOT_HEADER_SIZE..];
+        let len = payload.len() as u64;
+        let mut v1_bytes = Vec::with_capacity(8 + payload.len());
+        v1_bytes.extend_from_slice(&len.to_le_bytes());
+        v1_bytes.extend_from_slice(payload);
+
+        let (mut world2, seq) = snap.load_from_bytes(&v1_bytes, &codecs).unwrap();
+        assert_eq!(seq, 7);
+        let positions: Vec<(f32, f32)> =
+            world2.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert_eq!(positions, vec![(42.0, 99.0)]);
+    }
+
+    #[test]
+    fn v1_whose_length_prefix_starts_with_old_4byte_magic_loads_correctly() {
+        // Regression: the old 4-byte magic b"MKS1" = 0x31534B4D LE ≈ 790 MB.
+        // A v1 snapshot with that payload length would have been misclassified
+        // as v2 by the old detection logic. With 8-byte magic this is impossible
+        // because no valid payload length has ASCII in its high 4 bytes.
+        //
+        // We can't construct an 800 MB payload, but we CAN construct a v1-format
+        // buffer whose first 4 bytes happen to be b"MKS1" (by choosing an
+        // appropriate length) and verify it falls through to the v1 path.
+        // The payload won't be valid rkyv, but we should get a Format error
+        // (not a checksum mismatch — which would mean v2 was incorrectly selected).
+        let fake_len: u64 = u64::from_le_bytes(*b"MKS1\x00\x00\x00\x00");
+        let mut v1_bytes = Vec::new();
+        v1_bytes.extend_from_slice(&fake_len.to_le_bytes());
+        // Append a small dummy payload (won't match the declared length, but
+        // the detection logic runs before length validation in v1 path).
+        v1_bytes.extend_from_slice(&[0u8; 64]);
+
+        let snap = Snapshot::new();
+        let codecs = CodecRegistry::new();
+        let result = snap.load_from_bytes(&v1_bytes, &codecs);
+        // Should fail with a truncation or format error — NOT a CRC mismatch,
+        // which would indicate the v2 path was incorrectly taken.
+        let err = result.err().expect("should fail on truncated v1 data");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("checksum mismatch"),
+            "v1 snapshot with MKS1 length prefix was misclassified as v2: {msg}"
+        );
     }
 }

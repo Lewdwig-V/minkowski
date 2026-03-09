@@ -136,8 +136,20 @@ impl ColumnLockTable {
     fn release_one(&mut self, arch_id: usize, comp_id: ComponentId, mode: LockMode) {
         if let Some(lock) = self.locks.get_mut(&(arch_id, comp_id)) {
             match mode {
-                LockMode::Shared => lock.readers = lock.readers.saturating_sub(1),
-                LockMode::Exclusive => lock.writer = false,
+                LockMode::Shared => {
+                    debug_assert!(
+                        lock.readers > 0,
+                        "releasing shared lock on ({arch_id}, {comp_id}) that has no readers"
+                    );
+                    lock.readers = lock.readers.saturating_sub(1);
+                }
+                LockMode::Exclusive => {
+                    debug_assert!(
+                        lock.writer,
+                        "releasing exclusive lock on ({arch_id}, {comp_id}) that wasn't held"
+                    );
+                    lock.writer = false;
+                }
             }
         }
     }

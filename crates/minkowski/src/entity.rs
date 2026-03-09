@@ -88,7 +88,16 @@ impl EntityAllocator {
     /// before using `alloc()` or `is_alive()` on reserved indices.
     #[allow(dead_code)]
     pub fn reserve(&self) -> Entity {
-        let index = self.next_reserved.fetch_add(1, Ordering::Relaxed);
+        let index = self
+            .next_reserved
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current < u32::MAX {
+                    Some(current + 1)
+                } else {
+                    None
+                }
+            })
+            .expect("entity index space exhausted: reserve() cannot allocate past u32::MAX");
         Entity::new(index, 0)
     }
 
@@ -136,7 +145,11 @@ impl EntityAllocator {
     pub fn dealloc(&mut self, entity: Entity) -> bool {
         let idx = entity.index() as usize;
         if idx < self.generations.len() && self.generations[idx] == entity.generation() {
-            self.generations[idx] = self.generations[idx].wrapping_add(1);
+            let next_gen = self.generations[idx].checked_add(1).expect(
+                "entity generation overflow: slot has been recycled 2^32 times. \
+                 This is a robustness limit — the slot can no longer be safely reused.",
+            );
+            self.generations[idx] = next_gen;
             self.free_list.push(entity.index());
             self.total_despawns += 1;
             true
