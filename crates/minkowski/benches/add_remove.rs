@@ -27,7 +27,7 @@ fn add_remove_minkowski(c: &mut Criterion) {
             },
             |(mut world, entities)| {
                 for &e in &entities {
-                    world.insert(e, Health(100.0));
+                    world.insert(e, (Health(100.0),));
                 }
                 for &e in &entities {
                     world.remove::<Health>(e);

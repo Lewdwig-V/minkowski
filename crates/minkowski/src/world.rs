@@ -892,35 +892,43 @@ impl World {
         }
     }
 
-    pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
+    pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) {
         self.drain_orphans();
         assert!(self.is_alive(entity), "entity is not alive");
         let index = entity.index() as usize;
         let location = self.entity_locations[index].unwrap();
-        let comp_id = self.components.register::<T>();
+        let new_ids = B::component_ids(&mut self.components);
 
-        // If entity already has this component, overwrite in-place
-        {
-            let has_component = self.archetypes.archetypes[location.archetype_id.0]
-                .component_ids
-                .contains(comp_id);
-            if has_component {
-                let tick = self.next_tick();
-                let src_arch = &mut self.archetypes.archetypes[location.archetype_id.0];
-                let col_idx = src_arch.column_index(comp_id).unwrap();
-                unsafe {
-                    let ptr = src_arch.columns[col_idx].get_ptr_mut(location.row, tick) as *mut T;
-                    std::ptr::drop_in_place(ptr);
-                    std::ptr::write(ptr, component);
-                }
-                return;
+        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
+        let all_existing = new_ids
+            .iter()
+            .all(|&id| src_arch.component_ids.contains(id));
+
+        if all_existing {
+            // All bundle components already exist — overwrite in-place
+            let tick = self.next_tick();
+            let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
+            let row = location.row;
+            unsafe {
+                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                    let col_idx = arch.column_index(comp_id).unwrap();
+                    let dst = arch.columns[col_idx].get_ptr_mut(row, tick);
+                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
+                        drop_fn(dst);
+                    }
+                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                });
             }
+            return;
         }
 
-        // Compute target archetype: source components + new component
-        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
+        // Compute target archetype: source components ∪ new components
         let mut target_ids = src_arch.sorted_ids.clone();
-        target_ids.push(comp_id);
+        for &id in &new_ids {
+            if !src_arch.component_ids.contains(id) {
+                target_ids.push(id);
+            }
+        }
         target_ids.sort_unstable();
         let src_arch_id = location.archetype_id;
         let src_row = location.row;
@@ -928,15 +936,51 @@ impl World {
         let target_arch_id = self.archetypes.get_or_create(&target_ids, &self.components);
         let tick = self.next_tick();
 
+        // Check if source and target are the same archetype (all components
+        // already existed but we took the migration path due to a race-free
+        // logic flow — can't happen currently, but guard defensively).
+        if src_arch_id == target_arch_id {
+            let arch = &mut self.archetypes.archetypes[src_arch_id.0];
+            unsafe {
+                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                    let col_idx = arch.column_index(comp_id).unwrap();
+                    let dst = arch.columns[col_idx].get_ptr_mut(src_row, tick);
+                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
+                        drop_fn(dst);
+                    }
+                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                });
+            }
+            return;
+        }
+
         let (src_arch, target_arch) = get_pair_mut(
             &mut self.archetypes.archetypes,
             src_arch_id.0,
             target_arch_id.0,
         );
 
-        // Move shared columns: read ptr from source, push to target, swap_remove_no_drop source
+        // Collect which source columns have overwrites from the bundle,
+        // so we know to skip copying them (the bundle value wins).
+        let overwrite_src_cols: Vec<bool> = src_arch
+            .sorted_ids
+            .iter()
+            .map(|&cid| new_ids.contains(&cid))
+            .collect();
+
+        // Move non-overwritten columns from source to target
         for (src_col, &cid) in src_arch.sorted_ids.iter().enumerate() {
-            if let Some(tgt_col) = target_arch.column_index(cid) {
+            if overwrite_src_cols[src_col] {
+                // This column is being overwritten by the bundle — drop the
+                // old value and skip the copy; the bundle.put below writes it.
+                unsafe {
+                    let ptr = src_arch.columns[src_col].get_ptr(src_row);
+                    if let Some(drop_fn) = self.components.info(cid).drop_fn {
+                        drop_fn(ptr);
+                    }
+                    src_arch.columns[src_col].swap_remove_no_drop(src_row);
+                }
+            } else if let Some(tgt_col) = target_arch.column_index(cid) {
                 unsafe {
                     let ptr = src_arch.columns[src_col].get_ptr(src_row);
                     target_arch.columns[tgt_col].push(ptr);
@@ -945,11 +989,12 @@ impl World {
             }
         }
 
-        // Write the new component into target
-        let tgt_col = target_arch.column_index(comp_id).unwrap();
+        // Write all bundle components into target
         unsafe {
-            let comp = std::mem::ManuallyDrop::new(component);
-            target_arch.columns[tgt_col].push(&*comp as *const T as *mut u8);
+            bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
+                let tgt_col = target_arch.column_index(comp_id).unwrap();
+                target_arch.columns[tgt_col].push(ptr as *mut u8);
+            });
         }
         for col in &mut target_arch.columns {
             col.mark_changed(tick);
@@ -1488,7 +1533,7 @@ mod tests {
     fn insert_new_component() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        world.insert(e, Vel { dx: 3.0, dy: 4.0 });
+        world.insert(e, (Vel { dx: 3.0, dy: 4.0 },));
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
@@ -1497,8 +1542,41 @@ mod tests {
     fn insert_overwrites_existing() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        world.insert(e, Pos { x: 10.0, y: 20.0 });
+        world.insert(e, (Pos { x: 10.0, y: 20.0 },));
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 10.0, y: 20.0 }));
+    }
+
+    #[test]
+    fn insert_multi_component_bundle() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.insert(e, (Vel { dx: 3.0, dy: 4.0 }, Health(100u32)));
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
+        assert_eq!(world.get::<Health>(e), Some(&Health(100u32)));
+    }
+
+    #[test]
+    fn insert_bundle_partial_overwrite() {
+        // Some bundle components exist, some are new — mixed migration + overwrite
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        // Vel already exists, Health is new
+        world.insert(e, (Vel { dx: 9.0, dy: 8.0 }, Health(50u32)));
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 9.0, dy: 8.0 }));
+        assert_eq!(world.get::<Health>(e), Some(&Health(50u32)));
+    }
+
+    #[test]
+    fn insert_tuple_unpacks_correctly() {
+        // Regression: insert((T,)) must store T, not the 1-tuple (T,).
+        // Before the Bundle-based insert, this was a silent footgun.
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.insert(e, (Vel { dx: 1.0, dy: 2.0 },));
+        // If the tuple were stored as-is, get::<Vel> would return None
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 1.0, dy: 2.0 }));
     }
 
     #[test]
@@ -1519,7 +1597,7 @@ mod tests {
         let e3 = world.spawn((Pos { x: 3.0, y: 0.0 },));
 
         // Migrate e1 — e3 should swap into e1's old row
-        world.insert(e1, Vel { dx: 1.0, dy: 0.0 });
+        world.insert(e1, (Vel { dx: 1.0, dy: 0.0 },));
 
         // All entities still accessible with correct data
         assert_eq!(world.get::<Pos>(e1), Some(&Pos { x: 1.0, y: 0.0 }));
@@ -1587,7 +1665,7 @@ mod tests {
         assert_eq!(world.query::<&Pos>().count(), 1);
         assert_eq!(world.query::<(&Pos, &Vel)>().count(), 0);
 
-        world.insert(e, Vel { dx: 1.0, dy: 0.0 });
+        world.insert(e, (Vel { dx: 1.0, dy: 0.0 },));
         assert_eq!(world.query::<&Pos>().count(), 1);
         assert_eq!(world.query::<(&Pos, &Vel)>().count(), 1);
     }

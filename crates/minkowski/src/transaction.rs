@@ -468,8 +468,13 @@ impl SequentialTx {
         world.despawn(entity)
     }
 
-    pub fn insert<T: Component>(&mut self, world: &mut World, entity: Entity, component: T) {
-        world.insert(entity, component);
+    pub fn insert<B: crate::bundle::Bundle>(
+        &mut self,
+        world: &mut World,
+        entity: Entity,
+        bundle: B,
+    ) {
+        world.insert(entity, bundle);
     }
 
     pub fn remove<T: Component>(&mut self, world: &mut World, entity: Entity) -> Option<T> {
@@ -1301,7 +1306,7 @@ mod tests {
 
         let strategy = Sequential;
         let mut tx = strategy.begin(&mut world, &access);
-        tx.insert(&mut world, e, Vel(5.0));
+        tx.insert(&mut world, e, (Vel(5.0),));
         assert!(world.get::<Vel>(e).is_some());
 
         {
