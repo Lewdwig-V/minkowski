@@ -26,6 +26,9 @@ pub struct ComponentRegistry {
     by_type: HashMap<TypeId, ComponentId>,
     infos: Vec<ComponentInfo>,
     sparse_set: FixedBitSet,
+    /// Monotonic counter bumped on every registration. Enables query cache
+    /// staleness checks without recomputing `required_ids` bitsets.
+    version: u64,
 }
 
 impl ComponentRegistry {
@@ -34,7 +37,13 @@ impl ComponentRegistry {
             by_type: HashMap::new(),
             infos: Vec::new(),
             sparse_set: FixedBitSet::new(),
+            version: 0,
         }
+    }
+
+    /// Current registry version. Bumped on every component registration.
+    pub(crate) fn version(&self) -> u64 {
+        self.version
     }
 
     pub fn register<T: Component>(&mut self) -> ComponentId {
@@ -55,6 +64,7 @@ impl ComponentRegistry {
             drop_fn,
         });
         self.by_type.insert(type_id, id);
+        self.version += 1;
         id
     }
 
@@ -74,6 +84,7 @@ impl ComponentRegistry {
             layout,
             drop_fn: None,
         });
+        self.version += 1;
         id
     }
 

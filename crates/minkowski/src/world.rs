@@ -70,6 +70,9 @@ pub(crate) struct QueryCacheEntry {
     /// Checked on the next `query()` call to decide whether to commit
     /// `pending_read_tick`.
     iterated: Arc<AtomicBool>,
+    /// ComponentRegistry version when `required` was last computed.
+    /// Avoids recomputing the FixedBitSet on every query() call.
+    registry_version: u64,
 }
 
 /// Shared queue for entity IDs orphaned by aborted transactions.
@@ -735,6 +738,7 @@ impl World {
                 last_read_tick: Tick::default(),
                 pending_read_tick: None,
                 iterated: Arc::new(AtomicBool::new(false)),
+                registry_version: self.components.version(),
             });
 
         // Commit deferred tick from previous iterator, if it was iterated.
@@ -749,14 +753,19 @@ impl World {
             entry.pending_read_tick = None;
         }
 
-        // Refresh required bitset in case new components were registered since
-        // the cache entry was created. If the bitset changed, rescan from scratch.
-        let fresh_required = Q::required_ids(&self.components);
-        if fresh_required != entry.required {
-            entry.required = fresh_required;
-            entry.matched_ids.clear();
-            entry.last_archetype_count = 0;
-            entry.last_read_tick = Tick::default();
+        // Refresh required bitset if new components were registered since the
+        // cache entry was created. Version check avoids recomputing the FixedBitSet
+        // on every query() call — only recomputes when the registry actually grew.
+        let current_version = self.components.version();
+        if entry.registry_version != current_version {
+            let fresh_required = Q::required_ids(&self.components);
+            if fresh_required != entry.required {
+                entry.required = fresh_required;
+                entry.matched_ids.clear();
+                entry.last_archetype_count = 0;
+                entry.last_read_tick = Tick::default();
+            }
+            entry.registry_version = current_version;
         }
 
         // Incremental scan: only check archetypes added since last cache update
@@ -1305,14 +1314,19 @@ impl World {
                     last_read_tick: Tick::default(),
                     pending_read_tick: None,
                     iterated: Arc::new(AtomicBool::new(false)),
+                    registry_version: self.components.version(),
                 });
 
-            let fresh_required = Q::required_ids(&self.components);
-            if fresh_required != entry.required {
-                entry.required = fresh_required;
-                entry.matched_ids.clear();
-                entry.last_archetype_count = 0;
-                entry.last_read_tick = Tick::default();
+            let current_version = self.components.version();
+            if entry.registry_version != current_version {
+                let fresh_required = Q::required_ids(&self.components);
+                if fresh_required != entry.required {
+                    entry.required = fresh_required;
+                    entry.matched_ids.clear();
+                    entry.last_archetype_count = 0;
+                    entry.last_read_tick = Tick::default();
+                }
+                entry.registry_version = current_version;
             }
 
             if entry.last_archetype_count < total {
