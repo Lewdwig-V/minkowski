@@ -108,6 +108,14 @@ impl PageHeader {
     }
 }
 
+/// Sentinel slot entry marking an invalidated record.
+/// Both offset and length are zero — no valid record can have offset 0
+/// because that falls within the page header.
+const INVALIDATED_SLOT: SlotEntry = SlotEntry {
+    offset: 0,
+    length: 0,
+};
+
 /// A single entry in the slot directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotEntry {
@@ -115,6 +123,13 @@ pub struct SlotEntry {
     pub offset: u16,
     /// Length of the record in bytes.
     pub length: u16,
+}
+
+impl SlotEntry {
+    /// Returns true if this slot has been invalidated.
+    fn is_invalidated(&self) -> bool {
+        *self == INVALIDATED_SLOT
+    }
 }
 
 impl SlotEntry {
@@ -213,12 +228,16 @@ impl SlottedPage {
     }
 
     /// Read a record by slot index. Returns `None` if the index is out of
-    /// range or the slot entry references data outside the page (corruption).
+    /// range, the slot has been invalidated, or the slot entry references
+    /// data outside the page (corruption).
     pub fn get(&self, slot_index: u16) -> Option<&[u8]> {
         if slot_index >= self.header.slot_count {
             return None;
         }
         let entry = self.slot_entry(slot_index)?;
+        if entry.is_invalidated() {
+            return None;
+        }
         let start = entry.offset as usize;
         let end = start + entry.length as usize;
         if end > self.page_size {
@@ -384,6 +403,117 @@ impl SlottedPage {
         &self.header
     }
 
+    /// Mark a slot as invalidated. Returns the number of record bytes freed,
+    /// or `None` if the slot index is out of range or already invalidated.
+    ///
+    /// Invalidation writes a sentinel `(offset=0, length=0)` into the slot
+    /// directory. The record data is not zeroed — it becomes reclaimable
+    /// after [`compact`]. The page checksum is **not** recomputed; callers
+    /// should [`seal`] the page again after invalidation if integrity
+    /// checking is needed.
+    pub fn invalidate(&mut self, slot_index: u16) -> Option<usize> {
+        if slot_index >= self.header.slot_count {
+            return None;
+        }
+        let entry = self.slot_entry(slot_index)?;
+        if entry.is_invalidated() {
+            return None;
+        }
+        let freed = entry.length as usize;
+
+        // Overwrite the slot entry with the sentinel.
+        let pos = PAGE_HEADER_SIZE + (slot_index as usize) * SLOT_ENTRY_SIZE;
+        self.data[pos..pos + SLOT_ENTRY_SIZE].copy_from_slice(&INVALIDATED_SLOT.to_bytes());
+
+        Some(freed)
+    }
+
+    /// Returns true if the slot at `slot_index` has been invalidated.
+    /// Returns `false` for out-of-range indices (they were never valid).
+    pub fn is_slot_valid(&self, slot_index: u16) -> bool {
+        if slot_index >= self.header.slot_count {
+            return false;
+        }
+        match self.slot_entry(slot_index) {
+            Some(entry) => !entry.is_invalidated(),
+            None => false,
+        }
+    }
+
+    /// Bytes that [`compact`] would recover. This equals the space consumed
+    /// by invalidated slot directory entries plus the dead record data that
+    /// sits between the current `data_offset` and where it would be after
+    /// repacking only valid records.
+    pub fn reclaimable_space(&self) -> usize {
+        let mut invalidated_slots = 0usize;
+        let mut valid_data_bytes = 0usize;
+        for i in 0..self.header.slot_count {
+            if let Some(entry) = self.slot_entry(i) {
+                if entry.is_invalidated() {
+                    invalidated_slots += 1;
+                } else {
+                    valid_data_bytes += entry.length as usize;
+                }
+            }
+        }
+        let valid_slots = (self.header.slot_count as usize) - invalidated_slots;
+        // After compaction the page would use:
+        //   PAGE_HEADER_SIZE + valid_slots * SLOT_ENTRY_SIZE + valid_data_bytes
+        // Currently it uses:
+        //   PAGE_HEADER_SIZE + slot_count * SLOT_ENTRY_SIZE
+        //     + (page_size - data_offset)   [all record data, including dead]
+        let current_used = PAGE_HEADER_SIZE
+            + (self.header.slot_count as usize) * SLOT_ENTRY_SIZE
+            + (self.page_size - self.header.data_offset as usize);
+        let compacted_used = PAGE_HEADER_SIZE + valid_slots * SLOT_ENTRY_SIZE + valid_data_bytes;
+        current_used.saturating_sub(compacted_used)
+    }
+
+    /// Compact the page by removing invalidated slots and repacking valid
+    /// record data. Returns the number of free bytes recovered.
+    ///
+    /// After compaction, slot indices change — any external references to
+    /// slot indices within this page are invalidated. The page checksum is
+    /// **not** recomputed; callers should [`seal`] the page afterward.
+    pub fn compact(&mut self) -> usize {
+        let free_before = self.free_space();
+
+        // Collect valid records in slot order.
+        let mut valid: Vec<(u16, Vec<u8>)> = Vec::new(); // (original_index, data)
+        for i in 0..self.header.slot_count {
+            if let Some(entry) = self.slot_entry(i) {
+                if !entry.is_invalidated() {
+                    let start = entry.offset as usize;
+                    let end = start + entry.length as usize;
+                    if end <= self.page_size {
+                        valid.push((i, self.data[start..end].to_vec()));
+                    }
+                }
+            }
+        }
+
+        // Reset the page to empty (preserve page_seq and magic).
+        let page_seq = self.header.page_seq;
+        let magic = self.header.magic;
+        self.header.slot_count = 0;
+        self.header.free_offset = PAGE_HEADER_SIZE as u16;
+        self.header.data_offset = self.page_size as u16;
+        self.header.checksum = 0;
+        self.header.magic = magic;
+        self.header.page_seq = page_seq;
+        self.data.fill(0);
+        self.flush_header();
+
+        // Re-insert valid records.
+        for (_orig_idx, payload) in &valid {
+            self.try_insert(payload)
+                .expect("compaction: valid records must fit after removing invalidated ones");
+        }
+
+        let free_after = self.free_space();
+        free_after - free_before
+    }
+
     /// Read a slot entry at the given index. Returns `None` if the slot
     /// directory entry falls outside the page buffer (corrupt header).
     fn slot_entry(&self, index: u16) -> Option<SlotEntry> {
@@ -423,12 +553,16 @@ impl<'a> Iterator for SlotIter<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.page.header.slot_count {
-            return None;
+        // Skip invalidated slots.
+        while self.index < self.page.header.slot_count {
+            let idx = self.index;
+            self.index += 1;
+            if let Some(data) = self.page.get(idx) {
+                return Some(data);
+            }
+            // get() returns None for invalidated or corrupt slots — skip them.
         }
-        let data = self.page.get(self.index)?;
-        self.index += 1;
-        Some(data)
+        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -442,8 +576,9 @@ impl<'a> Iterator for SlotIter<'a> {
 ///
 /// This is an in-memory structure rebuilt on open by scanning page headers.
 /// For append-only WAL usage, only the current active page typically has
-/// free space. For future compaction scenarios, sealed pages with
-/// invalidated records could be added back to the availability list.
+/// free space. After compaction, sealed pages with invalidated records are
+/// added back to the availability list for reuse via
+/// [`AvailabilityList::reclaim_sealed`].
 pub struct AvailabilityList {
     /// Page indices with free space, sorted by available bytes descending
     /// for best-fit allocation.
@@ -507,6 +642,23 @@ impl AvailabilityList {
     /// Returns true if the availability list is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Compact a sealed page that has invalidated records and add it to the
+    /// availability list if sufficient free space is recovered.
+    ///
+    /// Returns the number of bytes recovered by compaction, or 0 if the
+    /// page has no reclaimable space. The page is re-sealed after
+    /// compaction so that its checksum is valid.
+    pub fn reclaim_sealed(&mut self, page: &mut SlottedPage) -> usize {
+        if page.reclaimable_space() == 0 {
+            return 0;
+        }
+        let recovered = page.compact();
+        page.seal();
+        let free = page.free_space();
+        self.update(page.page_seq(), free);
+        recovered
     }
 
     /// Iterate over entries.
@@ -959,5 +1111,233 @@ mod tests {
             msg.contains("slot directory end") && msg.contains("free_offset"),
             "{msg}"
         );
+    }
+
+    // ── Invalidation & compaction tests ──────────────────────────────
+
+    #[test]
+    fn invalidate_single_slot() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"hello").unwrap();
+        page.try_insert(b"world").unwrap();
+
+        assert!(page.is_slot_valid(0));
+        assert!(page.is_slot_valid(1));
+
+        let freed = page.invalidate(0);
+        assert_eq!(freed, Some(5)); // "hello" = 5 bytes
+
+        assert!(!page.is_slot_valid(0));
+        assert!(page.is_slot_valid(1));
+        assert_eq!(page.get(0), None);
+        assert_eq!(page.get(1), Some(b"world".as_slice()));
+    }
+
+    #[test]
+    fn invalidate_out_of_range_returns_none() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"data").unwrap();
+        assert_eq!(page.invalidate(5), None);
+    }
+
+    #[test]
+    fn invalidate_already_invalidated_returns_none() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"data").unwrap();
+        assert_eq!(page.invalidate(0), Some(4));
+        assert_eq!(page.invalidate(0), None);
+    }
+
+    #[test]
+    fn iter_slots_skips_invalidated() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"aaa").unwrap();
+        page.try_insert(b"bbb").unwrap();
+        page.try_insert(b"ccc").unwrap();
+
+        page.invalidate(1); // invalidate "bbb"
+
+        let records: Vec<&[u8]> = page.iter_slots().collect();
+        assert_eq!(records, vec![b"aaa".as_slice(), b"ccc"]);
+    }
+
+    #[test]
+    fn reclaimable_space_zero_when_no_invalidation() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"hello").unwrap();
+        assert_eq!(page.reclaimable_space(), 0);
+    }
+
+    #[test]
+    fn reclaimable_space_after_invalidation() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"hello").unwrap(); // 5 bytes data + 4 bytes slot = 9
+        page.try_insert(b"world").unwrap(); // 5 bytes data + 4 bytes slot = 9
+
+        page.invalidate(0);
+        // Invalidating slot 0 should make 5 (data) + 4 (slot entry) = 9 bytes reclaimable.
+        assert_eq!(page.reclaimable_space(), SLOT_ENTRY_SIZE + 5);
+    }
+
+    #[test]
+    fn compact_recovers_space() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"alpha").unwrap();
+        page.try_insert(b"beta").unwrap();
+        page.try_insert(b"gamma").unwrap();
+
+        let free_before = page.free_space();
+        page.invalidate(1); // invalidate "beta"
+
+        let recovered = page.compact();
+        // Recovered = SLOT_ENTRY_SIZE (4) + "beta" (4) = 8 bytes
+        assert_eq!(recovered, SLOT_ENTRY_SIZE + 4);
+
+        let free_after = page.free_space();
+        assert_eq!(free_after, free_before + SLOT_ENTRY_SIZE + 4);
+
+        // Remaining records are intact (note: slot indices change after compact).
+        assert_eq!(page.slot_count(), 2);
+        assert_eq!(page.get(0), Some(b"alpha".as_slice()));
+        assert_eq!(page.get(1), Some(b"gamma".as_slice()));
+    }
+
+    #[test]
+    fn compact_all_invalidated() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"one").unwrap();
+        page.try_insert(b"two").unwrap();
+        page.invalidate(0);
+        page.invalidate(1);
+
+        page.compact();
+        assert_eq!(page.slot_count(), 0);
+        assert_eq!(page.free_space(), DEFAULT_PAGE_SIZE - PAGE_HEADER_SIZE);
+    }
+
+    #[test]
+    fn compact_no_invalidation_is_noop() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"keep").unwrap();
+        let free_before = page.free_space();
+
+        let recovered = page.compact();
+        assert_eq!(recovered, 0);
+        assert_eq!(page.free_space(), free_before);
+        assert_eq!(page.get(0), Some(b"keep".as_slice()));
+    }
+
+    #[test]
+    fn compact_preserves_page_seq_and_magic() {
+        let mut page = SlottedPage::new(42, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"data").unwrap();
+        page.invalidate(0);
+        page.compact();
+
+        assert_eq!(page.page_seq(), 42);
+        assert_eq!(page.header().magic, PAGE_MAGIC);
+    }
+
+    #[test]
+    fn seal_after_compact_validates() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"keep").unwrap();
+        page.try_insert(b"drop").unwrap();
+        page.invalidate(1);
+        page.compact();
+        page.seal();
+        assert!(page.validate_checksum());
+    }
+
+    #[test]
+    fn reclaim_sealed_adds_to_availability() {
+        let mut page = SlottedPage::new(5, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"keep me").unwrap();
+        page.try_insert(b"remove me").unwrap();
+        page.seal();
+
+        page.invalidate(1);
+
+        let mut avail = AvailabilityList::new();
+        let recovered = avail.reclaim_sealed(&mut page);
+        assert!(recovered > 0);
+        assert!(page.validate_checksum(), "page should be re-sealed");
+
+        // The page should now be in the availability list.
+        assert_eq!(avail.len(), 1);
+        let fit = avail.find_fit(1);
+        assert_eq!(fit, Some(5));
+    }
+
+    #[test]
+    fn reclaim_sealed_noop_without_invalidation() {
+        let mut page = SlottedPage::new(3, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"data").unwrap();
+        page.seal();
+
+        let mut avail = AvailabilityList::new();
+        let recovered = avail.reclaim_sealed(&mut page);
+        assert_eq!(recovered, 0);
+        // Page should NOT be added to availability list (no new space).
+        // (It may or may not be added depending on existing free space.)
+    }
+
+    #[test]
+    fn compact_then_insert_reuses_space() {
+        let page_size = 128;
+        let mut page = SlottedPage::new(0, page_size);
+        // Fill most of the page.
+        page.try_insert(&[0xAA; 30]).unwrap();
+        page.try_insert(&[0xBB; 30]).unwrap();
+        page.try_insert(&[0xCC; 20]).unwrap();
+
+        // Can't fit another 30-byte record.
+        assert!(page.try_insert(&[0xDD; 30]).is_none());
+
+        // Invalidate the two 30-byte records.
+        page.invalidate(0);
+        page.invalidate(1);
+        page.compact();
+
+        // Now we should be able to fit a 30-byte record.
+        assert!(page.try_insert(&[0xDD; 30]).is_some());
+        assert_eq!(page.slot_count(), 2); // "CC" + "DD"
+    }
+
+    #[test]
+    fn is_slot_valid_out_of_range() {
+        let page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        assert!(!page.is_slot_valid(0));
+        assert!(!page.is_slot_valid(100));
+    }
+
+    #[test]
+    fn invalidate_all_then_iter_yields_nothing() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"a").unwrap();
+        page.try_insert(b"b").unwrap();
+        page.invalidate(0);
+        page.invalidate(1);
+        assert_eq!(page.iter_slots().count(), 0);
+    }
+
+    #[test]
+    fn write_read_roundtrip_with_invalidated_slots() {
+        let mut page = SlottedPage::new(0, DEFAULT_PAGE_SIZE);
+        page.try_insert(b"first").unwrap();
+        page.try_insert(b"second").unwrap();
+        page.try_insert(b"third").unwrap();
+        page.invalidate(1);
+        page.seal();
+
+        let mut buf = Vec::new();
+        page.write_to(&mut buf).unwrap();
+        let restored = SlottedPage::read_from(&mut buf.as_slice(), DEFAULT_PAGE_SIZE).unwrap();
+
+        assert_eq!(restored.slot_count(), 3);
+        assert_eq!(restored.get(0), Some(b"first".as_slice()));
+        assert_eq!(restored.get(1), None); // invalidated
+        assert_eq!(restored.get(2), Some(b"third".as_slice()));
+        assert!(restored.validate_checksum());
     }
 }
