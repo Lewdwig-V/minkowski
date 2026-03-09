@@ -64,15 +64,21 @@ impl Arena {
         let new_layout =
             Layout::from_size_align(new_capacity, ARENA_ALIGN).expect("invalid arena layout");
 
-        let new_ptr = if self.capacity == 0 {
-            unsafe { alloc::alloc(new_layout) }
-        } else {
-            let old_layout =
-                Layout::from_size_align(self.capacity, ARENA_ALIGN).expect("invalid arena layout");
-            unsafe { alloc::realloc(self.data.as_ptr(), old_layout, new_capacity) }
-        };
-
-        self.data = NonNull::new(new_ptr).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
+        // Always use alloc + copy + dealloc instead of realloc.
+        // realloc may not preserve alignment > max_align_t (typically 16 bytes).
+        // Same reasoning as BlobVec::grow — alignment guarantees are non-negotiable.
+        let new_ptr = unsafe { alloc::alloc(new_layout) };
+        let new_data =
+            NonNull::new(new_ptr).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
+        if self.capacity > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data.as_ptr(), new_data.as_ptr(), self.len);
+                let old_layout =
+                    Layout::from_size_align(self.capacity, ARENA_ALIGN).unwrap();
+                alloc::dealloc(self.data.as_ptr(), old_layout);
+            }
+        }
+        self.data = new_data;
         self.capacity = new_capacity;
     }
 }

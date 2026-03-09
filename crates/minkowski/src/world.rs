@@ -355,6 +355,12 @@ impl World {
 
         let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
         let row = location.row;
+        debug_assert!(
+            row < archetype.len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            row,
+            archetype.len()
+        );
 
         for col in &mut archetype.columns {
             unsafe {
@@ -550,6 +556,12 @@ impl World {
 
         let tick = self.next_tick();
         let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
+        debug_assert!(
+            location.row < archetype.len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            location.row,
+            archetype.len()
+        );
         let col_idx = archetype.column_index(comp_id)?;
         unsafe {
             let ptr = archetype.columns[col_idx].get_ptr_mut(location.row, tick) as *mut T;
@@ -908,6 +920,12 @@ impl World {
         assert!(self.is_alive(entity), "entity is not alive");
         let index = entity.index() as usize;
         let location = self.entity_locations[index].unwrap();
+        debug_assert!(
+            location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            location.row,
+            self.archetypes.archetypes[location.archetype_id.0].len()
+        );
         let new_ids = B::component_ids(&mut self.components);
 
         let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
@@ -1042,6 +1060,12 @@ impl World {
         }
         let index = entity.index() as usize;
         let location = self.entity_locations[index]?;
+        debug_assert!(
+            location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            location.row,
+            self.archetypes.archetypes[location.archetype_id.0].len()
+        );
         let comp_id = self.components.id::<T>()?;
 
         let src_arch = &self.archetypes.archetypes[location.archetype_id.0];

@@ -233,6 +233,13 @@ impl BlobVec {
         if self.item_layout.size() == 0 {
             NonNull::dangling().as_ptr()
         } else {
+            // <= because push() writes at index == len (within allocated capacity).
+            // Read-path callers (get_ptr, get_ptr_mut) have their own index < len checks.
+            debug_assert!(
+                index <= self.len,
+                "BlobVec::ptr_at out of bounds: index {index}, len {}",
+                self.len
+            );
             unsafe { self.data.as_ptr().add(index * self.item_layout.size()) }
         }
     }

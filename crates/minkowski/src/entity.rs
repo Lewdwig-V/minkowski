@@ -89,6 +89,10 @@ impl EntityAllocator {
     #[allow(dead_code)]
     pub fn reserve(&self) -> Entity {
         let index = self.next_reserved.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            index < u32::MAX,
+            "entity index space exhausted: reserve() wrapped past u32::MAX"
+        );
         Entity::new(index, 0)
     }
 
