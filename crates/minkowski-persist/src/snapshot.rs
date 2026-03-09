@@ -444,15 +444,14 @@ impl Snapshot {
         // poisoning the entity lifecycle.
         for arch_idx in 0..world.archetype_count() {
             for &entity in world.archetype_entities(arch_idx) {
-                assert!(
-                    world.is_alive(entity),
-                    "snapshot corruption: entity {:?} (index={}, gen={}) is in an archetype \
-                     but the allocator has a different generation — the snapshot's allocator \
-                     state is inconsistent with its archetype data",
-                    entity,
-                    entity.index(),
-                    entity.generation(),
-                );
+                if !world.is_alive(entity) {
+                    return Err(SnapshotError::Format(format!(
+                        "snapshot corruption: entity (index={}, gen={}) is in an archetype \
+                         but the allocator has a different generation",
+                        entity.index(),
+                        entity.generation(),
+                    )));
+                }
             }
         }
 
@@ -1063,31 +1062,57 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "snapshot corruption")]
-    fn snapshot_generation_mismatch_panics() {
-        // Simulate a corrupt snapshot: allocator generations disagree with
-        // archetype entity data. This exercises the same validation that
-        // restore_world performs after restore_allocator_state.
-        let mut w = World::new();
-        w.register_component::<Pos>();
-        w.spawn((Pos { x: 1.0, y: 2.0 },)); // entity(index=0, gen=0)
+    fn snapshot_generation_mismatch_returns_error() {
+        // Construct a snapshot where the allocator generation for entity 0 is
+        // 99, but the archetype data contains entity(0, gen=0). This simulates
+        // a corrupt or bit-rotted snapshot file. load_from_bytes must return
+        // Err(SnapshotError::Format), not panic.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        world.spawn((Pos { x: 1.0, y: 2.0 },)); // entity(index=0, gen=0)
 
-        // Overwrite allocator: gen[0] = 99, but archetype still has entity(0, gen=0).
-        w.restore_allocator_state(vec![99], vec![]);
+        let snap = Snapshot::new();
+        let (_, bytes) = snap.save_to_bytes(&world, &codecs, 0).unwrap();
 
-        // Walk archetypes and assert is_alive — mirrors restore_world's check.
-        for arch_idx in 0..w.archetype_count() {
-            for &entity in w.archetype_entities(arch_idx) {
-                assert!(
-                    w.is_alive(entity),
-                    "snapshot corruption: entity {:?} (index={}, gen={}) is in an archetype \
-                     but the allocator has a different generation — the snapshot's allocator \
-                     state is inconsistent with its archetype data",
-                    entity,
-                    entity.index(),
-                    entity.generation(),
-                );
+        // The rkyv payload contains the allocator's generations vec. The
+        // generation for index 0 is 0u32 LE = [0x00, 0x00, 0x00, 0x00].
+        // Corrupt it by flipping generation bytes in the payload, then
+        // recompute the CRC so the checksum passes.
+        // Find the generation value (0u32) in the allocator section.
+        // The allocator data is near the end of the payload. Search backwards
+        // for a 4-byte zero run that, when changed, causes a generation mismatch.
+        let mut tampered = bytes.clone();
+        let payload_start = SNAPSHOT_HEADER_SIZE;
+        let payload_len = tampered.len() - payload_start;
+
+        // Try corrupting 4-byte aligned positions from the end of the payload.
+        // One of them will be the allocator's generation for index 0.
+        let mut found_corruption = false;
+        for offset in (0..payload_len.saturating_sub(3)).rev() {
+            let abs = payload_start + offset;
+            if tampered[abs..abs + 4] == [0, 0, 0, 0] {
+                // Flip to gen=99 and recompute CRC.
+                tampered[abs] = 99;
+                let new_crc = crc32fast::hash(&tampered[payload_start..]);
+                tampered[8..12].copy_from_slice(&new_crc.to_le_bytes());
+
+                let result = snap.load_from_bytes(&tampered, &codecs);
+                if let Err(e) = result {
+                    let msg = format!("{e}");
+                    if msg.contains("snapshot corruption") {
+                        found_corruption = true;
+                        break;
+                    }
+                }
+                // Restore and try next position.
+                tampered[abs] = 0;
             }
         }
+
+        assert!(
+            found_corruption,
+            "failed to trigger generation mismatch by corrupting payload bytes"
+        );
     }
 }

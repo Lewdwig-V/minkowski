@@ -36,7 +36,7 @@ Snapshot files use the same CRC32 over the rkyv payload, stored in the v2 envelo
 
 Segment files use a 4-byte magic (`"MKW2"`) to distinguish v2 format from legacy v1 (no checksums). Legacy segments produce a hard error with a migration message — they are never silently reinterpreted.
 
-After snapshot restore, an entity generation consistency check validates that every entity in every archetype has a generation matching the restored allocator state. A corrupt snapshot where allocator generations diverge from archetype data would silently poison `is_alive()` — this assert catches it at load time.
+After snapshot restore, an entity generation consistency check validates that every entity in every archetype has a generation matching the restored allocator state. A corrupt snapshot where allocator generations diverge from archetype data would silently poison `is_alive()` — this returns `SnapshotError::Format` at load time, consistent with all other corruption detection in the snapshot path.
 ## Alternatives Considered
 
 - Full-world serialization per write — O(n) cost per mutation, unacceptable for large worlds
