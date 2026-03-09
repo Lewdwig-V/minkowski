@@ -1114,8 +1114,9 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
 ///
 /// Uses the full [`World::query`] path with tick management and filter
 /// support (including `Changed<T>`). The [`ReadOnlyWorldQuery`] bound
-/// guarantees no `&mut T` access through the query. Provides [`for_each`](QueryRef::for_each)
-/// and [`count`](QueryRef::count). For read-write iteration, see [`QueryMut`].
+/// guarantees no `&mut T` access through the query. Provides [`for_each`](QueryRef::for_each),
+/// [`for_each_chunk`](QueryRef::for_each_chunk), and [`count`](QueryRef::count).
+/// For read-write iteration, see [`QueryMut`].
 ///
 /// Registered via [`ReducerRegistry::register_query_ref`], dispatched
 /// via [`ReducerRegistry::run`].
@@ -1140,6 +1141,15 @@ impl<'a, Q: ReadOnlyWorldQuery + 'static> QueryRef<'a, Q> {
     /// world state but is not a stability guarantee.
     pub fn for_each(&mut self, f: impl FnMut(Q::Item<'_>)) {
         self.world.query::<Q>().for_each(f);
+    }
+
+    /// Iterate matching entities in contiguous typed slices per archetype.
+    ///
+    /// Same iteration order guarantees as [`for_each`](Self::for_each).
+    /// Yields typed slices that LLVM can auto-vectorize — prefer this over
+    /// `for_each` for numeric/math workloads.
+    pub fn for_each_chunk(&mut self, f: impl FnMut(Q::Slice<'_>)) {
+        self.world.query::<Q>().for_each_chunk(f);
     }
 
     pub fn count(&mut self) -> usize {

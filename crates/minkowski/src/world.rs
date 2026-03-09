@@ -807,6 +807,9 @@ impl World {
         let iterated_flag = if let Some(entry) = self.query_cache.get_mut(&type_id) {
             entry.pending_read_tick = Some(read_tick);
             entry.matched_ids = matched_ids;
+            // PERF: Arc::clone is one atomic increment per query() call.
+            // Could use raw pointer since &mut self guarantees single-threaded,
+            // but correctness-first — the atomic cost is negligible vs archetype scan.
             entry.iterated.clone()
         } else {
             unreachable!("cache entry was just inserted")
@@ -1248,26 +1251,29 @@ impl World {
     #[inline]
     pub fn has_changed<Q: WorldQuery + 'static>(&self) -> bool {
         let type_id = TypeId::of::<Q>();
-        let last_read_tick = match self.query_cache.get(&type_id) {
-            Some(entry) => {
-                // If the previous iterator was iterated, the pending tick
-                // represents the most recent baseline (not yet committed to
-                // last_read_tick — that happens on the next query() call).
-                // Use it so has_changed doesn't report stale true results.
-                if entry.iterated.load(Ordering::Relaxed) {
-                    entry.pending_read_tick.unwrap_or(entry.last_read_tick)
-                } else {
-                    entry.last_read_tick
-                }
-            }
+        let entry = match self.query_cache.get(&type_id) {
+            Some(entry) => entry,
             // No cache entry means never queried — first query will see everything.
             None => return false,
         };
-        let required = Q::required_ids(&self.components);
-        self.archetypes.archetypes.iter().any(|arch| {
-            !arch.is_empty()
-                && required.is_subset(&arch.component_ids)
-                && Q::matches_filters(arch, &self.components, last_read_tick)
+
+        // If the previous iterator was iterated, the pending tick
+        // represents the most recent baseline (not yet committed to
+        // last_read_tick — that happens on the next query() call).
+        // Use it so has_changed doesn't report stale true results.
+        let last_read_tick = if entry.iterated.load(Ordering::Relaxed) {
+            entry.pending_read_tick.unwrap_or(entry.last_read_tick)
+        } else {
+            entry.last_read_tick
+        };
+
+        // Use cached matched_ids to skip non-matching archetypes.
+        // Archetypes added after the last query() call are not in the cache,
+        // but they will be picked up on the next query() call. This is
+        // consistent with has_changed requiring a prior query() for baseline.
+        entry.matched_ids.iter().any(|arch_id| {
+            let arch = &self.archetypes.archetypes[arch_id.0];
+            !arch.is_empty() && Q::matches_filters(arch, &self.components, last_read_tick)
         })
     }
 

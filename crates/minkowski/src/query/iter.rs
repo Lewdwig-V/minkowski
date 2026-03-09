@@ -17,11 +17,11 @@ pub struct QueryIter<'w, Q: WorldQuery> {
     fetches: Vec<(Q::Fetch<'w>, usize)>, // (fetch_state, archetype_len)
     current_arch: usize,
     current_row: usize,
+    /// Whether we've already set the iterated flag (avoids repeated atomics).
+    marked: bool,
     /// Shared flag set on first iteration. `None` for iterators created
     /// without tick tracking (e.g., via `query_raw`).
     iterated: Option<Arc<AtomicBool>>,
-    /// Whether we've already set the iterated flag (avoids repeated atomics).
-    marked: bool,
     _marker: PhantomData<&'w Q>,
 }
 
