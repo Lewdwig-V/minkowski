@@ -324,6 +324,16 @@ impl SlottedPage {
                 ),
             ));
         }
+        if slot_dir_end > header.free_offset as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt page header: slot directory end ({slot_dir_end}) \
+                     exceeds free_offset ({})",
+                    header.free_offset
+                ),
+            ));
+        }
         if (header.free_offset as usize) < PAGE_HEADER_SIZE
             || (header.free_offset as usize) > page_size
         {
@@ -923,5 +933,31 @@ mod tests {
         page.seal();
         let result = SlottedPage::read_from(&mut page.data.as_slice(), page_size);
         assert!(result.is_ok(), "overflow magic should be accepted");
+    }
+
+    #[test]
+    fn read_from_slot_dir_exceeds_free_offset_errors() {
+        let page_size = 64;
+        let mut data = vec![0u8; page_size];
+        // Claim 5 slots: slot_dir_end = 20 + 5*4 = 40.
+        // Set free_offset = 24 (< 40), so the slot directory overruns free space.
+        let header = PageHeader {
+            magic: PAGE_MAGIC,
+            page_seq: 0,
+            slot_count: 5,
+            free_offset: 24,
+            data_offset: page_size as u16,
+            _padding: 0,
+            checksum: 0,
+        };
+        data[0..PAGE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+
+        let result = SlottedPage::read_from(&mut data.as_slice(), page_size);
+        assert!(result.is_err());
+        let msg = result.err().expect("should be Err").to_string();
+        assert!(
+            msg.contains("slot directory end") && msg.contains("free_offset"),
+            "{msg}"
+        );
     }
 }
