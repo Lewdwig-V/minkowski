@@ -71,6 +71,27 @@ impl Archetype {
     pub fn is_empty(&self) -> bool {
         self.entities.is_empty()
     }
+
+    /// Assert that every column has exactly as many rows as `entities.len()`.
+    /// Zero-cost in release builds — fires only under `debug_assertions`.
+    #[inline]
+    pub fn debug_assert_consistent(&self) {
+        if cfg!(debug_assertions) {
+            let entity_len = self.entities.len();
+            for (i, col) in self.columns.iter().enumerate() {
+                debug_assert_eq!(
+                    col.len(),
+                    entity_len,
+                    "archetype {:?} column {} has {} rows but entities has {} — \
+                     column/entity count mismatch after structural mutation",
+                    self.id,
+                    i,
+                    col.len(),
+                    entity_len,
+                );
+            }
+        }
+    }
 }
 
 /// Collection of archetypes with lookup by component set.

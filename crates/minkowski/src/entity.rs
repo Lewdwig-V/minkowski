@@ -136,7 +136,11 @@ impl EntityAllocator {
     pub fn dealloc(&mut self, entity: Entity) -> bool {
         let idx = entity.index() as usize;
         if idx < self.generations.len() && self.generations[idx] == entity.generation() {
-            self.generations[idx] = self.generations[idx].wrapping_add(1);
+            let next_gen = self.generations[idx].checked_add(1).expect(
+                "entity generation overflow: slot has been recycled 2^32 times. \
+                 This is a robustness limit — the slot can no longer be safely reused.",
+            );
+            self.generations[idx] = next_gen;
             self.free_list.push(entity.index());
             self.total_despawns += 1;
             true

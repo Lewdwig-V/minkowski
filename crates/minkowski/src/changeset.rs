@@ -51,6 +51,11 @@ impl Arena {
 
     /// Get a raw pointer to data at the given offset.
     pub fn get(&self, offset: usize) -> *const u8 {
+        debug_assert!(
+            offset <= self.len,
+            "arena read at offset {offset} exceeds arena length {}",
+            self.len
+        );
         unsafe { self.data.as_ptr().add(offset) }
     }
 

@@ -333,6 +333,7 @@ impl World {
         }
         let row = archetype.entities.len();
         archetype.entities.push(entity);
+        archetype.debug_assert_consistent();
 
         self.entity_locations[index] = Some(EntityLocation {
             archetype_id: arch_id,
@@ -1028,6 +1029,10 @@ impl World {
             archetype_id: target_arch_id,
             row: target_row,
         });
+
+        // Verify column/entity invariant after migration.
+        src_arch.debug_assert_consistent();
+        target_arch.debug_assert_consistent();
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
@@ -1085,6 +1090,7 @@ impl World {
                     row: src_row,
                 });
             }
+            arch.debug_assert_consistent();
             let empty_arch_id = self.archetypes.get_or_create(&[], &self.components);
             let empty_arch = &mut self.archetypes.archetypes[empty_arch_id.0];
             empty_arch.entities.push(entity);
@@ -1135,6 +1141,10 @@ impl World {
             archetype_id: target_arch_id,
             row: target_row,
         });
+
+        // Verify column/entity invariant after migration.
+        src_arch.debug_assert_consistent();
+        target_arch.debug_assert_consistent();
 
         Some(removed)
     }
