@@ -12,8 +12,9 @@ cargo test -p minkowski -- entity      # Run tests matching a filter
 cargo clippy --workspace --all-targets -- -D warnings   # Lint (strict, warnings are errors)
 cargo fmt --all                                          # Format
 
-cargo bench -p minkowski               # All criterion benchmarks (spawn, iterate, parallel, fragmented, add_remove, reducer)
-cargo bench -p minkowski -- spawn      # Single benchmark
+cargo bench -p minkowski-bench                      # All standardized benchmarks (simple_insert, simple_iter, fragmented_iter, heavy_compute, add_remove, schedule, serialize, reducer)
+cargo bench -p minkowski-bench -- simple_iter       # Single scenario
+cargo bench -p minkowski-bench -- simple_iter/par   # Sub-benchmark filter
 cargo bench -p minkowski-persist       # Persistence benchmarks (snapshot save/load/zero-copy, WAL append)
 
 cargo run -p minkowski-examples --example boids --release   # Boids flocking with query reducers + spatial grid (5K entities, 1K frames)
@@ -230,5 +231,5 @@ The corollary is that forging an ID — constructing one from a raw integer with
 | `memmap2` (persist) | Memory-mapped file I/O for zero-copy snapshot loading |
 | `thiserror` (persist) | Derive macros for `std::error::Error` impls |
 | `criterion` (dev) | Benchmark harness |
-| `hecs` (dev) | Benchmark comparison target |
+| `tempfile` (dev, bench) | Temporary directories for serialize benchmarks |
 | `fastrand` (examples) | Example RNG |

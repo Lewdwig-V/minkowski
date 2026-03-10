@@ -12,31 +12,3 @@ parking_lot = "0.12"
 rayon = "1"
 minkowski-derive = { path = "../minkowski-derive" }
 loom = { version = "0.7", optional = true }
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-hecs = "0.10"
-
-[[bench]]
-name = "spawn"
-harness = false
-
-[[bench]]
-name = "iterate"
-harness = false
-
-[[bench]]
-name = "parallel"
-harness = false
-
-[[bench]]
-name = "add_remove"
-harness = false
-
-[[bench]]
-name = "fragmented"
-harness = false
-
-[[bench]]
-name = "reducer"
-harness = false
