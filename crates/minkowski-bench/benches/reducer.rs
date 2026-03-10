@@ -1,16 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use minkowski::{DynamicCtx, Optimistic, QueryMut, QueryWriter, ReducerRegistry, World};
-
-#[derive(Clone, Copy)]
-struct Position {
-    x: f32,
-    y: f32,
-}
-#[derive(Clone, Copy)]
-struct Velocity {
-    dx: f32,
-    dy: f32,
-}
+use minkowski_bench::{Position, Velocity};
 
 fn setup_world() -> World {
     let mut world = World::new();
@@ -19,8 +9,13 @@ fn setup_world() -> World {
             Position {
                 x: i as f32,
                 y: 0.0,
+                z: 0.0,
             },
-            Velocity { dx: 1.0, dy: 0.0 },
+            Velocity {
+                dx: 1.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
         ));
     }
     world
@@ -38,12 +33,13 @@ fn bench_query_mut(c: &mut Criterion) {
                 query.for_each(|(pos, vel)| {
                     pos.x += vel.dx;
                     pos.y += vel.dy;
+                    pos.z += vel.dz;
                 });
             },
         )
         .unwrap();
 
-    c.bench_function("minkowski/query_mut_10k", |b| {
+    c.bench_function("reducer/query_mut_10k", |b| {
         b.iter(|| {
             registry.run(&mut world, id, ()).unwrap();
         });
@@ -64,13 +60,14 @@ fn bench_query_mut_chunk(c: &mut Criterion) {
                     for i in 0..positions.len() {
                         positions[i].x += velocities[i].dx;
                         positions[i].y += velocities[i].dy;
+                        positions[i].z += velocities[i].dz;
                     }
                 });
             },
         )
         .unwrap();
 
-    c.bench_function("minkowski/query_mut_chunk_10k", |b| {
+    c.bench_function("reducer/query_mut_chunk_10k", |b| {
         b.iter(|| {
             registry.run(&mut world, id, ()).unwrap();
         });
@@ -91,13 +88,14 @@ fn bench_query_writer(c: &mut Criterion) {
                     pos.modify(|p| {
                         p.x += vel.dx;
                         p.y += vel.dy;
+                        p.z += vel.dz;
                     });
                 });
             },
         )
         .unwrap();
 
-    c.bench_function("minkowski/query_writer_10k", |b| {
+    c.bench_function("reducer/query_writer_10k", |b| {
         b.iter(|| {
             registry.call(&strategy, &mut world, id, ()).unwrap();
         });
@@ -121,6 +119,7 @@ fn bench_dynamic_for_each(c: &mut Criterion) {
                     Position {
                         x: pos.x + vel.dx,
                         y: pos.y + vel.dy,
+                        z: pos.z + vel.dz,
                     },
                 ));
             });
@@ -130,7 +129,7 @@ fn bench_dynamic_for_each(c: &mut Criterion) {
         })
         .unwrap();
 
-    c.bench_function("minkowski/dynamic_for_each_10k", |b| {
+    c.bench_function("reducer/dynamic_for_each_10k", |b| {
         b.iter(|| {
             registry
                 .dynamic_call(&strategy, &mut world, id, &())
@@ -158,6 +157,7 @@ fn bench_dynamic_for_each_chunk(c: &mut Criterion) {
                             Position {
                                 x: positions[i].x + velocities[i].dx,
                                 y: positions[i].y + velocities[i].dy,
+                                z: positions[i].z + velocities[i].dz,
                             },
                         ));
                     }
@@ -169,7 +169,7 @@ fn bench_dynamic_for_each_chunk(c: &mut Criterion) {
         })
         .unwrap();
 
-    c.bench_function("minkowski/dynamic_for_each_chunk_10k", |b| {
+    c.bench_function("reducer/dynamic_for_each_chunk_10k", |b| {
         b.iter(|| {
             registry
                 .dynamic_call(&strategy, &mut world, id, &())

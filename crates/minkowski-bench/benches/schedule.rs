@@ -63,7 +63,7 @@ fn schedule(c: &mut Criterion) {
             "sys_read_pos",
             |mut q: QueryRef<'_, (&Position,)>, _: ()| {
                 q.for_each(|(_pos,)| {
-                    // read-only iteration — no-op
+                    // pure read — measures iteration overhead without mutation cost
                 });
             },
         )
