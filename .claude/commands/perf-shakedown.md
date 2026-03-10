@@ -128,9 +128,9 @@ After all 4 agents complete, aggregate their reports into the output format belo
 
 ### Benchmark Coverage
 
-1. List all benchmark files: run `ls crates/minkowski/benches/`
+1. List all benchmark files: run `ls crates/minkowski-bench/benches/`
 2. For each `PERF-CRITICAL` finding, check if a benchmark covers that hot path. If not, suggest a targeted benchmark.
-3. Suggest specific `cargo bench -p minkowski -- <filter>` commands for existing benchmarks that cover affected paths.
+3. Suggest specific `cargo bench -p minkowski-bench -- <filter>` commands for existing benchmarks that cover affected paths. Also check `cargo bench -p minkowski-persist` for persistence-specific benchmarks.
 
 ### New Hot Path Discovery
 
@@ -138,7 +138,7 @@ After all 4 agents complete, aggregate their reports into the output format belo
 2. Flag these as "consider adding to the hot path list in `/perf-shakedown`".
 3. Suggest `cargo flamegraph` or `perf record` commands for examples that exercise the changed code. Reference examples:
    - `boids` — query reducers + spatial grid (5K entities)
-   - `life` — QueryMut + Table + undo/redo (64x64 grid)
+   - `life` — QueryMut + Table (64x64 grid)
    - `nbody` — Barnes-Hut + query reducers (2K entities)
    - `persist` — Durable QueryWriter + WAL + rkyv snapshots (100 entities, 3 archetypes)
    - `battle` — multi-threaded EntityMut reducers (500 entities)
