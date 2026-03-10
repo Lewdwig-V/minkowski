@@ -28,7 +28,7 @@ use minkowski::{Entity, QueryMut, QueryRef, ReducerRegistry, World};
 use std::time::Instant;
 
 fn read_voltage(world: &World, node: Entity) -> f64 {
-    world.get::<Voltage>(node).map(|v| v.0).unwrap_or(0.0)
+    world.get::<Voltage>(node).map_or(0.0, |v| v.0)
 }
 
 // ── Simulation parameters ────────────────────────────────────────────
@@ -400,10 +400,7 @@ fn main() {
                     continue;
                 }
 
-                let i_sum = world
-                    .get::<CurrentSum>(*entity)
-                    .map(|cs| cs.0)
-                    .unwrap_or(0.0);
+                let i_sum = world.get::<CurrentSum>(*entity).map_or(0.0, |cs| cs.0);
                 if let Some(v) = world.get_mut::<Voltage>(*entity) {
                     v.0 += i_sum / cap * DT;
                 }
@@ -531,6 +528,7 @@ fn main() {
 
 // ── ASCII waveform plotter ───────────────────────────────────────────
 
+#[allow(clippy::cast_possible_wrap)]
 fn print_ascii_waveform(waveform: &WaveformData, probe_idx: usize, window_secs: f64) {
     let total_time = *waveform.times.last().unwrap_or(&0.0);
     let start_time = (total_time - window_secs).max(0.0);
@@ -566,7 +564,7 @@ fn print_ascii_waveform(waveform: &WaveformData, probe_idx: usize, window_secs: 
     let zero_row = ((0.0 - v_min) / v_range * (height - 1) as f64) as i32;
     if (0..height as i32).contains(&zero_row) {
         let row = (height - 1) - zero_row as usize;
-        for col in grid[row].iter_mut() {
+        for col in &mut grid[row] {
             *col = '·';
         }
     }

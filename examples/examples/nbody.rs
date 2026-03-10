@@ -147,7 +147,7 @@ impl Rect {
     fn quadrant(&self, point: Vec2) -> usize {
         let mx = self.x + self.w * 0.5;
         let my = self.y + self.h * 0.5;
-        let east = if point.x >= mx { 1 } else { 0 };
+        let east = usize::from(point.x >= mx);
         let south = if point.y >= my { 2 } else { 0 };
         east | south
     }

@@ -159,7 +159,7 @@ impl PagedSparseSet {
     }
 
     /// Iterates over all (entity, value_ptr) pairs.
-    pub fn iter(&self, mut f: impl FnMut(Entity, *mut u8)) {
+    pub fn for_each(&self, mut f: impl FnMut(Entity, *mut u8)) {
         for (i, &entity) in self.dense_entities.iter().enumerate() {
             let ptr = unsafe { self.dense_values.get_ptr(i) };
             f(entity, ptr);
@@ -318,6 +318,7 @@ impl SparseStorage {
     }
 
     /// Typed read-only iteration over a sparse component's entries.
+    #[allow(clippy::iter_not_returning_iterator)]
     pub fn iter<T: Component>(
         &self,
         comp_id: ComponentId,
@@ -329,7 +330,7 @@ impl SparseStorage {
             "SparseStorage type mismatch for ComponentId {comp_id}"
         );
         let mut items = Vec::with_capacity(set.len());
-        set.iter(|entity, ptr| {
+        set.for_each(|entity, ptr| {
             items.push((entity, unsafe { &*(ptr as *const T) }));
         });
         Some(items.into_iter())
@@ -542,7 +543,7 @@ mod tests {
         }
 
         let mut collected = Vec::new();
-        set.iter(|entity, ptr| {
+        set.for_each(|entity, ptr| {
             let val = unsafe { read_ptr::<u32>(ptr) };
             collected.push((entity, val));
         });

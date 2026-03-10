@@ -95,6 +95,7 @@ pub struct WormMetabolismParams {
 // ── Registration ─────────────────────────────────────────────────────
 
 /// Register all built-in reducers. Returns a map of name -> QueryReducerId.
+#[allow(clippy::cast_possible_wrap)]
 pub fn register_all(
     registry: &mut ReducerRegistry,
     world: &mut World,
@@ -367,7 +368,7 @@ pub fn register_all(
                     }
 
                     let alive = cells[idx];
-                    let new_alive = matches!((alive, count), (true, 2) | (true, 3) | (false, 3));
+                    let new_alive = matches!((alive, count), (true, 2 | 3) | (false, 3));
                     new_states.push(new_alive);
                 }
 

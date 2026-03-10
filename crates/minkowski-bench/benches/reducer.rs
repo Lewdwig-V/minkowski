@@ -29,7 +29,7 @@ fn bench_query_mut(c: &mut Criterion) {
         .register_query::<(&mut Position, &Velocity), (), _>(
             &mut world,
             "integrate",
-            |mut query: QueryMut<'_, (&mut Position, &Velocity)>, _: ()| {
+            |mut query: QueryMut<'_, (&mut Position, &Velocity)>, (): ()| {
                 query.for_each(|(pos, vel)| {
                     pos.x += vel.dx;
                     pos.y += vel.dy;
@@ -55,7 +55,7 @@ fn bench_query_mut_chunk(c: &mut Criterion) {
         .register_query::<(&mut Position, &Velocity), (), _>(
             &mut world,
             "integrate_chunk",
-            |mut query: QueryMut<'_, (&mut Position, &Velocity)>, _: ()| {
+            |mut query: QueryMut<'_, (&mut Position, &Velocity)>, (): ()| {
                 query.for_each_chunk(|(positions, velocities)| {
                     for i in 0..positions.len() {
                         positions[i].x += velocities[i].dx;
@@ -83,7 +83,7 @@ fn bench_query_writer(c: &mut Criterion) {
         .register_query_writer::<(&mut Position, &Velocity), (), _>(
             &mut world,
             "integrate_writer",
-            |mut query: QueryWriter<'_, (&mut Position, &Velocity)>, _: ()| {
+            |mut query: QueryWriter<'_, (&mut Position, &Velocity)>, (): ()| {
                 query.for_each(|(mut pos, vel)| {
                     pos.modify(|p| {
                         p.x += vel.dx;

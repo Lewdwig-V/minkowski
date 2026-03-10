@@ -144,8 +144,8 @@ mod tests {
         // Verify snapshot file was created
         let snaps: Vec<_> = std::fs::read_dir(&snap_dir)
             .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|x| x == "snap").unwrap_or(false))
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "snap"))
             .collect();
         assert_eq!(snaps.len(), 1);
     }

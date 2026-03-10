@@ -107,7 +107,7 @@ impl PySpatialGrid {
     /// Number of entities in the grid (as of last `rebuild()`).
     #[getter]
     fn entity_count(&self) -> usize {
-        self.cells.values().map(|v| v.len()).sum()
+        self.cells.values().map(Vec::len).sum()
     }
 
     /// Cell size used for grid bucketing.

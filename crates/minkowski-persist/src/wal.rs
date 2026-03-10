@@ -713,7 +713,7 @@ impl Wal {
     fn read_next_entry(&mut self, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
         match read_next_frame(&self.active_file, pos) {
             Ok(Some(result)) => Ok(Some(result)),
-            Ok(None) | Err(WalError::Format(_)) | Err(WalError::ChecksumMismatch { .. }) => {
+            Ok(None) | Err(WalError::Format(_) | WalError::ChecksumMismatch { .. }) => {
                 self.active_file.set_len(pos)?;
                 Ok(None)
             }
@@ -870,14 +870,11 @@ impl WalCursor {
         }
 
         // Find segment containing from_seq: largest start_seq <= from_seq
-        let seg_idx = match segments.iter().rposition(|(start, _)| *start <= from_seq) {
-            Some(idx) => idx,
-            None => {
-                return Err(WalError::CursorBehind {
-                    requested: from_seq,
-                    oldest: segments[0].0,
-                });
-            }
+        let Some(seg_idx) = segments.iter().rposition(|(start, _)| *start <= from_seq) else {
+            return Err(WalError::CursorBehind {
+                requested: from_seq,
+                oldest: segments[0].0,
+            });
         };
 
         let (start_seq, seg_path) = &segments[seg_idx];

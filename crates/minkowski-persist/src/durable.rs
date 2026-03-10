@@ -108,7 +108,6 @@ impl<S: Transact> Transact for Durable<S> {
                 }
                 Err(conflict) => {
                     last_conflict = Some(conflict);
-                    continue;
                 }
             }
         }

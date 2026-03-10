@@ -91,7 +91,7 @@ fn apply_rules(states: &[bool], counts: &[u8]) -> Vec<(usize, bool)> {
         let alive = states[i];
         let n = counts[i];
         let new_alive = match (alive, n) {
-            (true, 2) | (true, 3) => true,
+            (true, 2 | 3) => true,
             (true, _) => false,
             (false, 3) => true,
             (false, _) => false,

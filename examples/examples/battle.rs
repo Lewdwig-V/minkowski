@@ -206,7 +206,7 @@ fn run_frame<S: Transact>(
 fn spawn_arena(world: &mut World, count: usize) {
     let per_team = count / 2;
     for i in 0..count {
-        let team = if i < per_team { 0u8 } else { 1u8 };
+        let team = u8::from(i >= per_team);
         world.spawn((Health(100), Team(team), Damage(0), Healing(0)));
     }
 }

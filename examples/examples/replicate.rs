@@ -40,7 +40,7 @@ enum WireMessage {
 
 /// Source side: owns the authoritative World and WAL.
 /// Sends snapshot + WAL batches over the channel.
-fn source_side(tx: mpsc::Sender<WireMessage>) {
+fn source_side(tx: &mpsc::Sender<WireMessage>) {
     let dir = std::env::temp_dir().join("minkowski-replicate-source");
     std::fs::create_dir_all(&dir).unwrap();
     let wal_dir = dir.join("source.wal");
@@ -118,7 +118,7 @@ fn source_side(tx: mpsc::Sender<WireMessage>) {
 
 /// Replica side: reconstructs World from bytes received over the channel.
 /// Has its own CodecRegistry — no shared state with source.
-fn replica_side(rx: mpsc::Receiver<WireMessage>) -> World {
+fn replica_side(rx: &mpsc::Receiver<WireMessage>) -> World {
     // Replica registers codecs independently (could be different order)
     let mut codecs = CodecRegistry::new();
     let mut tmp = World::new();
@@ -127,9 +127,8 @@ fn replica_side(rx: mpsc::Receiver<WireMessage>) -> World {
     drop(tmp);
 
     // Receive and load snapshot
-    let snap_bytes = match rx.recv().unwrap() {
-        WireMessage::Snapshot(bytes) => bytes,
-        _ => panic!("expected snapshot"),
+    let WireMessage::Snapshot(snap_bytes) = rx.recv().unwrap() else {
+        panic!("expected snapshot")
     };
     println!("[replica] Received snapshot: {} bytes", snap_bytes.len());
 
@@ -142,9 +141,8 @@ fn replica_side(rx: mpsc::Receiver<WireMessage>) -> World {
     );
 
     // Receive and apply WAL batch
-    let batch_bytes = match rx.recv().unwrap() {
-        WireMessage::WalBatch(bytes) => bytes,
-        _ => panic!("expected WAL batch"),
+    let WireMessage::WalBatch(batch_bytes) = rx.recv().unwrap() else {
+        panic!("expected WAL batch")
     };
     println!("[replica] Received WAL batch: {} bytes", batch_bytes.len());
 
@@ -164,8 +162,8 @@ fn main() {
     let (tx, rx) = mpsc::channel();
 
     // Run source and replica — channel is the "network"
-    source_side(tx);
-    let replica = replica_side(rx);
+    source_side(&tx);
+    let replica = replica_side(&rx);
 
     // Verify convergence
     println!("\n=== Convergence check ===");

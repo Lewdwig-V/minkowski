@@ -31,7 +31,7 @@ impl MetricsSnapshot {
     /// Pass `Some(&wal)` to include WAL stats, or `None` for World-only metrics.
     pub fn capture(world: &World, wal: Option<&Wal>) -> Self {
         let world_stats = world.stats();
-        let wal_stats = wal.map(|w| w.stats());
+        let wal_stats = wal.map(Wal::stats);
 
         let mut archetypes = Vec::with_capacity(world.archetype_count());
         for arch_idx in 0..world.archetype_count() {

@@ -118,7 +118,7 @@ impl<T: Component + Ord + Clone> BTreeIndex<T> {
     ///
     /// Returns an empty slice if no entities match.
     pub fn get(&self, value: &T) -> &[Entity] {
-        self.tree.get(value).map(|v| v.as_slice()).unwrap_or(&[])
+        self.tree.get(value).map_or(&[], Vec::as_slice)
     }
 
     /// Iterate over `(value, entities)` pairs whose keys fall within `range`.
@@ -165,7 +165,7 @@ impl<T: Component + Ord + Clone> BTreeIndex<T> {
         last_sync: ChangeTick,
     ) -> Self {
         debug_assert_eq!(
-            tree.values().map(|v| v.len()).sum::<usize>(),
+            tree.values().map(Vec::len).sum::<usize>(),
             reverse.len(),
             "BTreeIndex::from_raw_parts: forward/reverse map size mismatch"
         );
@@ -263,7 +263,7 @@ impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
     ///
     /// Returns an empty slice if no entities match.
     pub fn get(&self, value: &T) -> &[Entity] {
-        self.map.get(value).map(|v| v.as_slice()).unwrap_or(&[])
+        self.map.get(value).map_or(&[], Vec::as_slice)
     }
 
     /// Number of entities tracked by the index (including stale entries).
@@ -305,7 +305,7 @@ impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
         last_sync: ChangeTick,
     ) -> Self {
         debug_assert_eq!(
-            map.values().map(|v| v.len()).sum::<usize>(),
+            map.values().map(Vec::len).sum::<usize>(),
             reverse.len(),
             "HashIndex::from_raw_parts: forward/reverse map size mismatch"
         );

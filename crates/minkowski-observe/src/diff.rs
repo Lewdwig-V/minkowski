@@ -25,6 +25,7 @@ pub struct MetricsDiff {
 
 impl MetricsDiff {
     /// Compute deltas from two consecutive snapshots.
+    #[allow(clippy::cast_possible_wrap)] // delta computation requires signed subtraction
     pub fn compute(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Self {
         let elapsed = after
             .timestamp

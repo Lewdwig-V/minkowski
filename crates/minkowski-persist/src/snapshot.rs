@@ -57,7 +57,7 @@ impl Snapshot {
         codecs: &CodecRegistry,
         wal_seq: u64,
     ) -> Result<SnapshotHeader, SnapshotError> {
-        let data = self.build_snapshot_data(world, codecs, wal_seq)?;
+        let data = Self::build_snapshot_data(world, codecs, wal_seq)?;
         let header = SnapshotHeader {
             wal_seq,
             archetype_count: data.archetypes.len(),
@@ -107,7 +107,7 @@ impl Snapshot {
         codecs: &CodecRegistry,
         wal_seq: u64,
     ) -> Result<(SnapshotHeader, Vec<u8>), SnapshotError> {
-        let data = self.build_snapshot_data(world, codecs, wal_seq)?;
+        let data = Self::build_snapshot_data(world, codecs, wal_seq)?;
         let header = SnapshotHeader {
             wal_seq,
             archetype_count: data.archetypes.len(),
@@ -208,7 +208,7 @@ impl Snapshot {
         let archived = rkyv::access::<ArchivedSnapshotData, rkyv::rancor::Error>(payload)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
 
-        let world = self.restore_world(archived, codecs)?;
+        let world = Self::restore_world(archived, codecs)?;
         let wal_seq: u64 = archived.wal_seq.into();
         Ok((world, wal_seq))
     }
@@ -216,7 +216,6 @@ impl Snapshot {
     // ── Internal helpers ─────────────────────────────────────────────
 
     fn build_snapshot_data(
-        &self,
         world: &World,
         codecs: &CodecRegistry,
         wal_seq: u64,
@@ -227,20 +226,19 @@ impl Snapshot {
         // Use stable names from codecs when available; fall back to world names.
         let schema: Vec<ComponentSchema> = (0..world.component_count())
             .map(|id| {
-                let name = codecs
-                    .stable_name(id)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
+                let name = codecs.stable_name(id).map_or_else(
+                    || {
                         world
                             .component_name(id)
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| format!("__unnamed_{id}"))
-                    });
+                            .map_or_else(|| format!("__unnamed_{id}"), str::to_string)
+                    },
+                    str::to_string,
+                );
                 ComponentSchema {
                     id,
                     name,
-                    size: world.component_layout(id).map(|l| l.size()).unwrap_or(0),
-                    align: world.component_layout(id).map(|l| l.align()).unwrap_or(1),
+                    size: world.component_layout(id).map_or(0, |l| l.size()),
+                    align: world.component_layout(id).map_or(1, |l| l.align()),
                 }
             })
             .collect();
@@ -324,7 +322,6 @@ impl Snapshot {
     }
 
     fn restore_world(
-        &self,
         data: &ArchivedSnapshotData,
         codecs: &CodecRegistry,
     ) -> Result<World, SnapshotError> {

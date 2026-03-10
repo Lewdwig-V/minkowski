@@ -122,7 +122,7 @@ pub struct TableIter<'w> {
 unsafe impl Send for TableIter<'_> {}
 unsafe impl Sync for TableIter<'_> {}
 
-impl<'w> TableIter<'w> {
+impl TableIter<'_> {
     pub(crate) fn new(col_ptrs: Vec<(*mut u8, usize)>, len: usize) -> Self {
         Self {
             col_ptrs,
@@ -133,7 +133,7 @@ impl<'w> TableIter<'w> {
     }
 }
 
-impl<'w> Iterator for TableIter<'w> {
+impl Iterator for TableIter<'_> {
     /// Yields a Vec of raw pointers, one per field in field order, pointing to the current row.
     type Item = Vec<*mut u8>;
 

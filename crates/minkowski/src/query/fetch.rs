@@ -285,13 +285,11 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
         registry: &ComponentRegistry,
         last_read_tick: crate::tick::Tick,
     ) -> bool {
-        let comp_id = match registry.id::<T>() {
-            Some(id) => id,
-            None => return false,
+        let Some(comp_id) = registry.id::<T>() else {
+            return false;
         };
-        let col_idx = match archetype.column_index(comp_id) {
-            Some(idx) => idx,
-            None => return false,
+        let Some(col_idx) = archetype.column_index(comp_id) else {
+            return false;
         };
         archetype.columns[col_idx]
             .changed_tick

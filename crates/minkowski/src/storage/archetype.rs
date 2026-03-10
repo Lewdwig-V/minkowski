@@ -95,6 +95,7 @@ impl Archetype {
 }
 
 /// Collection of archetypes with lookup by component set.
+#[allow(clippy::struct_field_names)]
 pub(crate) struct Archetypes {
     pub archetypes: Vec<Archetype>,
     by_components: HashMap<Vec<ComponentId>, ArchetypeId>,
@@ -161,7 +162,7 @@ mod tests {
         let pos_id = reg.register::<Pos>();
         let vel_id = reg.register::<Vel>();
         let mut ids = vec![pos_id, vel_id];
-        ids.sort();
+        ids.sort_unstable();
         let arch = Archetype::new(ArchetypeId(0), &ids, &reg);
         assert!(arch.component_ids.contains(pos_id));
         assert!(arch.component_ids.contains(vel_id));
@@ -173,7 +174,7 @@ mod tests {
         let mut reg = setup_registry();
         let pos_id = reg.register::<Pos>();
         let mut ids = vec![pos_id];
-        ids.sort();
+        ids.sort_unstable();
         let mut arch = Archetype::new(ArchetypeId(0), &ids, &reg);
 
         let entity = Entity::new(0, 0);
@@ -202,7 +203,7 @@ mod tests {
         let mut archetypes = Archetypes::new();
 
         let mut ids = vec![pos_id, vel_id];
-        ids.sort();
+        ids.sort_unstable();
         let a1 = archetypes.get_or_create(&ids, &reg);
         let a2 = archetypes.get_or_create(&ids, &reg);
         assert_eq!(a1, a2); // idempotent

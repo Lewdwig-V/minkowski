@@ -257,8 +257,8 @@ impl PyWorld {
         })?;
 
         // Sort component names to produce a canonical key for dispatch
-        let mut names: Vec<&str> = components.split(',').map(|s| s.trim()).collect();
-        names.sort();
+        let mut names: Vec<&str> = components.split(',').map(str::trim).collect();
+        names.sort_unstable();
         let key = names.join(",");
 
         let entity = spawn_typed(&mut self.world, &key, kwargs)?;
@@ -299,8 +299,8 @@ impl PyWorld {
         let mut entities = Vec::with_capacity(n);
 
         // Sort component names for canonical key
-        let mut comp_names: Vec<&str> = components.split(',').map(|s| s.trim()).collect();
-        comp_names.sort();
+        let mut comp_names: Vec<&str> = components.split(',').map(str::trim).collect();
+        comp_names.sort_unstable();
         let key = comp_names.join(",");
 
         for i in 0..n {
@@ -323,8 +323,9 @@ impl PyWorld {
     /// Pass component names as positional args:
     ///   `world.query_arrow("Position", "Velocity")`
     #[pyo3(signature = (*component_names))]
+    #[allow(clippy::needless_pass_by_value)]
     fn query_arrow(&mut self, component_names: Vec<String>) -> PyResult<PyRecordBatch> {
-        let names: Vec<&str> = component_names.iter().map(|s| s.as_str()).collect();
+        let names: Vec<&str> = component_names.iter().map(String::as_str).collect();
         let batch = query_to_record_batch(&mut self.world, &self.schema_registry, &names)
             .map_err(PyValueError::new_err)?;
         Ok(PyRecordBatch::new(batch))
@@ -335,12 +336,13 @@ impl PyWorld {
     /// Pass component names as positional args:
     ///   `world.query("Position", "Velocity")`
     #[pyo3(signature = (*component_names))]
+    #[allow(clippy::needless_pass_by_value)]
     fn query<'py>(
         &mut self,
         py: Python<'py>,
         component_names: Vec<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let names: Vec<&str> = component_names.iter().map(|s| s.as_str()).collect();
+        let names: Vec<&str> = component_names.iter().map(String::as_str).collect();
         let batch = query_to_record_batch(&mut self.world, &self.schema_registry, &names)
             .map_err(PyValueError::new_err)?;
 
@@ -357,6 +359,7 @@ impl PyWorld {
     /// `entity_ids`: list of u64 entity bit-packed IDs
     /// `kwargs`: column_name -> list of values (e.g. pos_x=[1.0, 2.0])
     #[pyo3(signature = (component, entity_ids, **kwargs))]
+    #[allow(clippy::needless_pass_by_value)]
     fn write_column(
         &mut self,
         component: &str,

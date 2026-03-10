@@ -192,6 +192,7 @@ impl SpatialGrid {
         }
     }
 
+    #[allow(clippy::cast_possible_wrap)]
     fn neighbors(&self, pos: Vec2) -> impl Iterator<Item = &(Entity, Vec2, Vec2)> {
         let cx = ((pos.x / self.cell_size) as usize).min(self.grid_w - 1);
         let cy = ((pos.y / self.cell_size) as usize).min(self.grid_w - 1);

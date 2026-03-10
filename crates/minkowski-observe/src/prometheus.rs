@@ -139,6 +139,7 @@ impl PrometheusExporter {
     }
 
     /// Update all gauge values from a snapshot.
+    #[allow(clippy::cast_possible_wrap)] // prometheus-client requires i64 gauge values
     pub fn update(&self, snapshot: &MetricsSnapshot) {
         self.entity_count.set(snapshot.world.entity_count as i64);
         self.archetype_count
@@ -265,7 +266,7 @@ mod tests {
         let output = exporter.render();
 
         assert!(output.contains("minkowski_archetype_entity_count"));
-        assert!(output.contains("5"));
+        assert!(output.contains('5'));
     }
 
     #[test]

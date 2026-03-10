@@ -114,6 +114,7 @@ impl UnitGrid {
         }
     }
 
+    #[allow(clippy::cast_possible_wrap)]
     fn neighbors(&self, x: f32, y: f32, range: f32) -> Vec<(Entity, f32, f32, u8)> {
         let cells_needed = (range / self.cell_size).ceil() as i32;
         let cx = ((x / self.cell_size) as usize).min(self.grid_w.saturating_sub(1));
@@ -245,6 +246,7 @@ fn changeset_to_events(changeset: &EnumChangeSet, world: &World) -> Vec<Replicat
 }
 
 // -- Operator thread ----------------------------------------------------------
+#[allow(clippy::needless_pass_by_value)]
 fn operator_thread(
     name: &'static str,
     faction: u8,
@@ -348,8 +350,7 @@ fn operator_thread(
     if let Some(intel_id) = world.component_id::<IntelReport>() {
         let count = world
             .iter_sparse::<IntelReport>(intel_id)
-            .map(|iter| iter.count())
-            .unwrap_or(0);
+            .map_or(0, Iterator::count);
         println!("  [{}] intel reports on spotted enemies: {}", name, count);
     } else {
         println!("  [{}] no intel reports (component never registered)", name);
@@ -554,7 +555,7 @@ fn main() {
                     tx.write(world, hvt_entity, Health(new_hp));
                 }
             });
-            let hp_val = world.get::<Health>(hvt_entity).map(|h| h.0).unwrap_or(0);
+            let hp_val = world.get::<Health>(hvt_entity).map_or(0, |h| h.0);
             frame_changeset.insert::<Health>(&mut world, hvt_entity, Health(hp_val));
             println!(
                 "    attack: HVT {} (damage {}, hp now {})",
@@ -610,7 +611,7 @@ fn main() {
                         }
                     }) {
                         Ok(()) => {
-                            let hp_val = world.get::<Health>(tgt_entity).map(|h| h.0).unwrap_or(0);
+                            let hp_val = world.get::<Health>(tgt_entity).map_or(0, |h| h.0);
                             frame_changeset.insert::<Health>(
                                 &mut world,
                                 tgt_entity,
@@ -699,7 +700,7 @@ fn main() {
                 if let Some(h) = world.get_mut::<Health>(*target) {
                     h.0 = h.0.saturating_sub(*damage);
                 }
-                let hp_val = world.get::<Health>(*target).map(|h| h.0).unwrap_or(0);
+                let hp_val = world.get::<Health>(*target).map_or(0, |h| h.0);
                 frame_changeset.insert::<Health>(&mut world, *target, Health(hp_val));
             }
         }
@@ -832,8 +833,7 @@ fn main() {
         if let Some(intel_id) = world.component_id::<IntelReport>() {
             let intel_count = world
                 .iter_sparse::<IntelReport>(intel_id)
-                .map(|iter| iter.count())
-                .unwrap_or(0);
+                .map_or(0, Iterator::count);
             if intel_count > 0 {
                 println!("  [server] {} active intel reports (sparse)", intel_count);
             }

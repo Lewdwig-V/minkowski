@@ -3,8 +3,8 @@ name = "minkowski"
 version = "1.0.1"
 edition = "2021"
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+[lints]
+workspace = true
 
 [dependencies]
 fixedbitset = "0.5"

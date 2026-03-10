@@ -3,6 +3,9 @@ name = "minkowski-persist"
 version = "1.0.1"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 minkowski = { path = "../minkowski" }
 rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }

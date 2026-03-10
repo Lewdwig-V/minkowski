@@ -643,7 +643,6 @@ pub trait Transact {
                 Err(conflict) => {
                     last_conflict = Some(conflict);
                     drop(tx);
-                    continue;
                 }
             }
         }
@@ -743,7 +742,6 @@ impl Transact for Pessimistic {
                     last_conflict = Some(conflict);
                     drop(tx);
                     backoff(attempt);
-                    continue;
                 }
             }
         }

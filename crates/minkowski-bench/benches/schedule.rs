@@ -13,7 +13,7 @@ fn schedule(c: &mut Criterion) {
         .register_query::<(&mut Position,), (), _>(
             &mut world,
             "sys_pos",
-            |mut q: QueryMut<'_, (&mut Position,)>, _: ()| {
+            |mut q: QueryMut<'_, (&mut Position,)>, (): ()| {
                 q.for_each(|(pos,)| {
                     pos.x += 1.0;
                 });
@@ -25,7 +25,7 @@ fn schedule(c: &mut Criterion) {
         .register_query::<(&mut Velocity,), (), _>(
             &mut world,
             "sys_vel",
-            |mut q: QueryMut<'_, (&mut Velocity,)>, _: ()| {
+            |mut q: QueryMut<'_, (&mut Velocity,)>, (): ()| {
                 q.for_each(|(vel,)| {
                     vel.dx += 0.1;
                 });
@@ -37,7 +37,7 @@ fn schedule(c: &mut Criterion) {
         .register_query::<(&mut Rotation,), (), _>(
             &mut world,
             "sys_rot",
-            |mut q: QueryMut<'_, (&mut Rotation,)>, _: ()| {
+            |mut q: QueryMut<'_, (&mut Rotation,)>, (): ()| {
                 q.for_each(|(rot,)| {
                     rot.x += 0.01;
                 });
@@ -49,7 +49,7 @@ fn schedule(c: &mut Criterion) {
         .register_query::<(&mut Transform,), (), _>(
             &mut world,
             "sys_transform",
-            |mut q: QueryMut<'_, (&mut Transform,)>, _: ()| {
+            |mut q: QueryMut<'_, (&mut Transform,)>, (): ()| {
                 q.for_each(|(t,)| {
                     t.matrix[0][0] += 0.001;
                 });
@@ -61,7 +61,7 @@ fn schedule(c: &mut Criterion) {
         .register_query_ref::<(&Position,), (), _>(
             &mut world,
             "sys_read_pos",
-            |mut q: QueryRef<'_, (&Position,)>, _: ()| {
+            |mut q: QueryRef<'_, (&Position,)>, (): ()| {
                 q.for_each(|(_pos,)| {
                     // pure read — measures iteration overhead without mutation cost
                 });

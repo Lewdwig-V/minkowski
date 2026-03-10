@@ -1254,7 +1254,7 @@ impl DynamicReducerId {
 /// which would bypass the ChangeSet and break optimistic validation.
 pub(crate) struct TransactionalWorld<'a>(pub(crate) &'a mut World);
 
-impl<'a> TransactionalWorld<'a> {
+impl TransactionalWorld<'_> {
     /// Reborrow as `&World` for read-only access (entity reducers, spawners).
     pub(crate) fn as_ref(&self) -> &World {
         self.0
@@ -1267,7 +1267,7 @@ impl<'a> TransactionalWorld<'a> {
     }
 }
 
-impl<'a> std::ops::Deref for TransactionalWorld<'a> {
+impl std::ops::Deref for TransactionalWorld<'_> {
     type Target = World;
     fn deref(&self) -> &World {
         self.0
@@ -1998,7 +1998,7 @@ pub struct DynamicReducerBuilder<'a> {
     remove_ids: HashSet<TypeId>,
 }
 
-impl<'a> DynamicReducerBuilder<'a> {
+impl DynamicReducerBuilder<'_> {
     /// Declare that the closure may read component `T`.
     pub fn can_read<T: crate::component::Component>(mut self) -> Self {
         let comp_id = self.world.register_component::<T>();
@@ -2127,8 +2127,8 @@ mod tests {
         let resolved = DynamicResolved::new(
             entries,
             Access::empty(),
-            Default::default(),
-            Default::default(),
+            HashSet::default(),
+            HashSet::default(),
         );
         assert_eq!(resolved.lookup::<u32>(), Some(0));
         assert_eq!(resolved.lookup::<f64>(), Some(2));
@@ -2143,8 +2143,8 @@ mod tests {
         let resolved = DynamicResolved::new(
             entries,
             Access::empty(),
-            Default::default(),
-            Default::default(),
+            HashSet::default(),
+            HashSet::default(),
         );
         // After dedup, duplicate entries are collapsed
         assert_eq!(resolved.lookup::<u32>(), Some(0));
@@ -2155,7 +2155,7 @@ mod tests {
         use std::any::TypeId;
         let mut bundles = HashSet::new();
         bundles.insert(TypeId::of::<(Pos, Vel)>());
-        let resolved = DynamicResolved::new(vec![], Access::empty(), bundles, Default::default());
+        let resolved = DynamicResolved::new(vec![], Access::empty(), bundles, HashSet::default());
         assert!(resolved.has_spawn_bundle::<(Pos, Vel)>());
         assert!(!resolved.has_spawn_bundle::<(Health,)>());
     }
@@ -2173,7 +2173,7 @@ mod tests {
         let mut access = Access::empty();
         access.add_read(pos_id);
         let resolved =
-            DynamicResolved::new(entries, access, Default::default(), Default::default());
+            DynamicResolved::new(entries, access, HashSet::default(), HashSet::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -2203,7 +2203,7 @@ mod tests {
         access.add_read(pos_id);
         access.add_read(vel_id);
         let resolved =
-            DynamicResolved::new(entries, access, Default::default(), Default::default());
+            DynamicResolved::new(entries, access, HashSet::default(), HashSet::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -2232,7 +2232,7 @@ mod tests {
         let mut access = Access::empty();
         access.add_write(pos_id);
         let resolved =
-            DynamicResolved::new(entries, access, Default::default(), Default::default());
+            DynamicResolved::new(entries, access, HashSet::default(), HashSet::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -2267,8 +2267,8 @@ mod tests {
         let resolved = DynamicResolved::new(
             vec![],
             Access::empty(),
-            Default::default(),
-            Default::default(),
+            HashSet::default(),
+            HashSet::default(),
         );
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -2859,7 +2859,7 @@ mod tests {
         let mut access = Access::empty();
         access.add_read(pos_id); // read only, no write
         let resolved =
-            DynamicResolved::new(entries, access, Default::default(), Default::default());
+            DynamicResolved::new(entries, access, HashSet::default(), HashSet::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -2886,8 +2886,8 @@ mod tests {
         let resolved = DynamicResolved::new(
             vec![],
             Access::empty(),
-            Default::default(),
-            Default::default(),
+            HashSet::default(),
+            HashSet::default(),
         );
 
         let default_tick = Arc::new(AtomicU64::new(0));
@@ -3251,9 +3251,8 @@ mod tests {
         let result = strategy.transact(&mut world, &access_with_pos, |tx, world| {
             attempt += 1;
             let (changeset, allocated) = tx.reducer_parts();
-            let spawner = Spawner::<(Health,)>::new(changeset, allocated, world);
+            let _spawner = Spawner::<(Health,)>::new(changeset, allocated, world);
             // Spawner allocates via reserve() — entity tracked in allocated
-            let _spawned = spawner;
 
             if attempt == 1 {
                 // Mutate to force conflict
@@ -3299,7 +3298,7 @@ mod tests {
         access.add_write(comp_id);
         let entries = vec![(TypeId::of::<u32>(), comp_id)];
         let resolved =
-            DynamicResolved::new(entries, access, Default::default(), Default::default());
+            DynamicResolved::new(entries, access, HashSet::default(), HashSet::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -3332,7 +3331,7 @@ mod tests {
         access.add_write(f64_id);
         let entries = vec![(TypeId::of::<f64>(), f64_id)];
         let resolved =
-            DynamicResolved::new(entries, access, Default::default(), Default::default());
+            DynamicResolved::new(entries, access, HashSet::default(), HashSet::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -3408,8 +3407,8 @@ mod tests {
         let resolved = DynamicResolved::new(
             vec![],
             Access::empty(),
-            Default::default(),
-            Default::default(),
+            HashSet::default(),
+            HashSet::default(),
         );
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -3434,8 +3433,8 @@ mod tests {
         let resolved = DynamicResolved::new(
             vec![],
             Access::empty(),
-            Default::default(),
-            Default::default(),
+            HashSet::default(),
+            HashSet::default(),
         );
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -3984,7 +3983,7 @@ mod tests {
 
     #[test]
     fn reducer_registry_default() {
-        let _registry: ReducerRegistry = Default::default();
+        let _registry: ReducerRegistry = ReducerRegistry::default();
     }
 
     // ── ReducerError tests ──────────────────────────────────────────
@@ -4127,7 +4126,7 @@ mod tests {
         access.add_read(pos_id);
         access.add_write(vel_id);
         let resolved =
-            DynamicResolved::new(entries, access, Default::default(), Default::default());
+            DynamicResolved::new(entries, access, HashSet::default(), HashSet::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);
@@ -4164,7 +4163,7 @@ mod tests {
         access.add_read(pos_id);
         access.set_despawns();
         let resolved =
-            DynamicResolved::new(entries, access, Default::default(), Default::default());
+            DynamicResolved::new(entries, access, HashSet::default(), HashSet::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
         let default_queried = AtomicBool::new(false);

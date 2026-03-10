@@ -2,3 +2,59 @@
 resolver = "2"
 members = ["crates/minkowski", "crates/minkowski-derive", "crates/minkowski-persist", "crates/minkowski-observe", "crates/minkowski-py", "crates/minkowski-bench", "examples"]
 exclude = ["fuzz"]
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# --- Design decisions, not sloppiness ---
+# ECS types naturally repeat module names (entity::Entity, world::World, etc.)
+module_name_repetitions = "allow"
+# We intentionally use &self → owned returns (e.g., query methods returning iterators)
+must_use_candidate = "allow"
+# Many ECS internals require exact bit-level casts; truncation is intentional
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+# Unsafe ECS internals manipulate raw pointers — ref_as_ptr / borrow_as_ptr / ptr_cast_constness
+# are core to the column-storage design (BlobVec, archetype migration, raw column access)
+ptr_as_ptr = "allow"
+ref_as_ptr = "allow"
+borrow_as_ptr = "allow"
+ptr_cast_constness = "allow"
+# BlobVec stores *mut u8 with guaranteed 64-byte alignment; clippy can't see the alignment contract
+cast_ptr_alignment = "allow"
+# Bundle/WorldQuery macro-generated tuple impls legitimately need many arguments
+too_many_arguments = "allow"
+too_many_lines = "allow"
+# Doc comments reference type names like ComponentId — backticking every one is noise
+doc_markdown = "allow"
+# Doc comments on every pub item would be noisy — public API has module-level docs
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Wildcard imports in prelude-style re-exports and test modules are idiomatic
+wildcard_imports = "allow"
+# Explicit returns in unsafe blocks aid readability
+needless_return = "allow"
+# These are noisy without value in an ECS context
+similar_names = "allow"
+single_match_else = "allow"
+if_not_else = "allow"
+match_same_arms = "allow"
+uninlined_format_args = "allow"
+# Return self from builders — ECS handles are not builders
+return_self_not_must_use = "allow"
+# Many internal functions are public for derive macro codegen
+missing_docs_in_private_items = "allow"
+# Allow bool params — ECS operations often have flag-style params (despawn: bool)
+fn_params_excessive_bools = "allow"
+struct_excessive_bools = "allow"
+# Unreadable literal is too aggressive for hex/bit constants
+unreadable_literal = "allow"
+# Tests use exact float equality intentionally and single-char entity names (a, b, c)
+float_cmp = "allow"
+many_single_char_names = "allow"
+# Test modules interleave helper structs with test functions
+items_after_statements = "allow"

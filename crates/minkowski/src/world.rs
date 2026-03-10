@@ -221,9 +221,8 @@ impl World {
         since: crate::tick::ChangeTick,
     ) -> Vec<(Entity, T)> {
         self.drain_orphans();
-        let comp_id = match self.components.id::<T>() {
-            Some(id) => id,
-            None => return Vec::new(),
+        let Some(comp_id) = self.components.id::<T>() else {
+            return Vec::new();
         };
         debug_assert!(
             !self.components.is_sparse(comp_id),
@@ -234,9 +233,8 @@ impl World {
         let mut results = Vec::new();
 
         for arch in &self.archetypes.archetypes {
-            let col_idx = match arch.column_index(comp_id) {
-                Some(idx) => idx,
-                None => continue,
+            let Some(col_idx) = arch.column_index(comp_id) else {
+                continue;
             };
             if !arch.columns[col_idx].changed_tick.is_newer_than(since_tick) {
                 continue;
@@ -348,9 +346,8 @@ impl World {
             return false;
         }
         let index = entity.index() as usize;
-        let location = match self.entity_locations[index] {
-            Some(loc) => loc,
-            None => return false,
+        let Some(location) = self.entity_locations[index] else {
+            return false;
         };
 
         let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
@@ -410,9 +407,8 @@ impl World {
                 continue;
             }
             seen.insert(index);
-            let location = match self.entity_locations[index] {
-                Some(loc) => loc,
-                None => continue,
+            let Some(location) = self.entity_locations[index] else {
+                continue;
             };
             by_archetype
                 .entry(location.archetype_id.0)
@@ -490,13 +486,11 @@ impl World {
         if !self.entities.is_alive(entity) {
             return false;
         }
-        let location = match self.entity_locations[entity.index() as usize] {
-            Some(loc) => loc,
-            None => return false,
+        let Some(location) = self.entity_locations[entity.index() as usize] else {
+            return false;
         };
-        let comp_id = match self.components.id::<T>() {
-            Some(id) => id,
-            None => return false,
+        let Some(comp_id) = self.components.id::<T>() else {
+            return false;
         };
         if self.components.is_sparse(comp_id) {
             return self.sparse.contains(comp_id, entity);
@@ -585,9 +579,8 @@ impl World {
             return results;
         }
 
-        let comp_id = match self.components.id::<T>() {
-            Some(id) => id,
-            None => return results,
+        let Some(comp_id) = self.components.id::<T>() else {
+            return results;
         };
 
         // Sparse fast path — no archetype grouping benefit
@@ -650,9 +643,8 @@ impl World {
             return results;
         }
 
-        let comp_id = match self.components.id::<T>() {
-            Some(id) => id,
-            None => return results,
+        let Some(comp_id) = self.components.id::<T>() else {
+            return results;
         };
 
         // Sparse fast path — duplicate check via sorted indices.
@@ -1297,10 +1289,9 @@ impl World {
     #[inline]
     pub fn has_changed<Q: WorldQuery + 'static>(&self) -> bool {
         let type_id = TypeId::of::<Q>();
-        let entry = match self.query_cache.get(&type_id) {
-            Some(entry) => entry,
-            // No cache entry means never queried — first query will see everything.
-            None => return false,
+        // No cache entry means never queried — first query will see everything.
+        let Some(entry) = self.query_cache.get(&type_id) else {
+            return false;
         };
 
         // If the previous iterator was iterated, the pending tick
@@ -1405,11 +1396,7 @@ impl World {
 
     /// Number of live (placed) entities across all archetypes.
     pub fn entity_count(&self) -> usize {
-        self.archetypes
-            .archetypes
-            .iter()
-            .map(|arch| arch.len())
-            .sum()
+        self.archetypes.archetypes.iter().map(Archetype::len).sum()
     }
 
     /// Read-only snapshot of engine statistics for observability.
@@ -2793,13 +2780,13 @@ mod tests {
     #[test]
     fn despawn_batch_last_row_no_swap() {
         let mut world = World::new();
-        let _a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
         let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
         // b is the last row — swap_remove just truncates, no copy needed
         let count = world.despawn_batch(&[b]);
         assert_eq!(count, 1);
         assert!(!world.is_alive(b));
-        assert_eq!(world.get::<Pos>(_a).unwrap().x, 1.0);
+        assert_eq!(world.get::<Pos>(a).unwrap().x, 1.0);
     }
 
     // ── Lazy tick advancement tests ────────────────────────────────
@@ -2818,8 +2805,8 @@ mod tests {
         let _ = world.get_mut::<Pos>(e);
 
         // Create a query but DROP it without iterating.
-        let _dropped = world.query::<(Changed<Pos>,)>();
-        drop(_dropped);
+        let dropped = world.query::<(Changed<Pos>,)>();
+        drop(dropped);
 
         // The change window should be preserved — we should still see the change.
         let count = world.query::<(Changed<Pos>,)>().count();
@@ -3001,8 +2988,8 @@ mod tests {
         let _ = world.query::<(&Pos,)>().count();
 
         // Create and drop without iterating.
-        let _dropped = world.query::<(&Pos,)>();
-        drop(_dropped);
+        let dropped = world.query::<(&Pos,)>();
+        drop(dropped);
 
         let info = world.query_tick_info::<(&Pos,)>().unwrap();
         assert!(info.has_pending_tick);

@@ -162,6 +162,7 @@ impl FoodGrid {
         }
     }
 
+    #[allow(clippy::cast_possible_wrap)]
     fn neighbors(&self, pos: Vec2) -> impl Iterator<Item = &(Entity, Vec2, f32)> {
         let cx = ((pos.x / self.cell_size) as usize).min(self.grid_w - 1);
         let cy = ((pos.y / self.cell_size) as usize).min(self.grid_w - 1);

@@ -138,13 +138,14 @@ impl CodecRegistry {
 
         // Duplicate name to a different ComponentId is a hard error.
         if let Some(&existing_id) = self.by_name.get(&stable_name) {
-            if existing_id != comp_id {
-                panic!(
-                    "duplicate stable name {:?}: already registered for ComponentId {}, \
-                     cannot register for ComponentId {}",
-                    stable_name, existing_id, comp_id
-                );
-            }
+            assert!(
+                existing_id == comp_id,
+                "duplicate stable name {:?}: already registered for ComponentId {}, \
+                 cannot register for ComponentId {}",
+                stable_name,
+                existing_id,
+                comp_id
+            );
         }
 
         let layout = Layout::new::<T>();
@@ -283,7 +284,7 @@ impl CodecRegistry {
     /// All registered ComponentIds.
     pub fn registered_ids(&self) -> Vec<ComponentId> {
         let mut ids: Vec<_> = self.codecs.keys().copied().collect();
-        ids.sort();
+        ids.sort_unstable();
         ids
     }
 

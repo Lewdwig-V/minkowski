@@ -67,7 +67,7 @@ impl SchemaRegistry {
 
     pub fn names(&self) -> Vec<&'static str> {
         let mut names: Vec<_> = self.schemas.keys().copied().collect();
-        names.sort();
+        names.sort_unstable();
         names
     }
 

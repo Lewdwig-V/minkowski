@@ -4,6 +4,9 @@ version = "1.0.1"
 edition = "2021"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 minkowski = { path = "../crates/minkowski" }
 minkowski-persist = { path = "../crates/minkowski-persist" }
