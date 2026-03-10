@@ -128,7 +128,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         assert!(wal.checkpoint_needed());
@@ -203,7 +203,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         // Also spawn some Score entities (not in WAL, just in world)

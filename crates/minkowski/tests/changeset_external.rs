@@ -16,33 +16,26 @@ struct Vel {
 }
 
 #[test]
-fn typed_insert_remove_roundtrip() {
+fn typed_insert() {
     let mut world = World::new();
     let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
     // Insert via typed API
     let mut cs = EnumChangeSet::new();
     cs.insert::<Vel>(&mut world, e, Vel { dx: 3.0, dy: 4.0 });
-    let reverse = cs.apply(&mut world);
+    cs.apply(&mut world).unwrap();
     assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
-
-    // Reverse undoes the insert
-    let _ = reverse.apply(&mut world);
-    assert_eq!(world.get::<Vel>(e), None);
 }
 
 #[test]
-fn typed_remove_roundtrip() {
+fn typed_remove() {
     let mut world = World::new();
     let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
 
     let mut cs = EnumChangeSet::new();
     cs.remove::<Vel>(&mut world, e);
-    let reverse = cs.apply(&mut world);
+    cs.apply(&mut world).unwrap();
     assert_eq!(world.get::<Vel>(e), None);
-
-    let _ = reverse.apply(&mut world);
-    assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
 }
 
 #[test]

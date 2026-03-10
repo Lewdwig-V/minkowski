@@ -523,7 +523,7 @@ mod tests {
                 let mut cs = minkowski::EnumChangeSet::new();
                 cs.spawn_bundle(&mut world, e, (Score(i),));
                 wal.append(&cs, &codecs).unwrap();
-                cs.apply(&mut world);
+                cs.apply(&mut world).unwrap();
             }
 
             // Build and save index
@@ -543,14 +543,14 @@ mod tests {
             let mut cs = minkowski::EnumChangeSet::new();
             cs.spawn_bundle(&mut world, e, (Score(99),));
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
 
             // Spawn another post-checkpoint entity
             let e2 = world.alloc_entity();
             let mut cs2 = minkowski::EnumChangeSet::new();
             cs2.spawn_bundle(&mut world, e2, (Score(88),));
             wal.append(&cs2, &codecs).unwrap();
-            cs2.apply(&mut world);
+            cs2.apply(&mut world).unwrap();
 
             // "Crash" — drop everything
         }

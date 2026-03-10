@@ -18,7 +18,7 @@ cargo bench -p minkowski-bench -- simple_iter/par   # Sub-benchmark filter
 cargo bench -p minkowski-persist       # Persistence benchmarks (snapshot save/load/zero-copy, WAL append)
 
 cargo run -p minkowski-examples --example boids --release   # Boids flocking with query reducers + spatial grid (5K entities, 1K frames)
-cargo run -p minkowski-examples --example life --release    # Game of Life with QueryMut reducer, Table, undo/redo (64x64 grid, 500 gens)
+cargo run -p minkowski-examples --example life --release    # Game of Life with QueryMut reducer, Table (64x64 grid, 500 gens)
 cargo run -p minkowski-examples --example nbody --release   # Barnes-Hut N-body with query reducers (2K entities, 1K frames)
 cargo run -p minkowski-examples --example scheduler --release   # ReducerRegistry-based conflict detection + batch scheduling (6 systems, 10 frames)
 cargo run -p minkowski-examples --example transaction --release   # Transaction strategies: raw Tx + reducer comparison (3 strategies, 100 entities)
@@ -118,7 +118,7 @@ Each BlobVec column stores a `changed_tick: Tick` — the tick at which it was l
 
 `CommandBuffer` stores `Vec<Box<dyn FnOnce(&mut World) + Send>>`. Used during query iteration when structural changes (spawn/despawn/insert/remove) must be deferred. Applied via `cmds.apply(&mut world)`.
 
-`EnumChangeSet` is the data-driven alternative: mutations are recorded as a `Vec<Mutation>` enum with component bytes in a contiguous `Arena`. `apply()` returns a reverse `EnumChangeSet` for rollback — applying the reverse undoes the original changes. Useful for persistence (WAL serialization) and transactions. Typed safe helpers (`insert<T>`, `remove<T>`, `spawn_bundle<B>`) wrap the raw `record_*` methods — they auto-register component types and handle `ManuallyDrop` internally. The raw methods remain for power users who already have a `ComponentId`.
+`EnumChangeSet` is the data-driven alternative: mutations are recorded as a `Vec<Mutation>` enum with component bytes in a contiguous `Arena`. `apply()` consumes the changeset and returns `Result<(), ApplyError>`. Useful for persistence (WAL serialization) and transactions. Typed safe helpers (`insert<T>`, `remove<T>`, `spawn_bundle<B>`) wrap the raw `record_*` methods — they auto-register component types and handle `ManuallyDrop` internally. The raw methods remain for power users who already have a `ComponentId`.
 
 ### Secondary Indexes
 

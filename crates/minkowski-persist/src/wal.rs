@@ -55,6 +55,8 @@ pub enum WalError {
     },
     #[error("cursor behind: requested seq {requested} but oldest available is {oldest}")]
     CursorBehind { requested: u64, oldest: u64 },
+    #[error("WAL apply error: {0}")]
+    Apply(#[from] minkowski::ApplyError),
 }
 
 /// Maximum WAL frame size (256 MB). Rejects corrupt length prefixes
@@ -292,7 +294,7 @@ pub(crate) fn apply_record(
             }
         }
     }
-    changeset.apply(world);
+    changeset.apply(world).map_err(WalError::Apply)?;
     Ok(())
 }
 
@@ -1032,7 +1034,7 @@ mod tests {
         assert_eq!(seq, 0);
         assert_eq!(wal.next_seq(), 1);
 
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
     }
 
@@ -1253,7 +1255,7 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 }, Health(100)));
         wal.append(&cs, &codecs_a).unwrap();
-        cs.apply(&mut world_a);
+        cs.apply(&mut world_a).unwrap();
 
         drop(wal);
 
@@ -1338,13 +1340,13 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 },));
         wal.append(&cs, &codecs_a).unwrap();
-        cs.apply(&mut world_a);
+        cs.apply(&mut world_a).unwrap();
 
         let mut cs2 = EnumChangeSet::new();
         cs2.insert::<Health>(&mut world_a, e, Health(50));
         cs2.remove::<Pos>(&mut world_a, e);
         wal.append(&cs2, &codecs_a).unwrap();
-        cs2.apply(&mut world_a);
+        cs2.apply(&mut world_a).unwrap();
 
         drop(wal);
 
@@ -1413,7 +1415,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         assert_eq!(wal.next_seq(), 20);
@@ -1455,7 +1457,7 @@ mod tests {
                     },),
                 );
                 wal.append(&cs, &codecs).unwrap();
-                cs.apply(&mut world);
+                cs.apply(&mut world).unwrap();
             }
         }
 
@@ -1486,7 +1488,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         let mut world2 = World::new();
@@ -1519,7 +1521,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         let before = wal.segment_count();
@@ -1566,7 +1568,7 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         let s1 = wal.stats();
         assert_eq!(s1.next_seq, 1);
@@ -1616,7 +1618,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         assert!(wal.checkpoint_needed());
@@ -1649,7 +1651,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         assert!(wal.checkpoint_needed());
 
@@ -1680,7 +1682,7 @@ mod tests {
             let mut cs = EnumChangeSet::new();
             cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
 
             wal.acknowledge_snapshot(wal.next_seq()).unwrap();
         }
@@ -1720,7 +1722,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         let ckpt_seq = wal.next_seq();
         wal.acknowledge_snapshot(ckpt_seq).unwrap();
@@ -1739,7 +1741,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         assert!(wal.segment_count() > 1, "must have rolled over");
         drop(wal);
@@ -1782,7 +1784,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         wal.acknowledge_snapshot(wal.next_seq()).unwrap();
         for i in 3..5 {
@@ -1797,7 +1799,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         let mut world2 = World::new();
@@ -1830,7 +1832,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         wal.delete_segments_before(u64::MAX).unwrap();
@@ -1869,7 +1871,7 @@ mod tests {
                     },),
                 );
                 wal.append(&cs, &codecs).unwrap();
-                cs.apply(&mut world);
+                cs.apply(&mut world).unwrap();
             }
             assert!(wal.segment_count() > 1);
 
@@ -1913,7 +1915,7 @@ mod tests {
                     },),
                 );
                 wal.append(&cs, &codecs).unwrap();
-                cs.apply(&mut world);
+                cs.apply(&mut world).unwrap();
             }
             assert!(wal.segment_count() > 1);
         }
@@ -1933,7 +1935,7 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 99.0, y: 99.0 },));
         wal2.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         drop(wal2);
 
         // Open with reversed registration order to exercise remap
@@ -1975,7 +1977,7 @@ mod tests {
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
         let seq = wal.append(&cs, &codecs).unwrap();
         assert_eq!(seq, 0);
-        cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         // Verify sparse component is present.
         assert_eq!(world.get::<Health>(e), Some(&Health(100)));
@@ -2017,7 +2019,7 @@ mod tests {
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Health>(e), None);
 
         // Replay into fresh world that has the entity with sparse component.
@@ -2058,7 +2060,7 @@ mod tests {
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Health>(e), Some(&Health(999)));
 
         // Replay into world with old sparse value.
@@ -2100,7 +2102,7 @@ mod tests {
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         // Replay into fresh world — Health registered via codecs.register
         // (not register_sparse), so sparse flag only comes from mark_sparse
@@ -2236,7 +2238,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         // Replay should succeed with no checksum errors.
@@ -2309,7 +2311,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         assert!(wal.segment_count() > 1);
 

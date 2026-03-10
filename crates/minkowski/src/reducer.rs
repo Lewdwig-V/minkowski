@@ -2252,7 +2252,7 @@ mod tests {
         // Not yet applied
         assert_eq!(world.get::<Pos>(e).unwrap().0, 1.0);
         // Apply changeset
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e).unwrap().0, 99.0);
     }
 
@@ -3317,7 +3317,7 @@ mod tests {
         let wrote = ctx.try_write::<u32>(e, 99);
         assert!(wrote);
 
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(*world.get::<u32>(e).unwrap(), 99);
     }
 
@@ -3504,7 +3504,7 @@ mod tests {
         assert_eq!(world.get::<Pos>(e).unwrap().0, 1.0);
         assert_eq!(cs.len(), 1);
         // Apply and verify
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e).unwrap().0, 99.0);
     }
 
@@ -3520,7 +3520,7 @@ mod tests {
             let mut wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet);
             wr.modify(|p| p.0 += 10.0);
         }
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e).unwrap().0, 20.0);
     }
 
@@ -3563,7 +3563,7 @@ mod tests {
         // World unchanged
         assert_eq!(world.get::<Pos>(e).unwrap().0, 5.0);
         // Apply changeset
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e).unwrap().0, 55.0);
     }
 
@@ -3589,7 +3589,7 @@ mod tests {
         assert_eq!(vel_ref.0, 4.0);
         // Write position via WritableRef
         pos_wr.set(Pos(vel_ref.0 + pos_wr.get().0));
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e).unwrap().0, 7.0);
     }
 

@@ -79,14 +79,14 @@ fuzz_target!(|data: &[u8]| {
                         let e = world.alloc_entity();
                         cs.spawn_bundle(&mut world, e, (*a,));
                         wal.append(&cs, &codecs).unwrap();
-                        cs.apply(&mut world);
+                        cs.apply(&mut world).unwrap();
                         live.push(e);
                     }
                     WalOp::SpawnAB(a, b) => {
                         let e = world.alloc_entity();
                         cs.spawn_bundle(&mut world, e, (*a, *b));
                         wal.append(&cs, &codecs).unwrap();
-                        cs.apply(&mut world);
+                        cs.apply(&mut world).unwrap();
                         live.push(e);
                     }
                     WalOp::InsertB(idx, b) => {
@@ -95,7 +95,7 @@ fuzz_target!(|data: &[u8]| {
                             let e = live[i];
                             cs.insert::<B>(&mut world, e, *b);
                             wal.append(&cs, &codecs).unwrap();
-                            cs.apply(&mut world);
+                            cs.apply(&mut world).unwrap();
                         }
                     }
                     WalOp::InsertD(idx, d) => {
@@ -104,7 +104,7 @@ fuzz_target!(|data: &[u8]| {
                             let e = live[i];
                             cs.insert::<D>(&mut world, e, *d);
                             wal.append(&cs, &codecs).unwrap();
-                            cs.apply(&mut world);
+                            cs.apply(&mut world).unwrap();
                         }
                     }
                 }

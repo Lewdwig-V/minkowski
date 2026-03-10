@@ -32,10 +32,10 @@ Determine which files to analyze:
 **Mutation (spawn, migrate, changeset apply)** — `crates/minkowski/src/`
 - `world.rs` — `spawn`, `insert`, `remove`, `despawn`, `despawn_batch` (group-sort-sweep), `get_mut`, `get_batch_mut`, `query`, `query_table_mut`, `has_changed` (archetype scan per call)
 - `bundle.rs` — `Bundle::put`, `component_ids`
-- `changeset.rs` — `EnumChangeSet::apply`, `record_insert`, arena allocation
+- `changeset.rs` — `EnumChangeSet::apply`, `changeset_insert_raw` (overwrite path), `changeset_remove_raw` (migration path), `record_insert` (arena alloc + Vec push), `Arena::alloc` (alignment + capacity check + copy)
 
 **Reducer (per-entity iteration through handles)** — `crates/minkowski/src/`
-- `reducer.rs` — `QueryWriter::for_each` (manual archetype scan), `QueryMut::for_each`/`for_each_chunk`, `QueryRef::for_each`/`for_each_chunk`, `DynamicCtx::for_each`, `EntityMut::get`/`set`/`remove`, `Spawner::spawn`
+- `reducer.rs` — `QueryWriter::for_each` (manual archetype scan), `WritableRef::modify` (clone + insert_raw), `WritableRef::set` (insert_raw), `QueryMut::for_each`/`for_each_chunk`, `QueryRef::for_each`/`for_each_chunk`, `DynamicCtx::for_each`, `DynamicCtx::write` (HashMap lookup + insert_raw), `EntityMut::get`/`set`/`remove`, `Spawner::spawn`
 
 **Persistence (I/O hot paths)** — `crates/minkowski-persist/src/`
 - `wal.rs` — `append`, `replay_from`, `scan_last_seq`
@@ -49,6 +49,44 @@ Determine which files to analyze:
 **Transaction (commit path)** — `crates/minkowski/src/`
 - `transaction.rs` — `try_commit`, `begin`, tick validation, changeset apply
 - `lock_table.rs` — `acquire`, `release`
+
+### Benchmark Baselines (as of v1.0.4)
+
+Reference numbers from `cargo bench -p minkowski-bench` on the dev machine. Use these to contextualize findings — a "PERF-CRITICAL" on a path that takes 1.6µs total is less urgent than one on a 250µs path.
+
+| Benchmark | Time | Per-entity | Notes |
+|---|---|---|---|
+| `simple_iter/for_each_chunk` | 1.6 µs | 0.16 ns | SIMD-friendly baseline |
+| `simple_iter/for_each` | 14.8 µs | 1.48 ns | 9x slower — per-element callback overhead |
+| `reducer/query_mut_10k` | 8.7 µs | 0.87 ns | Direct mutation baseline |
+| `reducer/query_mut_chunk_10k` | 1.7 µs | 0.17 ns | Chunk iteration ≈ raw iteration |
+| `reducer/query_writer_10k` | 139 µs | 13.9 ns | **16x query_mut** — buffered write overhead |
+| `reducer/dynamic_for_each_10k` | 253 µs | 25.3 ns | **29x query_mut** — HashMap + buffered writes |
+| `reducer/dynamic_for_each_chunk_10k` | 242 µs | 24.2 ns | Chunk doesn't help dynamic (write-back dominates) |
+| `simple_insert/batch` | 2.5 ms | 250 ns | Direct spawn |
+| `simple_insert/changeset` | 3.5 ms | 350 ns | Changeset spawn 1.4x direct |
+| `add_remove/add_remove` | 1.6 ms | 162 ns | Archetype migration cost |
+| `heavy_compute/sequential` | 9.3 µs | 9.3 ns | 4x4 matrix inversion |
+| `heavy_compute/parallel` | 1.1 ms | — | Rayon overhead dominates at 1K entities |
+| `simple_iter/par_for_each` | 691 µs | — | Rayon overhead dominates at 10K entities |
+| `serialize/snapshot_save` | 502 µs | 502 ns | 1K entities |
+| `serialize/snapshot_load` | 325 µs | 325 ns | 1K entities |
+| `serialize/wal_append` | 1.25 µs | — | Single mutation |
+| `serialize/wal_replay` | 1.76 ms | 1.76 µs | 1K mutations |
+
+### Known Bottlenecks (profiled, not yet addressed)
+
+These have been analyzed and are documented here to prevent re-discovery:
+
+1. **QueryWriter 16x overhead** — inherent to buffered writes: `clone()` + `arena.alloc()` + `Vec::push()` per entity in `WritableRef::modify`, then `entity_locations` lookup + `column_index` + `copy_nonoverlapping` per entity in `changeset_insert_raw`. The clone and arena alloc are the largest costs. No further optimization without changing the buffered-write architecture.
+
+2. **DynamicCtx 29x overhead** — QueryWriter costs PLUS `HashMap<TypeId, ComponentId>` lookup per `ctx.write()` call (in `DynamicResolved::lookup`). The HashMap is required for runtime type resolution. Consider: pre-resolved write handles cached per-entity, or a `Vec`-indexed lookup if `TypeId` can be mapped to a dense index.
+
+3. **`par_for_each` / parallel overhead** — rayon's thread pool spawn + work stealing amortizes poorly below ~50K entities. At 10K entities, sequential `for_each_chunk` is 430x faster. This is a rayon characteristic, not a Minkowski bug. Users should use `par_for_each` only for large entity counts or expensive per-entity work (like `heavy_compute`).
+
+4. **`for_each` vs `for_each_chunk` 9x gap** — per-element callback prevents SIMD auto-vectorization. `for_each_chunk` yields contiguous `&[T]` slices. This is the single biggest "free win" for users switching iteration style. Not an engine optimization — it's API choice.
+
+5. **Changeset spawn 1.4x direct** — arena allocation + mutation log overhead on top of the same archetype push work. Inherent to the data-driven mutation model.
 
 ## Phase 2 — Analysis
 
@@ -128,9 +166,9 @@ After all 4 agents complete, aggregate their reports into the output format belo
 
 ### Benchmark Coverage
 
-1. List all benchmark files: run `ls crates/minkowski/benches/`
+1. List all benchmark files: run `ls crates/minkowski-bench/benches/`
 2. For each `PERF-CRITICAL` finding, check if a benchmark covers that hot path. If not, suggest a targeted benchmark.
-3. Suggest specific `cargo bench -p minkowski -- <filter>` commands for existing benchmarks that cover affected paths.
+3. Suggest specific `cargo bench -p minkowski-bench -- <filter>` commands for existing benchmarks that cover affected paths. Also check `cargo bench -p minkowski-persist` for persistence-specific benchmarks.
 
 ### New Hot Path Discovery
 
@@ -138,7 +176,7 @@ After all 4 agents complete, aggregate their reports into the output format belo
 2. Flag these as "consider adding to the hot path list in `/perf-shakedown`".
 3. Suggest `cargo flamegraph` or `perf record` commands for examples that exercise the changed code. Reference examples:
    - `boids` — query reducers + spatial grid (5K entities)
-   - `life` — QueryMut + Table + undo/redo (64x64 grid)
+   - `life` — QueryMut + Table (64x64 grid)
    - `nbody` — Barnes-Hut + query reducers (2K entities)
    - `persist` — Durable QueryWriter + WAL + rkyv snapshots (100 entities, 3 archetypes)
    - `battle` — multi-threaded EntityMut reducers (500 entities)

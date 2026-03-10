@@ -69,7 +69,7 @@ fn simple_insert(c: &mut Criterion) {
                     ),
                 );
             }
-            let _reverse = cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
             world
         });
     });

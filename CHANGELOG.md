@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.4
+
+### Performance
+
+- **`EnumChangeSet::apply()` ~30-40% faster** — reverse changeset construction eliminated (was doubling per-mutation work with arena alloc + Vec push for undo data that no caller used). Single `next_tick()` atomic per `apply()` call instead of per mutation.
+
+### Breaking Changes
+
+- **`EnumChangeSet::apply()` returns `Result<(), ApplyError>`** instead of a reverse `EnumChangeSet`. The reverse changeset (for undo/redo) has been removed — it unconditionally doubled apply cost for a feature only used by one example.
+- **`ApplyError` enum** — `DeadEntity(Entity)` and `AlreadyPlaced(Entity)` variants. Replaces `assert!` panics with fallible error returns, consistent with `ReducerError`.
+- **`examples/life.rs` undo/redo removed** — the example now demonstrates Table queries and QueryMut without time-travel.
+
+### Benchmarks
+
+- **New `minkowski-bench` crate** with 8 standardized scenarios modeled after [ecs_bench_suite](https://github.com/rust-gamedev/ecs_bench_suite): `simple_insert`, `simple_iter`, `fragmented_iter`, `heavy_compute`, `add_remove`, `schedule`, `serialize`, `reducer`.
+- Old ad-hoc benchmarks removed from `crates/minkowski/benches/`. `hecs` dev-dependency dropped.
+
 ## 1.0.3
 
 ### Persistent Indexes (`minkowski` + `minkowski-persist`)

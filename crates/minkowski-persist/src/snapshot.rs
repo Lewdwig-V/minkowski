@@ -423,7 +423,9 @@ impl Snapshot {
                 changeset.record_spawn(entity, &ptrs);
             }
 
-            changeset.apply(&mut world);
+            changeset
+                .apply(&mut world)
+                .expect("snapshot restore: changeset apply failed — snapshot may be corrupt");
         }
 
         // Restore sparse components: sender IDs for insertion, codec IDs for deserialization.
@@ -698,7 +700,7 @@ mod tests {
             (Pos { x: 5.0, y: 6.0 }, Vel { dx: 0.5, dy: 0.6 }),
         );
         wal.append(&cs, &codecs).unwrap();
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         let entities: Vec<_> = world
             .query::<(minkowski::Entity, &Pos)>()
@@ -717,7 +719,7 @@ mod tests {
             cs2.insert::<Pos>(&mut world, *e, *new_pos);
         }
         wal.append(&cs2, &codecs).unwrap();
-        let _reverse2 = cs2.apply(&mut world);
+        cs2.apply(&mut world).unwrap();
 
         // Recover from snapshot + WAL
         let mut load_codecs = CodecRegistry::new();

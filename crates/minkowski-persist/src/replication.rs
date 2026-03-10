@@ -131,7 +131,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         (wal_dir, codecs)
     }
@@ -294,13 +294,13 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         let mut cs2 = EnumChangeSet::new();
         cs2.insert::<Health>(&mut world, e, Health(100));
         cs2.remove::<Pos>(&mut world, e);
         wal.append(&cs2, &codecs).unwrap();
-        cs2.apply(&mut world);
+        cs2.apply(&mut world).unwrap();
 
         drop(wal);
 
@@ -372,12 +372,12 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         let mut cs2 = EnumChangeSet::new();
         cs2.record_despawn(e);
         wal.append(&cs2, &codecs).unwrap();
-        cs2.apply(&mut world);
+        cs2.apply(&mut world).unwrap();
 
         drop(wal);
 
@@ -432,7 +432,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         wal.acknowledge_snapshot(wal.next_seq()).unwrap();
         for i in 3..5 {
@@ -447,7 +447,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         drop(wal);
@@ -488,7 +488,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         assert!(wal.segment_count() > 1);
         drop(wal);
@@ -528,7 +528,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         assert!(wal.segment_count() > 2);
         wal.delete_segments_before(15).unwrap();
@@ -614,7 +614,7 @@ mod tests {
                 },),
             );
             wal.append(&cs, &codecs).unwrap();
-            cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         drop(wal);

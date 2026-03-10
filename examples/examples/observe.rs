@@ -53,7 +53,7 @@ fn main() {
             ),
         );
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).expect("observe apply");
     }
 
     let snap1 = MetricsSnapshot::capture(&world, Some(&wal));
@@ -82,7 +82,7 @@ fn main() {
             },),
         );
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).expect("observe apply");
     }
 
     let snap2 = MetricsSnapshot::capture(&world, Some(&wal));

@@ -4,7 +4,30 @@ use std::ptr::NonNull;
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
+use crate::tick::Tick;
 use crate::world::{get_pair_mut, EntityLocation, World};
+
+/// Error returned by [`EnumChangeSet::apply`] when a mutation targets
+/// an invalid entity.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApplyError {
+    /// Mutation targeted an entity that is no longer alive.
+    DeadEntity(Entity),
+    /// Spawn targeted an entity already placed in an archetype.
+    AlreadyPlaced(Entity),
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadEntity(e) => write!(f, "entity {:?} is not alive", e),
+            Self::AlreadyPlaced(e) => write!(f, "entity {:?} is already placed", e),
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {}
 
 const ARENA_ALIGN: usize = 16;
 
@@ -107,6 +130,10 @@ struct DropEntry {
     offset: usize,
     /// Type-erased destructor (`drop_in_place::<T>`).
     drop_fn: unsafe fn(*mut u8),
+    /// Index of the mutation that owns this value. Used to partition
+    /// drop entries between processed (ownership transferred to World)
+    /// and unprocessed (must be dropped on error) during `apply()`.
+    mutation_idx: usize,
 }
 
 /// A single structural mutation recorded in a ChangeSet.
@@ -148,8 +175,8 @@ pub(crate) enum Mutation {
 /// with component bytes stored in a contiguous arena.
 ///
 /// [`apply()`](EnumChangeSet::apply) executes all buffered mutations against a
-/// [`World`] and returns a **reverse** `EnumChangeSet` — applying the reverse
-/// undoes the original changes, enabling rollback and undo/redo.
+/// [`World`], returning `Ok(())` on success or `Err(ApplyError)` if a
+/// mutation targets a dead or already-placed entity.
 ///
 /// Typed helpers — [`insert`](EnumChangeSet::insert), [`remove`](EnumChangeSet::remove),
 /// [`spawn_bundle`](EnumChangeSet::spawn_bundle) — auto-register component types and
@@ -290,7 +317,12 @@ impl EnumChangeSet {
         let value = std::mem::ManuallyDrop::new(value);
         let offset = self.record_insert(entity, comp_id, &*value as *const T as *const u8, layout);
         if let Some(drop_fn) = drop_fn {
-            self.drop_entries.push(DropEntry { offset, drop_fn });
+            let mutation_idx = self.mutations.len() - 1;
+            self.drop_entries.push(DropEntry {
+                offset,
+                drop_fn,
+                mutation_idx,
+            });
         }
     }
 
@@ -315,7 +347,12 @@ impl EnumChangeSet {
         let offset =
             self.record_sparse_insert(entity, comp_id, &*value as *const T as *const u8, layout);
         if let Some(drop_fn) = drop_fn {
-            self.drop_entries.push(DropEntry { offset, drop_fn });
+            let mutation_idx = self.mutations.len() - 1;
+            self.drop_entries.push(DropEntry {
+                offset,
+                drop_fn,
+                mutation_idx,
+            });
         }
     }
 
@@ -348,9 +385,14 @@ impl EnumChangeSet {
             });
         }
         // Register drop entries for components that need cleanup.
+        let mutation_idx = self.mutations.len(); // index of the Spawn we're about to push
         for &(comp_id, offset, _) in &components {
             if let Some(drop_fn) = world.components.info(comp_id).drop_fn {
-                self.drop_entries.push(DropEntry { offset, drop_fn });
+                self.drop_entries.push(DropEntry {
+                    offset,
+                    drop_fn,
+                    mutation_idx,
+                });
             }
         }
         self.mutations.push(Mutation::Spawn { entity, components });
@@ -373,9 +415,11 @@ impl EnumChangeSet {
         let value = std::mem::ManuallyDrop::new(value);
         let offset = self.record_insert(entity, comp_id, &*value as *const T as *const u8, layout);
         if std::mem::needs_drop::<T>() {
+            let mutation_idx = self.mutations.len() - 1;
             self.drop_entries.push(DropEntry {
                 offset,
                 drop_fn: crate::component::drop_ptr::<T>,
+                mutation_idx,
             });
         }
     }
@@ -394,9 +438,11 @@ impl EnumChangeSet {
         let offset =
             self.record_sparse_insert(entity, comp_id, &*value as *const T as *const u8, layout);
         if std::mem::needs_drop::<T>() {
+            let mutation_idx = self.mutations.len() - 1;
             self.drop_entries.push(DropEntry {
                 offset,
                 drop_fn: crate::component::drop_ptr::<T>,
+                mutation_idx,
             });
         }
     }
@@ -425,9 +471,14 @@ impl EnumChangeSet {
                 components.push((comp_id, offset, layout));
             });
         }
+        let mutation_idx = self.mutations.len();
         for &(comp_id, offset, _) in &components {
             if let Some(drop_fn) = registry.info(comp_id).drop_fn {
-                self.drop_entries.push(DropEntry { offset, drop_fn });
+                self.drop_entries.push(DropEntry {
+                    offset,
+                    drop_fn,
+                    mutation_idx,
+                });
             }
         }
         self.mutations.push(Mutation::Spawn { entity, components });
@@ -550,17 +601,43 @@ impl Drop for EnumChangeSet {
 }
 
 impl EnumChangeSet {
-    /// Apply every mutation in this changeset to `world`, returning a reverse
-    /// changeset that undoes the changes when applied.
-    pub fn apply(mut self, world: &mut World) -> EnumChangeSet {
-        // Disarm drop entries — ownership transfers to the world during apply.
-        // If apply panics (programming error), arena values may leak rather
-        // than double-drop, which is the safer failure mode.
-        self.drop_entries.clear();
+    /// Apply every mutation in this changeset to `world`.
+    ///
+    /// Returns `Ok(())` on success or `Err(ApplyError)` if a mutation targets
+    /// an invalid entity. A single tick is allocated for the entire batch.
+    pub fn apply(mut self, world: &mut World) -> Result<(), ApplyError> {
+        let tick = world.next_tick();
 
-        let mut reverse = EnumChangeSet::new();
+        let result = self.apply_mutations(world, tick);
 
-        for mutation in &self.mutations {
+        match result {
+            Ok(()) => {
+                // All mutations succeeded — disarm all drop entries.
+                // Ownership of arena-backed values has transferred to World.
+                self.drop_entries.clear();
+                Ok(())
+            }
+            Err((failed_idx, err)) => {
+                // Mutations 0..failed_idx succeeded (ownership transferred to World).
+                // Mutations failed_idx.. were not processed — their arena values
+                // must be dropped. Retain only drop entries for unprocessed mutations
+                // so the Drop impl cleans them up.
+                self.drop_entries
+                    .retain(|entry| entry.mutation_idx >= failed_idx);
+                Err(err)
+            }
+        }
+    }
+
+    /// Process all mutations. Returns `Err((mutation_index, error))` on failure,
+    /// where `mutation_index` is the index of the mutation that failed.
+    fn apply_mutations(
+        &self,
+        world: &mut World,
+        tick: crate::tick::Tick,
+    ) -> Result<(), (usize, ApplyError)> {
+        for (mutation_idx, mutation) in self.mutations.iter().enumerate() {
+            let map_err = |e| (mutation_idx, e);
             match mutation {
                 Mutation::Spawn { entity, components } => {
                     // Ensure the entity allocator's generations vec covers
@@ -568,12 +645,9 @@ impl EnumChangeSet {
                     // touch generations. Without this, is_alive() returns
                     // false for reserved-then-spawned entities.
                     world.entities.materialize_reserved();
-                    assert!(
-                        !world.is_placed(*entity),
-                        "EnumChangeSet::apply: cannot spawn entity {:?} — \
-                         already placed in an archetype",
-                        entity,
-                    );
+                    if world.is_placed(*entity) {
+                        return Err(map_err(ApplyError::AlreadyPlaced(*entity)));
+                    }
                     // --- Apply: push raw component data into the right archetype ---
                     let sorted_ids: Vec<ComponentId> = {
                         let mut ids: Vec<_> = components.iter().map(|&(id, _, _)| id).collect();
@@ -590,16 +664,14 @@ impl EnumChangeSet {
                         world.entity_locations.resize(index + 1, None);
                     }
 
-                    let tick = world.next_tick();
                     let archetype = &mut world.archetypes.archetypes[arch_id.0];
-                    for &(comp_id, offset, layout) in components {
+                    for &(comp_id, offset, _) in components {
                         let src = self.arena.get(offset);
                         let col = archetype.column_index(comp_id).unwrap();
                         unsafe {
                             archetype.columns[col].push(src as *mut u8);
                         }
                         archetype.columns[col].mark_changed(tick);
-                        let _ = layout;
                     }
                     let row = archetype.entities.len();
                     archetype.entities.push(*entity);
@@ -609,17 +681,12 @@ impl EnumChangeSet {
                         archetype_id: arch_id,
                         row,
                     });
-
-                    // --- Reverse: despawn this entity ---
-                    reverse.record_despawn(*entity);
                 }
 
                 Mutation::Despawn { entity } => {
-                    // --- Capture: read all components before despawning ---
-                    let comp_data = world.read_all_components(*entity).unwrap_or_default();
-                    reverse.record_spawn(*entity, &comp_data);
-                    // --- Apply ---
-                    world.despawn(*entity);
+                    if !world.despawn(*entity) {
+                        return Err(map_err(ApplyError::DeadEntity(*entity)));
+                    }
                 }
 
                 Mutation::Insert {
@@ -629,21 +696,15 @@ impl EnumChangeSet {
                     layout,
                 } => {
                     let data_ptr = self.arena.get(*offset);
-                    changeset_insert_raw(
-                        world,
-                        &mut reverse,
-                        *entity,
-                        *component_id,
-                        data_ptr,
-                        *layout,
-                    );
+                    changeset_insert_raw(world, *entity, *component_id, data_ptr, *layout, tick)
+                        .map_err(map_err)?;
                 }
 
                 Mutation::Remove {
                     entity,
                     component_id,
                 } => {
-                    changeset_remove_raw(world, &mut reverse, *entity, *component_id);
+                    changeset_remove_raw(world, *entity, *component_id, tick).map_err(map_err)?;
                 }
 
                 Mutation::SparseInsert {
@@ -652,7 +713,9 @@ impl EnumChangeSet {
                     offset,
                     layout,
                 } => {
-                    assert!(world.is_alive(*entity), "entity is not alive");
+                    if !world.is_alive(*entity) {
+                        return Err(map_err(ApplyError::DeadEntity(*entity)));
+                    }
                     let data_ptr = self.arena.get(*offset);
                     let info = world.components.info(*component_id);
                     let drop_fn = info.drop_fn;
@@ -661,48 +724,12 @@ impl EnumChangeSet {
                     // (needed for world.get/has routing after WAL replay).
                     world.components.mark_sparse(*component_id);
 
-                    // Apply: insert into sparse storage WITHOUT dropping old value.
-                    // If an overwrite occurred, the old bytes are still live in the
-                    // dense array slot (now overwritten) — we captured them first.
-                    let had_old = if let Some(old_ptr) =
-                        world.sparse.get_raw(*component_id, *entity)
-                    {
-                        // Old value exists — capture bytes for reverse before overwrite.
-                        let rev_offset =
-                            reverse.record_sparse_insert(*entity, *component_id, old_ptr, *layout);
-                        if let Some(drop_fn) = drop_fn {
-                            reverse.drop_entries.push(DropEntry {
-                                offset: rev_offset,
-                                drop_fn,
-                            });
-                        }
-                        true
-                    } else {
-                        // No old value — reverse is SparseRemove.
-                        reverse.record_sparse_remove(*entity, *component_id);
-                        false
-                    };
-
+                    // insert_raw handles both first-insert and overwrite
+                    // (drops old value on overwrite).
                     unsafe {
-                        if had_old {
-                            // Overwrite without drop — reverse changeset owns the old bytes.
-                            world.sparse.insert_raw_no_drop(
-                                *component_id,
-                                *entity,
-                                data_ptr,
-                                *layout,
-                                drop_fn,
-                            );
-                        } else {
-                            // First insert — no old value to worry about.
-                            world.sparse.insert_raw(
-                                *component_id,
-                                *entity,
-                                data_ptr,
-                                *layout,
-                                drop_fn,
-                            );
-                        }
+                        world
+                            .sparse
+                            .insert_raw(*component_id, *entity, data_ptr, *layout, drop_fn);
                     }
                 }
 
@@ -710,46 +737,32 @@ impl EnumChangeSet {
                     entity,
                     component_id,
                 } => {
-                    assert!(world.is_alive(*entity), "entity is not alive");
-                    let info = world.components.info(*component_id);
-                    let layout = info.layout;
-                    let drop_fn = info.drop_fn;
-
-                    // Capture old value for reverse before removing.
-                    if let Some(old_ptr) = world.sparse.get_raw(*component_id, *entity) {
-                        let rev_offset =
-                            reverse.record_sparse_insert(*entity, *component_id, old_ptr, layout);
-                        if let Some(drop_fn) = drop_fn {
-                            reverse.drop_entries.push(DropEntry {
-                                offset: rev_offset,
-                                drop_fn,
-                            });
-                        }
-                        // Remove WITHOUT drop — reverse changeset owns the old bytes.
-                        world.sparse.remove_raw_no_drop(*component_id, *entity);
-                    } else {
-                        // Nothing to remove — no-op.
-                        world.sparse.remove_raw(*component_id, *entity);
+                    if !world.is_alive(*entity) {
+                        return Err(map_err(ApplyError::DeadEntity(*entity)));
                     }
+                    // Remove with drop — no reverse to own the old bytes.
+                    world.sparse.remove_raw(*component_id, *entity);
                 }
             }
         }
 
-        reverse
+        Ok(())
     }
 }
 
-/// Raw insert: either overwrites an existing component in-place (capturing old
-/// value for reverse), or performs archetype migration to add a new component.
+/// Raw insert: either overwrites an existing component in-place or performs
+/// archetype migration to add a new component.
 fn changeset_insert_raw(
     world: &mut World,
-    reverse: &mut EnumChangeSet,
     entity: Entity,
     comp_id: ComponentId,
     data_ptr: *const u8,
     layout: Layout,
-) {
-    assert!(world.is_alive(entity), "entity is not alive");
+    tick: Tick,
+) -> Result<(), ApplyError> {
+    if !world.is_alive(entity) {
+        return Err(ApplyError::DeadEntity(entity));
+    }
     let index = entity.index() as usize;
     let location = world.entity_locations[index].unwrap();
 
@@ -759,12 +772,7 @@ fn changeset_insert_raw(
         // Entity already has this component — overwrite in-place.
         let col_idx = src_arch.column_index(comp_id).unwrap();
 
-        // Capture old value for reverse (read path — no tick).
-        let old_ptr = unsafe { src_arch.columns[col_idx].get_ptr(location.row) };
-        reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
-
         // Overwrite with new data (write path — marks column changed).
-        let tick = world.next_tick();
         let src_arch = &mut world.archetypes.archetypes[location.archetype_id.0];
         unsafe {
             let dst = src_arch.columns[col_idx].get_ptr_mut(location.row, tick);
@@ -775,9 +783,6 @@ fn changeset_insert_raw(
             std::ptr::copy_nonoverlapping(data_ptr, dst, layout.size());
         }
     } else {
-        // Entity does not have this component — reverse is Remove.
-        reverse.record_remove(entity, comp_id);
-
         // Archetype migration: source components + new component.
         let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
         let mut target_ids = src_arch.sorted_ids.clone();
@@ -789,7 +794,6 @@ fn changeset_insert_raw(
         let target_arch_id = world
             .archetypes
             .get_or_create(&target_ids, &world.components);
-        let tick = world.next_tick();
 
         let (src_arch, target_arch) = get_pair_mut(
             &mut world.archetypes.archetypes,
@@ -842,36 +846,27 @@ fn changeset_insert_raw(
             row: target_row,
         });
     }
+
+    Ok(())
 }
 
-/// Raw remove: performs archetype migration to remove a component, capturing its
-/// old value for the reverse changeset.
+/// Raw remove: performs archetype migration to remove a component, dropping
+/// the old value.
 fn changeset_remove_raw(
     world: &mut World,
-    reverse: &mut EnumChangeSet,
     entity: Entity,
     comp_id: ComponentId,
-) {
-    assert!(world.is_alive(entity), "entity is not alive");
+    tick: Tick,
+) -> Result<(), ApplyError> {
+    if !world.is_alive(entity) {
+        return Err(ApplyError::DeadEntity(entity));
+    }
     let index = entity.index() as usize;
     let location = world.entity_locations[index].unwrap();
     let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
 
     if !src_arch.component_ids.contains(comp_id) {
-        return; // Component not present — nothing to do.
-    }
-
-    // Capture old value for reverse (Insert). The source column will be
-    // swap_remove_no_drop'd below, so the reverse arena becomes the sole
-    // owner of this value — register a drop entry.
-    let info = world.components.info(comp_id);
-    let layout = info.layout;
-    let drop_fn = info.drop_fn;
-    let col_idx = src_arch.column_index(comp_id).unwrap();
-    let old_ptr = unsafe { src_arch.columns[col_idx].get_ptr(location.row) };
-    let offset = reverse.record_insert(entity, comp_id, old_ptr as *const u8, layout);
-    if let Some(drop_fn) = drop_fn {
-        reverse.drop_entries.push(DropEntry { offset, drop_fn });
+        return Ok(()); // Component not present — nothing to do.
     }
 
     // Compute target archetype: source components minus this one.
@@ -887,17 +882,10 @@ fn changeset_remove_raw(
     if target_ids.is_empty() {
         // Entity has no components left — move to empty archetype.
         let arch = &mut world.archetypes.archetypes[src_arch_id.0];
-        // swap_remove_no_drop for the removed component (data already captured)
-        let removed_col = arch.column_index(comp_id).unwrap();
-        unsafe {
-            arch.columns[removed_col].swap_remove_no_drop(src_row);
-        }
-        // swap_remove with drop for remaining columns
-        for (col_idx_inner, &cid) in arch.sorted_ids.iter().enumerate() {
-            if cid != comp_id {
-                unsafe {
-                    arch.columns[col_idx_inner].swap_remove(src_row);
-                }
+        // swap_remove with drop for all columns (including the removed one).
+        for col_idx_inner in 0..arch.columns.len() {
+            unsafe {
+                arch.columns[col_idx_inner].swap_remove(src_row);
             }
         }
         arch.entities.swap_remove(src_row);
@@ -916,7 +904,7 @@ fn changeset_remove_raw(
             archetype_id: empty_arch_id,
             row: empty_arch.entities.len() - 1,
         });
-        return;
+        return Ok(());
     }
 
     let target_arch_id = world
@@ -929,12 +917,12 @@ fn changeset_remove_raw(
         target_arch_id.0,
     );
 
-    // Move shared columns (skip removed component).
+    // Move shared columns (skip removed component — drop it).
     for (src_col, &cid) in src_arch.sorted_ids.iter().enumerate() {
         if cid == comp_id {
-            // Already captured — just discard from source.
+            // Drop the removed component's data.
             unsafe {
-                src_arch.columns[src_col].swap_remove_no_drop(src_row);
+                src_arch.columns[src_col].swap_remove(src_row);
             }
         } else if let Some(tgt_col) = target_arch.column_index(cid) {
             unsafe {
@@ -943,6 +931,11 @@ fn changeset_remove_raw(
                 src_arch.columns[src_col].swap_remove_no_drop(src_row);
             }
         }
+    }
+
+    // Mark target columns as changed.
+    for col in &mut target_arch.columns {
+        col.mark_changed(tick);
     }
 
     target_arch.entities.push(entity);
@@ -965,6 +958,8 @@ fn changeset_remove_raw(
         archetype_id: target_arch_id,
         row: target_row,
     });
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1087,7 +1082,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_spawn_and_reverse_despawns() {
+    fn apply_spawn() {
         let mut world = World::new();
         let entity = world.alloc_entity();
 
@@ -1098,76 +1093,58 @@ mod tests {
             (Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }),
         );
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert!(world.is_alive(entity));
         assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
-
-        // Reverse should despawn
-        let _ = reverse.apply(&mut world);
-        assert!(!world.is_alive(entity));
     }
 
     #[test]
-    fn apply_despawn_and_reverse_respawns() {
+    fn apply_despawn() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 5.0, y: 6.0 }, Vel { dx: 7.0, dy: 8.0 }));
 
         let mut cs = EnumChangeSet::new();
         cs.record_despawn(e);
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert!(!world.is_alive(e));
-
-        // Reverse should respawn — creates new entity with same data
-        let _ = reverse.apply(&mut world);
-        let count = world.query::<(&Pos, &Vel)>().count();
-        assert_eq!(count, 1);
     }
 
     #[test]
-    fn apply_insert_new_and_reverse_removes() {
+    fn apply_insert_new() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let mut cs = EnumChangeSet::new();
         cs.insert::<Vel>(&mut world, e, Vel { dx: 3.0, dy: 4.0 });
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
-
-        let _ = reverse.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), None);
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
     }
 
     #[test]
-    fn apply_insert_overwrite_and_reverse_restores() {
+    fn apply_insert_overwrite() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let mut cs = EnumChangeSet::new();
         cs.insert::<Pos>(&mut world, e, Pos { x: 99.0, y: 99.0 });
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 99.0, y: 99.0 }));
-
-        let _ = reverse.apply(&mut world);
-        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
     }
 
     #[test]
-    fn apply_remove_and_reverse_reinserts() {
+    fn apply_remove() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
 
         let mut cs = EnumChangeSet::new();
         cs.remove::<Vel>(&mut world, e);
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Vel>(e), None);
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
-
-        let _ = reverse.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
 
     #[test]
@@ -1175,27 +1152,8 @@ mod tests {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
         let cs = EnumChangeSet::new();
-        let reverse = cs.apply(&mut world);
-        assert!(reverse.is_empty());
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
-    }
-
-    #[test]
-    fn round_trip_forward_reverse_forward() {
-        let mut world = World::new();
-        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-
-        let mut cs = EnumChangeSet::new();
-        cs.insert::<Vel>(&mut world, e, Vel { dx: 10.0, dy: 20.0 });
-
-        let reverse = cs.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
-
-        let forward_again = reverse.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), None);
-
-        let _ = forward_again.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
     }
 
     // ── typed helper tests ────────────────────────────────────────
@@ -1208,28 +1166,25 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.insert::<Vel>(&mut world, e, Vel { dx: 3.0, dy: 4.0 });
 
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
     }
 
     #[test]
-    fn typed_insert_overwrite_and_reverse() {
+    fn typed_insert_overwrite() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let mut cs = EnumChangeSet::new();
         cs.insert::<Pos>(&mut world, e, Pos { x: 99.0, y: 99.0 });
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 99.0, y: 99.0 }));
-
-        let _ = reverse.apply(&mut world);
-        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
     }
 
     #[test]
-    fn typed_spawn_and_reverse() {
+    fn typed_spawn_and_apply() {
         let mut world = World::new();
         let entity = world.alloc_entity();
 
@@ -1240,29 +1195,23 @@ mod tests {
             (Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }),
         );
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert!(world.is_alive(entity));
         assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
         assert_eq!(world.get::<Vel>(entity), Some(&Vel { dx: 3.0, dy: 4.0 }));
-
-        let _ = reverse.apply(&mut world);
-        assert!(!world.is_alive(entity));
     }
 
     #[test]
-    fn typed_remove_and_reverse() {
+    fn typed_remove() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
 
         let mut cs = EnumChangeSet::new();
         cs.remove::<Vel>(&mut world, e);
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Vel>(e), None);
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
-
-        let _ = reverse.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
 
     #[test]
@@ -1276,13 +1225,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already placed")]
-    fn apply_spawn_panics_on_live_entity() {
+    fn apply_spawn_returns_error_on_live_entity() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         // Use raw record_spawn to bypass the spawn_bundle guard,
-        // then verify apply() catches it.
+        // then verify apply() returns AlreadyPlaced error.
         let pos_id = world.register_component::<Vel>();
         let vel = Vel { dx: 3.0, dy: 4.0 };
         let mut cs = EnumChangeSet::new();
@@ -1294,7 +1242,8 @@ mod tests {
                 Layout::new::<Vel>(),
             )],
         );
-        let _ = cs.apply(&mut world);
+        let result = cs.apply(&mut world);
+        assert!(matches!(result, Err(ApplyError::AlreadyPlaced(_))));
     }
 
     // ── Drop safety tests ─────────────────────────────────────────
@@ -1373,8 +1322,8 @@ mod tests {
         {
             let mut cs = EnumChangeSet::new();
             cs.insert::<Tracked>(&mut world, e, Tracked::new(42, &drops));
-            let _reverse = cs.apply(&mut world);
-            // cs dropped after apply — should not double-drop
+            cs.apply(&mut world).unwrap();
+            // cs consumed by apply — should not double-drop
         }
 
         // Value is now owned by the world; no spurious drops from changeset.
@@ -1389,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_of_remove_drops_owned_value() {
+    fn remove_drops_value() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Tracked::new(99, &drops)));
@@ -1399,19 +1348,15 @@ mod tests {
             "spawn transfers ownership, no drop"
         );
 
-        {
-            let mut cs = EnumChangeSet::new();
-            cs.remove::<Tracked>(&mut world, e);
-            let _reverse = cs.apply(&mut world);
-            // _reverse owns the Tracked value (remove used swap_remove_no_drop)
-            assert_eq!(drops.load(Ordering::SeqCst), 0, "no drop yet");
-            // reverse dropped here without apply()
-        }
+        let mut cs = EnumChangeSet::new();
+        cs.remove::<Tracked>(&mut world, e);
+        cs.apply(&mut world).unwrap();
 
+        // Remove now drops the value directly (no reverse changeset).
         assert_eq!(
             drops.load(Ordering::SeqCst),
             1,
-            "reverse drop should clean up owned value"
+            "remove should drop the value"
         );
     }
 
@@ -1425,7 +1370,7 @@ mod tests {
 
         let mut cs = EnumChangeSet::new();
         cs.insert_raw::<Vel>(e, vel_id, Vel { dx: 3.0, dy: 4.0 });
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
 
@@ -1458,13 +1403,13 @@ mod tests {
             &world.components,
             (Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }),
         );
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
         assert_eq!(world.get::<Vel>(entity), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
 
     #[test]
-    fn apply_batch_despawns_and_reverse() {
+    fn apply_batch_despawns() {
         let mut world = World::new();
         let a = world.spawn((10u32,));
         let b = world.spawn((20u32,));
@@ -1474,48 +1419,34 @@ mod tests {
         cs.record_despawn(a);
         cs.record_despawn(c);
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         assert!(!world.is_alive(a));
         assert!(world.is_alive(b));
         assert!(!world.is_alive(c));
         assert_eq!(*world.get::<u32>(b).unwrap(), 20);
-
-        // Reverse re-spawns with correct component data
-        let _re_reverse = reverse.apply(&mut world);
-        let mut values: Vec<u32> = Vec::new();
-        world
-            .query::<(&u32,)>()
-            .for_each(|(val,)| values.push(*val));
-        values.sort();
-        assert_eq!(values, vec![10, 20, 30]);
     }
 
     // ── Sparse mutation tests ────────────────────────────────────────
 
     #[test]
-    fn sparse_insert_and_reverse_removes() {
+    fn sparse_insert() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let mut cs = EnumChangeSet::new();
         cs.insert_sparse::<Vel>(&mut world, e, Vel { dx: 5.0, dy: 6.0 });
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         // Sparse component should be readable via world.get (routes through sparse).
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 5.0, dy: 6.0 }));
         // Archetype component still intact.
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
-
-        // Reverse should remove the sparse component.
-        let _ = reverse.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), None);
-        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
     }
 
     #[test]
-    fn sparse_insert_overwrite_and_reverse_restores() {
+    fn sparse_insert_overwrite() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
@@ -1527,16 +1458,12 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.insert_sparse::<Vel>(&mut world, e, Vel { dx: 99.0, dy: 99.0 });
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 99.0, dy: 99.0 }));
-
-        // Reverse should restore old value.
-        let _ = reverse.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 1.0, dy: 2.0 }));
     }
 
     #[test]
-    fn sparse_remove_and_reverse_reinserts() {
+    fn sparse_remove() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
         world.insert_sparse::<Vel>(e, Vel { dx: 3.0, dy: 4.0 });
@@ -1544,12 +1471,8 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.remove_sparse::<Vel>(&mut world, e);
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Vel>(e), None);
-
-        // Reverse should reinsert.
-        let _ = reverse.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
 
     #[test]
@@ -1561,8 +1484,7 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.remove_sparse::<Vel>(&mut world, e);
 
-        let reverse = cs.apply(&mut world);
-        assert!(reverse.is_empty());
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
     }
 
@@ -1594,7 +1516,7 @@ mod tests {
         {
             let mut cs = EnumChangeSet::new();
             cs.insert_sparse::<Tracked>(&mut world, e, Tracked::new(42, &drops));
-            let _reverse = cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
 
         // Value owned by sparse storage, no spurious drops.
@@ -1605,11 +1527,9 @@ mod tests {
     }
 
     #[test]
-    fn sparse_overwrite_tracked_no_double_drop() {
+    fn sparse_overwrite_tracked_drops_old() {
         // Verifies that overwriting a sparse component with a non-trivial
-        // destructor does not double-free. The old value's destructor must
-        // run exactly once: when the reverse changeset is dropped (not
-        // during the overwrite itself).
+        // destructor drops the old value exactly once during apply.
         let drops = Arc::new(AtomicUsize::new(0));
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
@@ -1618,23 +1538,19 @@ mod tests {
         {
             let mut cs = EnumChangeSet::new();
             cs.insert_sparse::<Tracked>(&mut world, e, Tracked::new(1, &drops));
-            let _reverse = cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         assert_eq!(drops.load(Ordering::SeqCst), 0, "no drops yet");
 
-        // Overwrite with a new Tracked.
+        // Overwrite with a new Tracked — old value dropped during apply.
         {
             let mut cs = EnumChangeSet::new();
             cs.insert_sparse::<Tracked>(&mut world, e, Tracked::new(2, &drops));
-            let reverse = cs.apply(&mut world);
-            // Reverse holds old value (Tracked(1)). Not dropped yet.
-            assert_eq!(drops.load(Ordering::SeqCst), 0, "reverse holds old value");
-            drop(reverse);
-            // Dropping reverse runs old value's destructor exactly once.
+            cs.apply(&mut world).unwrap();
             assert_eq!(
                 drops.load(Ordering::SeqCst),
                 1,
-                "old value dropped by reverse"
+                "old value dropped during apply"
             );
         }
 
@@ -1648,10 +1564,9 @@ mod tests {
     }
 
     #[test]
-    fn sparse_remove_tracked_no_double_drop() {
+    fn sparse_remove_tracked_drops_value() {
         // Verifies that removing a sparse component with a non-trivial
-        // destructor via changeset doesn't double-free. The old value's
-        // destructor runs when the reverse changeset is dropped.
+        // destructor via changeset drops the value during apply.
         let drops = Arc::new(AtomicUsize::new(0));
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
@@ -1660,22 +1575,19 @@ mod tests {
         {
             let mut cs = EnumChangeSet::new();
             cs.insert_sparse::<Tracked>(&mut world, e, Tracked::new(1, &drops));
-            let _reverse = cs.apply(&mut world);
+            cs.apply(&mut world).unwrap();
         }
         assert_eq!(drops.load(Ordering::SeqCst), 0);
 
-        // Remove via changeset.
+        // Remove via changeset — value dropped during apply.
         {
             let mut cs = EnumChangeSet::new();
             cs.remove_sparse::<Tracked>(&mut world, e);
-            let reverse = cs.apply(&mut world);
-            // Reverse holds old value.
-            assert_eq!(drops.load(Ordering::SeqCst), 0, "reverse holds old value");
-            drop(reverse);
+            cs.apply(&mut world).unwrap();
             assert_eq!(
                 drops.load(Ordering::SeqCst),
                 1,
-                "old value dropped by reverse"
+                "value dropped during apply"
             );
         }
 
@@ -1695,16 +1607,11 @@ mod tests {
         // Sparse insert
         cs.insert_sparse::<f32>(&mut world, e, 42.0f32);
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         // Both present
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 1.0, dy: 2.0 }));
         assert_eq!(world.get::<f32>(e), Some(&42.0f32));
-
-        // Reverse undoes both
-        let _forward = reverse.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), None);
-        assert_eq!(world.get::<f32>(e), None);
     }
 
     #[test]
@@ -1730,20 +1637,83 @@ mod tests {
     }
 
     #[test]
-    fn sparse_round_trip_forward_reverse_forward() {
+    fn sparse_insert_apply() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let mut cs = EnumChangeSet::new();
         cs.insert_sparse::<Vel>(&mut world, e, Vel { dx: 10.0, dy: 20.0 });
 
-        let reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
+    }
 
-        let forward_again = reverse.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), None);
+    /// Component with a drop counter — verifies no leaks on partial apply.
+    struct DropCounted {
+        _value: u32,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
 
-        let _ = forward_again.apply(&mut world);
-        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
+    impl Drop for DropCounted {
+        fn drop(&mut self) {
+            self.counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn partial_apply_drops_unapplied_values() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut world = World::new();
+        let live = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let dead = world.spawn((Pos { x: 3.0, y: 4.0 },));
+        world.despawn(dead); // dead entity
+
+        // Register the droppable component type.
+        let dc_id = world.register_component::<DropCounted>();
+
+        let mut cs = EnumChangeSet::new();
+        // Mutation 0: insert on live entity — will succeed
+        cs.insert_raw::<DropCounted>(
+            live,
+            dc_id,
+            DropCounted {
+                _value: 1,
+                counter: drops.clone(),
+            },
+        );
+        // Mutation 1: insert on dead entity — will fail
+        cs.insert_raw::<DropCounted>(
+            dead,
+            dc_id,
+            DropCounted {
+                _value: 2,
+                counter: drops.clone(),
+            },
+        );
+
+        // Apply should fail on mutation 1.
+        let result = cs.apply(&mut world);
+        assert!(result.is_err());
+
+        // Mutation 0's value transferred to World (not dropped by changeset).
+        // Mutation 1's value should have been dropped by the changeset cleanup.
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "unapplied value must be dropped"
+        );
+
+        // Despawn the live entity to drop mutation 0's value from World.
+        world.despawn(live);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "both values must be dropped total"
+        );
     }
 }

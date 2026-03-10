@@ -635,7 +635,9 @@ pub trait Transact {
                 Ok(forward) => {
                     tx.mark_committed();
                     drop(tx);
-                    forward.apply(world);
+                    forward
+                        .apply(world)
+                        .expect("changeset apply after successful commit");
                     return Ok(value);
                 }
                 Err(conflict) => {
@@ -732,7 +734,9 @@ impl Transact for Pessimistic {
                 Ok(forward) => {
                     tx.mark_committed();
                     drop(tx);
-                    forward.apply(world);
+                    forward
+                        .apply(world)
+                        .expect("changeset apply after successful commit");
                     return Ok(value);
                 }
                 Err(conflict) => {

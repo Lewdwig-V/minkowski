@@ -91,7 +91,7 @@ fn source_side(tx: mpsc::Sender<WireMessage>) {
             ),
         );
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world);
+        cs.apply(&mut world).expect("replicate apply");
     }
     println!(
         "[source] After mutations: {} entities, WAL seq {}",

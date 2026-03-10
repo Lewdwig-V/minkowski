@@ -88,7 +88,9 @@ impl<S: Transact> Transact for Durable<S> {
                         .lock()
                         .append(&forward, &self.codecs)
                         .expect("WAL write failed — durable commit impossible");
-                    forward.apply(world);
+                    forward
+                        .apply(world)
+                        .expect("changeset apply after successful commit");
 
                     // Fire checkpoint handler if threshold exceeded.
                     // Checkpoint is best-effort — the transaction is already
