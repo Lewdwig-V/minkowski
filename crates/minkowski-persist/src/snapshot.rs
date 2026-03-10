@@ -486,16 +486,59 @@ impl Default for Snapshot {
 /// Magic for incremental snapshot files (distinct from full snapshots).
 const INCREMENTAL_MAGIC: [u8; 8] = *b"MK2INCRK";
 
+/// Parameters for saving an incremental (delta) snapshot.
+///
+/// Groups the arguments needed by [`Snapshot::save_incremental`] and
+/// [`Snapshot::save_incremental_to_bytes`] into a single struct.
+pub struct IncrementalParams<'a> {
+    /// The current world to snapshot.
+    pub world: &'a World,
+    /// Codec registry for serialization.
+    pub codecs: &'a CodecRegistry,
+    /// WAL sequence number of the base (full) snapshot.
+    pub base_wal_seq: u64,
+    /// Current WAL sequence number.
+    pub wal_seq: u64,
+    /// [`ChangeTick`] captured when the base snapshot was taken.
+    /// Columns with ticks newer than this are considered dirty.
+    pub since_tick: ChangeTick,
+    /// The world produced by loading the base (full) snapshot.
+    /// Used to detect structural changes (entity count diffs).
+    pub base_world: &'a World,
+}
+
+fn incremental_header(
+    data: &IncrementalSnapshotData,
+    params: &IncrementalParams<'_>,
+) -> IncrementalSnapshotHeader {
+    IncrementalSnapshotHeader {
+        base_wal_seq: params.base_wal_seq,
+        wal_seq: params.wal_seq,
+        dirty_archetype_count: data.dirty_archetypes.len(),
+        clean_archetype_count: data.clean_archetypes.len(),
+        entity_count: data
+            .dirty_archetypes
+            .iter()
+            .map(|a| a.entities.len())
+            .sum::<usize>()
+            + data
+                .clean_archetypes
+                .iter()
+                .map(|a| a.entity_count as usize)
+                .sum::<usize>(),
+    }
+}
+
 impl Snapshot {
     /// Save an incremental snapshot containing only archetypes that changed
-    /// since `since_tick`.
+    /// since `params.since_tick`.
     ///
-    /// The `since_tick` should be the [`ChangeTick`] captured at the time of the
-    /// base (full) snapshot via [`World::change_tick`]. Archetypes whose columns
-    /// all have change ticks ≤ `since_tick` are recorded as clean references;
-    /// only dirty archetypes have their full data serialized.
+    /// An archetype is dirty if **any** of the following hold:
+    /// - Any column's change tick is newer than `since_tick`
+    /// - Its entity count differs from the matching archetype in `base_world`
+    /// - It has no matching archetype in `base_world` (new archetype)
     ///
-    /// Sparse components are always included in full (they lack per-column
+    /// Sparse components are always included in full (they lack per-entry
     /// change ticks). Schema and allocator state are always included.
     ///
     /// The file uses a distinct magic (`MK2INCRK`) so it cannot be confused
@@ -503,29 +546,10 @@ impl Snapshot {
     pub fn save_incremental(
         &self,
         path: &Path,
-        world: &World,
-        codecs: &CodecRegistry,
-        base_wal_seq: u64,
-        wal_seq: u64,
-        since_tick: ChangeTick,
+        params: &IncrementalParams<'_>,
     ) -> Result<IncrementalSnapshotHeader, SnapshotError> {
-        let data = self.build_incremental_data(world, codecs, base_wal_seq, wal_seq, since_tick)?;
-        let header = IncrementalSnapshotHeader {
-            base_wal_seq,
-            wal_seq,
-            dirty_archetype_count: data.dirty_archetypes.len(),
-            clean_archetype_count: data.clean_archetypes.len(),
-            entity_count: data
-                .dirty_archetypes
-                .iter()
-                .map(|a| a.entities.len())
-                .sum::<usize>()
-                + data
-                    .clean_archetypes
-                    .iter()
-                    .map(|a| a.entity_count as usize)
-                    .sum::<usize>(),
-        };
+        let data = self.build_incremental_data(params)?;
+        let header = incremental_header(&data, params);
 
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
@@ -561,32 +585,14 @@ impl Snapshot {
     /// Serialize an incremental snapshot to bytes (e.g. for network transfer).
     ///
     /// Returns `(header, wire_bytes)` in the same envelope format as
-    /// [`save_incremental`](Self::save_incremental).
+    /// [`save_incremental`](Self::save_incremental). See that method for the
+    /// dirty-detection semantics.
     pub fn save_incremental_to_bytes(
         &self,
-        world: &World,
-        codecs: &CodecRegistry,
-        base_wal_seq: u64,
-        wal_seq: u64,
-        since_tick: ChangeTick,
+        params: &IncrementalParams<'_>,
     ) -> Result<(IncrementalSnapshotHeader, Vec<u8>), SnapshotError> {
-        let data = self.build_incremental_data(world, codecs, base_wal_seq, wal_seq, since_tick)?;
-        let header = IncrementalSnapshotHeader {
-            base_wal_seq,
-            wal_seq,
-            dirty_archetype_count: data.dirty_archetypes.len(),
-            clean_archetype_count: data.clean_archetypes.len(),
-            entity_count: data
-                .dirty_archetypes
-                .iter()
-                .map(|a| a.entities.len())
-                .sum::<usize>()
-                + data
-                    .clean_archetypes
-                    .iter()
-                    .map(|a| a.entity_count as usize)
-                    .sum::<usize>(),
-        };
+        let data = self.build_incremental_data(params)?;
+        let header = incremental_header(&data, params);
 
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
@@ -679,12 +685,16 @@ impl Snapshot {
 
     fn build_incremental_data(
         &self,
-        world: &World,
-        codecs: &CodecRegistry,
-        base_wal_seq: u64,
-        wal_seq: u64,
-        since_tick: ChangeTick,
+        params: &IncrementalParams<'_>,
     ) -> Result<IncrementalSnapshotData, SnapshotError> {
+        let IncrementalParams {
+            world,
+            codecs,
+            base_wal_seq,
+            wal_seq,
+            since_tick,
+            base_world,
+        } = params;
         // Schema (full — same as full snapshot)
         let schema: Vec<ComponentSchema> = (0..world.component_count())
             .map(|id| {
@@ -713,6 +723,23 @@ impl Snapshot {
             free_list: free.to_vec(),
         };
 
+        // Build a lookup of base archetype entity counts, keyed by sorted
+        // component ID set, for structural dirty detection. Structural
+        // mutations (despawn, insert-migration, remove) do not bump
+        // per-column change ticks, so comparing entity counts against the
+        // base world is the only way to detect membership changes.
+        let base_entity_counts: HashMap<&[ComponentId], usize> = (0..base_world.archetype_count())
+            .filter_map(|idx| {
+                let ids = base_world.archetype_component_ids(idx);
+                let ents = base_world.archetype_entities(idx);
+                if ids.is_empty() || ents.is_empty() {
+                    None
+                } else {
+                    Some((ids, ents.len()))
+                }
+            })
+            .collect();
+
         // Partition archetypes into dirty vs clean
         let mut dirty_archetypes = Vec::new();
         let mut clean_archetypes = Vec::new();
@@ -733,11 +760,21 @@ impl Snapshot {
                 }
             }
 
-            // Check if any column changed since the base tick
-            let is_dirty = comp_ids.iter().any(|&comp_id| {
+            // Check column ticks for value-level changes
+            let ticks_dirty = comp_ids.iter().any(|&comp_id| {
                 let col_tick = world.archetype_column_changed_tick(arch_idx, comp_id);
                 col_tick.to_raw() > since_tick.to_raw()
             });
+
+            // Check entity count against base world for structural changes.
+            // If the archetype doesn't exist in base (new archetype), or its
+            // entity count differs, it's structurally dirty.
+            let structurally_dirty = match base_entity_counts.get(comp_ids) {
+                Some(&base_count) => entities.len() != base_count,
+                None => true, // new archetype — not in base
+            };
+
+            let is_dirty = ticks_dirty || structurally_dirty;
 
             if is_dirty {
                 // Serialize full archetype data (same as full snapshot)
@@ -784,8 +821,8 @@ impl Snapshot {
         }
 
         Ok(IncrementalSnapshotData {
-            base_wal_seq,
-            wal_seq,
+            base_wal_seq: *base_wal_seq,
+            wal_seq: *wal_seq,
             schema,
             allocator,
             dirty_archetypes,
@@ -1678,9 +1715,15 @@ mod tests {
         let (base_world, _) = snap.load(&base_path, &codecs).unwrap();
 
         // No mutations — incremental should have zero dirty archetypes
-        let header = snap
-            .save_incremental(&inc_path, &world, &codecs, 0, 1, since_tick)
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world,
+        };
+        let header = snap.save_incremental(&inc_path, &params).unwrap();
         assert_eq!(header.dirty_archetype_count, 0);
         assert_eq!(header.clean_archetype_count, 2);
         assert_eq!(header.entity_count, 2);
@@ -1730,9 +1773,15 @@ mod tests {
         }
 
         // Save incremental
-        let header = snap
-            .save_incremental(&inc_path, &world, &codecs, 0, 2, since_tick)
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 2,
+            since_tick,
+            base_world: &base_world,
+        };
+        let header = snap.save_incremental(&inc_path, &params).unwrap();
         // (Pos, Vel) archetype is dirty, (Pos) archetype is clean
         assert_eq!(header.dirty_archetype_count, 1);
         assert_eq!(header.clean_archetype_count, 1);
@@ -1773,16 +1822,15 @@ mod tests {
         let (base_world, _) = snap.load(&base_path, &codecs).unwrap();
 
         // Use default tick (0) — all archetypes are dirty
-        let header = snap
-            .save_incremental(
-                &inc_path,
-                &world,
-                &codecs,
-                0,
-                1,
-                minkowski::ChangeTick::default(),
-            )
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick: minkowski::ChangeTick::default(),
+            base_world: &base_world,
+        };
+        let header = snap.save_incremental(&inc_path, &params).unwrap();
         assert_eq!(header.dirty_archetype_count, 1);
         assert_eq!(header.clean_archetype_count, 0);
 
@@ -1813,9 +1861,15 @@ mod tests {
         let (base_world, _) = snap.load_from_bytes(&base_bytes, &codecs).unwrap();
 
         // Incremental (no changes)
-        let (header, inc_bytes) = snap
-            .save_incremental_to_bytes(&world, &codecs, 0, 1, since_tick)
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world,
+        };
+        let (header, inc_bytes) = snap.save_incremental_to_bytes(&params).unwrap();
         assert_eq!(header.dirty_archetype_count, 0);
 
         let (mut restored, seq) = snap
@@ -1835,16 +1889,17 @@ mod tests {
         codecs.register::<Pos>(&mut world);
         world.spawn((Pos { x: 1.0, y: 2.0 },));
 
+        let base_world = World::new();
         let snap = Snapshot::new();
-        snap.save_incremental(
-            &inc_path,
-            &world,
-            &codecs,
-            0,
-            0,
-            minkowski::ChangeTick::default(),
-        )
-        .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 0,
+            since_tick: minkowski::ChangeTick::default(),
+            base_world: &base_world,
+        };
+        snap.save_incremental(&inc_path, &params).unwrap();
 
         let data = std::fs::read(&inc_path).unwrap();
         assert_eq!(
@@ -1861,10 +1916,17 @@ mod tests {
         codecs.register::<Pos>(&mut world);
         world.spawn((Pos { x: 1.0, y: 2.0 },));
 
+        let base_world = World::new();
         let snap = Snapshot::new();
-        let (_, mut bytes) = snap
-            .save_incremental_to_bytes(&world, &codecs, 0, 0, minkowski::ChangeTick::default())
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 0,
+            since_tick: minkowski::ChangeTick::default(),
+            base_world: &base_world,
+        };
+        let (_, mut bytes) = snap.save_incremental_to_bytes(&params).unwrap();
 
         // Corrupt payload
         bytes[SNAPSHOT_HEADER_SIZE] ^= 0xFF;
@@ -1911,9 +1973,15 @@ mod tests {
         // Spawn a new entity in a NEW archetype (Pos, Vel)
         world.spawn((Pos { x: 10.0, y: 20.0 }, Vel { dx: 1.0, dy: 2.0 }));
 
-        let (header, inc_bytes) = snap
-            .save_incremental_to_bytes(&world, &codecs, 0, 1, since_tick)
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world,
+        };
+        let (header, inc_bytes) = snap.save_incremental_to_bytes(&params).unwrap();
         // New archetype is dirty (it was created after since_tick)
         assert!(header.dirty_archetype_count >= 1);
 
@@ -1945,9 +2013,15 @@ mod tests {
         // Add sparse after the base snapshot
         world.insert_sparse::<Vel>(e, Vel { dx: 10.0, dy: 20.0 });
 
-        let (_, inc_bytes) = snap
-            .save_incremental_to_bytes(&world, &codecs, 0, 1, since_tick)
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world,
+        };
+        let (_, inc_bytes) = snap.save_incremental_to_bytes(&params).unwrap();
 
         let (restored, _) = snap
             .load_incremental_from_bytes(&inc_bytes, &base_world, &codecs)
@@ -1969,10 +2043,17 @@ mod tests {
         codecs.register::<Pos>(&mut world);
         world.spawn((Pos { x: 1.0, y: 2.0 },));
 
+        let base_world = World::new();
         let snap = Snapshot::new();
-        let (header, _) = snap
-            .save_incremental_to_bytes(&world, &codecs, 42, 99, minkowski::ChangeTick::default())
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 42,
+            wal_seq: 99,
+            since_tick: minkowski::ChangeTick::default(),
+            base_world: &base_world,
+        };
+        let (header, _) = snap.save_incremental_to_bytes(&params).unwrap();
 
         assert_eq!(header.base_wal_seq, 42);
         assert_eq!(header.wal_seq, 99);
@@ -2002,6 +2083,7 @@ mod tests {
 
         // Full snapshot size
         let (_, full_bytes) = snap.save_to_bytes(&world, &codecs, 0).unwrap();
+        let (base_world, _) = snap.load_from_bytes(&full_bytes, &codecs).unwrap();
 
         // Mutate only the (Pos, Vel) entity
         for (pos, _vel) in world.query::<(&mut Pos, &Vel)>() {
@@ -2010,9 +2092,15 @@ mod tests {
         }
 
         // Incremental snapshot size
-        let (header, inc_bytes) = snap
-            .save_incremental_to_bytes(&world, &codecs, 0, 1, since_tick)
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world,
+        };
+        let (header, inc_bytes) = snap.save_incremental_to_bytes(&params).unwrap();
 
         assert_eq!(header.dirty_archetype_count, 1);
         assert_eq!(header.clean_archetype_count, 1);
@@ -2040,15 +2128,13 @@ mod tests {
         codecs_a.register_as::<Vel>("vel", &mut world_a);
 
         // Archetype 1: (Pos, Vel) — will be dirty
-        world_a.spawn((
-            Pos { x: 1.0, y: 2.0 },
-            Vel { dx: 3.0, dy: 4.0 },
-        ));
+        world_a.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
         // Archetype 2: (Pos) only — will be clean
         world_a.spawn((Pos { x: 5.0, y: 6.0 },));
 
         let snap = Snapshot::new();
         snap.save(&base_path, &world_a, &codecs_a, 0).unwrap();
+        let (base_world_a, _) = snap.load(&base_path, &codecs_a).unwrap();
 
         let since_tick = world_a.change_tick();
 
@@ -2058,9 +2144,15 @@ mod tests {
             unsafe { (*pos).x = 100.0 };
         }
 
-        let (_, inc_bytes) = snap
-            .save_incremental_to_bytes(&world_a, &codecs_a, 0, 1, since_tick)
-            .unwrap();
+        let params = IncrementalParams {
+            world: &world_a,
+            codecs: &codecs_a,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world_a,
+        };
+        let (_, inc_bytes) = snap.save_incremental_to_bytes(&params).unwrap();
 
         // "Process B" (receiver): OPPOSITE registration order
         let mut world_b_tmp = World::new();
@@ -2090,5 +2182,203 @@ mod tests {
             .map(|v| (v.0.dx, v.0.dy))
             .collect();
         assert_eq!(velocities, vec![(3.0, 4.0)]);
+    }
+
+    // ── Structural dirty detection tests ────────────────────────────
+
+    #[test]
+    fn incremental_despawn_marks_archetype_dirty() {
+        // Despawn doesn't bump column ticks, but the entity count changes,
+        // so the archetype must be classified as dirty.
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+
+        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let _e2 = world.spawn((Pos { x: 3.0, y: 4.0 },));
+
+        let snap = Snapshot::new();
+        snap.save(&base_path, &world, &codecs, 0).unwrap();
+        let (base_world, _) = snap.load(&base_path, &codecs).unwrap();
+
+        let since_tick = world.change_tick();
+
+        // Despawn one entity — column ticks are NOT bumped
+        world.despawn(e1);
+
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world,
+        };
+        let (header, inc_bytes) = snap.save_incremental_to_bytes(&params).unwrap();
+
+        // Must be dirty: entity count changed from 2 to 1
+        assert_eq!(
+            header.dirty_archetype_count, 1,
+            "archetype with despawned entity must be dirty"
+        );
+        assert_eq!(header.clean_archetype_count, 0);
+
+        let (mut restored, _) = snap
+            .load_incremental_from_bytes(&inc_bytes, &base_world, &codecs)
+            .unwrap();
+        let positions: Vec<(f32, f32)> = restored
+            .query::<(&Pos,)>()
+            .map(|p| (p.0.x, p.0.y))
+            .collect();
+        assert_eq!(positions, vec![(3.0, 4.0)]);
+    }
+
+    #[test]
+    fn incremental_insert_migration_marks_source_dirty() {
+        // Inserting a component migrates entity from archetype A to A∪{new}.
+        // The source archetype (A) loses a row without bumping column ticks,
+        // so it must be detected as structurally dirty.
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Vel>(&mut world);
+
+        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let _e2 = world.spawn((Pos { x: 3.0, y: 4.0 },));
+
+        let snap = Snapshot::new();
+        snap.save(&base_path, &world, &codecs, 0).unwrap();
+        let (base_world, _) = snap.load(&base_path, &codecs).unwrap();
+
+        let since_tick = world.change_tick();
+
+        // Migrate e1 from (Pos) to (Pos, Vel)
+        world.insert(e1, (Vel { dx: 10.0, dy: 20.0 },));
+
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world,
+        };
+        let (header, inc_bytes) = snap.save_incremental_to_bytes(&params).unwrap();
+
+        // Both archetypes must be dirty: source lost a row, target gained one
+        assert_eq!(
+            header.dirty_archetype_count, 2,
+            "both source and target archetypes must be dirty after migration"
+        );
+        assert_eq!(header.clean_archetype_count, 0);
+
+        let (mut restored, _) = snap
+            .load_incremental_from_bytes(&inc_bytes, &base_world, &codecs)
+            .unwrap();
+        assert_eq!(restored.query::<(&Pos,)>().count(), 2);
+        assert_eq!(restored.query::<(&Vel,)>().count(), 1);
+    }
+
+    #[test]
+    fn incremental_remove_migration_marks_source_dirty() {
+        // Removing a component migrates entity from archetype A to A\{removed}.
+        // The source archetype loses a row without bumping column ticks.
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Vel>(&mut world);
+
+        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.1, dy: 0.2 }));
+        let _e2 = world.spawn((Pos { x: 3.0, y: 4.0 }, Vel { dx: 0.3, dy: 0.4 }));
+
+        let snap = Snapshot::new();
+        snap.save(&base_path, &world, &codecs, 0).unwrap();
+        let (base_world, _) = snap.load(&base_path, &codecs).unwrap();
+
+        let since_tick = world.change_tick();
+
+        // Migrate e1 from (Pos, Vel) to (Pos)
+        world.remove::<Vel>(e1);
+
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world,
+        };
+        let (header, inc_bytes) = snap.save_incremental_to_bytes(&params).unwrap();
+
+        // Source archetype (Pos, Vel) shrunk, target (Pos) grew — both dirty
+        assert_eq!(
+            header.dirty_archetype_count, 2,
+            "both archetypes must be dirty after remove-migration"
+        );
+        assert_eq!(header.clean_archetype_count, 0);
+
+        let (mut restored, _) = snap
+            .load_incremental_from_bytes(&inc_bytes, &base_world, &codecs)
+            .unwrap();
+        assert_eq!(restored.query::<(&Pos,)>().count(), 2);
+        assert_eq!(restored.query::<(&Vel,)>().count(), 1);
+
+        // Verify the correct entity kept its Vel
+        let vels: Vec<(f32, f32)> = restored
+            .query::<(&Vel,)>()
+            .map(|v| (v.0.dx, v.0.dy))
+            .collect();
+        assert_eq!(vels, vec![(0.3, 0.4)]);
+    }
+
+    #[test]
+    fn incremental_spawn_after_base_marks_archetype_dirty() {
+        // Spawning a new entity into an existing archetype changes entity
+        // count. The archetype must be dirty even if no column ticks changed
+        // since the base (they will have changed due to spawn, but this test
+        // validates the structural check path is present).
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let snap = Snapshot::new();
+        snap.save(&base_path, &world, &codecs, 0).unwrap();
+        let (base_world, _) = snap.load(&base_path, &codecs).unwrap();
+
+        let since_tick = world.change_tick();
+
+        // Spawn into same archetype
+        world.spawn((Pos { x: 5.0, y: 6.0 },));
+
+        let params = IncrementalParams {
+            world: &world,
+            codecs: &codecs,
+            base_wal_seq: 0,
+            wal_seq: 1,
+            since_tick,
+            base_world: &base_world,
+        };
+        let (header, inc_bytes) = snap.save_incremental_to_bytes(&params).unwrap();
+
+        assert_eq!(header.dirty_archetype_count, 1);
+
+        let (mut restored, _) = snap
+            .load_incremental_from_bytes(&inc_bytes, &base_world, &codecs)
+            .unwrap();
+        assert_eq!(restored.query::<(&Pos,)>().count(), 2);
     }
 }
