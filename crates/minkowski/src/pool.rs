@@ -315,8 +315,13 @@ impl SlabPool {
         for class in 0..NUM_SIZE_CLASSES {
             let block_size = SIZE_CLASSES[class];
 
-            // Align partition start to block_size for correct alignment of returned pointers.
-            offset = (offset + block_size - 1) & !(block_size - 1);
+            // Align the absolute address (base + offset) to block_size, not just offset.
+            // The mmap base is page-aligned (4KB) but may not be aligned to larger
+            // block sizes (64KB, 1MB). Without this, blocks in those classes could
+            // be misaligned for components with align > page_size.
+            let abs_addr = base as usize + offset;
+            let aligned_addr = (abs_addr + block_size - 1) & !(block_size - 1);
+            offset = aligned_addr - base as usize;
 
             // Bytes allocated to this size class (rounded down to whole blocks).
             let class_bytes = total * PROPORTIONS[class] / proportion_sum;
@@ -361,22 +366,27 @@ unsafe impl PoolAllocator for SlabPool {
             return Ok(NonNull::new(layout.align() as *mut u8).expect("alignment is non-zero"));
         }
 
-        let start_class = size_class_for(layout).ok_or(PoolExhausted { requested: layout })?;
+        let class = size_class_for(layout).ok_or(PoolExhausted { requested: layout })?;
 
-        // Try the target class first, then fall back to larger classes.
-        for (class, &block_size) in SIZE_CLASSES.iter().enumerate().skip(start_class) {
-            let mut list = self.free_lists[class].lock();
-            if let Some(ptr) = list.pop() {
-                self.used_bytes.fetch_add(block_size, Ordering::Relaxed);
+        // No cross-class fallback: each class is a fixed partition.
+        // If this class is exhausted, return Err — the user adjusts
+        // their budget or size-class proportions. This matches TigerBeetle's
+        // fixed-partition model and avoids the dealloc class-mismatch bug
+        // where a block promoted to a larger class gets returned to the
+        // smaller class's free list on deallocation.
+        let mut list = self.free_lists[class].lock();
+        if let Some(ptr) = list.pop() {
+            drop(list); // release lock before atomic
+            self.used_bytes
+                .fetch_add(SIZE_CLASSES[class], Ordering::Relaxed);
 
-                debug_assert!(
-                    (ptr as usize).is_multiple_of(layout.align()),
-                    "SlabPool: block at {ptr:p} is not aligned to {}",
-                    layout.align()
-                );
+            debug_assert!(
+                (ptr as usize).is_multiple_of(layout.align()),
+                "SlabPool: block at {ptr:p} is not aligned to {}",
+                layout.align()
+            );
 
-                return Ok(NonNull::new(ptr).expect("free list block is non-null"));
-            }
+            return Ok(NonNull::new(ptr).expect("free list block is non-null"));
         }
 
         Err(PoolExhausted { requested: layout })
@@ -595,20 +605,16 @@ mod tests {
     }
 
     #[test]
-    fn slab_pool_falls_back_to_larger_class() {
-        // Use a small budget so class 0 (64B, 1% budget) has very few blocks.
+    fn slab_pool_no_cross_class_fallback() {
+        // Verify that exhausting one size class does NOT spill into larger
+        // classes. Each class is a fixed partition — this matches TigerBeetle's
+        // model and avoids the dealloc class-mismatch bug.
         let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
-        // Exhaust class 0 (64 B blocks).
+        // Exhaust class 0 (64B blocks).
         let mut ptrs = Vec::new();
-        loop {
-            // Try to allocate — once class 0 is empty, it should fall back
-            // to class 1 (256 B). We keep going until all classes are exhausted
-            // or we have enough to prove fallback worked.
-            let Ok(ptr) = pool.allocate(layout_small) else {
-                break;
-            };
+        while let Ok(ptr) = pool.allocate(layout_small) {
             ptrs.push(ptr);
         }
 
@@ -617,17 +623,23 @@ mod tests {
         let class0_bytes = 1024 * 1024 * PROPORTIONS[0] / proportion_sum;
         let class0_blocks = class0_bytes / SIZE_CLASSES[0];
 
-        // We should have gotten more blocks than class 0 alone provides,
-        // proving that fallback to larger classes occurred.
-        assert!(
-            ptrs.len() > class0_blocks,
-            "expected more than {class0_blocks} blocks (got {}), fallback to larger class failed",
+        // Should have gotten exactly class 0's block count — no spill.
+        assert_eq!(
+            ptrs.len(),
+            class0_blocks,
+            "expected exactly {class0_blocks} blocks from class 0, got {}",
             ptrs.len()
+        );
+
+        // Class 1 (256B) should still have blocks available.
+        let layout_medium = Layout::from_size_align(200, 8).unwrap();
+        assert!(
+            pool.allocate(layout_medium).is_ok(),
+            "class 1 should still have blocks after class 0 is exhausted"
         );
 
         // Clean up.
         for ptr in ptrs {
-            // SAFETY: each ptr was returned by `allocate` with layout_small.
             unsafe { pool.deallocate(ptr, layout_small) };
         }
     }
