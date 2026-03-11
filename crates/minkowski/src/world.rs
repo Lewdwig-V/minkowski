@@ -593,7 +593,8 @@ impl World {
             return results;
         }
 
-        // Group by archetype for cache locality.
+        // PERF: HashMap allocation is O(archetype_count) which is typically < 20.
+        // Not in a per-frame inner loop — called once per batch operation.
         let mut by_arch: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
         for (i, &entity) in entities.iter().enumerate() {
             if !self.entities.is_alive(entity) {
@@ -670,7 +671,8 @@ impl World {
             return results;
         }
 
-        // Group by archetype for cache locality.
+        // PERF: HashMap allocation is O(archetype_count) which is typically < 20.
+        // Not in a per-frame inner loop — called once per batch operation.
         let mut by_arch: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
         for (i, &entity) in entities.iter().enumerate() {
             if !self.entities.is_alive(entity) {

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use minkowski::{ComponentId, Entity, EnumChangeSet, World};
 
-use crate::codec::{CodecError, CodecRegistry};
+use crate::codec::{CodecError, CodecRegistry, CrcProof};
 use crate::record::*;
 
 /// Snapshot file magic identifying the v2 format with CRC32 checksums.
@@ -195,20 +195,23 @@ impl Snapshot {
         }
         let payload = &bytes[payload_offset..end];
 
-        // Verify CRC32 if present (v2 format).
-        if let Some(stored_crc) = stored_crc {
-            let actual_crc = crc32fast::hash(payload);
-            if actual_crc != stored_crc {
-                return Err(SnapshotError::Format(format!(
-                    "snapshot checksum mismatch: expected {stored_crc:#010x}, got {actual_crc:#010x}"
-                )));
-            }
-        }
+        // Verify CRC32 if present (v2 format). Produces a CrcProof that
+        // enables the raw_copy_size fast path in restore_world.
+        let proof = stored_crc
+            .map(|crc| {
+                CrcProof::verify(payload, crc).ok_or_else(|| {
+                    SnapshotError::Format(format!(
+                        "snapshot checksum mismatch: expected {crc:#010x}, got {:#010x}",
+                        crc32fast::hash(payload)
+                    ))
+                })
+            })
+            .transpose()?;
 
         let archived = rkyv::access::<ArchivedSnapshotData, rkyv::rancor::Error>(payload)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
 
-        let world = Self::restore_world(archived, codecs)?;
+        let world = Self::restore_world(archived, codecs, proof.as_ref())?;
         let wal_seq: u64 = archived.wal_seq.into();
         Ok((world, wal_seq))
     }
@@ -324,6 +327,7 @@ impl Snapshot {
     fn restore_world(
         data: &ArchivedSnapshotData,
         codecs: &CodecRegistry,
+        proof: Option<&CrcProof>,
     ) -> Result<World, SnapshotError> {
         let mut world = World::new();
 
@@ -400,15 +404,7 @@ impl Snapshot {
                         .layout(codec_id)
                         .ok_or(CodecError::UnregisteredComponent(codec_id))?;
 
-                    let raw = if let Some(size) = codecs.raw_copy_size(codec_id) {
-                        if archived_bytes.len() == size {
-                            archived_bytes.to_vec()
-                        } else {
-                            codecs.deserialize(codec_id, archived_bytes)?
-                        }
-                    } else {
-                        codecs.deserialize(codec_id, archived_bytes)?
-                    };
+                    let raw = codecs.decode(codec_id, archived_bytes, proof)?;
                     // Use sender_id for spawn — it matches the fresh world's ID space.
                     raw_components.push((sender_id, raw, layout));
                 }

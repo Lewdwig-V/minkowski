@@ -43,7 +43,7 @@ impl ReplicationBatch {
     /// Serialize to bytes via rkyv.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ReplicationError> {
         rkyv::to_bytes::<rkyv::rancor::Error>(self)
-            .map(|v| v.to_vec())
+            .map(rkyv::util::AlignedVec::into_vec)
             .map_err(|e| ReplicationError::Format(e.to_string()))
     }
 
@@ -76,7 +76,7 @@ pub fn apply_batch(
 
     let mut last_seq = None;
     for record in &batch.records {
-        apply_record(record, world, codecs, remap.as_ref())?;
+        apply_record(record, world, codecs, remap.as_ref(), None)?;
         last_seq = Some(record.seq);
     }
 

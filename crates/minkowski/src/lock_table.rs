@@ -63,7 +63,8 @@ impl ColumnLockTable {
         reads: &FixedBitSet,
         writes: &FixedBitSet,
     ) -> Result<ColumnLockSet, LockConflict> {
-        // Build sorted list of (arch_id, comp_id, mode) for deterministic ordering.
+        // PERF: Vec allocation runs once at transaction begin, not per-entity.
+        // Typical size is archetypes × accessed components (< 100 entries).
         let mut requests: Vec<(usize, ComponentId, LockMode)> = Vec::new();
         for arch in archetypes {
             for comp_id in reads.ones() {
