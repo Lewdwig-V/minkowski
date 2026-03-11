@@ -416,7 +416,7 @@ mod tests {
         reg: &ComponentRegistry,
         ids: &[crate::component::ComponentId],
     ) -> Archetype {
-        Archetype::new(ArchetypeId(0), ids, reg)
+        Archetype::new(ArchetypeId(0), ids, reg, &crate::pool::default_pool())
     }
 
     #[test]

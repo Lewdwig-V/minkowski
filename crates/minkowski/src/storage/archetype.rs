@@ -5,6 +5,7 @@ use fixedbitset::FixedBitSet;
 use super::blob_vec::BlobVec;
 use crate::component::{ComponentId, ComponentRegistry};
 use crate::entity::Entity;
+use crate::pool::SharedPool;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ArchetypeId(pub usize);
@@ -33,6 +34,7 @@ impl Archetype {
         id: ArchetypeId,
         sorted_component_ids: &[ComponentId],
         registry: &ComponentRegistry,
+        pool: &SharedPool,
     ) -> Self {
         let max_id = sorted_component_ids.iter().copied().max().unwrap_or(0);
         let mut bitset = FixedBitSet::with_capacity(max_id + 1);
@@ -42,7 +44,7 @@ impl Archetype {
         for (col_idx, &comp_id) in sorted_component_ids.iter().enumerate() {
             bitset.insert(comp_id);
             let info = registry.info(comp_id);
-            columns.push(BlobVec::new(info.layout, info.drop_fn, 0));
+            columns.push(BlobVec::new(info.layout, info.drop_fn, 0, pool.clone()));
             component_index[comp_id] = Some(col_idx);
         }
 
@@ -121,12 +123,13 @@ impl Archetypes {
         &mut self,
         sorted_ids: &[ComponentId],
         registry: &ComponentRegistry,
+        pool: &SharedPool,
     ) -> ArchetypeId {
         if let Some(&id) = self.by_components.get(sorted_ids) {
             return id;
         }
         let id = ArchetypeId(self.archetypes.len());
-        let archetype = Archetype::new(id, sorted_ids, registry);
+        let archetype = Archetype::new(id, sorted_ids, registry, pool);
         self.archetypes.push(archetype);
         self.by_components.insert(sorted_ids.to_vec(), id);
         self.generation += 1;
@@ -139,6 +142,7 @@ mod tests {
     use super::*;
     use crate::component::ComponentRegistry;
     use crate::entity::Entity;
+    use crate::pool::default_pool;
 
     #[derive(Debug, PartialEq, Clone, Copy)]
     struct Pos {
@@ -163,7 +167,7 @@ mod tests {
         let vel_id = reg.register::<Vel>();
         let mut ids = vec![pos_id, vel_id];
         ids.sort_unstable();
-        let arch = Archetype::new(ArchetypeId(0), &ids, &reg);
+        let arch = Archetype::new(ArchetypeId(0), &ids, &reg, &default_pool());
         assert!(arch.component_ids.contains(pos_id));
         assert!(arch.component_ids.contains(vel_id));
         assert_eq!(arch.len(), 0);
@@ -175,7 +179,7 @@ mod tests {
         let pos_id = reg.register::<Pos>();
         let mut ids = vec![pos_id];
         ids.sort_unstable();
-        let mut arch = Archetype::new(ArchetypeId(0), &ids, &reg);
+        let mut arch = Archetype::new(ArchetypeId(0), &ids, &reg, &default_pool());
 
         let entity = Entity::new(0, 0);
         let mut pos = Pos { x: 1.0, y: 2.0 };
@@ -204,12 +208,12 @@ mod tests {
 
         let mut ids = vec![pos_id, vel_id];
         ids.sort_unstable();
-        let a1 = archetypes.get_or_create(&ids, &reg);
-        let a2 = archetypes.get_or_create(&ids, &reg);
+        let a1 = archetypes.get_or_create(&ids, &reg, &default_pool());
+        let a2 = archetypes.get_or_create(&ids, &reg, &default_pool());
         assert_eq!(a1, a2); // idempotent
 
         let ids2 = vec![pos_id];
-        let a3 = archetypes.get_or_create(&ids2, &reg);
+        let a3 = archetypes.get_or_create(&ids2, &reg, &default_pool());
         assert_ne!(a1, a3); // different component set = different archetype
     }
 
@@ -220,11 +224,11 @@ mod tests {
         let mut archetypes = Archetypes::new();
 
         let gen_before = archetypes.generation();
-        archetypes.get_or_create(&[pos_id], &reg);
+        archetypes.get_or_create(&[pos_id], &reg, &default_pool());
         assert!(archetypes.generation() > gen_before);
 
         let gen_before = archetypes.generation();
-        archetypes.get_or_create(&[pos_id], &reg); // same, no new archetype
+        archetypes.get_or_create(&[pos_id], &reg, &default_pool()); // same, no new archetype
         assert_eq!(archetypes.generation(), gen_before);
     }
 }

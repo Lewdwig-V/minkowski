@@ -148,12 +148,13 @@ pub struct World {
 
 impl World {
     pub fn new() -> Self {
+        let pool = crate::pool::default_pool();
         Self {
             id: WorldId::next(),
             entities: EntityAllocator::new(),
             archetypes: Archetypes::new(),
             components: ComponentRegistry::new(),
-            sparse: SparseStorage::new(),
+            sparse: SparseStorage::new(pool),
             entity_locations: Vec::new(),
             table_cache: TableCache::new(),
             query_cache: HashMap::new(),
@@ -308,9 +309,11 @@ impl World {
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
         self.drain_orphans();
         let component_ids = B::component_ids(&mut self.components);
-        let arch_id = self
-            .archetypes
-            .get_or_create(&component_ids, &self.components);
+        let arch_id = self.archetypes.get_or_create(
+            &component_ids,
+            &self.components,
+            &crate::pool::default_pool(),
+        );
         let entity = self.entities.alloc();
         let index = entity.index() as usize;
 
@@ -959,7 +962,11 @@ impl World {
         let src_arch_id = location.archetype_id;
         let src_row = location.row;
 
-        let target_arch_id = self.archetypes.get_or_create(&target_ids, &self.components);
+        let target_arch_id = self.archetypes.get_or_create(
+            &target_ids,
+            &self.components,
+            &crate::pool::default_pool(),
+        );
         let tick = self.next_tick();
 
         // Check if source and target are the same archetype (all components
@@ -1112,7 +1119,9 @@ impl World {
                 });
             }
             arch.debug_assert_consistent();
-            let empty_arch_id = self.archetypes.get_or_create(&[], &self.components);
+            let empty_arch_id =
+                self.archetypes
+                    .get_or_create(&[], &self.components, &crate::pool::default_pool());
             let empty_arch = &mut self.archetypes.archetypes[empty_arch_id.0];
             empty_arch.entities.push(entity);
             self.entity_locations[index] = Some(EntityLocation {
@@ -1122,7 +1131,11 @@ impl World {
             return Some(removed);
         }
 
-        let target_arch_id = self.archetypes.get_or_create(&target_ids, &self.components);
+        let target_arch_id = self.archetypes.get_or_create(
+            &target_ids,
+            &self.components,
+            &crate::pool::default_pool(),
+        );
 
         let (src_arch, target_arch) = get_pair_mut(
             &mut self.archetypes.archetypes,

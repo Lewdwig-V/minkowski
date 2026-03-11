@@ -82,7 +82,8 @@ impl TableCache {
                 "duplicate component types in table"
             );
 
-            let arch_id = archetypes.get_or_create(&sorted_ids, components);
+            let arch_id =
+                archetypes.get_or_create(&sorted_ids, components, &crate::pool::default_pool());
             let archetype = &archetypes.archetypes[arch_id.0];
 
             // Map field index -> archetype column index
