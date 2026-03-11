@@ -665,11 +665,10 @@ impl EnumChangeSet {
                         ids.dedup();
                         ids
                     };
-                    let arch_id = world.archetypes.get_or_create(
-                        &sorted_ids,
-                        &world.components,
-                        &crate::pool::default_pool(),
-                    );
+                    let arch_id =
+                        world
+                            .archetypes
+                            .get_or_create(&sorted_ids, &world.components, &world.pool);
                     let index = entity.index() as usize;
 
                     if index >= world.entity_locations.len() {
@@ -803,11 +802,10 @@ fn changeset_insert_raw(
         let src_arch_id = location.archetype_id;
         let src_row = location.row;
 
-        let target_arch_id = world.archetypes.get_or_create(
-            &target_ids,
-            &world.components,
-            &crate::pool::default_pool(),
-        );
+        let target_arch_id =
+            world
+                .archetypes
+                .get_or_create(&target_ids, &world.components, &world.pool);
 
         let (src_arch, target_arch) = get_pair_mut(
             &mut world.archetypes.archetypes,
@@ -911,10 +909,9 @@ fn changeset_remove_raw(
             });
         }
         arch.debug_assert_consistent();
-        let empty_arch_id =
-            world
-                .archetypes
-                .get_or_create(&[], &world.components, &crate::pool::default_pool());
+        let empty_arch_id = world
+            .archetypes
+            .get_or_create(&[], &world.components, &world.pool);
         let empty_arch = &mut world.archetypes.archetypes[empty_arch_id.0];
         empty_arch.entities.push(entity);
         world.entity_locations[index] = Some(EntityLocation {
@@ -924,11 +921,10 @@ fn changeset_remove_raw(
         return Ok(());
     }
 
-    let target_arch_id = world.archetypes.get_or_create(
-        &target_ids,
-        &world.components,
-        &crate::pool::default_pool(),
-    );
+    let target_arch_id =
+        world
+            .archetypes
+            .get_or_create(&target_ids, &world.components, &world.pool);
 
     let (src_arch, target_arch) = get_pair_mut(
         &mut world.archetypes.archetypes,

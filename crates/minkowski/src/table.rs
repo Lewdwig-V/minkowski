@@ -66,6 +66,7 @@ impl TableCache {
         &mut self,
         components: &mut ComponentRegistry,
         archetypes: &mut Archetypes,
+        pool: &crate::pool::SharedPool,
     ) -> &TableDescriptor {
         let type_id = TypeId::of::<T>();
         self.descriptors.entry(type_id).or_insert_with(|| {
@@ -82,8 +83,7 @@ impl TableCache {
                 "duplicate component types in table"
             );
 
-            let arch_id =
-                archetypes.get_or_create(&sorted_ids, components, &crate::pool::default_pool());
+            let arch_id = archetypes.get_or_create(&sorted_ids, components, pool);
             let archetype = &archetypes.archetypes[arch_id.0];
 
             // Map field index -> archetype column index
@@ -298,7 +298,8 @@ mod tests {
         let mut archetypes = Archetypes::new();
         let mut cache = TableCache::new();
 
-        let desc = cache.get_or_create::<PosVel>(&mut components, &mut archetypes);
+        let pool = crate::pool::default_pool();
+        let desc = cache.get_or_create::<PosVel>(&mut components, &mut archetypes, &pool);
         assert_eq!(desc.col_indices.len(), 2);
         assert_eq!(desc.item_sizes.len(), 2);
     }
@@ -308,12 +309,13 @@ mod tests {
         let mut components = ComponentRegistry::new();
         let mut archetypes = Archetypes::new();
         let mut cache = TableCache::new();
+        let pool = crate::pool::default_pool();
 
         let id1 = cache
-            .get_or_create::<PosVel>(&mut components, &mut archetypes)
+            .get_or_create::<PosVel>(&mut components, &mut archetypes, &pool)
             .archetype_id;
         let id2 = cache
-            .get_or_create::<PosVel>(&mut components, &mut archetypes)
+            .get_or_create::<PosVel>(&mut components, &mut archetypes, &pool)
             .archetype_id;
         assert_eq!(id1, id2);
     }
@@ -393,7 +395,8 @@ mod tests {
         let mut archetypes = Archetypes::new();
         let mut cache = TableCache::new();
 
-        let desc = cache.get_or_create::<PosVel>(&mut components, &mut archetypes);
+        let pool = crate::pool::default_pool();
+        let desc = cache.get_or_create::<PosVel>(&mut components, &mut archetypes, &pool);
         // Both fields should have valid column indices
         let archetype = &archetypes.archetypes[desc.archetype_id.0];
         for &col_idx in &desc.col_indices {

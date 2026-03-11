@@ -1,6 +1,7 @@
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::{Entity, EntityAllocator};
+use crate::pool::{PoolExhausted, SharedPool, default_pool};
 use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
@@ -98,6 +99,10 @@ pub struct WorldStats {
     pub current_tick: u64,
     pub total_spawns: u64,
     pub total_despawns: u64,
+    /// Total capacity of the backing memory pool, if bounded.
+    pub pool_capacity: Option<usize>,
+    /// Bytes currently allocated from the pool, if tracked.
+    pub pool_used: Option<usize>,
 }
 
 /// Debug information about the tick state of a cached query type.
@@ -144,23 +149,33 @@ pub struct World {
     pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
     pub(crate) current_tick: Tick,
     pub(crate) orphan_queue: OrphanQueue,
+    pub(crate) pool: SharedPool,
 }
 
 impl World {
     pub fn new() -> Self {
-        let pool = crate::pool::default_pool();
+        Self::new_with_pool(default_pool())
+    }
+
+    pub(crate) fn new_with_pool(pool: SharedPool) -> Self {
         Self {
             id: WorldId::next(),
             entities: EntityAllocator::new(),
             archetypes: Archetypes::new(),
             components: ComponentRegistry::new(),
-            sparse: SparseStorage::new(pool),
+            sparse: SparseStorage::new(pool.clone()),
             entity_locations: Vec::new(),
             table_cache: TableCache::new(),
             query_cache: HashMap::new(),
             current_tick: Tick::default(),
             orphan_queue: OrphanQueue::new(),
+            pool,
         }
+    }
+
+    /// Create a [`WorldBuilder`] for configuring memory and allocation strategy.
+    pub fn builder() -> WorldBuilder {
+        WorldBuilder::new()
     }
 
     /// Advance the internal tick and return the new value.
@@ -309,11 +324,9 @@ impl World {
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
         self.drain_orphans();
         let component_ids = B::component_ids(&mut self.components);
-        let arch_id = self.archetypes.get_or_create(
-            &component_ids,
-            &self.components,
-            &crate::pool::default_pool(),
-        );
+        let arch_id = self
+            .archetypes
+            .get_or_create(&component_ids, &self.components, &self.pool);
         let entity = self.entities.alloc();
         let index = entity.index() as usize;
 
@@ -851,9 +864,10 @@ impl World {
 
     /// Resolve column pointers for a table's archetype.
     fn resolve_table_ptrs<T: crate::table::Table>(&mut self) -> (Vec<(*mut u8, usize)>, usize) {
-        let desc = self
-            .table_cache
-            .get_or_create::<T>(&mut self.components, &mut self.archetypes);
+        let pool = self.pool.clone();
+        let desc =
+            self.table_cache
+                .get_or_create::<T>(&mut self.components, &mut self.archetypes, &pool);
         let arch_id = desc.archetype_id;
         let col_indices = desc.col_indices.clone();
         let item_sizes = desc.item_sizes.clone();
@@ -905,9 +919,10 @@ impl World {
     /// Mark all columns in a table's archetype as changed.
     fn mark_table_columns_changed<T: crate::table::Table>(&mut self) {
         let tick = self.next_tick();
-        let desc = self
-            .table_cache
-            .get_or_create::<T>(&mut self.components, &mut self.archetypes);
+        let pool = self.pool.clone();
+        let desc =
+            self.table_cache
+                .get_or_create::<T>(&mut self.components, &mut self.archetypes, &pool);
         let arch_id = desc.archetype_id;
         let archetype = &mut self.archetypes.archetypes[arch_id.0];
         for col in &mut archetype.columns {
@@ -962,11 +977,9 @@ impl World {
         let src_arch_id = location.archetype_id;
         let src_row = location.row;
 
-        let target_arch_id = self.archetypes.get_or_create(
-            &target_ids,
-            &self.components,
-            &crate::pool::default_pool(),
-        );
+        let target_arch_id =
+            self.archetypes
+                .get_or_create(&target_ids, &self.components, &self.pool);
         let tick = self.next_tick();
 
         // Check if source and target are the same archetype (all components
@@ -1119,9 +1132,9 @@ impl World {
                 });
             }
             arch.debug_assert_consistent();
-            let empty_arch_id =
-                self.archetypes
-                    .get_or_create(&[], &self.components, &crate::pool::default_pool());
+            let empty_arch_id = self
+                .archetypes
+                .get_or_create(&[], &self.components, &self.pool);
             let empty_arch = &mut self.archetypes.archetypes[empty_arch_id.0];
             empty_arch.entities.push(entity);
             self.entity_locations[index] = Some(EntityLocation {
@@ -1131,11 +1144,9 @@ impl World {
             return Some(removed);
         }
 
-        let target_arch_id = self.archetypes.get_or_create(
-            &target_ids,
-            &self.components,
-            &crate::pool::default_pool(),
-        );
+        let target_arch_id =
+            self.archetypes
+                .get_or_create(&target_ids, &self.components, &self.pool);
 
         let (src_arch, target_arch) = get_pair_mut(
             &mut self.archetypes.archetypes,
@@ -1425,6 +1436,8 @@ impl World {
             current_tick: self.current_tick.raw(),
             total_spawns: self.entities.total_spawns,
             total_despawns: self.entities.total_despawns,
+            pool_capacity: self.pool.capacity(),
+            pool_used: self.pool.used(),
         }
     }
 
@@ -1529,6 +1542,82 @@ impl World {
 }
 
 impl Default for World {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── WorldBuilder ─────────────────────────────────────────────────────
+
+/// Hugepage configuration for the memory pool.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum HugePages {
+    /// Attempt 2 MiB hugepages, fall back to 4 KiB pages silently.
+    #[default]
+    Try,
+    /// Require hugepages — fail if unavailable.
+    Require,
+    /// Use regular 4 KiB pages only.
+    Off,
+}
+
+/// Builder for configuring [`World`] memory and allocation strategy.
+///
+/// # Example
+///
+/// ```
+/// use minkowski::WorldBuilder;
+///
+/// let world = WorldBuilder::new().build().unwrap();
+/// let stats = world.stats();
+/// assert!(stats.pool_capacity.is_none()); // system allocator
+/// ```
+pub struct WorldBuilder {
+    memory_budget: Option<usize>,
+    hugepages: HugePages,
+}
+
+impl WorldBuilder {
+    pub fn new() -> Self {
+        Self {
+            memory_budget: None,
+            hugepages: HugePages::default(),
+        }
+    }
+
+    /// Set a fixed memory budget in bytes. When set, the World will
+    /// allocate from a bounded slab pool instead of the system allocator.
+    ///
+    /// Not yet functional — `SlabPool` is implemented in a later task (C5).
+    /// Currently falls through to the default system allocator.
+    pub fn memory_budget(mut self, bytes: usize) -> Self {
+        self.memory_budget = Some(bytes);
+        self
+    }
+
+    /// Configure hugepage usage for the memory pool.
+    #[allow(dead_code)]
+    pub fn hugepages(mut self, hp: HugePages) -> Self {
+        self.hugepages = hp;
+        self
+    }
+
+    /// Build the [`World`]. Returns `Err` if the memory pool cannot be
+    /// allocated (only possible with a bounded `memory_budget`).
+    pub fn build(self) -> Result<World, PoolExhausted> {
+        let pool: SharedPool = match self.memory_budget {
+            Some(_bytes) => {
+                // TODO(C5): SlabPool::new(bytes, self.hugepages) — replace
+                // with mmap-backed slab pool when implemented.
+                default_pool()
+            }
+            None => default_pool(),
+        };
+        Ok(World::new_with_pool(pool))
+    }
+}
+
+impl Default for WorldBuilder {
     fn default() -> Self {
         Self::new()
     }
@@ -3008,6 +3097,54 @@ mod tests {
 
         let info = world.query_tick_info::<(&Pos,)>().unwrap();
         assert!(info.has_pending_tick);
+    }
+
+    // ── WorldBuilder tests ───────────────────────────────────────────
+
+    #[test]
+    fn world_builder_default_is_system_allocator() {
+        let world = World::builder().build().unwrap();
+        let stats = world.stats();
+        assert!(stats.pool_capacity.is_none());
+        assert!(stats.pool_used.is_none());
+    }
+
+    #[test]
+    fn world_new_still_works() {
+        let world = World::new();
+        let stats = world.stats();
+        assert!(stats.pool_capacity.is_none());
+        assert!(stats.pool_used.is_none());
+    }
+
+    #[test]
+    fn world_builder_with_memory_budget_still_defaults() {
+        // SlabPool not yet implemented — budget is accepted but falls through
+        // to the system allocator.
+        let world = WorldBuilder::new()
+            .memory_budget(64 * 1024 * 1024)
+            .build()
+            .unwrap();
+        let stats = world.stats();
+        // TODO(C5): once SlabPool exists, pool_capacity should be Some(64 MiB).
+        assert!(stats.pool_capacity.is_none());
+    }
+
+    #[test]
+    fn world_builder_spawn_and_query() {
+        let mut world = World::builder().build().unwrap();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+        let mut count = 0;
+        world.query::<(&Pos, &Vel)>().for_each(|_| count += 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn world_builder_default_impl() {
+        let builder = WorldBuilder::default();
+        let world = builder.build().unwrap();
+        assert_eq!(world.entity_count(), 0);
     }
 }
 

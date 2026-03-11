@@ -106,4 +106,4 @@ pub use reducer::{
 pub use retention::Expiry;
 pub use tick::ChangeTick;
 pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
-pub use world::{QueryTickInfo, World, WorldStats};
+pub use world::{HugePages, QueryTickInfo, World, WorldBuilder, WorldStats};
