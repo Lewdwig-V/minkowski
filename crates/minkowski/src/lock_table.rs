@@ -306,8 +306,8 @@ mod loom_tests {
     use crate::component::ComponentRegistry;
     use crate::storage::archetype::ArchetypeId;
     use crate::sync::Mutex;
-    use loom::sync::atomic::{AtomicBool, Ordering};
     use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicBool, Ordering};
     use loom::thread;
 
     // Archetype doesn't impl Clone, so each thread builds its own.

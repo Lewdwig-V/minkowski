@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use minkowski_bench::Position;
 
 macro_rules! define_fragments {
@@ -7,7 +7,9 @@ macro_rules! define_fragments {
     };
 }
 
-define_fragments!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
+define_fragments!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z
+);
 
 macro_rules! spawn_fragment {
     ($world:expr, $frag:ident) => {

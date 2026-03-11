@@ -47,7 +47,9 @@ pub enum WalError {
     Codec(#[from] CodecError),
     #[error("WAL format error: {0}")]
     Format(String),
-    #[error("WAL checksum mismatch at byte offset {offset}: expected {expected:#010x}, got {actual:#010x}")]
+    #[error(
+        "WAL checksum mismatch at byte offset {offset}: expected {expected:#010x}, got {actual:#010x}"
+    )]
     ChecksumMismatch {
         offset: u64,
         expected: u32,
@@ -1268,7 +1270,7 @@ mod tests {
             world_b.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
         assert_eq!(positions, vec![(1.0, 2.0)]);
 
-        let health: Vec<u32> = world_b.query::<(&Health,)>().map(|h| h.0 .0).collect();
+        let health: Vec<u32> = world_b.query::<(&Health,)>().map(|h| h.0.0).collect();
         assert_eq!(health, vec![100]);
     }
 
@@ -1355,7 +1357,7 @@ mod tests {
         let mut wal_b = Wal::open(&wal_dir, &codecs_b, default_config()).unwrap();
         wal_b.replay(&mut world_b, &codecs_b).unwrap();
 
-        let health: Vec<u32> = world_b.query::<(&Health,)>().map(|h| h.0 .0).collect();
+        let health: Vec<u32> = world_b.query::<(&Health,)>().map(|h| h.0.0).collect();
         assert_eq!(health, vec![50]);
         assert_eq!(world_b.query::<(&Pos,)>().count(), 0);
     }

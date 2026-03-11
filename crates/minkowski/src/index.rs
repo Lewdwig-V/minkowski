@@ -131,7 +131,7 @@ impl<T: Component + Ord + Clone> BTreeIndex<T> {
         &'a self,
         value: &T,
         world: &'a World,
-    ) -> impl Iterator<Item = Entity> + 'a {
+    ) -> impl Iterator<Item = Entity> + 'a + use<'a, T> {
         self.get(value)
             .iter()
             .copied()
@@ -177,12 +177,12 @@ impl<T: Component + Ord + Clone> BTreeIndex<T> {
     }
 
     fn remove_entity(&mut self, entity: Entity) {
-        if let Some(old_value) = self.reverse.remove(&entity) {
-            if let Some(bucket) = self.tree.get_mut(&old_value) {
-                bucket.retain(|&e| e != entity);
-                if bucket.is_empty() {
-                    self.tree.remove(&old_value);
-                }
+        if let Some(old_value) = self.reverse.remove(&entity)
+            && let Some(bucket) = self.tree.get_mut(&old_value)
+        {
+            bucket.retain(|&e| e != entity);
+            if bucket.is_empty() {
+                self.tree.remove(&old_value);
             }
         }
     }
@@ -286,7 +286,7 @@ impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
         &'a self,
         value: &T,
         world: &'a World,
-    ) -> impl Iterator<Item = Entity> + 'a {
+    ) -> impl Iterator<Item = Entity> + 'a + use<'a, T> {
         self.get(value)
             .iter()
             .copied()
@@ -317,12 +317,12 @@ impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
     }
 
     fn remove_entity(&mut self, entity: Entity) {
-        if let Some(old_value) = self.reverse.remove(&entity) {
-            if let Some(bucket) = self.map.get_mut(&old_value) {
-                bucket.retain(|&e| e != entity);
-                if bucket.is_empty() {
-                    self.map.remove(&old_value);
-                }
+        if let Some(old_value) = self.reverse.remove(&entity)
+            && let Some(bucket) = self.map.get_mut(&old_value)
+        {
+            bucket.retain(|&e| e != entity);
+            if bucket.is_empty() {
+                self.map.remove(&old_value);
             }
         }
     }

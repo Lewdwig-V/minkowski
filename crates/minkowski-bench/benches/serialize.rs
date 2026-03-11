@@ -1,6 +1,6 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use minkowski::EnumChangeSet;
-use minkowski_bench::{register_codecs, spawn_world, Position};
+use minkowski_bench::{Position, register_codecs, spawn_world};
 use minkowski_persist::{CodecRegistry, Snapshot, Wal, WalConfig};
 
 fn serialize(c: &mut Criterion) {

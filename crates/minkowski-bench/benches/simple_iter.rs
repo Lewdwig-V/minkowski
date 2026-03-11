@@ -1,5 +1,5 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use minkowski_bench::{spawn_world, Position, Velocity};
+use criterion::{Criterion, criterion_group, criterion_main};
+use minkowski_bench::{Position, Velocity, spawn_world};
 
 fn simple_iter(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_iter");

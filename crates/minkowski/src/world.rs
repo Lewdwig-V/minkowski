@@ -659,12 +659,12 @@ impl World {
                 assert!(w[0] != w[1], "duplicate entity in get_batch_mut");
             }
             for (i, &entity) in entities.iter().enumerate() {
-                if self.entities.is_alive(entity) {
-                    if let Some(val) = self.sparse.get_mut::<T>(comp_id, entity) {
-                        // SAFETY: the duplicate check above guarantees each entity
-                        // appears at most once, so no two results alias.
-                        results[i] = Some(unsafe { &mut *(val as *mut T) });
-                    }
+                if self.entities.is_alive(entity)
+                    && let Some(val) = self.sparse.get_mut::<T>(comp_id, entity)
+                {
+                    // SAFETY: the duplicate check above guarantees each entity
+                    // appears at most once, so no two results alias.
+                    results[i] = Some(unsafe { &mut *(val as *mut T) });
                 }
             }
             return results;

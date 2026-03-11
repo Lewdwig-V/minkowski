@@ -1,5 +1,5 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use minkowski_bench::{invert_4x4, Transform};
+use criterion::{Criterion, criterion_group, criterion_main};
+use minkowski_bench::{Transform, invert_4x4};
 
 fn spawn_heavy_world() -> minkowski::World {
     let mut world = minkowski::World::new();

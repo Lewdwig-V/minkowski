@@ -2,10 +2,10 @@
 
 use std::time::Instant;
 
-use minkowski::world::WorldStats;
 use minkowski::World;
-use minkowski_persist::wal::WalStats;
+use minkowski::world::WorldStats;
 use minkowski_persist::Wal;
+use minkowski_persist::wal::WalStats;
 
 /// Per-archetype detail.
 #[derive(Clone, Debug)]

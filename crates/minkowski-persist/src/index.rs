@@ -10,7 +10,7 @@ use rkyv::api::high::HighValidator;
 use rkyv::bytecheck::CheckBytes;
 use rkyv::de::Pool;
 use rkyv::ser::allocator::ArenaHandle;
-use rkyv::{rancor, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize, rancor};
 
 /// Index file magic identifying the persistent index format.
 const INDEX_MAGIC: [u8; 8] = *b"MK2INDXK";

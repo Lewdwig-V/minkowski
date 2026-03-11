@@ -1,6 +1,6 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use minkowski::{Optimistic, QueryMut, QueryReducerId, QueryRef, ReducerRegistry};
-use minkowski_bench::{spawn_world, Position, Rotation, Transform, Velocity};
+use minkowski_bench::{Position, Rotation, Transform, Velocity, spawn_world};
 
 fn schedule(c: &mut Criterion) {
     let mut group = c.benchmark_group("schedule");

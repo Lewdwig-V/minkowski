@@ -73,13 +73,18 @@ impl PagedSparseSet {
     pub unsafe fn insert(&mut self, entity: Entity, ptr: *const u8) {
         if let Some(dense) = self.dense_index(entity) {
             // Overwrite: drop old, copy new
-            let dst = self.dense_values.get_ptr(dense);
+            // SAFETY: `dense` is a valid index returned by `dense_index`.
+            let dst = unsafe { self.dense_values.get_ptr(dense) };
             if let Some(drop_fn) = self.dense_values.drop_fn {
-                drop_fn(dst);
+                // SAFETY: `dst` points to a live value of the stored type.
+                unsafe { drop_fn(dst) };
             }
             let size = self.dense_values.item_layout.size();
             if size > 0 {
-                std::ptr::copy_nonoverlapping(ptr, dst, size);
+                // SAFETY: `ptr` is valid per caller contract; `dst` was just
+                // cleared by drop (or is trivially copyable). Regions do not
+                // overlap because `ptr` is external and `dst` is in our BlobVec.
+                unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
             }
         } else {
             // New entry
@@ -102,7 +107,9 @@ impl PagedSparseSet {
             page[slot] = dense;
 
             self.dense_entities.push(entity);
-            self.dense_values.push(ptr as *mut u8);
+            // SAFETY: `ptr` points to a valid value matching this set's layout
+            // per caller contract. BlobVec::push copies the bytes.
+            unsafe { self.dense_values.push(ptr as *mut u8) };
         }
     }
 
@@ -116,10 +123,13 @@ impl PagedSparseSet {
     pub unsafe fn insert_no_drop(&mut self, entity: Entity, ptr: *const u8) -> bool {
         if let Some(dense) = self.dense_index(entity) {
             // Overwrite: copy new bytes WITHOUT dropping old.
-            let dst = self.dense_values.get_ptr(dense);
+            // SAFETY: `dense` is a valid index returned by `dense_index`.
+            let dst = unsafe { self.dense_values.get_ptr(dense) };
             let size = self.dense_values.item_layout.size();
             if size > 0 {
-                std::ptr::copy_nonoverlapping(ptr, dst, size);
+                // SAFETY: `ptr` is valid per caller contract; `dst` points to
+                // the existing slot. No overlap (external source vs BlobVec).
+                unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
             }
             true
         } else {
@@ -141,7 +151,9 @@ impl PagedSparseSet {
             page[slot] = dense;
 
             self.dense_entities.push(entity);
-            self.dense_values.push(ptr as *mut u8);
+            // SAFETY: `ptr` points to a valid value matching this set's layout
+            // per caller contract.
+            unsafe { self.dense_values.push(ptr as *mut u8) };
             false
         }
     }
@@ -234,7 +246,8 @@ use std::mem::ManuallyDrop;
 use crate::component::{Component, ComponentId};
 
 unsafe fn drop_ptr<T>(ptr: *mut u8) {
-    std::ptr::drop_in_place(ptr as *mut T);
+    // SAFETY: Caller guarantees `ptr` points to a live, aligned `T`.
+    unsafe { std::ptr::drop_in_place(ptr as *mut T) };
 }
 
 /// Typed sparse component storage backed by `PagedSparseSet`.
@@ -357,7 +370,8 @@ impl SparseStorage {
             set.dense_values.item_layout, layout,
             "insert_raw layout mismatch for ComponentId {comp_id}"
         );
-        set.insert(entity, ptr);
+        // SAFETY: Caller guarantees `ptr` is valid and matches `layout`.
+        unsafe { set.insert(entity, ptr) };
     }
 
     /// Like [`insert_raw`](Self::insert_raw), but does NOT drop the old value
@@ -382,7 +396,8 @@ impl SparseStorage {
             set.dense_values.item_layout, layout,
             "insert_raw_no_drop layout mismatch for ComponentId {comp_id}"
         );
-        set.insert_no_drop(entity, ptr)
+        // SAFETY: Caller guarantees `ptr` is valid and matches `layout`.
+        unsafe { set.insert_no_drop(entity, ptr) }
     }
 
     /// Raw read: returns a pointer to the sparse component data, or `None`.
@@ -440,13 +455,17 @@ mod tests {
 
     /// Helper: insert a typed value into the set.
     unsafe fn insert_val<T>(set: &mut PagedSparseSet, entity: Entity, mut val: T) {
-        set.insert(entity, &mut val as *mut T as *const u8);
+        // SAFETY: `&mut val` points to a valid `T`; caller ensures the set's
+        // layout matches `T`. We `forget` to avoid double-drop since the set
+        // now owns the bytes.
+        unsafe { set.insert(entity, &mut val as *mut T as *const u8) };
         std::mem::forget(val);
     }
 
     /// Helper: read a typed value from a raw pointer.
     unsafe fn read_ptr<T: Copy>(ptr: *mut u8) -> T {
-        *(ptr as *const T)
+        // SAFETY: Caller guarantees `ptr` points to a valid, aligned `T`.
+        unsafe { *(ptr as *const T) }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Arrow bridge: BlobVec column data → Arrow RecordBatch.
 
 use crate::schema::{ComponentSchema, SchemaRegistry};
-use arrow::array::{ArrayRef, BooleanArray, Float32Array, UInt32Array, UInt64Array, UInt8Array};
+use arrow::array::{ArrayRef, BooleanArray, Float32Array, UInt8Array, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use minkowski::{ComponentId, World};

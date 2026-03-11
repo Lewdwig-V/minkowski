@@ -140,11 +140,11 @@ unsafe impl<T: Component> WorldQuery for &T {
     }
 
     unsafe fn fetch<'w>(fetch: &ThinSlicePtr<T>, row: usize) -> &'w T {
-        &*fetch.ptr.add(row)
+        unsafe { &*fetch.ptr.add(row) }
     }
 
     unsafe fn as_slice<'w>(fetch: &ThinSlicePtr<T>, len: usize) -> &'w [T] {
-        std::slice::from_raw_parts(fetch.ptr as *const T, len)
+        unsafe { std::slice::from_raw_parts(fetch.ptr as *const T, len) }
     }
 }
 
@@ -171,11 +171,11 @@ unsafe impl<T: Component> WorldQuery for &mut T {
     }
 
     unsafe fn fetch<'w>(fetch: &ThinSlicePtr<T>, row: usize) -> &'w mut T {
-        &mut *fetch.ptr.add(row)
+        unsafe { &mut *fetch.ptr.add(row) }
     }
 
     unsafe fn as_slice<'w>(fetch: &ThinSlicePtr<T>, len: usize) -> &'w mut [T] {
-        std::slice::from_raw_parts_mut(fetch.ptr, len)
+        unsafe { std::slice::from_raw_parts_mut(fetch.ptr, len) }
     }
 }
 
@@ -194,11 +194,11 @@ unsafe impl WorldQuery for Entity {
     }
 
     unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
-        *fetch.ptr.add(row)
+        unsafe { *fetch.ptr.add(row) }
     }
 
     unsafe fn as_slice<'w>(fetch: &Self::Fetch<'w>, len: usize) -> &'w [Entity] {
-        std::slice::from_raw_parts(fetch.ptr as *const Entity, len)
+        unsafe { std::slice::from_raw_parts(fetch.ptr as *const Entity, len) }
     }
 }
 
@@ -229,13 +229,15 @@ unsafe impl<T: Component> WorldQuery for Option<&T> {
     }
 
     unsafe fn fetch<'w>(fetch: &Option<ThinSlicePtr<T>>, row: usize) -> Option<&'w T> {
-        fetch.as_ref().map(|f| &*f.ptr.add(row))
+        unsafe { fetch.as_ref().map(|f| &*f.ptr.add(row)) }
     }
 
     unsafe fn as_slice<'w>(fetch: &Option<ThinSlicePtr<T>>, len: usize) -> Option<&'w [T]> {
-        fetch
-            .as_ref()
-            .map(|f| std::slice::from_raw_parts(f.ptr as *const T, len))
+        unsafe {
+            fetch
+                .as_ref()
+                .map(|f| std::slice::from_raw_parts(f.ptr as *const T, len))
+        }
     }
 }
 
@@ -352,15 +354,15 @@ macro_rules! impl_world_query_tuple {
                 ($($name::init_fetch(archetype, registry),)*)
             }
 
-            unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
+            unsafe fn fetch<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> { unsafe {
                 let ($($name,)*) = fetch;
                 ($(<$name as WorldQuery>::fetch($name, row),)*)
-            }
+            }}
 
-            unsafe fn as_slice<'w>(fetch: &Self::Fetch<'w>, len: usize) -> Self::Slice<'w> {
+            unsafe fn as_slice<'w>(fetch: &Self::Fetch<'w>, len: usize) -> Self::Slice<'w> { unsafe {
                 let ($($name,)*) = fetch;
                 ($(<$name as WorldQuery>::as_slice($name, len),)*)
-            }
+            }}
         }
     };
 }

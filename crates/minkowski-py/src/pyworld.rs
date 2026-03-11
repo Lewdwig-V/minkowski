@@ -378,13 +378,10 @@ impl PyWorld {
             .fields
             .iter()
             .filter_map(|fm| {
-                kwargs.contains(fm.column_name).ok().and_then(|has| {
-                    if has {
-                        Some(fm.column_name)
-                    } else {
-                        None
-                    }
-                })
+                kwargs
+                    .contains(fm.column_name)
+                    .ok()
+                    .and_then(|has| if has { Some(fm.column_name) } else { None })
             })
             .collect();
 
@@ -412,7 +409,7 @@ impl PyWorld {
             if !self.world.is_alive(entity) {
                 return Err(PyValueError::new_err(format!("entity {bits} is not alive")));
             }
-            for (field_name, ref py_list) in &columns {
+            for (field_name, py_list) in &columns {
                 let value = py_list.get_item(i)?;
                 write_field_to_entity(&mut self.world, entity, component, field_name, &value)?;
             }

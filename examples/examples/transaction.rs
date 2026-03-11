@@ -62,7 +62,7 @@ fn avg_pos(world: &mut World) -> (f32, f32) {
 fn avg_health(world: &mut World) -> f32 {
     let (mut total, mut n) = (0u32, 0u32);
     for hp in world.query::<(&Health,)>() {
-        total += hp.0 .0;
+        total += hp.0.0;
         n += 1;
     }
     total as f32 / n as f32

@@ -5,7 +5,7 @@ use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
 use crate::tick::Tick;
-use crate::world::{get_pair_mut, EntityLocation, World};
+use crate::world::{EntityLocation, World, get_pair_mut};
 
 /// Error returned by [`EnumChangeSet::apply`] when a mutation targets
 /// an invalid entity.
@@ -1248,8 +1248,8 @@ mod tests {
 
     // ── Drop safety tests ─────────────────────────────────────────
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A non-Copy component that counts destructor calls via a shared counter.
     /// Each test creates its own counter, avoiding races with parallel tests.
@@ -1663,8 +1663,8 @@ mod tests {
 
     #[test]
     fn partial_apply_drops_unapplied_values() {
-        use std::sync::atomic::Ordering;
         use std::sync::Arc;
+        use std::sync::atomic::Ordering;
 
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 

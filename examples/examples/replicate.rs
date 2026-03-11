@@ -11,7 +11,7 @@
 
 use minkowski::{EnumChangeSet, World};
 use minkowski_persist::{
-    apply_batch, CodecRegistry, ReplicationBatch, Snapshot, Wal, WalConfig, WalCursor,
+    CodecRegistry, ReplicationBatch, Snapshot, Wal, WalConfig, WalCursor, apply_batch,
 };
 use rkyv::{Archive, Deserialize, Serialize};
 use std::sync::mpsc;

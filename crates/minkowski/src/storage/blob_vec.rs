@@ -83,7 +83,8 @@ impl BlobVec {
         let dst = self.ptr_at(self.len);
         let size = self.item_layout.size();
         if size > 0 {
-            std::ptr::copy_nonoverlapping(ptr, dst, size);
+            // SAFETY: caller guarantees ptr is valid for size bytes; dst is within allocated capacity
+            unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
         }
         self.len += 1;
     }
@@ -135,12 +136,15 @@ impl BlobVec {
         if row != last && size > 0 {
             let row_ptr = self.ptr_at(row);
             if let Some(drop_fn) = self.drop_fn {
-                drop_fn(row_ptr);
+                // SAFETY: row_ptr is valid; drop_fn was set at construction for this type
+                unsafe { drop_fn(row_ptr) };
             }
             let last_ptr = self.ptr_at(last);
-            std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size);
+            // SAFETY: last_ptr and row_ptr are non-overlapping valid pointers within allocation
+            unsafe { std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size) };
         } else if let Some(drop_fn) = self.drop_fn {
-            drop_fn(self.ptr_at(row));
+            // SAFETY: ptr_at returns valid pointer; drop_fn was set at construction for this type
+            unsafe { drop_fn(self.ptr_at(row)) };
         }
         self.len -= 1;
     }
@@ -156,12 +160,13 @@ impl BlobVec {
         let size = self.item_layout.size();
         let row_ptr = self.ptr_at(row);
         if size > 0 {
-            // Copy removed element to output
-            std::ptr::copy_nonoverlapping(row_ptr, ptr, size);
+            // SAFETY: row_ptr is valid for size bytes; ptr is valid per caller guarantee
+            unsafe { std::ptr::copy_nonoverlapping(row_ptr, ptr, size) };
             // Move last into the gap (if not same row)
             if row != last {
                 let last_ptr = self.ptr_at(last);
-                std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size);
+                // SAFETY: last_ptr and row_ptr are non-overlapping valid pointers
+                unsafe { std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size) };
             }
         }
         self.len -= 1;
@@ -180,7 +185,8 @@ impl BlobVec {
         if row != last && size > 0 {
             let row_ptr = self.ptr_at(row);
             let last_ptr = self.ptr_at(last);
-            std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size);
+            // SAFETY: last_ptr and row_ptr are non-overlapping valid pointers within allocation
+            unsafe { std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size) };
         }
         self.len -= 1;
     }
@@ -195,7 +201,8 @@ impl BlobVec {
     pub unsafe fn drop_in_place(&mut self, row: usize) {
         debug_assert!(row < self.len);
         if let Some(drop_fn) = self.drop_fn {
-            drop_fn(self.ptr_at(row));
+            // SAFETY: ptr_at returns valid pointer; drop_fn was set at construction for this type
+            unsafe { drop_fn(self.ptr_at(row)) };
         }
     }
 
@@ -213,7 +220,8 @@ impl BlobVec {
         if size > 0 {
             let src = self.ptr_at(src_row);
             let dst = self.ptr_at(dst_row);
-            std::ptr::copy_nonoverlapping(src, dst, size);
+            // SAFETY: src and dst are valid pointers within allocation; caller guarantees non-overlap semantics
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, size) };
         }
     }
 
@@ -321,18 +329,18 @@ mod tests {
     /// Push a typed value into a BlobVec, forgetting the original.
     unsafe fn push_val<T>(bv: &mut BlobVec, mut val: T) {
         let ptr = &mut val as *mut T as *mut u8;
-        bv.push(ptr);
+        unsafe { bv.push(ptr) };
         std::mem::forget(val);
     }
 
     /// Read a typed value from a BlobVec row.
     unsafe fn read_val<T: Copy>(bv: &BlobVec, row: usize) -> T {
-        let ptr = bv.get_ptr(row) as *const T;
-        *ptr
+        let ptr = unsafe { bv.get_ptr(row) } as *const T;
+        unsafe { *ptr }
     }
 
     unsafe fn drop_ptr<T>(ptr: *mut u8) {
-        std::ptr::drop_in_place(ptr as *mut T);
+        unsafe { std::ptr::drop_in_place(ptr as *mut T) };
     }
 
     fn bv_for<T>() -> BlobVec {

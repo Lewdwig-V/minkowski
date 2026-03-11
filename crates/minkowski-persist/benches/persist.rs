@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use minkowski::World;
 use minkowski_persist::{CodecRegistry, Snapshot, Wal, WalConfig};
 use rkyv::{Archive, Deserialize, Serialize};

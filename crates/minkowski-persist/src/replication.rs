@@ -15,7 +15,7 @@ use minkowski::{ComponentId, World};
 
 use crate::codec::{CodecError, CodecRegistry};
 use crate::record::ReplicationBatch;
-use crate::wal::{apply_record, WalError};
+use crate::wal::{WalError, apply_record};
 
 /// Errors from transport-agnostic replication operations.
 ///
@@ -353,7 +353,7 @@ mod tests {
             replica.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
         assert_eq!(positions, vec![(1.0, 2.0)]);
 
-        let health: Vec<u32> = replica.query::<(&Health,)>().map(|h| h.0 .0).collect();
+        let health: Vec<u32> = replica.query::<(&Health,)>().map(|h| h.0.0).collect();
         assert_eq!(health, vec![50]);
     }
 

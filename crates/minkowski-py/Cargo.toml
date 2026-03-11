@@ -1,7 +1,7 @@
 [package]
 name = "minkowski-py"
 version = "1.0.1"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [lints]

@@ -132,8 +132,8 @@ impl EntityAllocator {
         // materialize_reserved() already counted any prior reserve() calls.
         self.total_spawns += 1;
         if let Some(index) = self.free_list.pop() {
-            let gen = self.generations[index as usize];
-            Entity::new(index, gen)
+            let r#gen = self.generations[index as usize];
+            Entity::new(index, r#gen)
         } else {
             let index = self.generations.len() as u32;
             self.generations.push(0);
@@ -323,7 +323,7 @@ mod tests {
         let mut alloc = EntityAllocator::new();
         alloc.reserve(); // index 0
         alloc.reserve(); // index 1
-                         // alloc calls materialize_reserved internally, then allocates one more
+        // alloc calls materialize_reserved internally, then allocates one more
         let e = alloc.alloc();
         // 2 from materialize + 1 from alloc = 3
         assert_eq!(alloc.total_spawns, 3);

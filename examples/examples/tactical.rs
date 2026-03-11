@@ -332,10 +332,10 @@ fn operator_thread(
                     entity_bits,
                     health,
                 } => {
-                    if let Some(&local_e) = entity_map.get(entity_bits) {
-                        if let Some(h) = world.get_mut::<Health>(local_e) {
-                            h.0 = *health;
-                        }
+                    if let Some(&local_e) = entity_map.get(entity_bits)
+                        && let Some(h) = world.get_mut::<Health>(local_e)
+                    {
+                        h.0 = *health;
                     }
                 }
                 ReplicationEvent::Spawn { .. } => {

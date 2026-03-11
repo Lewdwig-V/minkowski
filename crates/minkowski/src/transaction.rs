@@ -631,7 +631,8 @@ pub trait Transact {
                 continue;
             }
             let value = f(&mut tx, world);
-            match self.try_commit(&mut tx, world) {
+            let commit_result = self.try_commit(&mut tx, world);
+            match commit_result {
                 Ok(forward) => {
                     tx.mark_committed();
                     drop(tx);
@@ -729,7 +730,8 @@ impl Transact for Pessimistic {
                 continue;
             }
             let value = f(&mut tx, world);
-            match self.try_commit(&mut tx, world) {
+            let commit_result = self.try_commit(&mut tx, world);
+            match commit_result {
                 Ok(forward) => {
                     tx.mark_committed();
                     drop(tx);
@@ -877,7 +879,7 @@ mod tests {
         let snap = world.snapshot_column_ticks(&read_bits);
 
         for pos in world.query::<(&mut Pos,)>() {
-            pos.0 .0 = 99.0;
+            pos.0.0 = 99.0;
         }
 
         let conflicts = world.check_column_conflicts(&snap);
@@ -942,7 +944,7 @@ mod tests {
 
         // Mutate a read column to force conflict
         for pos in world.query::<(&mut Pos,)>() {
-            pos.0 .0 = 42.0;
+            pos.0.0 = 42.0;
         }
 
         let result = strategy.try_commit(&mut tx, &mut world);
@@ -1097,7 +1099,7 @@ mod tests {
             if attempt == 1 {
                 // Mutate a read column to force conflict on first attempt
                 for pos in world.query::<(&mut Pos,)>() {
-                    pos.0 .0 = 99.0;
+                    pos.0.0 = 99.0;
                 }
             }
             tx.write::<Pos>(world, e, Pos(42.0));
@@ -1115,7 +1117,7 @@ mod tests {
         let result = strategy.transact(&mut world, &access, |_tx, world| {
             // Every attempt mutates the read column — conflict every time
             for pos in world.query::<(&mut Pos,)>() {
-                pos.0 .0 += 1.0;
+                pos.0.0 += 1.0;
             }
         });
         assert!(result.is_err());
@@ -1162,7 +1164,7 @@ mod tests {
                 spawned_on_first = Some(e);
                 // Mutate a read column to force conflict on first attempt
                 for pos in world.query::<(&mut Pos,)>() {
-                    pos.0 .0 = 99.0;
+                    pos.0.0 = 99.0;
                 }
             }
         });

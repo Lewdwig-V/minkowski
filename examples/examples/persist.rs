@@ -11,7 +11,7 @@
 
 use minkowski::{BTreeIndex, Optimistic, QueryWriter, ReducerRegistry, SpatialIndex, World};
 use minkowski_persist::{
-    load_btree_index, CodecRegistry, Durable, PersistentIndex, Snapshot, Wal, WalConfig,
+    CodecRegistry, Durable, PersistentIndex, Snapshot, Wal, WalConfig, load_btree_index,
 };
 use rkyv::{Archive, Deserialize, Serialize};
 

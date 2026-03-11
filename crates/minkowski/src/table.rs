@@ -262,17 +262,21 @@ mod tests {
     }
     unsafe impl<'w> TableRow<'w> for PosVelRef<'w> {
         unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
-            Self {
-                pos: &*(col_ptrs[0].0.add(row * col_ptrs[0].1) as *const Pos),
-                vel: &*(col_ptrs[1].0.add(row * col_ptrs[1].1) as *const Vel),
+            unsafe {
+                Self {
+                    pos: &*(col_ptrs[0].0.add(row * col_ptrs[0].1) as *const Pos),
+                    vel: &*(col_ptrs[1].0.add(row * col_ptrs[1].1) as *const Vel),
+                }
             }
         }
     }
     unsafe impl<'w> TableRow<'w> for PosVelMut<'w> {
         unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
-            Self {
-                pos: &mut *(col_ptrs[0].0.add(row * col_ptrs[0].1) as *mut Pos),
-                vel: &mut *(col_ptrs[1].0.add(row * col_ptrs[1].1) as *mut Vel),
+            unsafe {
+                Self {
+                    pos: &mut *(col_ptrs[0].0.add(row * col_ptrs[0].1) as *mut Pos),
+                    vel: &mut *(col_ptrs[1].0.add(row * col_ptrs[1].1) as *mut Vel),
+                }
             }
         }
     }

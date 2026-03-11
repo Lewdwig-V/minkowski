@@ -185,14 +185,14 @@ fn main() {
 
     // ── Generation loop ─────────────────────────────────────────────
 
-    for gen in 0..GENERATIONS {
+    for generation in 0..GENERATIONS {
         let frame_start = Instant::now();
 
         // Snapshot states, recount neighbors
         let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
         // Alternate between reducer and query_table_mut to exercise both paths
-        if gen % 2 == 0 {
+        if generation % 2 == 0 {
             registry
                 .run(&mut world, write_neighbors_id, counts.clone())
                 .unwrap();
@@ -210,11 +210,11 @@ fn main() {
         let _changed_count = world.query::<(Changed<CellState>,)>().count();
 
         // Print stats every 50 generations
-        if gen % 50 == 0 || gen == GENERATIONS - 1 {
+        if generation % 50 == 0 || generation == GENERATIONS - 1 {
             let dt_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
             println!(
                 "gen {:>4} | alive: {:>4} | changes: {:>4} | dt: {:.2}ms",
-                gen,
+                generation,
                 alive_count(&mut world),
                 change_count,
                 dt_ms,

@@ -855,7 +855,7 @@ unsafe impl<T: Component> WriterQuery for &T {
         _entity: Entity,
         _changeset: *mut EnumChangeSet,
     ) -> Self::WriterItem<'w> {
-        <&T as WorldQuery>::fetch(fetch, row)
+        unsafe { <&T as WorldQuery>::fetch(fetch, row) }
     }
 }
 
@@ -881,9 +881,11 @@ unsafe impl<T: Component> WriterQuery for &mut T {
         entity: Entity,
         changeset: *mut EnumChangeSet,
     ) -> Self::WriterItem<'w> {
-        let (ptr, comp_id) = fetch;
-        let current: &T = &*ptr.ptr.add(row);
-        WritableRef::new(entity, current, *comp_id, changeset)
+        unsafe {
+            let (ptr, comp_id) = fetch;
+            let current: &T = &*ptr.ptr.add(row);
+            WritableRef::new(entity, current, *comp_id, changeset)
+        }
     }
 }
 
@@ -928,7 +930,7 @@ unsafe impl<T: Component> WriterQuery for Option<&T> {
         _entity: Entity,
         _changeset: *mut EnumChangeSet,
     ) -> Self::WriterItem<'w> {
-        <Option<&T> as WorldQuery>::fetch(fetch, row)
+        unsafe { <Option<&T> as WorldQuery>::fetch(fetch, row) }
     }
 }
 
@@ -974,10 +976,10 @@ macro_rules! impl_writer_query_tuple {
                 row: usize,
                 entity: Entity,
                 changeset: *mut EnumChangeSet,
-            ) -> Self::WriterItem<'w> {
+            ) -> Self::WriterItem<'w> { unsafe {
                 let ($($name,)*) = fetch;
                 ($(<$name as WriterQuery>::fetch_writer($name, row, entity, changeset),)*)
-            }
+            }}
         }
     };
 }
@@ -1711,16 +1713,14 @@ impl ReducerRegistry {
         });
         // Update last_read_tick AFTER the changeset is applied (by transact),
         // but only if for_each/count was actually called during this invocation.
-        if result.is_ok() {
-            if let Some(arc) = &tick_arc {
-                if queried_flag
-                    .as_ref()
-                    .is_none_or(|q| q.load(Ordering::Relaxed))
-                {
-                    let new_tick = world.next_tick();
-                    arc.store(new_tick.raw(), Ordering::Relaxed);
-                }
-            }
+        if result.is_ok()
+            && let Some(arc) = &tick_arc
+            && queried_flag
+                .as_ref()
+                .is_none_or(|q| q.load(Ordering::Relaxed))
+        {
+            let new_tick = world.next_tick();
+            arc.store(new_tick.raw(), Ordering::Relaxed);
         }
         result.map_err(ReducerError::from)
     }
@@ -3257,7 +3257,7 @@ mod tests {
             if attempt == 1 {
                 // Mutate to force conflict
                 for pos in world.query::<(&mut Pos,)>() {
-                    pos.0 .0 = 99.0;
+                    pos.0.0 = 99.0;
                 }
             }
         });

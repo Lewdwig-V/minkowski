@@ -79,7 +79,8 @@ impl<S: Transact> Transact for Durable<S> {
                 continue;
             }
             let value = f(&mut tx, world);
-            match self.try_commit(&mut tx, world) {
+            let commit_result = self.try_commit(&mut tx, world);
+            match commit_result {
                 Ok(forward) => {
                     tx.mark_committed();
                     drop(tx);
@@ -125,8 +126,8 @@ mod tests {
     use crate::wal::{Wal, WalConfig};
     use minkowski::{Optimistic, Pessimistic};
     use rkyv::{Archive, Deserialize, Serialize};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]
     struct Pos {

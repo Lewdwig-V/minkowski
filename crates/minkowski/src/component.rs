@@ -128,7 +128,8 @@ impl ComponentRegistry {
     }
 
     unsafe fn drop_ptr<T>(ptr: *mut u8) {
-        std::ptr::drop_in_place(ptr as *mut T);
+        // SAFETY: caller guarantees ptr is valid, aligned, and points to an initialized T
+        unsafe { std::ptr::drop_in_place(ptr as *mut T) };
     }
 }
 
@@ -140,7 +141,8 @@ impl ComponentRegistry {
 /// The pointer must point to a valid, initialized `T`.
 #[allow(dead_code)]
 pub(crate) unsafe fn drop_ptr<T>(ptr: *mut u8) {
-    std::ptr::drop_in_place(ptr as *mut T);
+    // SAFETY: caller guarantees ptr is valid, aligned, and points to an initialized T
+    unsafe { std::ptr::drop_in_place(ptr as *mut T) };
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields};
+use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
 /// Derive macro for Table types.
 ///
@@ -104,9 +104,9 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
             unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
                 Self {
                     #(
-                        #field_names: &*(col_ptrs[#field_indices].0
+                        #field_names: unsafe { &*(col_ptrs[#field_indices].0
                             .add(row * col_ptrs[#field_indices].1)
-                            as *const #field_types),
+                            as *const #field_types) },
                     )*
                 }
             }
@@ -118,9 +118,9 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
             unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
                 Self {
                     #(
-                        #field_names: &mut *(col_ptrs[#field_indices].0
+                        #field_names: unsafe { &mut *(col_ptrs[#field_indices].0
                             .add(row * col_ptrs[#field_indices].1)
-                            as *mut #field_types),
+                            as *mut #field_types) },
                     )*
                 }
             }

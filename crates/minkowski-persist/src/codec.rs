@@ -38,7 +38,9 @@ pub enum CodecError {
          call `codecs.register::<T>(&mut world)` for each component type before persisting"
     )]
     UnregisteredComponent(ComponentId),
-    #[error("schema mismatch for component '{name}': sender has size={sender_size} align={sender_align}, receiver has size={receiver_size} align={receiver_align}")]
+    #[error(
+        "schema mismatch for component '{name}': sender has size={sender_size} align={sender_align}, receiver has size={receiver_size} align={receiver_align}"
+    )]
     SchemaMismatch {
         name: String,
         sender_size: usize,
@@ -237,11 +239,13 @@ impl CodecRegistry {
         ptr: *const u8,
         out: &mut Vec<u8>,
     ) -> Result<(), CodecError> {
-        let codec = self
-            .codecs
-            .get(&id)
-            .ok_or(CodecError::UnregisteredComponent(id))?;
-        (codec.serialize_fn)(ptr, out)
+        unsafe {
+            let codec = self
+                .codecs
+                .get(&id)
+                .ok_or(CodecError::UnregisteredComponent(id))?;
+            (codec.serialize_fn)(ptr, out)
+        }
     }
 
     /// Deserialize component bytes into a raw byte buffer.
@@ -602,9 +606,11 @@ mod tests {
         }];
         let result = codecs.build_remap(&schema);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unknown component name"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown component name")
+        );
     }
 }
