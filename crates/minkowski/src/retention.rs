@@ -151,28 +151,45 @@ mod tests {
     }
 
     #[test]
-    fn retention_despawns_at_boundary_tick() {
-        // Regression: the retention adapter must compare deadlines against
-        // the post-query tick, not a pre-query snapshot. world.query()
-        // advances the tick, so a pre-query snapshot lets entities at
-        // deadline == tick+1 survive one extra dispatch.
+    fn retention_no_expired_survivors() {
+        // Regression guard: the adapter must compare deadlines against the
+        // post-query tick, not a pre-query snapshot. world.query() advances
+        // the tick by 1, so an entity whose deadline falls in the 1-tick
+        // gap between pre-query and post-query would survive if the adapter
+        // uses a stale snapshot.
+        //
+        // Setup: spawn one entity with a far-future deadline, then advance
+        // the world tick to just below that deadline using dummy queries.
+        // The retention reducer's internal query is the operation that
+        // crosses the boundary. With post-query comparison the entity is
+        // caught; with pre-query comparison it survives.
         let mut world = World::new();
         let mut registry = crate::ReducerRegistry::new();
         let retention_id = registry.retention(&mut world);
 
-        // Set deadline to exactly the tick the query will advance to.
-        // The entity should be despawned on this run, not the next.
-        let pre_tick = world.change_tick().to_raw();
-        // world.query() inside retention will advance tick by at least 1,
-        // so deadline = pre_tick + 1 should be caught.
-        let deadline = ChangeTick::from_raw(pre_tick + 1);
-        let e = world.spawn((Expiry::at_tick(deadline),));
+        let deadline_raw = 200_u64;
+        world.spawn((Expiry::at_tick(ChangeTick::from_raw(deadline_raw)), 0u32));
+
+        // Advance tick to just below the deadline. Each query advances by 1.
+        while world.change_tick().to_raw() < deadline_raw - 1 {
+            world.query::<(&u32,)>().for_each(|_| {});
+        }
+        // Now: tick = deadline - 1. Entity is NOT yet expired.
+        // The retention reducer's query will advance tick to >= deadline.
+        // Pre-query check would see deadline <= (deadline-1) → false → BUG
+        // Post-query check sees deadline <= deadline → true → correct
 
         registry.run(&mut world, retention_id, ()).unwrap();
-        assert!(
-            !world.is_alive(e),
-            "entity at deadline tick+1 should be despawned by the run that crosses its deadline"
-        );
+
+        let post_tick = world.change_tick();
+        world.query::<(&Expiry,)>().for_each(|(expiry,)| {
+            assert!(
+                !expiry.is_expired(post_tick),
+                "entity with deadline {} survived retention but is expired at tick {}",
+                expiry.deadline().to_raw(),
+                post_tick.to_raw(),
+            );
+        });
     }
 
     #[test]
