@@ -7,22 +7,7 @@
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use minkowski::{EnumChangeSet, World};
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct Position {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct Velocity {
-    dx: f32,
-    dy: f32,
-    dz: f32,
-}
+use minkowski_bench::{Position, Velocity};
 
 const N: usize = 10_000;
 
