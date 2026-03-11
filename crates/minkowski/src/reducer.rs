@@ -1671,29 +1671,32 @@ impl ReducerRegistry {
         let resolved = ResolvedComponents(Vec::new());
 
         let adapter: ScheduledAdapter = Box::new(|world, _args_any| {
-            // Collect (entity, deadline) pairs during the scan. We must NOT
-            // snapshot change_tick() before the query because world.query()
-            // advances the tick — a pre-query snapshot would let entities at
+            // Collect candidates during the scan. We must NOT check expiry
+            // before the query completes because world.query() advances the
+            // tick — a pre-query snapshot would let entities at
             // deadline == tick+1 survive even though the query itself pushed
             // the world past their deadline.
-            let mut candidates: Vec<(Entity, u64)> = Vec::new();
+            let mut candidates: Vec<(Entity, crate::retention::Expiry)> = Vec::new();
             world
                 .query::<(Entity, &crate::retention::Expiry)>()
                 .for_each(|(entity, expiry)| {
-                    candidates.push((entity, expiry.deadline().to_raw()));
+                    candidates.push((entity, *expiry));
                 });
             // Capture tick AFTER the query so the comparison reflects the
             // true current state of the world.
-            let current_tick = world.change_tick().to_raw();
+            let current_tick = world.change_tick();
             let expired: Vec<Entity> = candidates
                 .into_iter()
-                .filter_map(|(e, deadline)| (deadline <= current_tick).then_some(e))
+                .filter_map(|(e, exp)| exp.is_expired(current_tick).then_some(e))
                 .collect();
             if !expired.is_empty() {
                 world.despawn_batch(&expired);
             }
         });
 
+        // Double-underscore prefix marks engine-built-in reducers.
+        // push_entry rejects duplicate names, preventing user reducers
+        // from colliding with built-ins.
         let id = self
             .push_entry(
                 "__retention",

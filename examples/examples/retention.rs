@@ -1,4 +1,4 @@
-//! Retention: automatic entity cleanup via Expiry + RetentionReducer.
+//! Retention: tick-based entity cleanup via Expiry + RetentionReducer.
 //!
 //! Spawns entities with varying TTLs. Each "frame" advances the world tick
 //! by running dummy mutations, then runs the retention reducer to despawn
@@ -6,7 +6,7 @@
 //!
 //! Run: cargo run -p minkowski-examples --example retention --release
 
-use minkowski::{ChangeTick, Expiry, ReducerRegistry, World};
+use minkowski::{Expiry, ReducerRegistry, World};
 
 fn main() {
     let mut world = World::new();
@@ -17,18 +17,17 @@ fn main() {
     // Each mutable operation (spawn, query, despawn) advances the internal
     // tick by 1, so 100 dummy queries per frame ≈ 100 ticks per frame.
     let ttls: &[u64] = &[10, 50, 100, 200, 500];
-    let base_tick = world.change_tick().to_raw();
+    let now = world.change_tick();
 
     println!(
         "--- Spawning {} entities with TTLs: {ttls:?} ---",
         ttls.len()
     );
-    println!("    base tick: {base_tick}");
+    println!("    base tick: {}", now.to_raw());
     println!();
 
     for &ttl in ttls {
-        let deadline = ChangeTick::from_raw(base_tick + ttl);
-        world.spawn((Expiry::at_tick(deadline), ttl as u32));
+        world.spawn((Expiry::with_ttl(now, ttl), ttl as u32));
     }
 
     // Simulate frames — each iteration advances the tick via dummy queries.

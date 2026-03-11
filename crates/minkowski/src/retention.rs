@@ -1,4 +1,4 @@
-//! Expiry component and retention reducer for automatic entity cleanup.
+//! Expiry component and retention reducer for tick-based entity cleanup.
 //!
 //! `Expiry` marks entities for despawn at a target tick. The retention
 //! reducer scans for expired entities and batch-despawns them. The user
@@ -8,18 +8,18 @@ use crate::tick::ChangeTick;
 
 /// Marks an entity for despawn when the world tick reaches or exceeds this value.
 ///
-/// Set at spawn time via [`World::change_tick`](crate::World::change_tick):
+/// Compute the deadline from the current tick via
+/// [`World::change_tick`](crate::World::change_tick) and pass it at spawn time:
 ///
 /// ```ignore
-/// let ttl_ticks = 1000;
-/// let deadline = ChangeTick::from_raw(world.change_tick().to_raw() + ttl_ticks);
-/// world.spawn((data, Expiry(deadline)));
+/// let deadline = Expiry::with_ttl(world.change_tick(), 1000);
+/// world.spawn((data, deadline));
 /// ```
 ///
 /// The tick is a monotonic u64 from change detection — **not** wall-clock time.
 /// For time-based TTL, convert duration to ticks based on your tick rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Expiry(pub ChangeTick);
+pub struct Expiry(ChangeTick);
 
 impl Expiry {
     /// Create an expiry at the given tick.
@@ -27,9 +27,19 @@ impl Expiry {
         Self(tick)
     }
 
+    /// Create an expiry `ttl` ticks from `now`.
+    pub fn with_ttl(now: ChangeTick, ttl: u64) -> Self {
+        Self(ChangeTick::from_raw(now.to_raw().saturating_add(ttl)))
+    }
+
     /// The deadline tick.
     pub fn deadline(&self) -> ChangeTick {
         self.0
+    }
+
+    /// Returns `true` if the deadline has been reached or passed.
+    pub fn is_expired(&self, current: ChangeTick) -> bool {
+        self.0.to_raw() <= current.to_raw()
     }
 }
 
@@ -51,6 +61,28 @@ mod tests {
         let tick = ChangeTick::from_raw(42);
         let exp = Expiry::at_tick(tick);
         assert_eq!(exp.deadline().to_raw(), 42);
+    }
+
+    #[test]
+    fn expiry_with_ttl() {
+        let now = ChangeTick::from_raw(100);
+        let exp = Expiry::with_ttl(now, 50);
+        assert_eq!(exp.deadline().to_raw(), 150);
+    }
+
+    #[test]
+    fn expiry_with_ttl_saturates() {
+        let now = ChangeTick::from_raw(u64::MAX - 10);
+        let exp = Expiry::with_ttl(now, 100);
+        assert_eq!(exp.deadline().to_raw(), u64::MAX);
+    }
+
+    #[test]
+    fn expiry_is_expired() {
+        let exp = Expiry::at_tick(ChangeTick::from_raw(100));
+        assert!(!exp.is_expired(ChangeTick::from_raw(99)));
+        assert!(exp.is_expired(ChangeTick::from_raw(100))); // boundary: equal
+        assert!(exp.is_expired(ChangeTick::from_raw(101)));
     }
 
     #[test]
