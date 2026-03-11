@@ -80,6 +80,11 @@ impl BlobVec {
         self.len == 0
     }
 
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Pushes a value by copying `item_layout.size()` bytes from `ptr`.
     ///
     /// # Safety
@@ -304,6 +309,26 @@ impl BlobVec {
         }
         self.data = new_data;
         self.capacity = new_capacity;
+    }
+
+    /// Like [`push`] but returns `Err(PoolExhausted)` instead of panicking
+    /// when the pool cannot grow to accommodate the new element.
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid, initialized value matching this BlobVec's layout.
+    /// Caller is responsible for not double-dropping the source value.
+    pub(crate) unsafe fn try_push(&mut self, ptr: *mut u8) -> Result<(), PoolExhausted> {
+        if self.len == self.capacity {
+            self.try_grow()?;
+        }
+        let dst = self.ptr_at(self.len);
+        let size = self.item_layout.size();
+        if size > 0 {
+            // SAFETY: caller guarantees ptr is valid for size bytes; dst is within allocated capacity
+            unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
+        }
+        self.len += 1;
+        Ok(())
     }
 
     /// Like [`grow`] but returns `Err(PoolExhausted)` instead of panicking

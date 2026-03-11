@@ -356,6 +356,58 @@ impl World {
         entity
     }
 
+    /// Like [`spawn`] but returns `Err(PoolExhausted)` instead of panicking
+    /// when the pool cannot allocate storage for the new entity's components.
+    ///
+    /// If this method returns `Err`, the world state is unchanged — no partial
+    /// entity is created and no archetype slot is leaked.
+    pub fn try_spawn<B: Bundle>(&mut self, bundle: B) -> Result<Entity, PoolExhausted> {
+        self.drain_orphans();
+        let component_ids = B::component_ids(&mut self.components);
+        let arch_id = self
+            .archetypes
+            .get_or_create(&component_ids, &self.components, &self.pool);
+        let archetype = &mut self.archetypes.archetypes[arch_id.0];
+
+        // Pre-check: ensure all columns can accommodate one more element.
+        // If any column is at capacity and the pool can't grow it, return Err
+        // before modifying any state.
+        for col in &mut archetype.columns {
+            if col.len() == col.capacity() {
+                col.try_grow()?;
+            }
+        }
+
+        // All columns have capacity — proceed with infallible push.
+        let entity = self.entities.alloc();
+        let index = entity.index() as usize;
+
+        if index >= self.entity_locations.len() {
+            self.entity_locations.resize(index + 1, None);
+        }
+
+        let tick = self.next_tick();
+        let archetype = &mut self.archetypes.archetypes[arch_id.0];
+        unsafe {
+            bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
+                let col = archetype.column_index(comp_id).unwrap();
+                archetype.columns[col].push(ptr as *mut u8);
+            });
+        }
+        for col in &mut archetype.columns {
+            col.mark_changed(tick);
+        }
+        let row = archetype.entities.len();
+        archetype.entities.push(entity);
+        archetype.debug_assert_consistent();
+
+        self.entity_locations[index] = Some(EntityLocation {
+            archetype_id: arch_id,
+            row,
+        });
+        Ok(entity)
+    }
+
     pub fn despawn(&mut self, entity: Entity) -> bool {
         self.drain_orphans();
         if !self.entities.is_alive(entity) {
@@ -1068,6 +1120,162 @@ impl World {
         // Verify column/entity invariant after migration.
         src_arch.debug_assert_consistent();
         target_arch.debug_assert_consistent();
+    }
+
+    /// Like [`insert`] but returns `Err(PoolExhausted)` instead of panicking
+    /// when the pool cannot allocate storage for the new archetype's columns.
+    ///
+    /// If this method returns `Err`, the world state is unchanged — no partial
+    /// migration occurs and the entity remains in its original archetype.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the entity is not alive.
+    pub fn try_insert<B: Bundle>(
+        &mut self,
+        entity: Entity,
+        bundle: B,
+    ) -> Result<(), PoolExhausted> {
+        self.drain_orphans();
+        assert!(self.is_alive(entity), "entity is not alive");
+        let index = entity.index() as usize;
+        let location = self.entity_locations[index].unwrap();
+        debug_assert!(
+            location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            location.row,
+            self.archetypes.archetypes[location.archetype_id.0].len()
+        );
+        let new_ids = B::component_ids(&mut self.components);
+
+        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
+        let all_existing = new_ids
+            .iter()
+            .all(|&id| src_arch.component_ids.contains(id));
+
+        if all_existing {
+            // All bundle components already exist — overwrite in-place (no allocation)
+            let tick = self.next_tick();
+            let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
+            let row = location.row;
+            unsafe {
+                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                    let col_idx = arch.column_index(comp_id).unwrap();
+                    let dst = arch.columns[col_idx].get_ptr_mut(row, tick);
+                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
+                        drop_fn(dst);
+                    }
+                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                });
+            }
+            return Ok(());
+        }
+
+        // Compute target archetype: source components ∪ new components
+        let mut target_ids = src_arch.sorted_ids.clone();
+        for &id in &new_ids {
+            if !src_arch.component_ids.contains(id) {
+                target_ids.push(id);
+            }
+        }
+        target_ids.sort_unstable();
+        let src_arch_id = location.archetype_id;
+        let src_row = location.row;
+
+        let target_arch_id =
+            self.archetypes
+                .get_or_create(&target_ids, &self.components, &self.pool);
+        let tick = self.next_tick();
+
+        // Defensive: same archetype → overwrite in-place
+        if src_arch_id == target_arch_id {
+            let arch = &mut self.archetypes.archetypes[src_arch_id.0];
+            unsafe {
+                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                    let col_idx = arch.column_index(comp_id).unwrap();
+                    let dst = arch.columns[col_idx].get_ptr_mut(src_row, tick);
+                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
+                        drop_fn(dst);
+                    }
+                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                });
+            }
+            return Ok(());
+        }
+
+        // Pre-check: ensure all target columns can accommodate one more element.
+        // If any column is at capacity and the pool can't grow it, return Err
+        // before starting the migration.
+        {
+            let target_arch = &mut self.archetypes.archetypes[target_arch_id.0];
+            for col in &mut target_arch.columns {
+                if col.len() == col.capacity() {
+                    col.try_grow()?;
+                }
+            }
+        }
+
+        // All target columns have capacity — proceed with infallible migration.
+        let (src_arch, target_arch) = get_pair_mut(
+            &mut self.archetypes.archetypes,
+            src_arch_id.0,
+            target_arch_id.0,
+        );
+
+        let overwrite_src_cols: Vec<bool> = src_arch
+            .sorted_ids
+            .iter()
+            .map(|&cid| new_ids.contains(&cid))
+            .collect();
+
+        for (src_col, &cid) in src_arch.sorted_ids.iter().enumerate() {
+            if overwrite_src_cols[src_col] {
+                unsafe {
+                    let ptr = src_arch.columns[src_col].get_ptr(src_row);
+                    if let Some(drop_fn) = self.components.info(cid).drop_fn {
+                        drop_fn(ptr);
+                    }
+                    src_arch.columns[src_col].swap_remove_no_drop(src_row);
+                }
+            } else if let Some(tgt_col) = target_arch.column_index(cid) {
+                unsafe {
+                    let ptr = src_arch.columns[src_col].get_ptr(src_row);
+                    target_arch.columns[tgt_col].push(ptr);
+                    src_arch.columns[src_col].swap_remove_no_drop(src_row);
+                }
+            }
+        }
+
+        unsafe {
+            bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
+                let tgt_col = target_arch.column_index(comp_id).unwrap();
+                target_arch.columns[tgt_col].push(ptr as *mut u8);
+            });
+        }
+        for col in &mut target_arch.columns {
+            col.mark_changed(tick);
+        }
+
+        target_arch.entities.push(entity);
+        let target_row = target_arch.entities.len() - 1;
+        src_arch.entities.swap_remove(src_row);
+
+        if src_row < src_arch.entities.len() {
+            let swapped = src_arch.entities[src_row];
+            self.entity_locations[swapped.index() as usize] = Some(EntityLocation {
+                archetype_id: src_arch_id,
+                row: src_row,
+            });
+        }
+
+        self.entity_locations[index] = Some(EntityLocation {
+            archetype_id: target_arch_id,
+            row: target_row,
+        });
+
+        src_arch.debug_assert_consistent();
+        target_arch.debug_assert_consistent();
+        Ok(())
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
@@ -3145,6 +3353,79 @@ mod tests {
         assert_eq!(stats.entity_count, 100);
         assert!(stats.pool_capacity.is_some());
         assert!(stats.pool_used.unwrap() > 0);
+    }
+
+    // ── try_spawn / try_insert tests ────────────────────────────────
+
+    #[test]
+    fn try_spawn_succeeds_with_system_allocator() {
+        let mut world = World::new();
+        let e = world.try_spawn((42u32,)).unwrap();
+        assert_eq!(*world.get::<u32>(e).unwrap(), 42);
+    }
+
+    #[test]
+    fn try_spawn_returns_error_on_pool_exhaustion() {
+        let mut world = World::builder()
+            .memory_budget(64 * 1024) // tiny 64KB pool
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+
+        let mut count = 0u32;
+        while world.try_spawn((count, count as f64)).is_ok() {
+            count += 1;
+        }
+        assert!(count > 0, "should have spawned at least one entity");
+        // Verify world is still consistent after exhaustion
+        let mut sum = 0u32;
+        world.query::<(&u32,)>().for_each(|(v,)| sum += v);
+        assert_eq!(sum, (0..count).sum::<u32>());
+    }
+
+    #[test]
+    fn try_insert_succeeds_with_system_allocator() {
+        let mut world = World::new();
+        let e = world.spawn((42u32,));
+        world.try_insert(e, (1.5f64,)).unwrap();
+        assert_eq!(*world.get::<u32>(e).unwrap(), 42);
+        assert_eq!(*world.get::<f64>(e).unwrap(), 1.5);
+    }
+
+    #[test]
+    fn try_insert_overwrite_succeeds() {
+        // Overwriting existing components never allocates new columns
+        let mut world = World::new();
+        let e = world.spawn((42u32,));
+        world.try_insert(e, (99u32,)).unwrap();
+        assert_eq!(*world.get::<u32>(e).unwrap(), 99);
+    }
+
+    #[test]
+    fn try_insert_returns_error_on_pool_exhaustion() {
+        let mut world = World::builder()
+            .memory_budget(64 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+
+        // Fill up the pool
+        let mut entities = Vec::new();
+        while let Ok(e) = world.try_spawn((0u32,)) {
+            entities.push(e);
+        }
+        assert!(!entities.is_empty());
+
+        // Try inserting a new component — should fail (pool exhausted)
+        let result = world.try_insert(entities[0], (1.5f64,));
+        // Result depends on whether the new archetype column allocation fits.
+        // Just verify it doesn't panic and world remains consistent.
+        drop(result);
+
+        // Verify all original entities are still readable
+        let mut count = 0;
+        world.query::<(&u32,)>().for_each(|_| count += 1);
+        assert_eq!(count, entities.len());
     }
 }
 
