@@ -80,6 +80,7 @@ pub mod index;
 pub(crate) mod lock_table;
 pub mod query;
 pub mod reducer;
+pub mod retention;
 pub mod storage;
 pub(crate) mod sync;
 pub mod table;
@@ -100,6 +101,7 @@ pub use reducer::{
     EntityRef, QueryMut, QueryReducerId, QueryRef, QueryWriter, ReducerError, ReducerId,
     ReducerInfo, ReducerRegistry, Spawner, WritableRef, WriterQuery,
 };
+pub use retention::Expiry;
 pub use tick::ChangeTick;
 pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
 pub use world::{QueryTickInfo, World, WorldStats};

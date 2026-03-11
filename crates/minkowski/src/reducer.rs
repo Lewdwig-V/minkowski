@@ -1651,6 +1651,65 @@ impl ReducerRegistry {
         Ok(QueryReducerId(id.0))
     }
 
+    // ── Built-in reducers ────────────────────────────────────────
+
+    /// Register the built-in retention reducer that despawns entities whose
+    /// [`Expiry`](crate::Expiry) deadline has been reached.
+    ///
+    /// The reducer queries `(Entity, &Expiry)`, collects entities where
+    /// `expiry.deadline().to_raw() <= world.change_tick().to_raw()`, and
+    /// batch-despawns them.
+    ///
+    /// # Panics
+    /// Panics if a reducer named `"__retention"` is already registered.
+    pub fn retention(&mut self, world: &mut World) -> QueryReducerId {
+        let expiry_id = world.register_component::<crate::retention::Expiry>();
+        let mut access = Access::empty();
+        access.add_read(expiry_id);
+        access.set_despawns();
+
+        let resolved = ResolvedComponents(Vec::new());
+
+        let adapter: ScheduledAdapter = Box::new(|world, _args_any| {
+            // Collect candidates during the scan. We must NOT check expiry
+            // before the query completes because world.query() advances the
+            // tick — a pre-query snapshot would let entities at
+            // deadline == tick+1 survive even though the query itself pushed
+            // the world past their deadline.
+            let mut candidates: Vec<(Entity, crate::retention::Expiry)> = Vec::new();
+            world
+                .query::<(Entity, &crate::retention::Expiry)>()
+                .for_each(|(entity, expiry)| {
+                    candidates.push((entity, *expiry));
+                });
+            // Capture tick AFTER the query so the comparison reflects the
+            // true current state of the world.
+            let current_tick = world.change_tick();
+            let expired: Vec<Entity> = candidates
+                .into_iter()
+                .filter_map(|(e, exp)| exp.is_expired(current_tick).then_some(e))
+                .collect();
+            if !expired.is_empty() {
+                world.despawn_batch(&expired);
+            }
+        });
+
+        // Double-underscore prefix marks engine-built-in reducers.
+        // push_entry rejects duplicate names, preventing user reducers
+        // from colliding with built-ins.
+        let id = self
+            .push_entry(
+                "__retention",
+                access,
+                resolved,
+                ReducerKind::Scheduled(adapter),
+                None,
+                None,
+            )
+            .expect("__retention reducer name conflict");
+        QueryReducerId(id.0)
+    }
+
     // ── Dynamic registration ────────────────────────────────────
 
     /// Start building a dynamic reducer. Returns a builder that lets you
