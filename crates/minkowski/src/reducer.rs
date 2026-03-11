@@ -1066,6 +1066,30 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
         let required = Q::required_ids(&self.world.components);
         let cs_ptr = self.changeset;
 
+        // Pre-allocate changeset capacity based on matching entity count.
+        // This avoids Vec<Mutation> and Arena reallocation during iteration.
+        {
+            let mut entity_count = 0;
+            for arch in &self.world.archetypes.archetypes {
+                if !arch.is_empty()
+                    && required.is_subset(&arch.component_ids)
+                    && Q::matches_filters(arch, &self.world.components, last_tick)
+                {
+                    entity_count += arch.len();
+                }
+            }
+            if entity_count > 0 {
+                let cs = unsafe { &mut *cs_ptr };
+                let mutable_count = Q::mutable_ids(&self.world.components).count_ones(..);
+                let mutations_needed = entity_count * mutable_count;
+                cs.mutations.reserve(mutations_needed);
+                // Estimate 64 bytes per mutation for arena (covers most component sizes
+                // with alignment padding). Over-estimation is cheap; under-estimation
+                // causes reallocation.
+                cs.arena.reserve(mutations_needed * 64);
+            }
+        }
+
         for arch in &self.world.archetypes.archetypes {
             if arch.is_empty() || !required.is_subset(&arch.component_ids) {
                 continue;

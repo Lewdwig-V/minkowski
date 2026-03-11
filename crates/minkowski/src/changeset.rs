@@ -54,6 +54,13 @@ impl Arena {
         }
     }
 
+    /// Pre-allocate at least `bytes` of arena capacity.
+    pub fn reserve(&mut self, bytes: usize) {
+        if bytes > self.capacity {
+            self.grow(bytes);
+        }
+    }
+
     /// Copy `layout.size()` bytes from `src` into the arena.
     /// Returns the byte offset where data was written.
     #[inline]
@@ -211,6 +218,20 @@ pub struct EnumChangeSet {
 impl EnumChangeSet {
     pub fn new() -> Self {
         Self::new_in(default_pool())
+    }
+
+    /// Create a changeset pre-allocated for `mutations` mutations, each up to
+    /// `bytes_per_mutation` bytes of component data. Avoids reallocation during
+    /// recording when the mutation count is known ahead of time.
+    pub fn with_capacity(mutations: usize, bytes_per_mutation: usize) -> Self {
+        let pool = default_pool();
+        let mut arena = Arena::new(pool.clone());
+        arena.reserve(mutations * bytes_per_mutation);
+        Self {
+            mutations: Vec::with_capacity(mutations),
+            arena,
+            drop_entries: Vec::new(),
+        }
     }
 
     pub(crate) fn new_in(pool: SharedPool) -> Self {
