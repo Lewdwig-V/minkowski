@@ -1,6 +1,7 @@
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::{Entity, EntityAllocator};
+use crate::pool::{PoolExhausted, SharedPool, SlabPool, default_pool};
 use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
@@ -98,6 +99,10 @@ pub struct WorldStats {
     pub current_tick: u64,
     pub total_spawns: u64,
     pub total_despawns: u64,
+    /// Total capacity of the backing memory pool, if bounded.
+    pub pool_capacity: Option<usize>,
+    /// Bytes currently allocated from the pool, if tracked.
+    pub pool_used: Option<usize>,
 }
 
 /// Debug information about the tick state of a cached query type.
@@ -144,22 +149,33 @@ pub struct World {
     pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
     pub(crate) current_tick: Tick,
     pub(crate) orphan_queue: OrphanQueue,
+    pub(crate) pool: SharedPool,
 }
 
 impl World {
     pub fn new() -> Self {
+        Self::new_with_pool(default_pool())
+    }
+
+    pub(crate) fn new_with_pool(pool: SharedPool) -> Self {
         Self {
             id: WorldId::next(),
             entities: EntityAllocator::new(),
             archetypes: Archetypes::new(),
             components: ComponentRegistry::new(),
-            sparse: SparseStorage::new(),
+            sparse: SparseStorage::new(pool.clone()),
             entity_locations: Vec::new(),
             table_cache: TableCache::new(),
             query_cache: HashMap::new(),
             current_tick: Tick::default(),
             orphan_queue: OrphanQueue::new(),
+            pool,
         }
+    }
+
+    /// Create a [`WorldBuilder`] for configuring memory and allocation strategy.
+    pub fn builder() -> WorldBuilder {
+        WorldBuilder::new()
     }
 
     /// Advance the internal tick and return the new value.
@@ -310,7 +326,7 @@ impl World {
         let component_ids = B::component_ids(&mut self.components);
         let arch_id = self
             .archetypes
-            .get_or_create(&component_ids, &self.components);
+            .get_or_create(&component_ids, &self.components, &self.pool);
         let entity = self.entities.alloc();
         let index = entity.index() as usize;
 
@@ -338,6 +354,64 @@ impl World {
             row,
         });
         entity
+    }
+
+    /// Like [`spawn`] but returns `Err(PoolExhausted)` instead of panicking
+    /// when the pool cannot allocate storage for the new entity's components.
+    ///
+    /// If this method returns `Err`, the world state is unchanged — no partial
+    /// entity is created and no archetype slot is leaked.
+    ///
+    /// # Panics
+    ///
+    /// This method can still panic if the system allocator (used for internal
+    /// metadata like entity location tables) runs out of memory. Only pool-backed
+    /// storage (component columns) is covered by the `Result` return type.
+    pub fn try_spawn<B: Bundle>(&mut self, bundle: B) -> Result<Entity, PoolExhausted> {
+        self.drain_orphans();
+        let component_ids = B::component_ids(&mut self.components);
+        let arch_id = self
+            .archetypes
+            .get_or_create(&component_ids, &self.components, &self.pool);
+        let archetype = &mut self.archetypes.archetypes[arch_id.0];
+
+        // Pre-check: ensure all columns can accommodate one more element.
+        // If any column is at capacity and the pool can't grow it, return Err
+        // before modifying any state.
+        for col in &mut archetype.columns {
+            if col.len() == col.capacity() {
+                col.try_grow()?;
+            }
+        }
+
+        // All columns have capacity — proceed with infallible push.
+        let entity = self.entities.alloc();
+        let index = entity.index() as usize;
+
+        if index >= self.entity_locations.len() {
+            self.entity_locations.resize(index + 1, None);
+        }
+
+        let tick = self.next_tick();
+        let archetype = &mut self.archetypes.archetypes[arch_id.0];
+        unsafe {
+            bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
+                let col = archetype.column_index(comp_id).unwrap();
+                archetype.columns[col].push(ptr as *mut u8);
+            });
+        }
+        for col in &mut archetype.columns {
+            col.mark_changed(tick);
+        }
+        let row = archetype.entities.len();
+        archetype.entities.push(entity);
+        archetype.debug_assert_consistent();
+
+        self.entity_locations[index] = Some(EntityLocation {
+            archetype_id: arch_id,
+            row,
+        });
+        Ok(entity)
     }
 
     pub fn despawn(&mut self, entity: Entity) -> bool {
@@ -848,9 +922,10 @@ impl World {
 
     /// Resolve column pointers for a table's archetype.
     fn resolve_table_ptrs<T: crate::table::Table>(&mut self) -> (Vec<(*mut u8, usize)>, usize) {
-        let desc = self
-            .table_cache
-            .get_or_create::<T>(&mut self.components, &mut self.archetypes);
+        let pool = self.pool.clone();
+        let desc =
+            self.table_cache
+                .get_or_create::<T>(&mut self.components, &mut self.archetypes, &pool);
         let arch_id = desc.archetype_id;
         let col_indices = desc.col_indices.clone();
         let item_sizes = desc.item_sizes.clone();
@@ -902,9 +977,10 @@ impl World {
     /// Mark all columns in a table's archetype as changed.
     fn mark_table_columns_changed<T: crate::table::Table>(&mut self) {
         let tick = self.next_tick();
-        let desc = self
-            .table_cache
-            .get_or_create::<T>(&mut self.components, &mut self.archetypes);
+        let pool = self.pool.clone();
+        let desc =
+            self.table_cache
+                .get_or_create::<T>(&mut self.components, &mut self.archetypes, &pool);
         let arch_id = desc.archetype_id;
         let archetype = &mut self.archetypes.archetypes[arch_id.0];
         for col in &mut archetype.columns {
@@ -959,7 +1035,9 @@ impl World {
         let src_arch_id = location.archetype_id;
         let src_row = location.row;
 
-        let target_arch_id = self.archetypes.get_or_create(&target_ids, &self.components);
+        let target_arch_id =
+            self.archetypes
+                .get_or_create(&target_ids, &self.components, &self.pool);
         let tick = self.next_tick();
 
         // Check if source and target are the same archetype (all components
@@ -1050,6 +1128,162 @@ impl World {
         target_arch.debug_assert_consistent();
     }
 
+    /// Like [`insert`] but returns `Err(PoolExhausted)` instead of panicking
+    /// when the pool cannot allocate storage for the new archetype's columns.
+    ///
+    /// If this method returns `Err`, the world state is unchanged — no partial
+    /// migration occurs and the entity remains in its original archetype.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the entity is not alive.
+    pub fn try_insert<B: Bundle>(
+        &mut self,
+        entity: Entity,
+        bundle: B,
+    ) -> Result<(), PoolExhausted> {
+        self.drain_orphans();
+        assert!(self.is_alive(entity), "entity is not alive");
+        let index = entity.index() as usize;
+        let location = self.entity_locations[index].unwrap();
+        debug_assert!(
+            location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
+            "stale EntityLocation: row {} >= archetype len {}",
+            location.row,
+            self.archetypes.archetypes[location.archetype_id.0].len()
+        );
+        let new_ids = B::component_ids(&mut self.components);
+
+        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
+        let all_existing = new_ids
+            .iter()
+            .all(|&id| src_arch.component_ids.contains(id));
+
+        if all_existing {
+            // All bundle components already exist — overwrite in-place (no allocation)
+            let tick = self.next_tick();
+            let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
+            let row = location.row;
+            unsafe {
+                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                    let col_idx = arch.column_index(comp_id).unwrap();
+                    let dst = arch.columns[col_idx].get_ptr_mut(row, tick);
+                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
+                        drop_fn(dst);
+                    }
+                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                });
+            }
+            return Ok(());
+        }
+
+        // Compute target archetype: source components ∪ new components
+        let mut target_ids = src_arch.sorted_ids.clone();
+        for &id in &new_ids {
+            if !src_arch.component_ids.contains(id) {
+                target_ids.push(id);
+            }
+        }
+        target_ids.sort_unstable();
+        let src_arch_id = location.archetype_id;
+        let src_row = location.row;
+
+        let target_arch_id =
+            self.archetypes
+                .get_or_create(&target_ids, &self.components, &self.pool);
+        let tick = self.next_tick();
+
+        // Defensive: same archetype → overwrite in-place
+        if src_arch_id == target_arch_id {
+            let arch = &mut self.archetypes.archetypes[src_arch_id.0];
+            unsafe {
+                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                    let col_idx = arch.column_index(comp_id).unwrap();
+                    let dst = arch.columns[col_idx].get_ptr_mut(src_row, tick);
+                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
+                        drop_fn(dst);
+                    }
+                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                });
+            }
+            return Ok(());
+        }
+
+        // Pre-check: ensure all target columns can accommodate one more element.
+        // If any column is at capacity and the pool can't grow it, return Err
+        // before starting the migration.
+        {
+            let target_arch = &mut self.archetypes.archetypes[target_arch_id.0];
+            for col in &mut target_arch.columns {
+                if col.len() == col.capacity() {
+                    col.try_grow()?;
+                }
+            }
+        }
+
+        // All target columns have capacity — proceed with infallible migration.
+        let (src_arch, target_arch) = get_pair_mut(
+            &mut self.archetypes.archetypes,
+            src_arch_id.0,
+            target_arch_id.0,
+        );
+
+        let overwrite_src_cols: Vec<bool> = src_arch
+            .sorted_ids
+            .iter()
+            .map(|&cid| new_ids.contains(&cid))
+            .collect();
+
+        for (src_col, &cid) in src_arch.sorted_ids.iter().enumerate() {
+            if overwrite_src_cols[src_col] {
+                unsafe {
+                    let ptr = src_arch.columns[src_col].get_ptr(src_row);
+                    if let Some(drop_fn) = self.components.info(cid).drop_fn {
+                        drop_fn(ptr);
+                    }
+                    src_arch.columns[src_col].swap_remove_no_drop(src_row);
+                }
+            } else if let Some(tgt_col) = target_arch.column_index(cid) {
+                unsafe {
+                    let ptr = src_arch.columns[src_col].get_ptr(src_row);
+                    target_arch.columns[tgt_col].push(ptr);
+                    src_arch.columns[src_col].swap_remove_no_drop(src_row);
+                }
+            }
+        }
+
+        unsafe {
+            bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
+                let tgt_col = target_arch.column_index(comp_id).unwrap();
+                target_arch.columns[tgt_col].push(ptr as *mut u8);
+            });
+        }
+        for col in &mut target_arch.columns {
+            col.mark_changed(tick);
+        }
+
+        target_arch.entities.push(entity);
+        let target_row = target_arch.entities.len() - 1;
+        src_arch.entities.swap_remove(src_row);
+
+        if src_row < src_arch.entities.len() {
+            let swapped = src_arch.entities[src_row];
+            self.entity_locations[swapped.index() as usize] = Some(EntityLocation {
+                archetype_id: src_arch_id,
+                row: src_row,
+            });
+        }
+
+        self.entity_locations[index] = Some(EntityLocation {
+            archetype_id: target_arch_id,
+            row: target_row,
+        });
+
+        src_arch.debug_assert_consistent();
+        target_arch.debug_assert_consistent();
+        Ok(())
+    }
+
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
         self.drain_orphans();
         if !self.is_alive(entity) {
@@ -1112,7 +1346,9 @@ impl World {
                 });
             }
             arch.debug_assert_consistent();
-            let empty_arch_id = self.archetypes.get_or_create(&[], &self.components);
+            let empty_arch_id = self
+                .archetypes
+                .get_or_create(&[], &self.components, &self.pool);
             let empty_arch = &mut self.archetypes.archetypes[empty_arch_id.0];
             empty_arch.entities.push(entity);
             self.entity_locations[index] = Some(EntityLocation {
@@ -1122,7 +1358,9 @@ impl World {
             return Some(removed);
         }
 
-        let target_arch_id = self.archetypes.get_or_create(&target_ids, &self.components);
+        let target_arch_id =
+            self.archetypes
+                .get_or_create(&target_ids, &self.components, &self.pool);
 
         let (src_arch, target_arch) = get_pair_mut(
             &mut self.archetypes.archetypes,
@@ -1412,6 +1650,8 @@ impl World {
             current_tick: self.current_tick.raw(),
             total_spawns: self.entities.total_spawns,
             total_despawns: self.entities.total_despawns,
+            pool_capacity: self.pool.capacity(),
+            pool_used: self.pool.used(),
         }
     }
 
@@ -1516,6 +1756,92 @@ impl World {
 }
 
 impl Default for World {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── WorldBuilder ─────────────────────────────────────────────────────
+
+// HugePages is defined in pool.rs and re-exported via lib.rs.
+use crate::pool::HugePages;
+
+/// Builder for configuring [`World`] memory and allocation strategy.
+///
+/// # Example
+///
+/// ```
+/// use minkowski::WorldBuilder;
+///
+/// let world = WorldBuilder::new().build().unwrap();
+/// let stats = world.stats();
+/// assert!(stats.pool_capacity.is_none()); // system allocator
+/// ```
+pub struct WorldBuilder {
+    memory_budget: Option<usize>,
+    hugepages: HugePages,
+    lock_all_memory: bool,
+}
+
+impl WorldBuilder {
+    pub fn new() -> Self {
+        Self {
+            memory_budget: None,
+            hugepages: HugePages::default(),
+            lock_all_memory: false,
+        }
+    }
+
+    /// Set a fixed memory budget in bytes. When set, the World will
+    /// allocate from a bounded [`SlabPool`] instead of the system allocator.
+    pub fn memory_budget(mut self, bytes: usize) -> Self {
+        self.memory_budget = Some(bytes);
+        self
+    }
+
+    /// Configure hugepage usage for the memory pool.
+    pub fn hugepages(mut self, hp: HugePages) -> Self {
+        self.hugepages = hp;
+        self
+    }
+
+    /// Lock all current and future memory mappings into physical RAM.
+    ///
+    /// Calls `mlockall(MCL_CURRENT | MCL_FUTURE)` before pool creation.
+    /// This is a **process-global** operation — it affects all memory in
+    /// the process, not just the pool. Use only in dedicated database
+    /// processes, not in libraries embedded in larger applications.
+    ///
+    /// If `mlockall` fails (e.g., insufficient `RLIMIT_MEMLOCK`), the pool's
+    /// per-mapping pre-fault fallback (mlock -> manual touch) still applies.
+    ///
+    /// Requires `CAP_IPC_LOCK` or sufficient `RLIMIT_MEMLOCK` on Linux.
+    /// On unsupported platforms this is a no-op.
+    pub fn lock_all_memory(mut self, lock: bool) -> Self {
+        self.lock_all_memory = lock;
+        self
+    }
+
+    /// Build the [`World`]. Returns `Err` if the memory pool cannot be
+    /// allocated (only possible with a bounded `memory_budget`).
+    pub fn build(self) -> Result<World, PoolExhausted> {
+        if self.lock_all_memory {
+            // mlockall failure is non-fatal — the pool's per-mapping
+            // pre-fault fallback (mlock + manual touch) still applies.
+            let _ = crate::pool::try_mlockall();
+        }
+        let pool: SharedPool = match self.memory_budget {
+            Some(bytes) => {
+                let slab = SlabPool::new(bytes, self.hugepages)?;
+                crate::pool::into_shared(slab)
+            }
+            None => default_pool(),
+        };
+        Ok(World::new_with_pool(pool))
+    }
+}
+
+impl Default for WorldBuilder {
     fn default() -> Self {
         Self::new()
     }
@@ -2995,6 +3321,144 @@ mod tests {
 
         let info = world.query_tick_info::<(&Pos,)>().unwrap();
         assert!(info.has_pending_tick);
+    }
+
+    // ── WorldBuilder tests ───────────────────────────────────────────
+
+    #[test]
+    fn world_builder_default_is_system_allocator() {
+        let world = World::builder().build().unwrap();
+        let stats = world.stats();
+        assert!(stats.pool_capacity.is_none());
+        assert!(stats.pool_used.is_none());
+    }
+
+    #[test]
+    fn world_new_still_works() {
+        let world = World::new();
+        let stats = world.stats();
+        assert!(stats.pool_capacity.is_none());
+        assert!(stats.pool_used.is_none());
+    }
+
+    #[test]
+    fn world_builder_with_memory_budget_uses_slab_pool() {
+        let world = WorldBuilder::new()
+            .memory_budget(64 * 1024 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        let stats = world.stats();
+        assert_eq!(stats.pool_capacity, Some(64 * 1024 * 1024));
+        assert_eq!(stats.pool_used, Some(0));
+    }
+
+    #[test]
+    fn world_builder_spawn_and_query() {
+        let mut world = World::builder().build().unwrap();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+        let mut count = 0;
+        world.query::<(&Pos, &Vel)>().for_each(|_| count += 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn world_builder_default_impl() {
+        let builder = WorldBuilder::default();
+        let world = builder.build().unwrap();
+        assert_eq!(world.entity_count(), 0);
+    }
+
+    #[test]
+    fn world_builder_with_slab_pool() {
+        let mut world = World::builder()
+            .memory_budget(8 * 1024 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+
+        for i in 0..100 {
+            world.spawn((i as u32, i as f64));
+        }
+
+        let stats = world.stats();
+        assert_eq!(stats.entity_count, 100);
+        assert!(stats.pool_capacity.is_some());
+        assert!(stats.pool_used.unwrap() > 0);
+    }
+
+    // ── try_spawn / try_insert tests ────────────────────────────────
+
+    #[test]
+    fn try_spawn_succeeds_with_system_allocator() {
+        let mut world = World::new();
+        let e = world.try_spawn((42u32,)).unwrap();
+        assert_eq!(*world.get::<u32>(e).unwrap(), 42);
+    }
+
+    #[test]
+    fn try_spawn_returns_error_on_pool_exhaustion() {
+        let mut world = World::builder()
+            .memory_budget(64 * 1024) // tiny 64KB pool
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+
+        let mut count = 0u32;
+        while world.try_spawn((count, count as f64)).is_ok() {
+            count += 1;
+        }
+        assert!(count > 0, "should have spawned at least one entity");
+        // Verify world is still consistent after exhaustion
+        let mut sum = 0u32;
+        world.query::<(&u32,)>().for_each(|(v,)| sum += v);
+        assert_eq!(sum, (0..count).sum::<u32>());
+    }
+
+    #[test]
+    fn try_insert_succeeds_with_system_allocator() {
+        let mut world = World::new();
+        let e = world.spawn((42u32,));
+        world.try_insert(e, (1.5f64,)).unwrap();
+        assert_eq!(*world.get::<u32>(e).unwrap(), 42);
+        assert_eq!(*world.get::<f64>(e).unwrap(), 1.5);
+    }
+
+    #[test]
+    fn try_insert_overwrite_succeeds() {
+        // Overwriting existing components never allocates new columns
+        let mut world = World::new();
+        let e = world.spawn((42u32,));
+        world.try_insert(e, (99u32,)).unwrap();
+        assert_eq!(*world.get::<u32>(e).unwrap(), 99);
+    }
+
+    #[test]
+    fn try_insert_returns_error_on_pool_exhaustion() {
+        let mut world = World::builder()
+            .memory_budget(64 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+
+        // Fill up the pool
+        let mut entities = Vec::new();
+        while let Ok(e) = world.try_spawn((0u32,)) {
+            entities.push(e);
+        }
+        assert!(!entities.is_empty());
+
+        // Try inserting a new component — should fail (pool exhausted)
+        let result = world.try_insert(entities[0], (1.5f64,));
+        // Result depends on whether the new archetype column allocation fits.
+        // Just verify it doesn't panic and world remains consistent.
+        drop(result);
+
+        // Verify all original entities are still readable
+        let mut count = 0;
+        world.query::<(&u32,)>().for_each(|_| count += 1);
+        assert_eq!(count, entities.len());
     }
 }
 

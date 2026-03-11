@@ -1,9 +1,10 @@
-use std::alloc::{self, Layout};
+use std::alloc::Layout;
 use std::ptr::NonNull;
 
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
+use crate::pool::{SharedPool, default_pool};
 use crate::tick::Tick;
 use crate::world::{EntityLocation, World, get_pair_mut};
 
@@ -40,14 +41,16 @@ pub(crate) struct Arena {
     data: NonNull<u8>,
     len: usize,
     capacity: usize,
+    pool: SharedPool,
 }
 
 impl Arena {
-    pub fn new() -> Self {
+    pub fn new(pool: SharedPool) -> Self {
         Self {
             data: NonNull::dangling(),
             len: 0,
             capacity: 0,
+            pool,
         }
     }
 
@@ -90,14 +93,15 @@ impl Arena {
         // Always use alloc + copy + dealloc instead of realloc.
         // realloc may not preserve alignment > max_align_t (typically 16 bytes).
         // Same reasoning as BlobVec::grow — alignment guarantees are non-negotiable.
-        let new_ptr = unsafe { alloc::alloc(new_layout) };
-        let new_data =
-            NonNull::new(new_ptr).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
+        let new_data = self
+            .pool
+            .allocate(new_layout)
+            .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout));
         if self.capacity > 0 {
             unsafe {
                 std::ptr::copy_nonoverlapping(self.data.as_ptr(), new_data.as_ptr(), self.len);
                 let old_layout = Layout::from_size_align(self.capacity, ARENA_ALIGN).unwrap();
-                alloc::dealloc(self.data.as_ptr(), old_layout);
+                self.pool.deallocate(self.data, old_layout);
             }
         }
         self.data = new_data;
@@ -116,8 +120,10 @@ impl Drop for Arena {
         if self.capacity > 0 {
             let layout =
                 Layout::from_size_align(self.capacity, ARENA_ALIGN).expect("invalid arena layout");
+            // SAFETY: self.data was returned by a prior call to pool.allocate
+            // with this layout, and will not be used after this call.
             unsafe {
-                alloc::dealloc(self.data.as_ptr(), layout);
+                self.pool.deallocate(self.data, layout);
             }
         }
     }
@@ -202,9 +208,13 @@ pub struct EnumChangeSet {
 
 impl EnumChangeSet {
     pub fn new() -> Self {
+        Self::new_in(default_pool())
+    }
+
+    pub(crate) fn new_in(pool: SharedPool) -> Self {
         Self {
             mutations: Vec::new(),
-            arena: Arena::new(),
+            arena: Arena::new(pool),
             drop_entries: Vec::new(),
         }
     }
@@ -655,9 +665,10 @@ impl EnumChangeSet {
                         ids.dedup();
                         ids
                     };
-                    let arch_id = world
-                        .archetypes
-                        .get_or_create(&sorted_ids, &world.components);
+                    let arch_id =
+                        world
+                            .archetypes
+                            .get_or_create(&sorted_ids, &world.components, &world.pool);
                     let index = entity.index() as usize;
 
                     if index >= world.entity_locations.len() {
@@ -791,9 +802,10 @@ fn changeset_insert_raw(
         let src_arch_id = location.archetype_id;
         let src_row = location.row;
 
-        let target_arch_id = world
-            .archetypes
-            .get_or_create(&target_ids, &world.components);
+        let target_arch_id =
+            world
+                .archetypes
+                .get_or_create(&target_ids, &world.components, &world.pool);
 
         let (src_arch, target_arch) = get_pair_mut(
             &mut world.archetypes.archetypes,
@@ -897,7 +909,9 @@ fn changeset_remove_raw(
             });
         }
         arch.debug_assert_consistent();
-        let empty_arch_id = world.archetypes.get_or_create(&[], &world.components);
+        let empty_arch_id = world
+            .archetypes
+            .get_or_create(&[], &world.components, &world.pool);
         let empty_arch = &mut world.archetypes.archetypes[empty_arch_id.0];
         empty_arch.entities.push(entity);
         world.entity_locations[index] = Some(EntityLocation {
@@ -907,9 +921,10 @@ fn changeset_remove_raw(
         return Ok(());
     }
 
-    let target_arch_id = world
-        .archetypes
-        .get_or_create(&target_ids, &world.components);
+    let target_arch_id =
+        world
+            .archetypes
+            .get_or_create(&target_ids, &world.components, &world.pool);
 
     let (src_arch, target_arch) = get_pair_mut(
         &mut world.archetypes.archetypes,
@@ -968,7 +983,7 @@ mod tests {
 
     #[test]
     fn arena_alloc_and_read_back() {
-        let mut arena = Arena::new();
+        let mut arena = Arena::new(default_pool());
         let value: u32 = 42;
         let layout = Layout::new::<u32>();
         let offset = arena.alloc(&value as *const u32 as *const u8, layout);
@@ -978,7 +993,7 @@ mod tests {
 
     #[test]
     fn arena_alignment() {
-        let mut arena = Arena::new();
+        let mut arena = Arena::new(default_pool());
         let byte: u8 = 0xFF;
         let _ = arena.alloc(&byte as *const u8, Layout::new::<u8>());
 
@@ -989,7 +1004,7 @@ mod tests {
 
     #[test]
     fn arena_zst() {
-        let mut arena = Arena::new();
+        let mut arena = Arena::new(default_pool());
         let layout = Layout::new::<()>();
         let offset = arena.alloc(std::ptr::null(), layout);
         assert_eq!(offset, 0);

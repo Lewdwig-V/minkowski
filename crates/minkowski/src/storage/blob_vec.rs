@@ -1,6 +1,7 @@
-use std::alloc::{self, Layout};
+use std::alloc::Layout;
 use std::ptr::NonNull;
 
+use crate::pool::{PoolExhausted, SharedPool};
 use crate::tick::Tick;
 
 /// Type-erased growable array. Stores raw bytes with a known `Layout`.
@@ -12,6 +13,7 @@ pub(crate) struct BlobVec {
     len: usize,
     capacity: usize,
     pub(crate) changed_tick: Tick,
+    pool: SharedPool,
 }
 
 // Safety: BlobVec stores Component data which requires Send + Sync.
@@ -36,7 +38,12 @@ impl BlobVec {
     }
 
     /// Creates a new `BlobVec` for items with the given layout and optional drop function.
-    pub fn new(item_layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>, capacity: usize) -> Self {
+    pub fn new(
+        item_layout: Layout,
+        drop_fn: Option<unsafe fn(*mut u8)>,
+        capacity: usize,
+        pool: SharedPool,
+    ) -> Self {
         let (data, capacity) = if item_layout.size() == 0 {
             (NonNull::dangling(), usize::MAX)
         } else if capacity == 0 {
@@ -47,8 +54,9 @@ impl BlobVec {
                 Self::alloc_align(&item_layout),
             )
             .expect("invalid layout");
-            let ptr = unsafe { alloc::alloc(layout) };
-            let data = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+            let data = pool
+                .allocate(layout)
+                .unwrap_or_else(|_| std::alloc::handle_alloc_error(layout));
             (data, capacity)
         };
         Self {
@@ -58,6 +66,7 @@ impl BlobVec {
             len: 0,
             capacity,
             changed_tick: Tick::default(),
+            pool,
         }
     }
 
@@ -69,6 +78,11 @@ impl BlobVec {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Pushes a value by copying `item_layout.size()` bytes from `ptr`.
@@ -274,9 +288,10 @@ impl BlobVec {
         //
         // Check the allocation result BEFORE copying — alloc can return null
         // under memory pressure, and copy_nonoverlapping on a null dst is UB.
-        let new_ptr = unsafe { alloc::alloc(new_layout) };
-        let new_data =
-            NonNull::new(new_ptr).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
+        let new_data = self
+            .pool
+            .allocate(new_layout)
+            .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout));
         if self.capacity > 0 {
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -289,11 +304,70 @@ impl BlobVec {
                     Self::alloc_align(&self.item_layout),
                 )
                 .unwrap();
-                alloc::dealloc(self.data.as_ptr(), old_layout);
+                self.pool.deallocate(self.data, old_layout);
             }
         }
         self.data = new_data;
         self.capacity = new_capacity;
+    }
+
+    /// Like [`push`] but returns `Err(PoolExhausted)` instead of panicking
+    /// when the pool cannot grow to accommodate the new element.
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid, initialized value matching this BlobVec's layout.
+    /// Caller is responsible for not double-dropping the source value.
+    pub(crate) unsafe fn try_push(&mut self, ptr: *mut u8) -> Result<(), PoolExhausted> {
+        if self.len == self.capacity {
+            self.try_grow()?;
+        }
+        let dst = self.ptr_at(self.len);
+        let size = self.item_layout.size();
+        if size > 0 {
+            // SAFETY: caller guarantees ptr is valid for size bytes; dst is within allocated capacity
+            unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Like [`grow`] but returns `Err(PoolExhausted)` instead of panicking
+    /// when the pool cannot satisfy the allocation.
+    pub(crate) fn try_grow(&mut self) -> Result<(), PoolExhausted> {
+        let size = self.item_layout.size();
+        if size == 0 {
+            return Ok(());
+        }
+        let new_capacity = if self.capacity == 0 {
+            4
+        } else {
+            self.capacity * 2
+        };
+        let new_layout = Layout::from_size_align(
+            size.checked_mul(new_capacity).expect("capacity overflow"),
+            Self::alloc_align(&self.item_layout),
+        )
+        .expect("invalid layout");
+
+        let new_data = self.pool.allocate(new_layout)?;
+        if self.capacity > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.data.as_ptr(),
+                    new_data.as_ptr(),
+                    size * self.len,
+                );
+                let old_layout = Layout::from_size_align(
+                    size * self.capacity,
+                    Self::alloc_align(&self.item_layout),
+                )
+                .unwrap();
+                self.pool.deallocate(self.data, old_layout);
+            }
+        }
+        self.data = new_data;
+        self.capacity = new_capacity;
+        Ok(())
     }
 }
 
@@ -312,7 +386,7 @@ impl Drop for BlobVec {
                 Layout::from_size_align(size * self.capacity, Self::alloc_align(&self.item_layout))
                     .unwrap();
             unsafe {
-                alloc::dealloc(self.data.as_ptr(), layout);
+                self.pool.deallocate(self.data, layout);
             }
         }
     }
@@ -321,6 +395,7 @@ impl Drop for BlobVec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::default_pool;
     use std::alloc::Layout;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -349,14 +424,14 @@ mod tests {
         } else {
             None
         };
-        BlobVec::new(Layout::new::<T>(), drop_fn, 0)
+        BlobVec::new(Layout::new::<T>(), drop_fn, 0, default_pool())
     }
 
     // ── tests ───────────────────────────────────────────────
 
     #[test]
     fn new_is_empty() {
-        let bv = BlobVec::new(Layout::new::<u32>(), None, 0);
+        let bv = BlobVec::new(Layout::new::<u32>(), None, 0, default_pool());
         assert_eq!(bv.len(), 0);
         assert!(bv.is_empty());
     }
@@ -499,7 +574,7 @@ mod tests {
     #[test]
     fn zst_push_and_len() {
         // Zero-sized types should track length but not allocate
-        let mut bv = BlobVec::new(Layout::new::<()>(), None, 0);
+        let mut bv = BlobVec::new(Layout::new::<()>(), None, 0, default_pool());
         unsafe {
             let mut unit = ();
             bv.push(&mut unit as *mut () as *mut u8);
@@ -512,7 +587,7 @@ mod tests {
     fn column_base_is_64_byte_aligned() {
         for &(size, align) in &[(4, 4), (8, 8), (1, 1), (12, 4), (32, 16)] {
             let layout = Layout::from_size_align(size, align).unwrap();
-            let mut bv = BlobVec::new(layout, None, 8);
+            let mut bv = BlobVec::new(layout, None, 8, default_pool());
             unsafe {
                 let mut val = vec![0u8; size];
                 bv.push(val.as_mut_ptr());
@@ -528,7 +603,7 @@ mod tests {
 
     #[test]
     fn initial_capacity() {
-        let mut bv = BlobVec::new(Layout::new::<u32>(), None, 16);
+        let mut bv = BlobVec::new(Layout::new::<u32>(), None, 16, default_pool());
         // Should not reallocate for the first 16 pushes
         for i in 0u32..16 {
             unsafe {

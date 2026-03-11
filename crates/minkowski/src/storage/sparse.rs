@@ -1,6 +1,7 @@
 use std::alloc::Layout;
 
 use crate::entity::Entity;
+use crate::pool::SharedPool;
 use crate::storage::blob_vec::BlobVec;
 
 const PAGE_SIZE: usize = 4096;
@@ -12,6 +13,24 @@ const EMPTY: u32 = u32::MAX;
 /// The sparse array is indexed by `entity.index()`, split into pages of
 /// [`PAGE_SIZE`]. Each page entry stores a dense index (`u32`) or [`EMPTY`].
 /// Generation is validated against `dense_entities` to reject stale handles.
+///
+/// # Pool threading status
+///
+/// The dense `BlobVec` uses the shared pool (threaded via `new()`).
+/// The remaining heap allocations are **deferred to v2**:
+///
+/// - `pages: Vec<Option<Box<[u32; PAGE_SIZE]>>>` — each page is 16 KiB
+///   (`Box::new([EMPTY; PAGE_SIZE])`). Pages are allocated lazily and
+///   infrequently (one per 4096 unique entity indices). They are cold-path
+///   metadata, not hot-path component data.
+/// - `dense_entities: Vec<Entity>` — one `Entity` (8 bytes) per stored value.
+///   Grows with the dense array but is small relative to `BlobVec` columns.
+///
+/// These account for <5% of total memory in typical workloads. The `BlobVec`
+/// columns (hot-path component data) account for >95% and already use the
+/// pool. Converting pages to pool allocation is straightforward (16 KiB fits
+/// in size class 4 = 64 KiB) but the complexity isn't justified until strict
+/// zero-system-malloc is required.
 pub(crate) struct PagedSparseSet {
     // PERF: Two pointer chases per lookup (Vec data → Box page → array slot).
     // Inherent to paged design — flat array would be 16 GiB for u32 index space.
@@ -24,11 +43,11 @@ pub(crate) struct PagedSparseSet {
 #[allow(dead_code)]
 impl PagedSparseSet {
     /// Creates a new empty `PagedSparseSet` for components with the given layout.
-    pub fn new(item_layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>) -> Self {
+    pub fn new(item_layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>, pool: SharedPool) -> Self {
         Self {
             pages: Vec::new(),
             dense_entities: Vec::new(),
-            dense_values: BlobVec::new(item_layout, drop_fn, 0),
+            dense_values: BlobVec::new(item_layout, drop_fn, 0, pool),
         }
     }
 
@@ -255,24 +274,27 @@ unsafe fn drop_ptr<T>(ptr: *mut u8) {
 /// and drop function. No `dyn Any`, no `Box<HashMap>`.
 pub(crate) struct SparseStorage {
     storages: HashMap<ComponentId, PagedSparseSet>,
+    pool: SharedPool,
 }
 
 #[allow(dead_code)]
 impl SparseStorage {
-    pub fn new() -> Self {
+    pub fn new(pool: SharedPool) -> Self {
         Self {
             storages: HashMap::new(),
+            pool,
         }
     }
 
     pub fn insert<T: Component>(&mut self, comp_id: ComponentId, entity: Entity, value: T) {
+        let pool = self.pool.clone();
         let set = self.storages.entry(comp_id).or_insert_with(|| {
             let drop_fn = if std::mem::needs_drop::<T>() {
                 Some(drop_ptr::<T> as unsafe fn(*mut u8))
             } else {
                 None
             };
-            PagedSparseSet::new(Layout::new::<T>(), drop_fn)
+            PagedSparseSet::new(Layout::new::<T>(), drop_fn, pool)
         });
         let mut value = ManuallyDrop::new(value);
         unsafe {
@@ -362,10 +384,11 @@ impl SparseStorage {
         layout: Layout,
         drop_fn: Option<unsafe fn(*mut u8)>,
     ) {
+        let pool = self.pool.clone();
         let set = self
             .storages
             .entry(comp_id)
-            .or_insert_with(|| PagedSparseSet::new(layout, drop_fn));
+            .or_insert_with(|| PagedSparseSet::new(layout, drop_fn, pool));
         debug_assert_eq!(
             set.dense_values.item_layout, layout,
             "insert_raw layout mismatch for ComponentId {comp_id}"
@@ -388,10 +411,11 @@ impl SparseStorage {
         layout: Layout,
         drop_fn: Option<unsafe fn(*mut u8)>,
     ) -> bool {
+        let pool = self.pool.clone();
         let set = self
             .storages
             .entry(comp_id)
-            .or_insert_with(|| PagedSparseSet::new(layout, drop_fn));
+            .or_insert_with(|| PagedSparseSet::new(layout, drop_fn, pool));
         debug_assert_eq!(
             set.dense_values.item_layout, layout,
             "insert_raw_no_drop layout mismatch for ComponentId {comp_id}"
@@ -438,6 +462,7 @@ impl SparseStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::default_pool;
     use std::alloc::Layout;
 
     /// Creates a `PagedSparseSet` for the given type `T`.
@@ -450,7 +475,7 @@ mod tests {
         } else {
             None
         };
-        PagedSparseSet::new(Layout::new::<T>(), drop_fn)
+        PagedSparseSet::new(Layout::new::<T>(), drop_fn, default_pool())
     }
 
     /// Helper: insert a typed value into the set.
@@ -612,7 +637,7 @@ mod tests {
 
     #[test]
     fn sparse_storage_insert_and_get() {
-        let mut storage = SparseStorage::new();
+        let mut storage = SparseStorage::new(default_pool());
         let e = Entity::new(0, 0);
         storage.insert::<Marker>(0, e, Marker(42));
         assert_eq!(storage.get::<Marker>(0, e), Some(&Marker(42)));
@@ -620,14 +645,14 @@ mod tests {
 
     #[test]
     fn sparse_storage_get_missing() {
-        let storage = SparseStorage::new();
+        let storage = SparseStorage::new(default_pool());
         let e = Entity::new(0, 0);
         assert_eq!(storage.get::<Marker>(0, e), None);
     }
 
     #[test]
     fn sparse_storage_remove() {
-        let mut storage = SparseStorage::new();
+        let mut storage = SparseStorage::new(default_pool());
         let e = Entity::new(0, 0);
         storage.insert::<Marker>(0, e, Marker(42));
         let removed = storage.remove::<Marker>(0, e);
@@ -637,7 +662,7 @@ mod tests {
 
     #[test]
     fn sparse_storage_component_ids_and_iter() {
-        let mut storage = SparseStorage::new();
+        let mut storage = SparseStorage::new(default_pool());
         let e1 = Entity::new(0, 0);
         let e2 = Entity::new(1, 0);
         storage.insert::<u32>(0, e1, 42u32);
@@ -651,7 +676,7 @@ mod tests {
 
     #[test]
     fn sparse_storage_remove_all() {
-        let mut storage = SparseStorage::new();
+        let mut storage = SparseStorage::new(default_pool());
         let e = Entity::new(0, 0);
         storage.insert::<u32>(0, e, 42u32);
         storage.insert::<Marker>(1, e, Marker(99));

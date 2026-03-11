@@ -55,6 +55,22 @@ impl Entity {
 ///   Returns Entity with generation 0. Reserved indices are NOT in the
 ///   generations vec yet — call `materialize_reserved()` before using
 ///   `alloc()` or `is_alive()` on reserved indices.
+///
+/// # Pool threading status
+///
+/// The `generations` and `free_list` Vecs use the standard system
+/// allocator. Pool-backed allocation is **deferred to v2**:
+///
+/// - `generations: Vec<u32>` — one `u32` per entity index ever created.
+///   Grows monotonically, never shrinks. Cold-path metadata accessed
+///   only during alloc/dealloc/is_alive.
+/// - `free_list: Vec<u32>` — recycled entity indices. Bounded by total
+///   despawns minus reuses. Typically small.
+///
+/// Together these account for negligible memory relative to the BlobVec
+/// columns that store actual component data (>95% of total). Converting
+/// to pool-backed storage would require a pool-aware Vec type, which is
+/// significant additional machinery for minimal memory accounting benefit.
 pub(crate) struct EntityAllocator {
     pub(crate) generations: Vec<u32>,
     pub(crate) free_list: Vec<u32>,

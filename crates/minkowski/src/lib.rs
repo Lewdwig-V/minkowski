@@ -78,6 +78,7 @@ pub mod component;
 pub mod entity;
 pub mod index;
 pub(crate) mod lock_table;
+pub(crate) mod pool;
 pub mod query;
 pub mod reducer;
 pub mod retention;
@@ -95,6 +96,7 @@ pub use component::ComponentId;
 pub use entity::Entity;
 pub use index::{BTreeIndex, HashIndex, SpatialIndex};
 pub use minkowski_derive::Table;
+pub use pool::{HugePages, PoolExhausted};
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
 pub use reducer::{
     ComponentSet, Contains, DynamicCtx, DynamicReducerBuilder, DynamicReducerId, EntityMut,
@@ -104,4 +106,4 @@ pub use reducer::{
 pub use retention::Expiry;
 pub use tick::ChangeTick;
 pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
-pub use world::{QueryTickInfo, World, WorldStats};
+pub use world::{QueryTickInfo, World, WorldBuilder, WorldStats};

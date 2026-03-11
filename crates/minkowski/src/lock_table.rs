@@ -166,7 +166,12 @@ mod tests {
         let mut reg = ComponentRegistry::new();
         let pos_id = reg.register::<f32>();
         let vel_id = reg.register::<u32>();
-        let arch = Archetype::new(ArchetypeId(0), &[pos_id, vel_id], &reg);
+        let arch = Archetype::new(
+            ArchetypeId(0),
+            &[pos_id, vel_id],
+            &reg,
+            &crate::pool::default_pool(),
+        );
         (vec![arch], pos_id, vel_id)
     }
 
@@ -318,7 +323,12 @@ mod loom_tests {
         let mut reg = ComponentRegistry::new();
         let pos_id = reg.register::<f32>();
         let vel_id = reg.register::<u32>();
-        let arch = Archetype::new(ArchetypeId(0), &[pos_id, vel_id], &reg);
+        let arch = Archetype::new(
+            ArchetypeId(0),
+            &[pos_id, vel_id],
+            &reg,
+            &crate::pool::default_pool(),
+        );
         (vec![arch], pos_id, vel_id)
     }
 

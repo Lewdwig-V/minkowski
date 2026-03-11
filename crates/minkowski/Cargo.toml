@@ -8,6 +8,8 @@ workspace = true
 
 [dependencies]
 fixedbitset = "0.5"
+libc = "0.2"
+memmap2 = "0.9"
 parking_lot = "0.12"
 rayon = "1"
 minkowski-derive = { path = "../minkowski-derive" }

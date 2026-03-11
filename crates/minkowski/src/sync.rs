@@ -7,7 +7,7 @@
 pub(crate) use parking_lot::Mutex;
 
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(not(loom))]
 pub(crate) use std::sync::Arc;
@@ -16,7 +16,7 @@ pub(crate) use std::sync::Arc;
 pub(crate) use loom::sync::Arc;
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // loom::sync::Mutex::lock() returns Result — wrap to match parking_lot's
 // infallible API so call sites don't change.
