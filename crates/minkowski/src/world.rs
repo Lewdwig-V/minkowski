@@ -361,6 +361,12 @@ impl World {
     ///
     /// If this method returns `Err`, the world state is unchanged — no partial
     /// entity is created and no archetype slot is leaked.
+    ///
+    /// # Panics
+    ///
+    /// This method can still panic if the system allocator (used for internal
+    /// metadata like entity location tables) runs out of memory. Only pool-backed
+    /// storage (component columns) is covered by the `Result` return type.
     pub fn try_spawn<B: Bundle>(&mut self, bundle: B) -> Result<Entity, PoolExhausted> {
         self.drain_orphans();
         let component_ids = B::component_ids(&mut self.components);
@@ -1806,6 +1812,9 @@ impl WorldBuilder {
     /// the process, not just the pool. Use only in dedicated database
     /// processes, not in libraries embedded in larger applications.
     ///
+    /// If `mlockall` fails (e.g., insufficient `RLIMIT_MEMLOCK`), the pool's
+    /// per-mapping pre-fault fallback (mlock -> manual touch) still applies.
+    ///
     /// Requires `CAP_IPC_LOCK` or sufficient `RLIMIT_MEMLOCK` on Linux.
     /// On unsupported platforms this is a no-op.
     pub fn lock_all_memory(mut self, lock: bool) -> Self {
@@ -1817,7 +1826,9 @@ impl WorldBuilder {
     /// allocated (only possible with a bounded `memory_budget`).
     pub fn build(self) -> Result<World, PoolExhausted> {
         if self.lock_all_memory {
-            crate::pool::mlockall_best_effort();
+            // mlockall failure is non-fatal — the pool's per-mapping
+            // pre-fault fallback (mlock + manual touch) still applies.
+            let _ = crate::pool::try_mlockall();
         }
         let pool: SharedPool = match self.memory_budget {
             Some(bytes) => Arc::new(SlabPool::new(bytes, self.hugepages)?),

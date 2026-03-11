@@ -9,7 +9,7 @@ use std::alloc::Layout;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Error returned when the memory pool is exhausted.
 #[derive(Debug, Clone)]
@@ -47,8 +47,8 @@ pub enum HugePages {
 /// # Safety
 ///
 /// Implementations must return properly aligned, non-overlapping memory
-/// regions. `deallocate` must only be called with pointers and layouts
-/// previously returned by `allocate`.
+/// regions. `deallocate` must only be called with pointers returned by
+/// a prior call to `allocate` with the same `Layout`.
 #[allow(dead_code)]
 pub unsafe trait PoolAllocator: Send + Sync {
     /// Allocate a block satisfying `layout`.
@@ -58,8 +58,8 @@ pub unsafe trait PoolAllocator: Send + Sync {
     ///
     /// # Safety
     ///
-    /// `ptr` must have been returned by a prior call to `allocate` with a
-    /// compatible layout. The caller must not use `ptr` after this call.
+    /// `ptr` must have been returned by a prior call to `allocate` with
+    /// the same `Layout`. The caller must not use `ptr` after this call.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout);
 
     /// Total capacity in bytes, if bounded. `None` for unbounded allocators.
@@ -100,7 +100,7 @@ unsafe impl PoolAllocator for SystemAllocator {
             return;
         }
         // SAFETY: caller guarantees `ptr` was returned by a prior `allocate`
-        // with a compatible layout, and `layout.size() > 0`.
+        // with the same layout, and `layout.size() > 0`.
         unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
     }
 }
@@ -117,23 +117,21 @@ pub(crate) fn default_pool() -> SharedPool {
 
 // ── mlockall ────────────────────────────────────────────────────────
 
-/// Call `mlockall(MCL_CURRENT | MCL_FUTURE)` to lock all current and future
+/// Attempt `mlockall(MCL_CURRENT | MCL_FUTURE)` to lock all current and future
 /// memory mappings into physical RAM. This is a process-global operation.
 ///
-/// Best-effort: silently ignored on platforms without `mlockall` or if the
-/// call fails (insufficient privileges).
+/// Returns `true` if the call succeeded, `false` if it failed (insufficient
+/// privileges, unsupported platform, etc.).
 #[cfg(unix)]
-pub(crate) fn mlockall_best_effort() {
+pub(crate) fn try_mlockall() -> bool {
     // SAFETY: mlockall is a process-global operation with no memory
     // unsafety. It may fail due to insufficient RLIMIT_MEMLOCK.
-    unsafe {
-        libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
-    }
+    unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) == 0 }
 }
 
 #[cfg(not(unix))]
-pub(crate) fn mlockall_best_effort() {
-    // No-op on non-Unix platforms.
+pub(crate) fn try_mlockall() -> bool {
+    false
 }
 
 // ── MmapRegion ──────────────────────────────────────────────────────
@@ -184,20 +182,21 @@ impl MmapRegion {
         //
         // 3. Manual touch sweep — write one byte per page (4 KB stride).
         //    Always works, no privilege requirements. Slowest but guaranteed.
-        let mut mmap = MmapOptions::new()
+
+        // Try MAP_POPULATE first. Track whether it succeeded so we can
+        // skip redundant mlock/touch when it did.
+        let (mut mmap, populated) = MmapOptions::new()
             .len(size)
-            .populate() // Attempt 1: MAP_POPULATE
+            .populate()
             .map_anon()
-            .or_else(|_| {
-                // populate() failed — try without it, then mlock/touch.
-                MmapOptions::new().len(size).map_anon()
-            })
+            .map(|m| (m, true))
+            .or_else(|_| MmapOptions::new().len(size).map_anon().map(|m| (m, false)))
             .map_err(|_| PoolExhausted { requested: layout })?;
 
         // If MAP_POPULATE succeeded, pages are already faulted. If it
         // didn't (we fell through to the plain mmap), we need to force
         // pages into RAM via mlock or manual touch.
-        if mmap.lock().is_err() {
+        if !populated && mmap.lock().is_err() {
             // mlock failed (insufficient RLIMIT_MEMLOCK or platform
             // doesn't support it) — manual touch sweep as final fallback.
             Self::prefault_manual(&mut mmap);
@@ -222,6 +221,10 @@ impl MmapRegion {
         self.mmap.as_mut_ptr()
     }
 
+    fn as_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
+    }
+
     fn len(&self) -> usize {
         self.mmap.len()
     }
@@ -241,13 +244,6 @@ const SIZE_CLASSES: [usize; NUM_SIZE_CLASSES] = [64, 256, 1024, 4096, 65_536, 1_
 /// - Class 5 (1 MB):  33% — bulk column pre-allocation
 const PROPORTIONS: [usize; NUM_SIZE_CLASSES] = [1, 2, 4, 20, 40, 33];
 
-/// Intrusive free-list node. Stored at the start of each free block.
-/// Every size class is >= 64 bytes, so `FreeBlock` (pointer-sized) always fits.
-#[repr(C)]
-struct FreeBlock {
-    next: *mut FreeBlock,
-}
-
 /// Return the size-class index for a given layout, or `None` if too large.
 fn size_class_for(layout: Layout) -> Option<usize> {
     // The effective allocation size must satisfy both size and alignment.
@@ -258,16 +254,21 @@ fn size_class_for(layout: Layout) -> Option<usize> {
 /// TigerBeetle-style slab allocator backed by a single mmap'd region.
 ///
 /// Memory is partitioned into fixed-size blocks across six size classes.
-/// Allocation and deallocation are lock-free (CAS on per-class free lists).
+/// Allocation and deallocation are serialized per size class via `Mutex`.
+///
+// PERF: parking_lot::Mutex is a single atomic CAS on uncontended paths.
+// If profiling shows contention, consider upgrading to a lock-free
+// structure with ABA protection (tagged pointers or epoch-based reclamation).
 pub(crate) struct SlabPool {
     region: MmapRegion,
-    free_lists: [AtomicPtr<FreeBlock>; NUM_SIZE_CLASSES],
+    free_lists: [parking_lot::Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES],
     used_bytes: AtomicUsize,
 }
 
-// SAFETY: All mutable state is behind atomics. FreeBlock pointers point
-// into the mmap region which is not deallocated while SlabPool exists.
-// The mmap region is owned by SlabPool and outlives all allocations.
+// SAFETY: `*mut u8` inside the Mutex Vecs points into the mmap region which
+// is owned by SlabPool and outlives all allocations. The Mutex provides
+// exclusive access to the free list vectors. The raw pointers are never
+// dereferenced outside the lock — they are just addresses returned to callers.
 unsafe impl Send for SlabPool {}
 unsafe impl Sync for SlabPool {}
 
@@ -278,8 +279,9 @@ impl SlabPool {
         let base = region.as_mut_ptr();
         let total = region.len();
 
-        // Initialize free lists as null.
-        let free_lists = std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut()));
+        // Initialize free lists as empty Vecs.
+        let free_lists: [parking_lot::Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES] =
+            std::array::from_fn(|_| parking_lot::Mutex::new(Vec::new()));
 
         // Partition the region into size-class blocks proportionally.
         let proportion_sum: usize = PROPORTIONS.iter().sum();
@@ -287,33 +289,31 @@ impl SlabPool {
 
         for class in 0..NUM_SIZE_CLASSES {
             let block_size = SIZE_CLASSES[class];
+
+            // Align partition start to block_size for correct alignment of returned pointers.
+            offset = (offset + block_size - 1) & !(block_size - 1);
+
             // Bytes allocated to this size class (rounded down to whole blocks).
             let class_bytes = total * PROPORTIONS[class] / proportion_sum;
             let block_count = class_bytes / block_size;
 
-            // Build free list from last block to first so that the first
-            // allocation pops the lowest address (better cache locality).
-            let mut head: *mut FreeBlock = std::ptr::null_mut();
-            for i in (0..block_count).rev() {
+            let mut list = free_lists[class].lock();
+            list.reserve(block_count);
+
+            // Push blocks from first to last so that pop yields the lowest
+            // address first (better cache locality).
+            for i in 0..block_count {
                 let block_offset = offset + i * block_size;
-                assert!(
-                    block_offset + block_size <= total,
-                    "block at offset {block_offset} (size {block_size}) exceeds region of {total} bytes"
-                );
-                // SAFETY: `block_offset + block_size <= total` (asserted above),
+                if block_offset + block_size > total {
+                    break;
+                }
+                // SAFETY: `block_offset + block_size <= total` (checked above),
                 // and `base` points to the start of a valid mmap region of
-                // `total` bytes. Each block is at least 64 bytes, large enough
-                // for a FreeBlock (pointer-sized).
-                let block_ptr = unsafe { base.add(block_offset).cast::<FreeBlock>() };
-                // SAFETY: `block_ptr` is properly aligned (64-byte blocks are
-                // >= pointer alignment) and within the mmap region. We are the
-                // sole writer during construction.
-                unsafe { (*block_ptr).next = head };
-                head = block_ptr;
+                // `total` bytes. Each block is at least 64 bytes.
+                let block_ptr = unsafe { base.add(block_offset) };
+                list.push(block_ptr);
             }
 
-            // Single-threaded init — Relaxed is sufficient.
-            free_lists[class].store(head, Ordering::Relaxed);
             offset += block_count * block_size;
         }
 
@@ -326,70 +326,63 @@ impl SlabPool {
 }
 
 // SAFETY: SlabPool returns properly aligned, non-overlapping memory regions.
-// Each block is a fixed-size slab from the mmap region. Blocks are at least
-// 64 bytes (cache-line aligned), satisfying any layout whose alignment <= 64.
-// Size classes are chosen such that `layout.size() <= block_size`. The free
-// list is lock-free (CAS) and each block is returned to exactly one caller.
+// Each block is a fixed-size slab from the mmap region. Blocks within each
+// size class are aligned to their class size. Size classes are chosen such
+// that `layout.size() <= block_size` and `layout.align() <= block_size`.
+// The Mutex serializes access to each free list.
 unsafe impl PoolAllocator for SlabPool {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
         if layout.size() == 0 {
             return Ok(NonNull::new(layout.align() as *mut u8).expect("alignment is non-zero"));
         }
 
-        let class = size_class_for(layout).ok_or(PoolExhausted { requested: layout })?;
+        let start_class = size_class_for(layout).ok_or(PoolExhausted { requested: layout })?;
 
-        // Lock-free CAS pop from free list.
-        loop {
-            let head = self.free_lists[class].load(Ordering::Acquire);
-            if head.is_null() {
-                return Err(PoolExhausted { requested: layout });
+        // Try the target class first, then fall back to larger classes.
+        for (class, &block_size) in SIZE_CLASSES.iter().enumerate().skip(start_class) {
+            let mut list = self.free_lists[class].lock();
+            if let Some(ptr) = list.pop() {
+                self.used_bytes.fetch_add(block_size, Ordering::Relaxed);
+
+                debug_assert!(
+                    (ptr as usize).is_multiple_of(layout.align()),
+                    "SlabPool: block at {ptr:p} is not aligned to {}",
+                    layout.align()
+                );
+
+                return Ok(NonNull::new(ptr).expect("free list block is non-null"));
             }
-            // SAFETY: `head` is non-null and points to a FreeBlock within
-            // the mmap region. It was either written during init or pushed
-            // back by a prior `deallocate`. No other thread can pop this
-            // same block because we haven't CAS'd it out yet — if another
-            // thread pops it first, our CAS will fail and we retry.
-            let next = unsafe { (*head).next };
-            if self.free_lists[class]
-                .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                self.used_bytes
-                    .fetch_add(SIZE_CLASSES[class], Ordering::Relaxed);
-                return Ok(NonNull::new(head.cast()).expect("free list block is non-null"));
-            }
-            // CAS failed — another thread popped concurrently. Retry.
         }
+
+        Err(PoolExhausted { requested: layout })
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         if layout.size() == 0 {
             return;
         }
-        let Some(class) = size_class_for(layout) else {
-            return;
-        };
 
-        let block = ptr.as_ptr().cast::<FreeBlock>();
+        let class = size_class_for(layout);
+        debug_assert!(
+            class.is_some(),
+            "SlabPool::deallocate: layout (size={}, align={}) exceeds max size class — \
+             caller violated the allocate/deallocate contract",
+            layout.size(),
+            layout.align()
+        );
+        let Some(class) = class else { return };
 
-        // Lock-free CAS push to free list.
-        loop {
-            let head = self.free_lists[class].load(Ordering::Acquire);
-            // SAFETY: `block` was returned by a prior `allocate` from this
-            // size class. It points within the mmap region and is at least
-            // 64 bytes — large enough for FreeBlock. The caller guarantees
-            // no other references exist.
-            unsafe { (*block).next = head };
-            if self.free_lists[class]
-                .compare_exchange_weak(head, block, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                self.used_bytes
-                    .fetch_sub(SIZE_CLASSES[class], Ordering::Relaxed);
-                return;
-            }
-            // CAS failed — another thread pushed concurrently. Retry.
-        }
+        debug_assert!(
+            ptr.as_ptr() >= self.region.as_ptr().cast_mut()
+                && (ptr.as_ptr() as usize) < self.region.as_ptr() as usize + self.region.len(),
+            "SlabPool::deallocate: pointer {:p} is outside pool region",
+            ptr.as_ptr()
+        );
+
+        let mut list = self.free_lists[class].lock();
+        list.push(ptr.as_ptr());
+        self.used_bytes
+            .fetch_sub(SIZE_CLASSES[class], Ordering::Relaxed);
     }
 
     fn capacity(&self) -> Option<usize> {
@@ -536,6 +529,81 @@ mod tests {
             pool.deallocate(p1, small);
             pool.deallocate(p2, medium);
             pool.deallocate(p3, large);
+        }
+    }
+
+    #[test]
+    fn slab_pool_used_returns_to_zero_after_dealloc() {
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        assert_eq!(pool.used(), Some(0));
+
+        let layout = Layout::from_size_align(64, 64).unwrap();
+        let p1 = pool.allocate(layout).unwrap();
+        let p2 = pool.allocate(layout).unwrap();
+        assert!(pool.used().unwrap() > 0);
+
+        // SAFETY: ptrs were returned by `allocate` with this layout.
+        unsafe {
+            pool.deallocate(p1, layout);
+            pool.deallocate(p2, layout);
+        }
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_zero_size_allocation() {
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let layout = Layout::from_size_align(0, 1).unwrap();
+        let ptr = pool.allocate(layout).unwrap();
+        assert_eq!(pool.used(), Some(0), "ZST should not consume pool bytes");
+        // SAFETY: ptr was returned by `allocate` with this layout (zero-size).
+        unsafe { pool.deallocate(ptr, layout) };
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_oversized_returns_error() {
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        // 2 MB exceeds the largest size class (1 MB).
+        let layout = Layout::from_size_align(2 * 1024 * 1024, 8).unwrap();
+        assert!(pool.allocate(layout).is_err());
+    }
+
+    #[test]
+    fn slab_pool_falls_back_to_larger_class() {
+        // Use a small budget so class 0 (64B, 1% budget) has very few blocks.
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+
+        // Exhaust class 0 (64 B blocks).
+        let mut ptrs = Vec::new();
+        loop {
+            // Try to allocate — once class 0 is empty, it should fall back
+            // to class 1 (256 B). We keep going until all classes are exhausted
+            // or we have enough to prove fallback worked.
+            let Ok(ptr) = pool.allocate(layout_small) else {
+                break;
+            };
+            ptrs.push(ptr);
+        }
+
+        // Calculate how many blocks class 0 should have had.
+        let proportion_sum: usize = PROPORTIONS.iter().sum();
+        let class0_bytes = 1024 * 1024 * PROPORTIONS[0] / proportion_sum;
+        let class0_blocks = class0_bytes / SIZE_CLASSES[0];
+
+        // We should have gotten more blocks than class 0 alone provides,
+        // proving that fallback to larger classes occurred.
+        assert!(
+            ptrs.len() > class0_blocks,
+            "expected more than {class0_blocks} blocks (got {}), fallback to larger class failed",
+            ptrs.len()
+        );
+
+        // Clean up.
+        for ptr in ptrs {
+            // SAFETY: each ptr was returned by `allocate` with layout_small.
+            unsafe { pool.deallocate(ptr, layout_small) };
         }
     }
 }
