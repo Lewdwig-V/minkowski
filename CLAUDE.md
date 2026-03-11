@@ -34,6 +34,7 @@ cargo run -p minkowski-examples --example observe --release   # Observability: M
 cargo run -p minkowski-examples --example blob --release   # Blob offloading: BlobRef component + BlobStore lifecycle trait, MemoryBlobStore cleanup (5 entities, orphan deletion)
 cargo run -p minkowski-examples --example retention --release   # Retention: Expiry countdown + RetentionReducer, dispatch-count TTL, progressive despawn (5 entities, 8 frames)
 cargo run -p minkowski-examples --example pool --release   # Memory pool: TigerBeetle-style WorldBuilder with 16 MB budget, try_spawn until exhaustion, pool stats (131K entities)
+cargo run -p minkowski-examples --example profile_changeset --release   # Profiling harness: QueryWriter vs QueryMut flamegraph capture (10K entities, 1K iterations)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
