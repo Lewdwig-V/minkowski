@@ -18,8 +18,8 @@
 
 ### Retention (`minkowski`)
 
-- **`Expiry` component** — tick-based TTL with `at_tick()` and `with_ttl()` constructors. `is_expired(current_tick)` for manual checks.
-- **`ReducerRegistry::retention()`** — built-in scheduled reducer that batch-despawns expired entities. Tick captured after `world.query()` to avoid off-by-one at boundary ticks.
+- **`Expiry` component** — dispatch-count countdown with `Expiry::after(n)`. Each retention dispatch decrements the counter; entities at zero are despawned. No ticks or wall-clock time exposed — the user thinks in retention cycles, a concept they fully control.
+- **`ReducerRegistry::retention()`** — built-in scheduled reducer. Queries `&mut Expiry`, decrements all counters, batch-despawns zeros.
 
 ### Observability (`minkowski-observe`)
 
@@ -41,7 +41,7 @@
 
 ### Verification
 
-- 481 unit tests (up from 398), 19 observe tests (up from 14).
+- 480 unit tests (up from 398), 19 observe tests (up from 14).
 - Full Miri + Tree Borrows pass including pool allocator tests.
 - 2 loom tests for concurrent slab pool allocation/deallocation.
 

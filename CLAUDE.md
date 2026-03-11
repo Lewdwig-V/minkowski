@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo test -p minkowski --lib          # Unit tests (481 tests, fast)
+cargo test -p minkowski --lib          # Unit tests (480 tests, fast)
 cargo test -p minkowski                # All tests including doc tests
 cargo test -p minkowski -- entity      # Run tests matching a filter
 
@@ -32,7 +32,7 @@ cargo run -p minkowski-examples --example circuit --release   # Analog circuit s
 cargo run -p minkowski-examples --example tactical --release   # Multi-operator tactical map: sparse components, par_for_each, Optimistic Conflict, entity bit packing, HashIndex stale validation, EnumChangeSet/MutationRef replication (100 units, 10 ticks, 2 threads)
 cargo run -p minkowski-examples --example observe --release   # Observability: MetricsSnapshot capture, diff, entity churn (100 entities, 2 archetypes)
 cargo run -p minkowski-examples --example blob --release   # Blob offloading: BlobRef component + BlobStore lifecycle trait, MemoryBlobStore cleanup (5 entities, orphan deletion)
-cargo run -p minkowski-examples --example retention --release   # Retention: Expiry component + RetentionReducer, tick-based TTL, progressive despawn (5 entities, 6 frames)
+cargo run -p minkowski-examples --example retention --release   # Retention: Expiry countdown + RetentionReducer, dispatch-count TTL, progressive despawn (5 entities, 8 frames)
 cargo run -p minkowski-examples --example pool --release   # Memory pool: TigerBeetle-style WorldBuilder with 16 MB budget, try_spawn until exhaustion, pool stats (131K entities)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)

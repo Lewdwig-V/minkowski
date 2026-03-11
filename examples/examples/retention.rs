@@ -1,8 +1,8 @@
-//! Retention: tick-based entity cleanup via Expiry + RetentionReducer.
+//! Retention: dispatch-count entity cleanup via Expiry + RetentionReducer.
 //!
-//! Spawns entities with varying TTLs. Each "frame" advances the world tick
-//! by running dummy mutations, then runs the retention reducer to despawn
-//! expired entities.
+//! Spawns entities with varying lifetimes. Each frame runs the retention
+//! reducer once, decrementing Expiry counters and despawning entities
+//! that reach zero.
 //!
 //! Run: cargo run -p minkowski-examples --example retention --release
 
@@ -13,41 +13,38 @@ fn main() {
     let mut registry = ReducerRegistry::new();
     let retention_id = registry.retention(&mut world);
 
-    // Spawn entities with different TTLs (in ticks from now).
-    // Each mutable operation (spawn, query, despawn) advances the internal
-    // tick by 1, so 100 dummy queries per frame ≈ 100 ticks per frame.
-    let ttls: &[u64] = &[10, 50, 100, 200, 500];
-    let now = world.change_tick();
+    // Spawn entities that expire after different numbers of retention dispatches.
+    // Expiry::after(n) means "survive n dispatches, despawn on the nth."
+    let lifetimes: &[u32] = &[1, 2, 3, 5, 8];
 
     println!(
-        "--- Spawning {} entities with TTLs: {ttls:?} ---",
-        ttls.len()
+        "--- Spawning {} entities with lifetimes: {lifetimes:?} dispatches ---",
+        lifetimes.len()
     );
-    println!("    base tick: {}", now.to_raw());
     println!();
 
-    for &ttl in ttls {
-        world.spawn((Expiry::with_ttl(now, ttl), ttl as u32));
+    for &n in lifetimes {
+        world.spawn((Expiry::after(n), n));
     }
 
-    // Simulate frames — each iteration advances the tick via dummy queries.
-    for frame in 0..6 {
-        // Advance tick by doing work (each query call advances tick by 1).
-        for _ in 0..100 {
-            world.query::<(&u32,)>().for_each(|_| {});
-        }
-
+    // Each loop iteration is one "frame" — run retention once per frame.
+    for frame in 1..=10 {
         let before = world.entity_count();
         registry.run(&mut world, retention_id, ()).unwrap();
         let after = world.entity_count();
-        let tick = world.change_tick().to_raw();
-
         let despawned = before - after;
-        println!(
-            "Frame {frame}: tick={tick}, entities {before} -> {after} ({despawned} despawned)"
-        );
+
+        if despawned > 0 {
+            println!("Frame {frame}: {before} -> {after} entities ({despawned} despawned)");
+        } else {
+            println!("Frame {frame}: {after} entities");
+        }
+
+        if after == 0 {
+            break;
+        }
     }
 
     println!();
-    println!("--- Final entity count: {} ---", world.entity_count());
+    println!("--- All entities expired ---");
 }

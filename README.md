@@ -45,7 +45,7 @@ registry.run(&mut world, move_id, ());
 ### Building & testing
 
 ```
-cargo test -p minkowski                # 486 tests
+cargo test -p minkowski                # 485 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
@@ -72,7 +72,7 @@ Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration
 | Layer | What it catches | When it runs |
 |---|---|---|
 | **Type system + borrow checker** | Aliased `&mut T`, lifetime violations, `Send`/`Sync` misuse. `ReadOnlyWorldQuery` prevents `&mut T` through `&World`. | Every build |
-| **481 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
+| **480 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
 | **[Miri][miri] + [Tree Borrows][tree-borrows]** | Undefined behavior: use-after-free, uninitialized reads, aliasing violations in `unsafe` blocks. Full test suite passes under the strict Tree Borrows model. | Every PR (CI) |
 | **[ThreadSanitizer][tsan]** | Data races: unsynchronized concurrent memory accesses. Full test suite including rayon `par_for_each` passes under TSan instrumentation. | Every PR (CI) |
 | **[Loom][loom]** | Concurrency invariant violations: exhaustive thread interleaving enumeration over OrphanQueue push/drain, column lock acquire/upgrade/deadlock-freedom, and entity ID reservation contention. | Every PR (CI) |
@@ -263,7 +263,7 @@ store.on_orphaned(&orphaned_refs);
 
 ### Retention
 
-`Expiry` is a tick-based TTL component. `RetentionReducer` is a built-in scheduled reducer that batch-despawns expired entities — you control when and how often it runs.
+`Expiry` is a countdown component — it counts retention dispatches, not ticks or wall-clock time. Each call to `registry.run()` decrements all counters by one and despawns entities that reach zero. You control how often retention runs; the engine never runs it automatically.
 
 ```rust
 use minkowski::{World, Expiry, ReducerRegistry};
@@ -272,11 +272,10 @@ let mut world = World::new();
 let mut registry = ReducerRegistry::new();
 let retention_id = registry.retention(&mut world);
 
-// Spawn with a TTL of 100 ticks from now
-let tick = world.change_tick();
-world.spawn((data, Expiry::with_ttl(tick, 100)));
+// This entity survives 5 retention dispatches
+world.spawn((data, Expiry::after(5)));
 
-// Run retention periodically — entities past their deadline are despawned
+// Each call is one "retention cycle" — counters decrement, zeros despawn
 registry.run(&mut world, retention_id, ());
 ```
 
