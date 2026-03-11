@@ -56,6 +56,7 @@ impl Arena {
 
     /// Copy `layout.size()` bytes from `src` into the arena.
     /// Returns the byte offset where data was written.
+    #[inline]
     pub fn alloc(&mut self, src: *const u8, layout: Layout) -> usize {
         if layout.size() == 0 {
             return 0;
@@ -76,6 +77,7 @@ impl Arena {
     }
 
     /// Get a raw pointer to data at the given offset.
+    #[inline]
     pub fn get(&self, offset: usize) -> *const u8 {
         debug_assert!(
             offset <= self.len,
@@ -258,6 +260,7 @@ impl EnumChangeSet {
 
     /// Record inserting a component on an entity. Returns the arena byte offset
     /// where the component data was stored.
+    #[inline]
     pub fn record_insert(
         &mut self,
         entity: Entity,
@@ -415,6 +418,7 @@ impl EnumChangeSet {
     /// Insert with a pre-resolved ComponentId. Same as `insert()` but
     /// skips `world.register_component::<T>()`. Used by typed reducer handles.
     #[allow(dead_code)]
+    #[inline]
     pub(crate) fn insert_raw<T: Component>(
         &mut self,
         entity: Entity,

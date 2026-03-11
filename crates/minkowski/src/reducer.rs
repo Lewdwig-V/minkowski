@@ -785,6 +785,7 @@ impl<'a, T: Component> WritableRef<'a, T> {
 
     /// Buffer a write. The value is stored in the changeset and applied on commit.
     #[allow(dead_code)]
+    #[inline]
     pub fn set(&mut self, value: T) {
         // Safety: the raw pointer is valid for the lifetime of the transaction.
         // Multiple WritableRefs in a tuple query share this pointer, but the
@@ -796,6 +797,7 @@ impl<'a, T: Component> WritableRef<'a, T> {
 
     /// Clone the current value, apply `f`, and buffer the result.
     #[allow(dead_code)]
+    #[inline]
     pub fn modify(&mut self, f: impl FnOnce(&mut T))
     where
         T: Clone,
