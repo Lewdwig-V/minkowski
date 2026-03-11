@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 
-use crate::codec::{CodecError, CodecRegistry};
+use crate::codec::{CodecError, CodecRegistry, CrcProof};
 use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 
 // WAL segment format (v2):
@@ -148,7 +148,10 @@ fn write_segment_magic(writer: &mut BufWriter<&File>) -> Result<u64, WalError> {
 /// (torn write). Returns `Err` on corrupt payload, checksum mismatch,
 /// or oversized frame. Does NOT truncate the file — callers decide how
 /// to handle errors.
-pub(crate) fn read_next_frame(file: &File, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
+pub(crate) fn read_next_frame(
+    file: &File,
+    pos: u64,
+) -> Result<Option<(WalEntry, u64, CrcProof)>, WalError> {
     // Read 8-byte header: [len: u32 LE][crc32: u32 LE]
     let mut header_buf = [0u8; FRAME_HEADER_SIZE as usize];
     match read_exact_at(file, pos, &mut header_buf) {
@@ -171,17 +174,14 @@ pub(crate) fn read_next_frame(file: &File, pos: u64) -> Result<Option<(WalEntry,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    let actual_crc = crc32fast::hash(&payload);
-    if actual_crc != stored_crc {
-        return Err(WalError::ChecksumMismatch {
-            offset: pos,
-            expected: stored_crc,
-            actual: actual_crc,
-        });
-    }
+    let proof = CrcProof::verify(&payload, stored_crc).ok_or(WalError::ChecksumMismatch {
+        offset: pos,
+        expected: stored_crc,
+        actual: crc32fast::hash(&payload),
+    })?;
     let entry = rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&payload)
         .map_err(|e| WalError::Format(format!("corrupt WAL entry at byte offset {pos}: {e}")))?;
-    Ok(Some((entry, pos + FRAME_HEADER_SIZE + len as u64)))
+    Ok(Some((entry, pos + FRAME_HEADER_SIZE + len as u64, proof)))
 }
 
 /// Write a single WAL frame: `[len: u32 LE][crc32: u32 LE][payload]`.
@@ -207,6 +207,7 @@ pub(crate) fn apply_record(
     world: &mut World,
     codecs: &CodecRegistry,
     remap: Option<&HashMap<ComponentId, ComponentId>>,
+    proof: Option<&CrcProof>,
 ) -> Result<(), WalError> {
     // When no remap is provided, use identity mapping (same-process replay).
     // When a schema-derived remap exists, unmapped IDs are an error — the
@@ -237,7 +238,7 @@ pub(crate) fn apply_record(
                     Vec::new();
                 for (comp_id, data) in components {
                     let local_id = remap_id(*comp_id)?;
-                    let raw = codecs.deserialize(local_id, data)?;
+                    let raw = codecs.decode(local_id, data, proof)?;
                     let layout = codecs
                         .layout(local_id)
                         .ok_or(CodecError::UnregisteredComponent(local_id))?;
@@ -258,7 +259,7 @@ pub(crate) fn apply_record(
                 data,
             } => {
                 let local_id = remap_id(*component_id)?;
-                let raw = codecs.deserialize(local_id, data)?;
+                let raw = codecs.decode(local_id, data, proof)?;
                 let layout = codecs
                     .layout(local_id)
                     .ok_or(CodecError::UnregisteredComponent(local_id))?;
@@ -276,7 +277,7 @@ pub(crate) fn apply_record(
                 data,
             } => {
                 let local_id = remap_id(*component_id)?;
-                let raw = codecs.deserialize(local_id, data)?;
+                let raw = codecs.decode(local_id, data, proof)?;
                 let layout = codecs
                     .layout(local_id)
                     .ok_or(CodecError::UnregisteredComponent(local_id))?;
@@ -417,7 +418,7 @@ impl Wal {
                 let mut pos: u64 = SEGMENT_MAGIC_SIZE;
                 let mut seg_last = 0u64;
                 let mut seg_has = false;
-                while let Some((entry, next_pos)) = read_next_frame(&seg_file, pos)? {
+                while let Some((entry, next_pos, _proof)) = read_next_frame(&seg_file, pos)? {
                     match entry {
                         WalEntry::Mutations(record) => {
                             seg_last = record.seq;
@@ -452,7 +453,7 @@ impl Wal {
                 let mut pos: u64 = SEGMENT_MAGIC_SIZE;
                 let mut seg_mutation_bytes: u64 = 0;
                 let mut found = false;
-                while let Some((entry, next_pos)) = read_next_frame(&seg_file, pos)? {
+                while let Some((entry, next_pos, _proof)) = read_next_frame(&seg_file, pos)? {
                     let frame_bytes = next_pos - pos;
                     match entry {
                         WalEntry::Checkpoint { snapshot_seq } => {
@@ -595,14 +596,14 @@ impl Wal {
             let mut pos: u64 = SEGMENT_MAGIC_SIZE;
             let mut remap: Option<HashMap<ComponentId, ComponentId>> = None;
 
-            while let Some((entry, next_pos)) = read_next_frame(&seg_file, pos)? {
+            while let Some((entry, next_pos, proof)) = read_next_frame(&seg_file, pos)? {
                 match entry {
                     WalEntry::Schema(schema) => {
                         remap = Some(codecs.build_remap(&schema.components)?);
                     }
                     WalEntry::Mutations(record) => {
                         if record.seq >= from_seq {
-                            apply_record(&record, world, codecs, remap.as_ref())?;
+                            apply_record(&record, world, codecs, remap.as_ref(), Some(&proof))?;
                             last_seq = record.seq;
                         }
                     }
@@ -714,7 +715,7 @@ impl Wal {
     /// (crash recovery) and returns `Ok(None)`.
     fn read_next_entry(&mut self, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
         match read_next_frame(&self.active_file, pos) {
-            Ok(Some(result)) => Ok(Some(result)),
+            Ok(Some((entry, next_pos, _proof))) => Ok(Some((entry, next_pos))),
             Ok(None) | Err(WalError::Format(_) | WalError::ChecksumMismatch { .. }) => {
                 self.active_file.set_len(pos)?;
                 Ok(None)
@@ -888,17 +889,17 @@ impl WalCursor {
         // Scan forward to from_seq
         loop {
             match read_next_frame(&file, pos)? {
-                Some((WalEntry::Schema(s), next_pos)) => {
+                Some((WalEntry::Schema(s), next_pos, _proof)) => {
                     schema = Some(s);
                     pos = next_pos;
                 }
-                Some((WalEntry::Mutations(record), next_pos)) => {
+                Some((WalEntry::Mutations(record), next_pos, _proof)) => {
                     if record.seq >= from_seq {
                         break; // Don't advance past this record
                     }
                     pos = next_pos;
                 }
-                Some((WalEntry::Checkpoint { .. }, next_pos)) => {
+                Some((WalEntry::Checkpoint { .. }, next_pos, _proof)) => {
                     pos = next_pos;
                 }
                 None => break,
@@ -924,16 +925,16 @@ impl WalCursor {
 
         while records.len() < limit {
             match read_next_frame(&self.file, self.pos)? {
-                Some((WalEntry::Schema(s), next_pos)) => {
+                Some((WalEntry::Schema(s), next_pos, _proof)) => {
                     self.schema = Some(s);
                     self.pos = next_pos;
                 }
-                Some((WalEntry::Mutations(record), next_pos)) => {
+                Some((WalEntry::Mutations(record), next_pos, _proof)) => {
                     self.next_seq = record.seq + 1;
                     records.push(record);
                     self.pos = next_pos;
                 }
-                Some((WalEntry::Checkpoint { .. }, next_pos)) => {
+                Some((WalEntry::Checkpoint { .. }, next_pos, _proof)) => {
                     self.pos = next_pos;
                 }
                 None => {
@@ -966,7 +967,7 @@ impl WalCursor {
                 self.pos = SEGMENT_MAGIC_SIZE;
                 self.current_segment_start_seq = *start_seq;
                 // Parse schema preamble of new segment
-                if let Some((WalEntry::Schema(s), next_pos)) =
+                if let Some((WalEntry::Schema(s), next_pos, _proof)) =
                     read_next_frame(&self.file, SEGMENT_MAGIC_SIZE)?
                 {
                     self.schema = Some(s);
@@ -1428,7 +1429,7 @@ mod tests {
         for (_, seg_path) in &segments {
             let file = File::open(seg_path).unwrap();
             // First frame starts after the 4-byte segment magic.
-            let (entry, _) = read_next_frame(&file, SEGMENT_MAGIC_SIZE).unwrap().unwrap();
+            let (entry, _, _proof) = read_next_frame(&file, SEGMENT_MAGIC_SIZE).unwrap().unwrap();
             assert!(matches!(entry, WalEntry::Schema(_)));
         }
     }

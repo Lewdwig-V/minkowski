@@ -285,6 +285,27 @@ impl CodecRegistry {
         self.codecs.get(&id).and_then(|c| c.raw_copy_size)
     }
 
+    /// Deserialize component bytes, using the `raw_copy_size` fast path (direct
+    /// memcpy, no rkyv bytecheck) when a [`CrcProof`] is provided and the
+    /// component's archived layout matches its native layout.
+    ///
+    /// Without a proof, falls through to [`deserialize`](Self::deserialize)
+    /// which runs full rkyv validation — safe for untrusted bytes.
+    pub(crate) fn decode(
+        &self,
+        id: ComponentId,
+        bytes: &[u8],
+        proof: Option<&CrcProof>,
+    ) -> Result<Vec<u8>, CodecError> {
+        if proof.is_some()
+            && let Some(size) = self.raw_copy_size(id)
+            && bytes.len() == size
+        {
+            return Ok(bytes.to_vec());
+        }
+        self.deserialize(id, bytes)
+    }
+
     /// All registered ComponentIds.
     pub fn registered_ids(&self) -> Vec<ComponentId> {
         let mut ids: Vec<_> = self.codecs.keys().copied().collect();
@@ -364,6 +385,25 @@ impl CodecRegistry {
 impl Default for CodecRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Zero-sized proof that a byte payload has been CRC32-verified.
+///
+/// Unforgeable: the only constructor runs the actual CRC computation
+/// and compares against the expected checksum. The `raw_copy_size` fast
+/// path in [`CodecRegistry::decode`] requires this proof — unverified
+/// bytes go through full rkyv bytecheck validation instead.
+pub(crate) struct CrcProof(());
+
+impl CrcProof {
+    /// Verify a payload's CRC32 checksum. Returns proof on success, `None` on mismatch.
+    pub(crate) fn verify(payload: &[u8], expected_crc: u32) -> Option<Self> {
+        if crc32fast::hash(payload) == expected_crc {
+            Some(Self(()))
+        } else {
+            None
+        }
     }
 }
 
