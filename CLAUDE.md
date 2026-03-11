@@ -31,6 +31,7 @@ cargo run -p minkowski-examples --example flatworm --release   # Flatworm (plana
 cargo run -p minkowski-examples --example circuit --release   # Analog circuit sim: 555 astable → LCR bandpass → 741 follower, symplectic Euler (200K steps, ASCII waveform)
 cargo run -p minkowski-examples --example tactical --release   # Multi-operator tactical map: sparse components, par_for_each, Optimistic Conflict, entity bit packing, HashIndex stale validation, EnumChangeSet/MutationRef replication (100 units, 10 ticks, 2 threads)
 cargo run -p minkowski-examples --example observe --release   # Observability: MetricsSnapshot capture, diff, entity churn (100 entities, 2 archetypes)
+cargo run -p minkowski-examples --example blob --release   # Blob offloading: BlobRef component + BlobStore lifecycle trait, MemoryBlobStore cleanup (5 entities, orphan deletion)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests

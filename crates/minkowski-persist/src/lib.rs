@@ -1,3 +1,4 @@
+pub mod blob;
 pub mod checkpoint;
 pub mod codec;
 pub mod durable;
@@ -7,6 +8,7 @@ pub mod replication;
 pub mod snapshot;
 pub mod wal;
 
+pub use blob::{BlobRef, BlobStore};
 pub use checkpoint::{AutoCheckpoint, CheckpointHandler};
 pub use codec::{CodecError, CodecRegistry};
 pub use durable::Durable;
