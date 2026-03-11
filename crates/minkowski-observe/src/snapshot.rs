@@ -79,6 +79,15 @@ impl std::fmt::Display for MetricsSnapshot {
             self.world.free_list_len, self.world.query_cache_len, self.world.current_tick
         )?;
 
+        if let (Some(cap), Some(used)) = (self.world.pool_capacity, self.world.pool_used) {
+            let pct = if cap > 0 {
+                (used as f64 / cap as f64) * 100.0
+            } else {
+                0.0
+            };
+            writeln!(f, "  pool: {used} / {cap} bytes ({pct:.1}%)")?;
+        }
+
         if let Some(ref wal) = self.wal {
             writeln!(
                 f,
@@ -185,5 +194,32 @@ mod tests {
         assert!(output.contains("entities: 1"));
         assert!(output.contains("archetypes:"));
         assert!(output.contains("tick:"));
+    }
+
+    #[test]
+    fn snapshot_with_pool_shows_pool_info() {
+        use minkowski::HugePages;
+        let mut world = World::builder()
+            .memory_budget(4 * 1024 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let snap = MetricsSnapshot::capture(&world, None);
+        assert!(snap.world.pool_capacity.is_some());
+        assert!(snap.world.pool_used.unwrap() > 0);
+
+        let output = format!("{snap}");
+        assert!(output.contains("pool:"));
+        assert!(output.contains("bytes"));
+    }
+
+    #[test]
+    fn snapshot_without_pool_omits_pool_line() {
+        let world = World::new();
+        let snap = MetricsSnapshot::capture(&world, None);
+        let output = format!("{snap}");
+        assert!(!output.contains("pool:"));
     }
 }

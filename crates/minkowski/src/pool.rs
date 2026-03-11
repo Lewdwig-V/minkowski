@@ -147,14 +147,14 @@ pub(crate) fn into_shared<A: PoolAllocator + 'static>(alloc: A) -> SharedPool {
 ///
 /// Returns `true` if the call succeeded, `false` if it failed (insufficient
 /// privileges, unsupported platform, etc.).
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 pub(crate) fn try_mlockall() -> bool {
     // SAFETY: mlockall is a process-global operation with no memory
     // unsafety. It may fail due to insufficient RLIMIT_MEMLOCK.
     unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) == 0 }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), miri))]
 pub(crate) fn try_mlockall() -> bool {
     false
 }
@@ -172,6 +172,13 @@ struct MmapRegion {
 }
 
 impl MmapRegion {
+    /// Create the mmap region with full pre-fault chain.
+    ///
+    /// Miri only supports `mmap` with `MAP_PRIVATE|MAP_ANONYMOUS` — no
+    /// `MAP_POPULATE`, `MAP_HUGETLB`, `mlock`, or `write_volatile` page
+    /// touch. Under `cfg(miri)` we use plain `map_anon()` and skip
+    /// pre-faulting entirely (there's no real VM subsystem to fault into).
+    #[cfg(not(miri))]
     fn new(size: usize, hugepages: HugePages) -> Result<Self, PoolExhausted> {
         use memmap2::MmapOptions;
         let layout = Layout::from_size_align(size, 1).expect("valid layout");
@@ -230,8 +237,21 @@ impl MmapRegion {
         Ok(Self { mmap, huge: false })
     }
 
+    /// Miri-compatible path: plain `MAP_PRIVATE|MAP_ANONYMOUS` only.
+    #[cfg(miri)]
+    fn new(size: usize, _hugepages: HugePages) -> Result<Self, PoolExhausted> {
+        use memmap2::MmapOptions;
+        let layout = Layout::from_size_align(size, 1).expect("valid layout");
+        let mmap = MmapOptions::new()
+            .len(size)
+            .map_anon()
+            .map_err(|_| PoolExhausted { requested: layout })?;
+        Ok(Self { mmap, huge: false })
+    }
+
     /// Write one byte per page to force the kernel to back the mapping
     /// with physical memory. This is the last-resort pre-fault path.
+    #[cfg(not(miri))]
     fn prefault_manual(mmap: &mut memmap2::MmapMut) {
         const PAGE_SIZE: usize = 4096;
         let ptr = mmap.as_mut_ptr();
@@ -244,10 +264,6 @@ impl MmapRegion {
 
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.mmap.as_mut_ptr()
-    }
-
-    fn as_ptr(&self) -> *const u8 {
-        self.mmap.as_ptr()
     }
 
     fn len(&self) -> usize {
@@ -285,7 +301,15 @@ fn size_class_for(layout: Layout) -> Option<usize> {
 // If profiling shows contention, consider upgrading to a lock-free
 // structure with ABA protection (tagged pointers or epoch-based reclamation).
 pub(crate) struct SlabPool {
-    region: MmapRegion,
+    /// Keeps the mmap alive. Never re-borrowed after construction —
+    /// use `base` and `total` instead to avoid Tree Borrows invalidation.
+    _region: MmapRegion,
+    /// Cached from `region.as_mut_ptr()` at construction. Using
+    /// `region.as_ptr()` later would create a shared reborrow that
+    /// freezes the tag, making all writes through mutable pointers UB
+    /// under Tree Borrows.
+    base: *mut u8,
+    total: usize,
     free_lists: [Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES],
     used_bytes: AtomicUsize,
 }
@@ -301,6 +325,11 @@ impl SlabPool {
     /// Create a new slab pool backed by an mmap region of `budget` bytes.
     pub(crate) fn new(budget: usize, hugepages: HugePages) -> Result<Self, PoolExhausted> {
         let mut region = MmapRegion::new(budget, hugepages)?;
+
+        // Cache base pointer and length now. After this point we never
+        // re-borrow the MmapMut — calling `as_ptr()` would create a
+        // shared reborrow that freezes all outstanding mutable pointers
+        // under Tree Borrows.
         let base = region.as_mut_ptr();
         let total = region.len();
 
@@ -348,7 +377,9 @@ impl SlabPool {
         }
 
         Ok(Self {
-            region,
+            _region: region,
+            base,
+            total,
             free_lists,
             used_bytes: AtomicUsize::new(0),
         })
@@ -408,8 +439,7 @@ unsafe impl PoolAllocator for SlabPool {
         let Some(class) = class else { return };
 
         debug_assert!(
-            ptr.as_ptr() >= self.region.as_ptr().cast_mut()
-                && (ptr.as_ptr() as usize) < self.region.as_ptr() as usize + self.region.len(),
+            ptr.as_ptr() >= self.base && (ptr.as_ptr() as usize) < self.base as usize + self.total,
             "SlabPool::deallocate: pointer {:p} is outside pool region",
             ptr.as_ptr()
         );
@@ -421,7 +451,7 @@ unsafe impl PoolAllocator for SlabPool {
     }
 
     fn capacity(&self) -> Option<usize> {
-        Some(self.region.len())
+        Some(self.total)
     }
 
     fn used(&self) -> Option<usize> {

@@ -25,6 +25,10 @@ pub struct PrometheusExporter {
     total_spawns: Gauge,
     total_despawns: Gauge,
 
+    // Pool gauges
+    pool_capacity_bytes: Gauge,
+    pool_used_bytes: Gauge,
+
     // WAL gauges
     wal_seq: Gauge,
     wal_segment_count: Gauge,
@@ -86,6 +90,20 @@ impl PrometheusExporter {
             total_despawns.clone(),
         );
 
+        let pool_capacity_bytes = Gauge::default();
+        let pool_used_bytes = Gauge::default();
+
+        registry.register(
+            "minkowski_pool_capacity_bytes",
+            "Memory pool total capacity in bytes (0 if no pool)",
+            pool_capacity_bytes.clone(),
+        );
+        registry.register(
+            "minkowski_pool_used_bytes",
+            "Memory pool bytes currently allocated (0 if no pool)",
+            pool_used_bytes.clone(),
+        );
+
         let wal_seq = Gauge::default();
         let wal_segment_count = Gauge::default();
         let wal_bytes_since_checkpoint = Gauge::default();
@@ -130,6 +148,8 @@ impl PrometheusExporter {
             tick,
             total_spawns,
             total_despawns,
+            pool_capacity_bytes,
+            pool_used_bytes,
             wal_seq,
             wal_segment_count,
             wal_bytes_since_checkpoint,
@@ -153,6 +173,11 @@ impl PrometheusExporter {
         self.total_spawns.set(snapshot.world.total_spawns as i64);
         self.total_despawns
             .set(snapshot.world.total_despawns as i64);
+
+        self.pool_capacity_bytes
+            .set(snapshot.world.pool_capacity.unwrap_or(0) as i64);
+        self.pool_used_bytes
+            .set(snapshot.world.pool_used.unwrap_or(0) as i64);
 
         if let Some(ref wal) = snapshot.wal {
             self.wal_seq.set(wal.next_seq as i64);
@@ -267,6 +292,27 @@ mod tests {
 
         assert!(output.contains("minkowski_archetype_entity_count"));
         assert!(output.contains('5'));
+    }
+
+    #[test]
+    fn update_sets_pool_gauges() {
+        use minkowski::HugePages;
+        let mut world = World::builder()
+            .memory_budget(4 * 1024 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        world.spawn((42_u32,));
+
+        let snap = MetricsSnapshot::capture(&world, None);
+        let exporter = PrometheusExporter::new();
+        exporter.update(&snap);
+        let output = exporter.render();
+
+        assert!(output.contains("minkowski_pool_capacity_bytes 4194304"));
+        assert!(output.contains("minkowski_pool_used_bytes"));
+        // Pool used should be > 0 after spawning
+        assert!(!output.contains("minkowski_pool_used_bytes 0\n"));
     }
 
     #[test]

@@ -45,7 +45,7 @@ registry.run(&mut world, move_id, ());
 ### Building & testing
 
 ```
-cargo test -p minkowski                # 493 tests across 3 crates
+cargo test -p minkowski                # 486 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
@@ -61,6 +61,10 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 - **Composable persistence** — `Durable<S>` wraps any transaction strategy to add WAL logging. Zero-copy snapshot loading via mmap + rkyv. The core engine has no serialization dependency.
 - **Mechanisms, not policy** — no built-in scheduler, no application lifecycle. Minkowski provides `Access` bitsets and `is_compatible()` for framework authors to build their own scheduling. Secondary indexes are external consumers of the change detection system.
 
+## Deep Dive
+
+For a comprehensive walkthrough of the internals — storage model, query engine, transaction system, persistence layer, memory management — see the [DeepWiki](https://deepwiki.com/Lewdwig-V/minkowski). It's auto-generated from the source and always up to date.
+
 ## Soundness
 
 Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration — the performance-critical paths that make an ECS fast. Six layers of verification ensure these paths are correct:
@@ -68,7 +72,7 @@ Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration
 | Layer | What it catches | When it runs |
 |---|---|---|
 | **Type system + borrow checker** | Aliased `&mut T`, lifetime violations, `Send`/`Sync` misuse. `ReadOnlyWorldQuery` prevents `&mut T` through `&World`. | Every build |
-| **398 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
+| **481 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
 | **[Miri][miri] + [Tree Borrows][tree-borrows]** | Undefined behavior: use-after-free, uninitialized reads, aliasing violations in `unsafe` blocks. Full test suite passes under the strict Tree Borrows model. | Every PR (CI) |
 | **[ThreadSanitizer][tsan]** | Data races: unsynchronized concurrent memory accesses. Full test suite including rayon `par_for_each` passes under TSan instrumentation. | Every PR (CI) |
 | **[Loom][loom]** | Concurrency invariant violations: exhaustive thread interleaving enumeration over OrphanQueue push/drain, column lock acquire/upgrade/deadlock-freedom, and entity ID reservation contention. | Every PR (CI) |
@@ -151,6 +155,8 @@ durable.transact(&mut world, access, |tx, world| { /* ... */ });
 // Changeset written to WAL on successful commit
 ```
 
+**Persistence vs. the memory pool**: `Durable<S>` and `WorldBuilder`'s mmap pool solve different problems. The pool pre-allocates volatile RAM — anonymous `MAP_ANONYMOUS` pages that vanish when the process exits. It controls memory *layout and budget*, not durability. `Durable<S>` writes committed mutations to a WAL on *disk* before they're visible, giving crash safety. They compose naturally: a pooled World with `Durable<Optimistic>` gives crash-safe transactions within a fixed memory envelope. Use the pool alone for bounded in-memory workloads that don't need crash recovery. Use `Durable` alone for crash safety with the system allocator. Use both when you want both guarantees.
+
 ## Schema & Mutation
 
 `#[derive(Table)]` declares a named schema with typed row accessors — queries against a table skip archetype matching entirely:
@@ -190,7 +196,7 @@ println!("{diff}");
 
 Entity churn tracking is exact — every spawn and despawn is counted. Per-archetype detail (entity count, component names, estimated byte footprint) is included in every snapshot.
 
-`PrometheusExporter` converts snapshots into OpenMetrics text format — 13 gauges covering world state, WAL pressure, and per-archetype breakdowns. No HTTP server included; call `exporter.render()` and mount the result on your own `/metrics` endpoint. Compatible with Grafana, Datadog, or any Prometheus-compatible tool.
+`PrometheusExporter` converts snapshots into OpenMetrics text format — 15 gauges covering world state, memory pool, WAL pressure, and per-archetype breakdowns. No HTTP server included; call `exporter.render()` and mount the result on your own `/metrics` endpoint. Compatible with Grafana, Datadog, or any Prometheus-compatible tool.
 
 ## Indexing
 
@@ -213,15 +219,81 @@ let mut idx = match load_btree_index::<Score>(&idx_path, post_restore_tick) {
 
 Examples include a [uniform grid][uniform-grid] for neighbor search, a [Barnes-Hut][barnes-hut] quadtree for force approximation, and a persistent `BTreeIndex` in the [`persist`](examples/examples/persist.rs) example.
 
+## Memory Management
+
+RAM is fast, expensive, and limited. Minkowski provides three complementary features to help you do more with less:
+
+### Pre-allocated Memory Pool
+
+`WorldBuilder` creates a World backed by a single [mmap][mmap] region — all memory is allocated upfront at startup, [TigerBeetle][tigerbeetle]-style. After initialization, `try_spawn` and `try_insert` return `Err(PoolExhausted)` instead of crashing the process on exhaustion. No dynamic allocation on the data path.
+
+```rust
+use minkowski::{World, HugePages, PoolExhausted};
+
+let mut world = World::builder()
+    .memory_budget(64 * 1024 * 1024)   // 64 MB fixed budget
+    .hugepages(HugePages::Try)          // 2 MiB pages if available
+    .lock_all_memory(true)              // mlockall — prevent swapping
+    .build()?;
+
+// Spawn until the pool is full — no OOM kill, just a Result
+match world.try_spawn((pos, vel)) {
+    Ok(entity) => { /* success */ }
+    Err(PoolExhausted { .. }) => { /* shed load, evict, or report */ }
+}
+```
+
+The pool uses size-classed slab allocation (64 B to 1 MB) with a three-tier pre-fault chain: `MAP_POPULATE` → `mlock` → manual page touch. `World::new()` still works — it uses the system allocator with no budget limit.
+
+### Blob Offloading
+
+Large per-entity assets (images, meshes, audio) shouldn't live in column storage. `BlobRef` is a lightweight component that stores an external key (S3 path, URL, content hash). The `BlobStore` trait provides a cleanup hook — after despawning entities, collect orphaned refs and let your store delete the external data.
+
+```rust
+use minkowski_persist::{BlobRef, BlobStore};
+
+// Entity holds a key, not the bytes
+world.spawn((metadata, BlobRef::new("s3://bucket/mesh-00af.bin")));
+
+// After despawn, clean up external storage
+store.on_orphaned(&orphaned_refs);
+```
+
+`BlobRef` lives in `minkowski-persist` for [rkyv][rkyv] serialization support — blob references survive snapshots and WAL replay. The engine stores only the reference; blob lifecycle is the user's responsibility (same external composition pattern as [indexes](#indexing)).
+
+### Retention
+
+`Expiry` is a tick-based TTL component. `RetentionReducer` is a built-in scheduled reducer that batch-despawns expired entities — you control when and how often it runs.
+
+```rust
+use minkowski::{World, Expiry, ReducerRegistry};
+
+let mut world = World::new();
+let mut registry = ReducerRegistry::new();
+let retention_id = registry.retention(&mut world);
+
+// Spawn with a TTL of 100 ticks from now
+let tick = world.change_tick();
+world.spawn((data, Expiry::with_ttl(tick, 100)));
+
+// Run retention periodically — entities past their deadline are despawned
+registry.run(&mut world, retention_id, ());
+```
+
+Together, these three features let a Minkowski deployment run indefinitely within a fixed memory envelope: the pool caps total memory, blob offloading keeps large assets external, and retention prevents unbounded entity growth.
+
 ## Examples
 
-14 examples cover the full API surface — from basic queries to multi-threaded replication. See [`examples/README.md`](examples/README.md) for the full catalogue.
+17 examples cover the full API surface — from basic queries to multi-threaded replication. See [`examples/README.md`](examples/README.md) for the full catalogue.
 
 ```
-cargo run -p minkowski-examples --example boids --release     # flocking simulation
-cargo run -p minkowski-examples --example persist --release    # WAL + snapshot lifecycle
-cargo run -p minkowski-examples --example replicate --release  # network replication via channels
-cargo run -p minkowski-examples --example reducer --release    # tour of all 7 reducer handles
+cargo run -p minkowski-examples --example boids --release      # flocking simulation
+cargo run -p minkowski-examples --example persist --release     # WAL + snapshot lifecycle
+cargo run -p minkowski-examples --example replicate --release   # network replication via channels
+cargo run -p minkowski-examples --example reducer --release     # tour of all 7 reducer handles
+cargo run -p minkowski-examples --example pool --release        # pre-allocated memory pool
+cargo run -p minkowski-examples --example blob --release        # blob offloading to external store
+cargo run -p minkowski-examples --example retention --release   # tick-based entity retention
 ```
 
 ## Python / Jupyter Integration
@@ -264,10 +336,6 @@ Minkowski was built with Claude Code from the first commit. The development work
 - **Pre-commit hooks** — `cargo fmt` and `cargo clippy -D warnings` run automatically on every commit
 
 The commands teach the paradigm, not just the API — they encode the design principles and invariants that emerged across iterative development.
-
-## Architecture Decision Records
-
-Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each records what was decided, what alternatives were considered, and what trade-offs were accepted. For a comprehensive walkthrough of the internals — storage model, query engine, transaction system, persistence layer — see the [DeepWiki](https://deepwiki.com/Lewdwig-V/minkowski).
 
 ## Glossary
 
@@ -315,4 +383,6 @@ This project is licensed under the [Mozilla Public License 2.0](https://www.mozi
 [cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
 [tsan]: https://clang.llvm.org/docs/ThreadSanitizer.html
 [loom]: https://github.com/tokio-rs/loom
+[mmap]: https://en.wikipedia.org/wiki/Mmap
+[tigerbeetle]: https://tigerbeetle.com/
 [wal]: https://en.wikipedia.org/wiki/Write-ahead_logging

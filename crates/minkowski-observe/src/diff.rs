@@ -21,6 +21,8 @@ pub struct MetricsDiff {
     pub wal_seq_delta: Option<u64>,
     pub archetype_delta: i64,
     pub largest_archetypes: Vec<ArchetypeSize>,
+    /// Pool usage delta in bytes. `None` when neither snapshot uses a pool.
+    pub pool_used_delta: Option<i64>,
 }
 
 impl MetricsDiff {
@@ -70,6 +72,11 @@ impl MetricsDiff {
         sorted.sort_by(|a, b| b.entity_count.cmp(&a.entity_count));
         sorted.truncate(5);
 
+        let pool_used_delta = match (before.world.pool_used, after.world.pool_used) {
+            (Some(b), Some(a)) => Some(a as i64 - b as i64),
+            _ => None,
+        };
+
         Self {
             elapsed,
             entity_delta,
@@ -78,6 +85,7 @@ impl MetricsDiff {
             wal_seq_delta,
             archetype_delta,
             largest_archetypes: sorted,
+            pool_used_delta,
         }
     }
 }
@@ -95,6 +103,9 @@ impl std::fmt::Display for MetricsDiff {
             None => writeln!(f, "  tick delta: {}  WAL: n/a", self.tick_delta)?,
         }
         writeln!(f, "  archetype delta: {:+}", self.archetype_delta)?;
+        if let Some(pool_delta) = self.pool_used_delta {
+            writeln!(f, "  pool used delta: {:+} bytes", pool_delta)?;
+        }
 
         if !self.largest_archetypes.is_empty() {
             writeln!(f, "  largest archetypes:")?;
@@ -197,5 +208,46 @@ mod tests {
 
         assert!(output.contains("entity delta:"));
         assert!(output.contains("tick delta:"));
+    }
+
+    #[test]
+    fn diff_pool_used_delta() {
+        use minkowski::HugePages;
+        let mut world = World::builder()
+            .memory_budget(4 * 1024 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        let before = MetricsSnapshot::capture(&world, None);
+        for _ in 0..100 {
+            world.spawn((Pos { x: 1.0, y: 2.0 },));
+        }
+        let after = MetricsSnapshot::capture(&world, None);
+
+        let diff = MetricsDiff::compute(&before, &after);
+        assert!(
+            diff.pool_used_delta.is_some(),
+            "pool_used_delta should be present with pooled world"
+        );
+        assert!(
+            diff.pool_used_delta.unwrap() > 0,
+            "pool usage should increase after spawning entities"
+        );
+
+        let output = format!("{diff}");
+        assert!(output.contains("pool used delta:"));
+    }
+
+    #[test]
+    fn diff_no_pool_omits_delta() {
+        let mut world = World::new();
+        let before = MetricsSnapshot::capture(&world, None);
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let after = MetricsSnapshot::capture(&world, None);
+
+        let diff = MetricsDiff::compute(&before, &after);
+        assert!(diff.pool_used_delta.is_none());
+        let output = format!("{diff}");
+        assert!(!output.contains("pool used delta:"));
     }
 }

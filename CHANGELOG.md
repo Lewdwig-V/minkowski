@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.1.0
+
+### Memory Management (`minkowski`)
+
+- **TigerBeetle-style slab pool allocator** — `WorldBuilder` creates a World backed by a single mmap region with a fixed memory budget. Six size classes (64 B to 1 MB) with mutex-serialized free lists. Pre-fault fallback chain: `MAP_POPULATE` → `mlock` → manual page touch. Optional 2 MiB hugepage support via `HugePages::Try` / `HugePages::Require`.
+- **`try_spawn<B>()` / `try_insert<B>()`** — fallible spawn and insert that return `Err(PoolExhausted)` instead of crashing on pool exhaustion. Pre-check all column capacities before committing any state changes.
+- **`WorldBuilder`** — builder pattern for pool configuration: `memory_budget()`, `hugepages()`, `lock_all_memory()`. `World::new()` unchanged (system allocator, no budget).
+- **`try_mlockall()`** — opt-in `mlockall(MCL_CURRENT | MCL_FUTURE)` for dedicated database processes. Non-fatal on failure.
+- **Pool observability** — `WorldStats` gains `pool_capacity: Option<usize>` and `pool_used: Option<usize>`.
+- **Miri compatibility** — pool tests pass under Miri with Tree Borrows. Mmap region uses plain `MAP_PRIVATE|MAP_ANONYMOUS` under `cfg(miri)`, skipping unsupported syscalls (`MAP_POPULATE`, `mlock`).
+
+### Blob Offloading (`minkowski-persist`)
+
+- **`BlobRef` component** — lightweight string key for external object store references (S3/MinIO paths, URLs, content hashes). Private inner field with `debug_assert!` non-empty. rkyv `Archive + Serialize + Deserialize` for WAL/snapshot persistence.
+- **`BlobStore` trait** — lifecycle hook with `on_orphaned(&mut self, refs: &[&BlobRef])` for external blob cleanup after entity despawn. Follows the `SpatialIndex` external composition pattern.
+
+### Retention (`minkowski`)
+
+- **`Expiry` component** — tick-based TTL with `at_tick()` and `with_ttl()` constructors. `is_expired(current_tick)` for manual checks.
+- **`ReducerRegistry::retention()`** — built-in scheduled reducer that batch-despawns expired entities. Tick captured after `world.query()` to avoid off-by-one at boundary ticks.
+
+### Observability (`minkowski-observe`)
+
+- **Pool metrics in `MetricsSnapshot`** — Display output includes pool capacity, used bytes, and utilization percentage when a pooled World is captured.
+- **`MetricsDiff::pool_used_delta`** — tracks pool usage change between snapshots. `None` for system-allocator worlds.
+- **`PrometheusExporter`** — two new gauges: `minkowski_pool_capacity_bytes`, `minkowski_pool_used_bytes`. Total gauges: 13 → 15.
+
+### Documentation
+
+- **New README sections** — Memory Management (pool, blob offloading, retention), Deep Dive (DeepWiki link).
+- **Persistence vs. pool clarification** — explains that the mmap pool is volatile anonymous RAM, not file-backed persistence.
+- **Removed ADRs and plans** — stale design documents replaced by [DeepWiki](https://deepwiki.com/Lewdwig-V/minkowski).
+
+### Examples
+
+- **`pool`** — `WorldBuilder` with 16 MB budget, spawns ~131K entities until graceful exhaustion.
+- **`blob`** — `BlobRef` + `MemoryBlobStore` cleanup pattern.
+- **`retention`** — progressive tick-based expiry across simulation frames.
+
+### Verification
+
+- 481 unit tests (up from 398), 19 observe tests (up from 14).
+- Full Miri + Tree Borrows pass including pool allocator tests.
+- 2 loom tests for concurrent slab pool allocation/deallocation.
+
 ## 1.0.4
 
 ### Performance
@@ -182,7 +227,7 @@ Initial stable release of the Minkowski column-oriented ECS storage engine.
 
 - `MetricsSnapshot::capture()` — point-in-time world + WAL metrics
 - `MetricsDiff::compute()` — diff between two snapshots with entity churn tracking
-- `PrometheusExporter` — 13 OpenMetrics gauges for world state, WAL pressure, per-archetype breakdowns
+- `PrometheusExporter` — OpenMetrics gauges for world state, WAL pressure, per-archetype breakdowns
 - `Display` impls for human-readable snapshot and diff output
 - Exact spawn/despawn counters via `EntityAllocator`
 
@@ -214,6 +259,5 @@ Initial stable release of the Minkowski column-oriented ECS storage engine.
 
 ### Documentation
 
-- Architecture Decision Records in `docs/adr/`
 - Reducer correctness guide (`docs/reducer-correctness.md`)
 - CLAUDE.md with build commands, architecture overview, key conventions
