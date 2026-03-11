@@ -81,7 +81,7 @@ fn main() {
     println!("\n--- Remaining blob refs ---");
     world.query::<(&BlobRef,)>().for_each(|(r,)| {
         let size = store.get(r.key()).map_or(0, <[u8]>::len);
-        println!("  {}: {} bytes", r.key(), size);
+        println!("  {r}: {size} bytes"); // BlobRef implements Display
     });
 
     println!("\nDone.");

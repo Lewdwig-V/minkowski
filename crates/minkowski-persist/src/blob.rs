@@ -20,13 +20,26 @@ pub struct BlobRef(String);
 
 impl BlobRef {
     /// Create a new blob reference from a key string.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that `key` is non-empty. Empty keys are never meaningful
+    /// in any object store backend.
     pub fn new(key: impl Into<String>) -> Self {
-        Self(key.into())
+        let key = key.into();
+        debug_assert!(!key.is_empty(), "BlobRef key must not be empty");
+        Self(key)
     }
 
     /// The key/URL string.
     pub fn key(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::fmt::Display for BlobRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -117,6 +130,20 @@ mod tests {
         });
         keys.sort();
         assert_eq!(keys, vec!["s3://1", "s3://2"]);
+    }
+
+    #[test]
+    fn blob_ref_display() {
+        let r = BlobRef::new("s3://bucket/key.bin");
+        assert_eq!(r.to_string(), "s3://bucket/key.bin");
+        assert_eq!(format!("{r}"), "s3://bucket/key.bin");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "BlobRef key must not be empty")]
+    fn blob_ref_empty_key_panics_in_debug() {
+        BlobRef::new("");
     }
 
     #[test]
