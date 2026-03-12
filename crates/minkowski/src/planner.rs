@@ -713,15 +713,23 @@ impl SubscriptionBuilder<'_> {
 
     /// Add a range predicate backed by a proven BTree index.
     ///
-    /// Note: only `Indexed<T>` created from `BTreeIndex` can serve range
-    /// predicates. Passing a hash-backed witness will still compile but the
-    /// plan will note the limitation. For full compile-time enforcement,
-    /// use `Indexed::btree()` which requires `T: Ord`.
+    /// # Panics
+    ///
+    /// Panics if `witness` was created from a `HashIndex`. Hash indexes
+    /// support only exact-match lookups — they cannot answer range queries.
+    /// Use `Indexed::btree()` to obtain a witness that satisfies this
+    /// requirement.
     pub fn where_range<T: Component + Ord + Clone>(
         mut self,
         witness: Indexed<T>,
         selectivity: f64,
     ) -> Self {
+        assert!(
+            witness.kind != IndexKind::Hash,
+            "where_range requires a BTree index, but got a Hash index for {}. \
+             Hash indexes cannot answer range queries — use a BTreeIndex instead.",
+            std::any::type_name::<T>(),
+        );
         self.indexed_predicates.push(IndexedPredicate {
             component_name: std::any::type_name::<T>(),
             index_kind: witness.kind,
@@ -2314,6 +2322,51 @@ mod tests {
             }
             other => panic!("expected Filter or IndexLookup, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn subscription_where_range_accepts_btree_witness() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let planner = QueryPlanner::new(&world);
+        let witness = Indexed::btree(&idx);
+
+        let sub = planner
+            .subscribe::<(&Score,)>()
+            .where_range(witness, 0.1)
+            .build();
+
+        match sub.root() {
+            PlanNode::IndexLookup { index_kind, .. } => {
+                assert_eq!(*index_kind, IndexKind::BTree);
+            }
+            other => panic!("expected IndexLookup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "where_range requires a BTree index")]
+    fn subscription_where_range_rejects_hash_witness() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let mut idx = HashIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let planner = QueryPlanner::new(&world);
+        let witness = Indexed::hash(&idx);
+
+        // This should panic — hash indexes cannot serve range queries.
+        planner
+            .subscribe::<(&Score,)>()
+            .where_range(witness, 0.1)
+            .build();
     }
 
     // ── Constraint validation ───────────────────────────────────────
