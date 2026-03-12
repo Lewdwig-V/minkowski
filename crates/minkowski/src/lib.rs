@@ -99,8 +99,8 @@ pub use index::{BTreeIndex, HasBTreeIndex, HasHashIndex, HashIndex, SpatialIndex
 pub use minkowski_derive::Table;
 pub use planner::{
     CardinalityConstraint, Cost, IndexKind, Indexed, JoinKind, PlanNode, PlanWarning, Predicate,
-    QueryPlanResult, QueryPlanner, SubscriptionBuilder, SubscriptionPlan, TablePlanner,
-    VecExecNode, VectorizeOpts, VectorizedPlan,
+    QueryPlanResult, QueryPlanner, SubscriptionBuilder, SubscriptionError, SubscriptionPlan,
+    TablePlanner, VecExecNode, VectorizeOpts, VectorizedPlan,
 };
 pub use pool::{HugePages, PoolExhausted};
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};

@@ -138,7 +138,8 @@ fn main() {
         .subscribe::<(&Score, &Team)>()
         .where_eq(score_witness, 0.001) // very selective
         .where_eq(team_witness, 0.2) // less selective
-        .build();
+        .build()
+        .unwrap();
     println!("{}", sub.explain());
 
     println!("=== 5. Constraint-Based Optimization ===\n");

@@ -686,8 +686,47 @@ pub struct SubscriptionBuilder<'w> {
     total_entities: usize,
     query_name: &'static str,
     indexed_predicates: Vec<IndexedPredicate>,
+    errors: Vec<SubscriptionError>,
     _world: PhantomData<&'w World>,
 }
+
+/// Errors from [`SubscriptionBuilder::build`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubscriptionError {
+    /// `where_range` was called with a Hash index witness.
+    /// Hash indexes support only exact-match lookups and cannot answer range
+    /// queries. Use a `BTreeIndex` instead.
+    HashIndexOnRange {
+        component_name: &'static str,
+    },
+    /// A selectivity value was NaN. Selectivity must be a finite number in
+    /// `[0.0, 1.0]`.
+    NanSelectivity {
+        component_name: &'static str,
+    },
+}
+
+impl fmt::Display for SubscriptionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubscriptionError::HashIndexOnRange { component_name } => {
+                write!(
+                    f,
+                    "where_range requires a BTree index, but got a Hash index for `{component_name}`. \
+                     Hash indexes cannot answer range queries — use a BTreeIndex instead."
+                )
+            }
+            SubscriptionError::NanSelectivity { component_name } => {
+                write!(
+                    f,
+                    "selectivity for `{component_name}` is NaN — must be a finite number in [0.0, 1.0]"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubscriptionError {}
 
 #[allow(dead_code)]
 struct IndexedPredicate {
@@ -701,10 +740,17 @@ struct IndexedPredicate {
 impl SubscriptionBuilder<'_> {
     /// Add an equality predicate backed by a proven index.
     pub fn where_eq<T: Component>(mut self, witness: Indexed<T>, selectivity: f64) -> Self {
+        let name = std::any::type_name::<T>();
+        if selectivity.is_nan() {
+            self.errors.push(SubscriptionError::NanSelectivity {
+                component_name: name,
+            });
+            return self;
+        }
         self.indexed_predicates.push(IndexedPredicate {
-            component_name: std::any::type_name::<T>(),
+            component_name: name,
             index_kind: witness.kind,
-            predicate_desc: format!("Eq({})", std::any::type_name::<T>()),
+            predicate_desc: format!("Eq({})", name),
             selectivity: selectivity.clamp(0.0, 1.0),
             cardinality: witness.cardinality,
         });
@@ -713,27 +759,34 @@ impl SubscriptionBuilder<'_> {
 
     /// Add a range predicate backed by a proven BTree index.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `witness` was created from a `HashIndex`. Hash indexes
-    /// support only exact-match lookups — they cannot answer range queries.
-    /// Use `Indexed::btree()` to obtain a witness that satisfies this
-    /// requirement.
+    /// Returns [`SubscriptionError::HashIndexOnRange`] (via [`build`](Self::build))
+    /// if `witness` was created from a `HashIndex`. Hash indexes support only
+    /// exact-match lookups — they cannot answer range queries. Use a
+    /// `BTreeIndex` instead.
     pub fn where_range<T: Component + Ord + Clone>(
         mut self,
         witness: Indexed<T>,
         selectivity: f64,
     ) -> Self {
-        assert!(
-            witness.kind != IndexKind::Hash,
-            "where_range requires a BTree index, but got a Hash index for {}. \
-             Hash indexes cannot answer range queries — use a BTreeIndex instead.",
-            std::any::type_name::<T>(),
-        );
+        let name = std::any::type_name::<T>();
+        if witness.kind == IndexKind::Hash {
+            self.errors.push(SubscriptionError::HashIndexOnRange {
+                component_name: name,
+            });
+            return self;
+        }
+        if selectivity.is_nan() {
+            self.errors.push(SubscriptionError::NanSelectivity {
+                component_name: name,
+            });
+            return self;
+        }
         self.indexed_predicates.push(IndexedPredicate {
-            component_name: std::any::type_name::<T>(),
+            component_name: name,
             index_kind: witness.kind,
-            predicate_desc: format!("Range({})", std::any::type_name::<T>()),
+            predicate_desc: format!("Range({})", name),
             selectivity: selectivity.clamp(0.0, 1.0),
             cardinality: witness.cardinality,
         });
@@ -742,7 +795,16 @@ impl SubscriptionBuilder<'_> {
 
     /// Compile the subscription plan. Every predicate is guaranteed to have
     /// an index, so the plan never falls back to a full scan for filtering.
-    pub fn build(self) -> SubscriptionPlan {
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`SubscriptionError`] if any predicate was invalid
+    /// (e.g. a Hash index used with `where_range`, or a NaN selectivity).
+    pub fn build(self) -> Result<SubscriptionPlan, SubscriptionError> {
+        if let Some(err) = self.errors.into_iter().next() {
+            return Err(err);
+        }
+
         let mut node: PlanNode = PlanNode::Scan {
             query_name: self.query_name,
             estimated_rows: self.total_entities,
@@ -752,7 +814,7 @@ impl SubscriptionBuilder<'_> {
         // Sort predicates by selectivity (most selective first) for optimal
         // index intersection ordering.
         let mut preds = self.indexed_predicates;
-        preds.sort_by(|a, b| a.selectivity.partial_cmp(&b.selectivity).unwrap());
+        preds.sort_by(|a, b| a.selectivity.total_cmp(&b.selectivity));
 
         // The most selective predicate becomes the driving index lookup.
         // Remaining predicates become chained index lookups / filters.
@@ -783,7 +845,7 @@ impl SubscriptionBuilder<'_> {
             }
         }
 
-        SubscriptionPlan { root: node }
+        Ok(SubscriptionPlan { root: node })
     }
 }
 
@@ -1137,6 +1199,7 @@ impl<'w> QueryPlanner<'w> {
             total_entities: self.total_entities,
             query_name: std::any::type_name::<Q>(),
             indexed_predicates: Vec::new(),
+            errors: Vec::new(),
             _world: PhantomData,
         }
     }
@@ -2276,7 +2339,8 @@ mod tests {
         let sub = planner
             .subscribe::<(&Score,)>()
             .where_eq(witness, 0.001)
-            .build();
+            .build()
+            .unwrap();
 
         // Subscription plans have no warnings (all predicates are indexed).
         match sub.root() {
@@ -2307,7 +2371,8 @@ mod tests {
             .subscribe::<(&Score, &Team)>()
             .where_eq(team_w, 0.2) // less selective
             .where_eq(score_w, 0.001) // more selective — should drive
-            .build();
+            .build()
+            .unwrap();
 
         // Most selective predicate (Score) should be the driving index lookup.
         match sub.root() {
@@ -2339,7 +2404,8 @@ mod tests {
         let sub = planner
             .subscribe::<(&Score,)>()
             .where_range(witness, 0.1)
-            .build();
+            .build()
+            .unwrap();
 
         match sub.root() {
             PlanNode::IndexLookup { index_kind, .. } => {
@@ -2350,7 +2416,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "where_range requires a BTree index")]
     fn subscription_where_range_rejects_hash_witness() {
         let mut world = World::new();
         for i in 0..100 {
@@ -2362,11 +2427,37 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let witness = Indexed::hash(&idx);
 
-        // This should panic — hash indexes cannot serve range queries.
-        planner
+        // Hash indexes cannot serve range queries — build returns an error.
+        let result = planner
             .subscribe::<(&Score,)>()
             .where_range(witness, 0.1)
             .build();
+        match result {
+            Err(SubscriptionError::HashIndexOnRange { .. }) => {}
+            other => panic!("expected HashIndexOnRange error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subscription_nan_selectivity_returns_error() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let planner = QueryPlanner::new(&world);
+        let witness = Indexed::btree(&idx);
+
+        let result = planner
+            .subscribe::<(&Score,)>()
+            .where_eq(witness, f64::NAN)
+            .build();
+        match result {
+            Err(SubscriptionError::NanSelectivity { .. }) => {}
+            other => panic!("expected NanSelectivity error, got {:?}", other),
+        }
     }
 
     // ── Constraint validation ───────────────────────────────────────
