@@ -83,7 +83,7 @@
 //! ```
 
 use std::any::TypeId;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Write as _};
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
@@ -188,6 +188,10 @@ pub enum IndexKind {
     Hash,
 }
 
+/// Type-erased lookup function for predicate-specific index access.
+/// Takes a `&dyn Any` (the predicate's `lookup_value`) and returns matching entities.
+type PredicateLookupFn = Arc<dyn Fn(&dyn std::any::Any) -> Arc<[Entity]> + Send + Sync>;
+
 /// Type-erased index metadata for the planner.
 struct IndexDescriptor {
     component_name: &'static str,
@@ -195,7 +199,14 @@ struct IndexDescriptor {
     cardinality: usize, // number of entities in the index
     /// Type-erased function that returns all entities tracked by this index.
     /// Captured at registration time when the concrete index type is available.
+    /// Used as a fallback when no predicate-specific lookup is available.
     all_entities_fn: Option<IndexLookupFn>,
+    /// Predicate-specific equality lookup. Takes `&dyn Any` (downcast to `T`),
+    /// returns only entities matching the exact value. O(log n) for BTree, O(1) for Hash.
+    eq_lookup_fn: Option<PredicateLookupFn>,
+    /// Predicate-specific range lookup. Takes `&dyn Any` (downcast to `(Bound<T>, Bound<T>)`),
+    /// returns only entities within the range. O(log n + k) for BTree, not available for Hash.
+    range_lookup_fn: Option<PredicateLookupFn>,
 }
 
 impl fmt::Debug for IndexDescriptor {
@@ -205,7 +216,31 @@ impl fmt::Debug for IndexDescriptor {
             .field("kind", &self.kind)
             .field("cardinality", &self.cardinality)
             .field("has_exec", &self.all_entities_fn.is_some())
+            .field("has_eq_lookup", &self.eq_lookup_fn.is_some())
+            .field("has_range_lookup", &self.range_lookup_fn.is_some())
             .finish()
+    }
+}
+
+impl IndexDescriptor {
+    /// Create a predicate-specific `IndexLookupFn` when possible,
+    /// falling back to `all_entities_fn` (full index scan) otherwise.
+    fn lookup_fn_for(&self, pred: &Predicate) -> Option<IndexLookupFn> {
+        // Try predicate-specific lookup first — O(1) or O(log n) vs O(n).
+        if let Some(lookup_value) = &pred.lookup_value {
+            let targeted_fn = match &pred.kind {
+                PredicateKind::Eq => self.eq_lookup_fn.as_ref(),
+                PredicateKind::Range => self.range_lookup_fn.as_ref(),
+                PredicateKind::Custom(_) => None,
+            };
+            if let Some(lookup) = targeted_fn {
+                let lookup = Arc::clone(lookup);
+                let value = Arc::clone(lookup_value);
+                return Some(Arc::new(move || lookup(value.as_ref())));
+            }
+        }
+        // Fallback: return all entities and let the filter_fn narrow them.
+        self.all_entities_fn.clone()
     }
 }
 
@@ -228,6 +263,10 @@ pub struct Predicate {
     /// Type-erased filter closure for execution. Captured at predicate
     /// construction when the concrete value is available.
     filter_fn: Option<FilterFn>,
+    /// Type-erased predicate value for index lookups. Eq stores `Arc<T>`,
+    /// Range stores `Arc<(Bound<T>, Bound<T>)>`. Downcast by the index's
+    /// `eq_lookup_fn` / `range_lookup_fn` at plan-build time.
+    lookup_value: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 enum PredicateKind {
@@ -244,6 +283,7 @@ impl Predicate {
     pub fn eq<T: Component + PartialEq>(value: T) -> Self {
         let value = Arc::new(value);
         let filter_val = Arc::clone(&value);
+        let lookup_val: Arc<dyn std::any::Any + Send + Sync> = value.clone();
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
@@ -252,6 +292,7 @@ impl Predicate {
             filter_fn: Some(Arc::new(move |world: &World, entity: Entity| {
                 world.get::<T>(entity).is_some_and(|v| *v == *filter_val)
             })),
+            lookup_value: Some(lookup_val),
         }
     }
 
@@ -271,6 +312,9 @@ impl Predicate {
             Bound::Excluded(v) => Bound::Excluded(v.clone()),
             Bound::Unbounded => Bound::Unbounded,
         };
+        // Separate clones for the lookup_value (consumed by index) vs filter_fn.
+        let lookup_val: Arc<dyn std::any::Any + Send + Sync> =
+            Arc::new((low.clone(), high.clone()));
         let low = Arc::new(low);
         let high = Arc::new(high);
         Predicate {
@@ -293,6 +337,7 @@ impl Predicate {
                     lo_ok && hi_ok
                 })
             })),
+            lookup_value: Some(lookup_val),
         }
     }
 
@@ -315,6 +360,7 @@ impl Predicate {
             kind: PredicateKind::Custom(description.into()),
             selectivity: sanitize_selectivity(selectivity),
             filter_fn: Some(Arc::new(filter)),
+            lookup_value: None,
         }
     }
 
@@ -1576,9 +1622,9 @@ impl ScanBuilder<'_> {
             };
 
             // Closure tree: index lookup intersected with scan for archetype
-            // matching, then filtered by predicate.
-            closures = if let Some(lookup) = &first_idx.all_entities_fn {
-                let lookup = Arc::clone(lookup);
+            // matching, then filtered by predicate.  Use predicate-specific
+            // lookup (O(1)/O(log n)) when available, falling back to full scan.
+            closures = if let Some(lookup) = first_idx.lookup_fn_for(first_pred) {
                 let base: ClosureNode = if let Some(scan) = &self.scan_fn {
                     ClosureNode::HashJoin {
                         build: Box::new(ClosureNode::Scan {
@@ -1811,20 +1857,49 @@ impl<'w> QueryPlanner<'w> {
             "QueryPlanner::add_btree_index: component `{}` not registered in this World",
             std::any::type_name::<T>()
         );
-        // Snapshot index entities at registration time for plan execution.
-        // Stored as Arc<[Entity]> so the lookup closure returns a cheap
-        // Arc::clone instead of copying the entire entity list on each call.
-        let snapshot: Arc<[Entity]> = index
-            .range(..)
-            .flat_map(|(_, ents)| ents.iter().copied())
+        // Snapshot the BTreeMap for predicate-specific lookups.
+        let (tree, _, _) = index.as_raw_parts();
+        let tree_snapshot: Arc<BTreeMap<T, Vec<Entity>>> = Arc::new(tree.clone());
+
+        // all_entities_fn: fallback full-index scan.
+        let tree_all: Arc<BTreeMap<T, Vec<Entity>>> = Arc::clone(&tree_snapshot);
+        let all_snapshot: Arc<[Entity]> = tree_all
+            .values()
+            .flat_map(|ents| ents.iter().copied())
             .collect();
+
+        // eq_lookup_fn: O(log n) point lookup — downcast &dyn Any to T.
+        let tree_eq = Arc::clone(&tree_snapshot);
+        let eq_fn: PredicateLookupFn = Arc::new(move |value: &dyn std::any::Any| {
+            let key = value
+                .downcast_ref::<T>()
+                .expect("eq_lookup_fn: type mismatch in downcast");
+            tree_eq
+                .get(key)
+                .map_or_else(|| Arc::from([]), |ents| ents.iter().copied().collect())
+        });
+
+        // range_lookup_fn: O(log n + k) range scan — downcast to (Bound<T>, Bound<T>).
+        let tree_range = Arc::clone(&tree_snapshot);
+        let range_fn: PredicateLookupFn = Arc::new(move |value: &dyn std::any::Any| {
+            let (lo, hi) = value
+                .downcast_ref::<(Bound<T>, Bound<T>)>()
+                .expect("range_lookup_fn: type mismatch in downcast");
+            tree_range
+                .range((lo.clone(), hi.clone()))
+                .flat_map(|(_, ents)| ents.iter().copied())
+                .collect()
+        });
+
         self.indexes.insert(
             TypeId::of::<T>(),
             IndexDescriptor {
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::BTree,
                 cardinality: index.len(),
-                all_entities_fn: Some(Arc::new(move || Arc::clone(&snapshot))),
+                all_entities_fn: Some(Arc::new(move || Arc::clone(&all_snapshot))),
+                eq_lookup_fn: Some(eq_fn),
+                range_lookup_fn: Some(range_fn),
             },
         );
     }
@@ -1843,12 +1918,28 @@ impl<'w> QueryPlanner<'w> {
             "QueryPlanner::add_hash_index: component `{}` not registered in this World",
             std::any::type_name::<T>()
         );
-        // Snapshot index entities at registration time for plan execution.
-        // Stored as Arc<[Entity]> — see add_btree_index for rationale.
-        let snapshot: Arc<[Entity]> = {
-            let (map, _, _) = index.as_raw_parts();
-            map.values().flat_map(|ents| ents.iter().copied()).collect()
-        };
+        // Snapshot the HashMap for predicate-specific lookups.
+        let (map, _, _) = index.as_raw_parts();
+        let map_snapshot: Arc<HashMap<T, Vec<Entity>>> = Arc::new(map.clone());
+
+        // all_entities_fn: fallback full-index scan.
+        let map_all = Arc::clone(&map_snapshot);
+        let all_snapshot: Arc<[Entity]> = map_all
+            .values()
+            .flat_map(|ents| ents.iter().copied())
+            .collect();
+
+        // eq_lookup_fn: O(1) point lookup — downcast &dyn Any to T.
+        let map_eq = Arc::clone(&map_snapshot);
+        let eq_fn: PredicateLookupFn = Arc::new(move |value: &dyn std::any::Any| {
+            let key = value
+                .downcast_ref::<T>()
+                .expect("eq_lookup_fn: type mismatch in downcast");
+            map_eq
+                .get(key)
+                .map_or_else(|| Arc::from([]), |ents| ents.iter().copied().collect())
+        });
+
         // Only insert if no BTree index is already registered for this type
         // (BTree is strictly more capable than Hash).
         self.indexes
@@ -1857,7 +1948,9 @@ impl<'w> QueryPlanner<'w> {
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::Hash,
                 cardinality: index.len(),
-                all_entities_fn: Some(Arc::new(move || Arc::clone(&snapshot))),
+                all_entities_fn: Some(Arc::new(move || Arc::clone(&all_snapshot))),
+                eq_lookup_fn: Some(eq_fn),
+                range_lookup_fn: None, // Hash doesn't support range queries.
             });
     }
 
@@ -4019,6 +4112,122 @@ mod tests {
         }
         // Team(1) entities with Score: indices 1, 4, 7 = 3
         assert_eq!(result.len(), 3);
+    }
+
+    // ── Predicate-specific index lookup ─────────────────────────────────
+
+    #[test]
+    fn execute_btree_eq_uses_targeted_lookup() {
+        // Verify that BTree + Eq predicate returns only matching entities,
+        // not the entire index (regression: was O(n) full-index scan).
+        let mut world = World::new();
+        for i in 0..200 {
+            world.spawn((Score(i), Team(i % 10)));
+        }
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&btree, &world);
+
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build();
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 1);
+        assert_eq!(*world.get::<Score>(result[0]).unwrap(), Score(42));
+    }
+
+    #[test]
+    fn execute_btree_range_uses_targeted_lookup() {
+        // Verify that BTree + Range predicate returns only entities in range,
+        // not the entire index (regression: was O(n) full-index scan).
+        let mut world = World::new();
+        for i in 0..200 {
+            world.spawn((Score(i),));
+        }
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&btree, &world);
+
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(10)..Score(20)))
+            .build();
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 10); // scores 10..20
+        for e in &result {
+            let s = world.get::<Score>(*e).unwrap().0;
+            assert!((10..20).contains(&s), "score {s} out of range");
+        }
+    }
+
+    #[test]
+    fn execute_hash_eq_uses_targeted_lookup() {
+        // Verify that Hash + Eq predicate returns only matching entities,
+        // not the entire index (regression: was O(n) full-index scan).
+        let mut world = World::new();
+        for i in 0..200 {
+            world.spawn((Score(i), Team(i % 10)));
+        }
+        let mut hash = HashIndex::<Team>::new();
+        hash.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index(&hash, &world);
+
+        let plan = planner
+            .scan::<(&Score, &Team)>()
+            .filter(Predicate::eq(Team(3)))
+            .build();
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 20); // 200 / 10 teams
+        for e in &result {
+            assert_eq!(*world.get::<Team>(*e).unwrap(), Team(3));
+        }
+    }
+
+    #[test]
+    fn execute_btree_eq_nonexistent_value_returns_empty() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Score(i),));
+        }
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&btree, &world);
+
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(999)))
+            .build();
+        let result = plan.execute(&world);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn execute_hash_eq_nonexistent_value_returns_empty() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Team(i),));
+        }
+        let mut hash = HashIndex::<Team>::new();
+        hash.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index(&hash, &world);
+
+        let plan = planner
+            .scan::<(&Team,)>()
+            .filter(Predicate::eq(Team(999)))
+            .build();
+        let result = plan.execute(&world);
+        assert!(result.is_empty());
     }
 
     // ── Vectorized execution ───────────────────────────────────────────
