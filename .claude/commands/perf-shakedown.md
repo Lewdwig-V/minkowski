@@ -50,7 +50,7 @@ Determine which files to analyze:
 - `transaction.rs` — `try_commit`, `begin`, tick validation, changeset apply
 - `lock_table.rs` — `acquire`, `release`
 
-### Benchmark Baselines (as of v1.0.4)
+### Benchmark Baselines (as of v1.1.0)
 
 Reference numbers from `cargo bench -p minkowski-bench` on the dev machine. Use these to contextualize findings — a "PERF-CRITICAL" on a path that takes 1.6µs total is less urgent than one on a 250µs path.
 
@@ -58,13 +58,17 @@ Reference numbers from `cargo bench -p minkowski-bench` on the dev machine. Use 
 |---|---|---|---|
 | `simple_iter/for_each_chunk` | 1.6 µs | 0.16 ns | SIMD-friendly baseline |
 | `simple_iter/for_each` | 14.8 µs | 1.48 ns | 9x slower — per-element callback overhead |
-| `reducer/query_mut_10k` | 8.7 µs | 0.87 ns | Direct mutation baseline |
+| `reducer/query_mut_10k` | 11 µs | 1.1 ns | Direct mutation baseline |
 | `reducer/query_mut_chunk_10k` | 1.7 µs | 0.17 ns | Chunk iteration ≈ raw iteration |
-| `reducer/query_writer_10k` | 139 µs | 13.9 ns | **16x query_mut** — buffered write overhead |
-| `reducer/dynamic_for_each_10k` | 253 µs | 25.3 ns | **29x query_mut** — HashMap + buffered writes |
-| `reducer/dynamic_for_each_chunk_10k` | 242 µs | 24.2 ns | Chunk doesn't help dynamic (write-back dominates) |
-| `simple_insert/batch` | 2.5 ms | 250 ns | Direct spawn |
-| `simple_insert/changeset` | 3.5 ms | 350 ns | Changeset spawn 1.4x direct |
+| `reducer/query_writer_10k` | 96 µs | 9.6 ns | **~9x query_mut** — buffered write overhead |
+| `reducer/dynamic_for_each_10k` | 176 µs | 17.6 ns | **~16x query_mut** — identity-hashed lookup + buffered writes |
+| `reducer/dynamic_for_each_chunk_10k` | 176 µs | 17.6 ns | Chunk helps less for dynamic (write-back dominates) |
+| `changeset/record_10k_inserts` | 193 µs | 19.3 ns | Arena alloc + Vec push (recording only) |
+| `changeset/apply_10k_overwrites` | 77 µs | 7.7 ns | Entity lookup + memcpy + tick mark (apply only) |
+| `changeset/record_apply_10k` | 307 µs | 30.7 ns | Full round-trip (record + apply) |
+| `changeset/new_drop_empty` | 11 ns | — | Per-transaction allocation cost |
+| `simple_insert/batch` | 2.9 ms | 290 ns | Direct spawn |
+| `simple_insert/changeset` | 4.4 ms | 440 ns | Changeset spawn ~1.5x direct |
 | `add_remove/add_remove` | 1.6 ms | 162 ns | Archetype migration cost |
 | `heavy_compute/sequential` | 9.3 µs | 9.3 ns | 4x4 matrix inversion |
 | `heavy_compute/parallel` | 1.1 ms | — | Rayon overhead dominates at 1K entities |
@@ -74,19 +78,57 @@ Reference numbers from `cargo bench -p minkowski-bench` on the dev machine. Use 
 | `serialize/wal_append` | 1.25 µs | — | Single mutation |
 | `serialize/wal_replay` | 1.76 ms | 1.76 µs | 1K mutations |
 
-### Known Bottlenecks (profiled, not yet addressed)
+### Regression Guards
+
+These optimizations were applied in the v1.1.0 profiling investigation (PR #90, #92).
+If any of them are accidentally reverted, the corresponding benchmarks will regress.
+Agents should verify these invariants are maintained when modifying the listed files.
+
+1. **`#[inline]` on changeset hot paths** (`changeset.rs`, `reducer.rs`):
+   `Arena::alloc`, `Arena::get`, `record_insert`, `insert_raw`, `WritableRef::set`,
+   `WritableRef::modify` must remain `#[inline]`. Removing any of these causes ~30%
+   QueryWriter regression — profiling showed 33% of self-time was function call
+   prologue/epilogue on these small functions. Benchmark: `reducer/query_writer_10k`.
+
+2. **QueryWriter pre-allocation** (`reducer.rs:QueryWriter::for_each`):
+   The entity-count pre-scan + `mutations.reserve()` + `arena.reserve()` block must
+   remain in `for_each`, capped at `MAX_PREALLOC_MUTATIONS` (64K). Removing it causes
+   ~7% QueryWriter regression from Vec/Arena reallocation during iteration. The cap
+   prevents overallocation for conditional-update reducers that match many entities but
+   write to few. Benchmark: `reducer/query_writer_10k`.
+
+3. **Identity hasher for `DynamicResolved`** (`reducer.rs:TypeIdHasher`):
+   The `HashMap<TypeId, ComponentId, TypeIdBuildHasher>` in `DynamicResolved` must use
+   the identity hasher, not the default `SipHash`. `TypeId` is a compiler-generated
+   `u64` — SipHash was spending 29% of DynamicCtx time on unnecessary cryptographic
+   hashing. Benchmark: `reducer/dynamic_for_each_10k`.
+
+4. **`#[inline]` on DynamicCtx hot paths** (`reducer.rs`):
+   `DynamicCtx::write` and `DynamicResolved::lookup` must remain `#[inline]`.
+   Benchmark: `reducer/dynamic_for_each_10k`.
+
+### Known Bottlenecks (profiled, residual after optimization)
 
 These have been analyzed and are documented here to prevent re-discovery:
 
-1. **QueryWriter 16x overhead** — inherent to buffered writes: `clone()` + `arena.alloc()` + `Vec::push()` per entity in `WritableRef::modify`, then `entity_locations` lookup + `column_index` + `copy_nonoverlapping` per entity in `changeset_insert_raw`. The clone and arena alloc are the largest costs. No further optimization without changing the buffered-write architecture.
+1. **QueryWriter ~9x overhead** — after inlining and pre-allocation (down from 16x).
+   Remaining cost is inherent to buffered writes: `clone()` + arena copy per entity in
+   `WritableRef::modify`, then per-entity `entity_locations` lookup + `column_index` +
+   `copy_nonoverlapping` in `changeset_insert_raw` during apply. The apply phase (62%
+   of profile) is dominated by per-mutation enum match (computed jump table) and entity
+   location lookup. A batch overwrite fast path in `apply()` could reduce this further
+   (~20% estimated) but adds significant complexity for moderate gain.
 
-2. **DynamicCtx 29x overhead** — QueryWriter costs PLUS `HashMap<TypeId, ComponentId>` lookup per `ctx.write()` call (in `DynamicResolved::lookup`). The HashMap is required for runtime type resolution. Consider: pre-resolved write handles cached per-entity, or a `Vec`-indexed lookup if `TypeId` can be mapped to a dense index.
+2. **DynamicCtx ~1.8x over QueryWriter** — after identity hasher (down from ~2.7x).
+   Remaining cost is the collect-then-write `Vec` pattern (structural to dynamic
+   reducers — can't inline writes during iteration because the type is resolved at
+   runtime) plus the `assert!` write-permission check per `ctx.write()` call.
 
 3. **`par_for_each` / parallel overhead** — rayon's thread pool spawn + work stealing amortizes poorly below ~50K entities. At 10K entities, sequential `for_each_chunk` is 430x faster. This is a rayon characteristic, not a Minkowski bug. Users should use `par_for_each` only for large entity counts or expensive per-entity work (like `heavy_compute`).
 
 4. **`for_each` vs `for_each_chunk` 9x gap** — per-element callback prevents SIMD auto-vectorization. `for_each_chunk` yields contiguous `&[T]` slices. This is the single biggest "free win" for users switching iteration style. Not an engine optimization — it's API choice.
 
-5. **Changeset spawn 1.4x direct** — arena allocation + mutation log overhead on top of the same archetype push work. Inherent to the data-driven mutation model.
+5. **Changeset spawn ~1.5x direct** — arena allocation + mutation log overhead on top of the same archetype push work. Inherent to the data-driven mutation model.
 
 ## Phase 2 — Analysis
 

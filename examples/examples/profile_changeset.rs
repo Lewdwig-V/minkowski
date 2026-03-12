@@ -13,7 +13,7 @@
 //!
 //! Compare time spent in each to identify where the overhead lives.
 
-use minkowski::{Optimistic, QueryMut, QueryWriter, ReducerRegistry, World};
+use minkowski::{DynamicCtx, Optimistic, QueryMut, QueryWriter, ReducerRegistry, World};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -100,6 +100,38 @@ fn run_query_writer(world: &mut World, registry: &mut ReducerRegistry) {
     }
 }
 
+/// Subject: dynamic reducer with collect-then-write pattern.
+#[inline(never)]
+fn run_dynamic(world: &mut World, registry: &mut ReducerRegistry) {
+    let strategy = Optimistic::new(world);
+    let id = registry
+        .dynamic("integrate_dynamic", world)
+        .can_read::<Position>()
+        .can_read::<Velocity>()
+        .can_write::<Position>()
+        .build(|ctx: &mut DynamicCtx, _args: &()| {
+            let mut updates = Vec::new();
+            ctx.for_each::<(minkowski::Entity, &Position, &Velocity)>(|(entity, pos, vel)| {
+                updates.push((
+                    entity,
+                    Position {
+                        x: pos.x + vel.dx,
+                        y: pos.y + vel.dy,
+                        z: pos.z + vel.dz,
+                    },
+                ));
+            });
+            for (entity, pos) in updates {
+                ctx.write(entity, pos);
+            }
+        })
+        .unwrap();
+
+    for _ in 0..ITERATIONS {
+        registry.dynamic_call(&strategy, world, id, &()).unwrap();
+    }
+}
+
 fn main() {
     // Phase 1: QueryMut baseline
     let mut world = setup_world();
@@ -111,5 +143,11 @@ fn main() {
     let mut world = setup_world();
     let mut registry = ReducerRegistry::new();
     run_query_writer(&mut world, &mut registry);
+    std::hint::black_box(&world);
+
+    // Phase 3: DynamicCtx subject
+    let mut world = setup_world();
+    let mut registry = ReducerRegistry::new();
+    run_dynamic(&mut world, &mut registry);
     std::hint::black_box(&world);
 }
