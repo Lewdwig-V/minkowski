@@ -194,6 +194,17 @@ struct IndexDescriptor {
 
 // ── Predicates ───────────────────────────────────────────────────────
 
+/// Clamp selectivity to [0.0, 1.0], treating NaN as 1.0 (worst-case).
+///
+/// `f64::clamp` preserves NaN, so we must check explicitly.
+fn sanitize_selectivity(s: f64) -> f64 {
+    if s.is_nan() {
+        1.0
+    } else {
+        s.clamp(0.0, 1.0)
+    }
+}
+
 /// A predicate that can be pushed down into an index lookup or applied as
 /// a post-fetch filter.
 pub struct Predicate {
@@ -250,18 +261,22 @@ impl Predicate {
 
     /// Custom predicate with a user-provided description.
     /// Always applied as a post-fetch filter (cannot be pushed into an index).
+    ///
+    /// NaN selectivity is normalized to 1.0 (worst-case, full scan).
     pub fn custom<T: Component>(description: &str, selectivity: f64) -> Self {
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
             kind: PredicateKind::Custom(description.into()),
-            selectivity: selectivity.clamp(0.0, 1.0),
+            selectivity: sanitize_selectivity(selectivity),
         }
     }
 
     /// Override the default selectivity estimate.
+    ///
+    /// NaN selectivity is normalized to 1.0 (worst-case, full scan).
     pub fn with_selectivity(mut self, selectivity: f64) -> Self {
-        self.selectivity = selectivity.clamp(0.0, 1.0);
+        self.selectivity = sanitize_selectivity(selectivity);
         self
     }
 
@@ -2620,6 +2635,17 @@ mod tests {
 
         let pred = Predicate::eq(Score(42)).with_selectivity(-1.0);
         assert!(pred.selectivity.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn nan_selectivity_normalized_to_worst_case() {
+        // with_selectivity
+        let pred = Predicate::eq(Score(42)).with_selectivity(f64::NAN);
+        assert!((pred.selectivity - 1.0).abs() < f64::EPSILON);
+
+        // custom constructor
+        let pred = Predicate::custom::<Score>("test", f64::NAN);
+        assert!((pred.selectivity - 1.0).abs() < f64::EPSILON);
     }
 
     // ── Display ─────────────────────────────────────────────────────
