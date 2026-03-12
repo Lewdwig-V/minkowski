@@ -110,11 +110,13 @@ pub struct Cost {
 
 impl Cost {
     /// Estimated number of rows this node will produce.
+    #[inline]
     pub fn rows(&self) -> f64 {
         self.rows
     }
 
     /// Estimated CPU cost (comparison/hash operations).
+    #[inline]
     pub fn cpu(&self) -> f64 {
         self.cpu
     }
@@ -169,6 +171,7 @@ impl Cost {
     }
 
     /// Total cost for comparison (cpu-dominated since everything is in memory).
+    #[inline]
     pub fn total(&self) -> f64 {
         self.cpu
     }
@@ -186,7 +189,6 @@ pub enum IndexKind {
 }
 
 /// Type-erased index metadata for the planner.
-#[derive(Clone)]
 struct IndexDescriptor {
     component_name: &'static str,
     kind: IndexKind,
@@ -213,11 +215,7 @@ impl fmt::Debug for IndexDescriptor {
 ///
 /// `f64::clamp` preserves NaN, so we must check explicitly.
 fn sanitize_selectivity(s: f64) -> f64 {
-    if s.is_nan() {
-        1.0
-    } else {
-        s.clamp(0.0, 1.0)
-    }
+    if s.is_nan() { 1.0 } else { s.clamp(0.0, 1.0) }
 }
 
 /// A predicate that can be pushed down into an index lookup or applied as
@@ -436,6 +434,7 @@ pub enum PlanNode {
 
 impl PlanNode {
     /// Cost of this node (including children).
+    #[inline]
     pub fn cost(&self) -> Cost {
         match self {
             PlanNode::Scan { cost, .. }
@@ -447,12 +446,16 @@ impl PlanNode {
     }
 
     /// Estimated output row count.
+    #[inline]
     pub fn estimated_rows(&self) -> f64 {
         self.cost().rows
     }
 
     fn fmt_indent(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
-        let pad = "  ".repeat(indent);
+        // Write indentation without heap allocation: two spaces per level.
+        for _ in 0..indent {
+            f.write_str("  ")?;
+        }
         match self {
             PlanNode::Scan {
                 query_name,
@@ -461,7 +464,7 @@ impl PlanNode {
             } => {
                 writeln!(
                     f,
-                    "{pad}Scan [{query_name}] rows={estimated_rows} cpu={:.1}",
+                    "Scan [{query_name}] rows={estimated_rows} cpu={:.1}",
                     cost.cpu
                 )
             }
@@ -474,7 +477,7 @@ impl PlanNode {
             } => {
                 writeln!(
                     f,
-                    "{pad}IndexLookup [{index_kind:?} on {component_name}] {predicate} rows={estimated_rows} cpu={:.1}",
+                    "IndexLookup [{index_kind:?} on {component_name}] {predicate} rows={estimated_rows} cpu={:.1}",
                     cost.cpu
                 )
             }
@@ -487,7 +490,7 @@ impl PlanNode {
             } => {
                 writeln!(
                     f,
-                    "{pad}Filter [{predicate}] sel={selectivity:.2} rows={:.0} cpu={:.1}",
+                    "Filter [{predicate}] sel={selectivity:.2} rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
                 child.fmt_indent(f, indent + 1)
@@ -500,7 +503,7 @@ impl PlanNode {
             } => {
                 writeln!(
                     f,
-                    "{pad}HashJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
+                    "HashJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
                 left.fmt_indent(f, indent + 1)?;
@@ -514,7 +517,7 @@ impl PlanNode {
             } => {
                 writeln!(
                     f,
-                    "{pad}NestedLoopJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
+                    "NestedLoopJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
                 left.fmt_indent(f, indent + 1)?;
@@ -1013,7 +1016,10 @@ impl fmt::Debug for SubscriptionPlan {
 type ScanFn = Arc<dyn Fn(&World) -> Vec<Entity> + Send + Sync>;
 
 /// Type-erased index lookup function: return matching entities from the index.
-type IndexLookupFn = Arc<dyn Fn() -> Vec<Entity> + Send + Sync>;
+/// Returns `Arc<[Entity]>` to avoid cloning the entity list on every call —
+/// callers that need mutation (filter, sort) pay the allocation cost only when
+/// they actually mutate.
+type IndexLookupFn = Arc<dyn Fn() -> Arc<[Entity]> + Send + Sync>;
 
 /// Type-erased filter function: given `&World` and `Entity`, return true if
 /// the entity passes the predicate.
@@ -1026,6 +1032,7 @@ enum ProbeSet {
 }
 
 impl ProbeSet {
+    #[inline]
     fn contains(&self, e: Entity) -> bool {
         match self {
             ProbeSet::Single(set) => set.contains(&e),
@@ -1045,10 +1052,12 @@ impl ProbeSet {
 /// morsel-sized batches: scans yield chunks, filters operate on batches,
 /// index gathers sort by archetype, and hash joins partition the build side.
 enum ExecNode {
-    /// Chunked archetype scan — collects entities per archetype in batches
-    /// of `chunk_size`. Maps to `VecExecNode::ChunkedScan`.
+    /// Chunked archetype scan — collects entities per archetype in batches.
+    /// `chunk_size` is advisory metadata from the vectorized plan (used for
+    /// test assertions and plan introspection). Maps to `VecExecNode::ChunkedScan`.
     ChunkedScan {
         scan_fn: ScanFn,
+        #[cfg_attr(not(test), expect(dead_code))]
         chunk_size: usize,
     },
     /// Index-driven gather — entities from the index snapshot, sorted by
@@ -1088,25 +1097,21 @@ impl ExecNode {
         match self {
             ExecNode::ChunkedScan {
                 scan_fn,
-                chunk_size,
+                chunk_size: _,
             } => {
-                // Collect all matching entities, then process in morsel-sized
-                // chunks for cache-friendly access patterns. The scan_fn
-                // already iterates per-archetype; chunk_size subdivides large
-                // archetypes into L1-friendly batches.
-                let all = scan_fn(world);
-                let mut result = Vec::with_capacity(all.len());
-                for chunk in all.chunks(*chunk_size) {
-                    result.extend_from_slice(chunk);
-                }
-                result
+                // The scan_fn already iterates per-archetype in contiguous
+                // chunks. The chunk_size parameter is advisory metadata for
+                // higher-level scheduling — no re-chunking needed here.
+                scan_fn(world)
             }
             ExecNode::IndexGather {
                 lookup_fn,
                 sort_by_archetype,
             } => {
-                let mut entities: Vec<Entity> = lookup_fn()
-                    .into_iter()
+                let snapshot = lookup_fn();
+                let mut entities: Vec<Entity> = snapshot
+                    .iter()
+                    .copied()
                     .filter(|e| world.is_alive(*e))
                     .collect();
                 if *sort_by_archetype {
@@ -1240,7 +1245,9 @@ impl ExecNode {
     #[cfg(test)]
     fn sort_by_archetype(&self) -> Option<bool> {
         match self {
-            ExecNode::IndexGather { sort_by_archetype, .. } => Some(*sort_by_archetype),
+            ExecNode::IndexGather {
+                sort_by_archetype, ..
+            } => Some(*sort_by_archetype),
             _ => None,
         }
     }
@@ -1261,11 +1268,26 @@ impl ExecNode {
 /// Combined with [`VecExecNode`] parameters by [`lower_to_executable`] to produce
 /// the final [`ExecNode`].
 enum ClosureNode {
-    Scan { scan_fn: ScanFn },
-    IndexLookup { lookup_fn: IndexLookupFn },
-    Filter { child: Box<ClosureNode>, filter_fn: FilterFn },
-    HashJoin { build: Box<ClosureNode>, probe: Box<ClosureNode>, join_kind: JoinKind },
-    NestedLoopJoin { left: Box<ClosureNode>, right: Box<ClosureNode>, join_kind: JoinKind },
+    Scan {
+        scan_fn: ScanFn,
+    },
+    IndexLookup {
+        lookup_fn: IndexLookupFn,
+    },
+    Filter {
+        child: Box<ClosureNode>,
+        filter_fn: FilterFn,
+    },
+    HashJoin {
+        build: Box<ClosureNode>,
+        probe: Box<ClosureNode>,
+        join_kind: JoinKind,
+    },
+    NestedLoopJoin {
+        left: Box<ClosureNode>,
+        right: Box<ClosureNode>,
+        join_kind: JoinKind,
+    },
 }
 
 /// Lower a [`ClosureNode`] + [`VecExecNode`] pair into a vectorized [`ExecNode`].
@@ -1274,38 +1296,46 @@ enum ClosureNode {
 /// provides the vectorization parameters (chunk sizes, partition counts, sort
 /// hints). The two trees are structurally isomorphic — they were built from the
 /// same logical plan.
-fn lower_to_executable(closures: &ClosureNode, vec_node: &VecExecNode) -> ExecNode {
+///
+/// Takes ownership of the closure tree to avoid `Arc::clone` on every node.
+fn lower_to_executable(closures: ClosureNode, vec_node: &VecExecNode) -> ExecNode {
     match (closures, vec_node) {
         (ClosureNode::Scan { scan_fn }, VecExecNode::ChunkedScan { avg_chunk_size, .. }) => {
             ExecNode::ChunkedScan {
-                scan_fn: Arc::clone(scan_fn),
+                scan_fn,
                 chunk_size: *avg_chunk_size,
             }
         }
         (ClosureNode::IndexLookup { lookup_fn }, VecExecNode::IndexGather { .. }) => {
             ExecNode::IndexGather {
-                lookup_fn: Arc::clone(lookup_fn),
+                lookup_fn,
                 sort_by_archetype: true,
             }
         }
         (
             ClosureNode::Filter { child, filter_fn },
-            VecExecNode::SIMDFilter { child: vec_child, .. },
+            VecExecNode::SIMDFilter {
+                child: vec_child, ..
+            },
         ) => {
-            let child_exec = lower_to_executable(child, vec_child);
             // Batch size: use the child's estimated rows or a sensible default.
             let batch_size = match vec_child.as_ref() {
                 VecExecNode::ChunkedScan { avg_chunk_size, .. } => *avg_chunk_size,
                 _ => 256, // default batch for non-scan children
             };
+            let child_exec = lower_to_executable(*child, vec_child);
             ExecNode::BatchFilter {
                 child: Box::new(child_exec),
-                filter_fn: Arc::clone(filter_fn),
+                filter_fn,
                 batch_size,
             }
         }
         (
-            ClosureNode::HashJoin { build, probe, join_kind },
+            ClosureNode::HashJoin {
+                build,
+                probe,
+                join_kind,
+            },
             VecExecNode::PartitionedHashJoin {
                 build: vec_build,
                 probe: vec_probe,
@@ -1313,85 +1343,111 @@ fn lower_to_executable(closures: &ClosureNode, vec_node: &VecExecNode) -> ExecNo
                 ..
             },
         ) => ExecNode::PartitionedHashJoin {
-            build: Box::new(lower_to_executable(build, vec_build)),
-            probe: Box::new(lower_to_executable(probe, vec_probe)),
-            join_kind: *join_kind,
+            build: Box::new(lower_to_executable(*build, vec_build)),
+            probe: Box::new(lower_to_executable(*probe, vec_probe)),
+            join_kind,
             partitions: *partitions,
         },
         (
-            ClosureNode::NestedLoopJoin { left, right, join_kind },
+            ClosureNode::NestedLoopJoin {
+                left,
+                right,
+                join_kind,
+            },
             VecExecNode::BatchNestedLoopJoin {
                 left: vec_left,
                 right: vec_right,
                 ..
             },
         ) => ExecNode::BatchNestedLoopJoin {
-            left: Box::new(lower_to_executable(left, vec_left)),
-            right: Box::new(lower_to_executable(right, vec_right)),
-            join_kind: *join_kind,
+            left: Box::new(lower_to_executable(*left, vec_left)),
+            right: Box::new(lower_to_executable(*right, vec_right)),
+            join_kind,
         },
         // Fallback: structural mismatch between closure tree and vec tree.
         // This can happen when the vec lowering produces a different shape
         // (e.g., Scan closure but IndexGather vec node for index-driven plans).
         // Fall back to reasonable defaults.
         (ClosureNode::Scan { scan_fn }, _) => ExecNode::ChunkedScan {
-            scan_fn: Arc::clone(scan_fn),
+            scan_fn,
             chunk_size: 4096,
         },
         (ClosureNode::IndexLookup { lookup_fn }, _) => ExecNode::IndexGather {
-            lookup_fn: Arc::clone(lookup_fn),
+            lookup_fn,
             sort_by_archetype: true,
         },
         (ClosureNode::Filter { child, filter_fn }, _) => {
             // If vec tree shape doesn't match, walk the vec child if possible,
             // otherwise use the fallback with default batch size.
-            let child_exec = lower_to_executable_fallback(child);
+            let child_exec = lower_to_executable_fallback(*child);
             ExecNode::BatchFilter {
                 child: Box::new(child_exec),
-                filter_fn: Arc::clone(filter_fn),
+                filter_fn,
                 batch_size: 256,
             }
         }
-        (ClosureNode::HashJoin { build, probe, join_kind }, _) => ExecNode::PartitionedHashJoin {
-            build: Box::new(lower_to_executable_fallback(build)),
-            probe: Box::new(lower_to_executable_fallback(probe)),
-            join_kind: *join_kind,
+        (
+            ClosureNode::HashJoin {
+                build,
+                probe,
+                join_kind,
+            },
+            _,
+        ) => ExecNode::PartitionedHashJoin {
+            build: Box::new(lower_to_executable_fallback(*build)),
+            probe: Box::new(lower_to_executable_fallback(*probe)),
+            join_kind,
             partitions: 1,
         },
-        (ClosureNode::NestedLoopJoin { left, right, join_kind }, _) => ExecNode::BatchNestedLoopJoin {
-            left: Box::new(lower_to_executable_fallback(left)),
-            right: Box::new(lower_to_executable_fallback(right)),
-            join_kind: *join_kind,
+        (
+            ClosureNode::NestedLoopJoin {
+                left,
+                right,
+                join_kind,
+            },
+            _,
+        ) => ExecNode::BatchNestedLoopJoin {
+            left: Box::new(lower_to_executable_fallback(*left)),
+            right: Box::new(lower_to_executable_fallback(*right)),
+            join_kind,
         },
     }
 }
 
 /// Fallback lowering when the closure tree shape doesn't match the vec tree.
-fn lower_to_executable_fallback(closures: &ClosureNode) -> ExecNode {
+fn lower_to_executable_fallback(closures: ClosureNode) -> ExecNode {
     match closures {
         ClosureNode::Scan { scan_fn } => ExecNode::ChunkedScan {
-            scan_fn: Arc::clone(scan_fn),
+            scan_fn,
             chunk_size: 4096,
         },
         ClosureNode::IndexLookup { lookup_fn } => ExecNode::IndexGather {
-            lookup_fn: Arc::clone(lookup_fn),
+            lookup_fn,
             sort_by_archetype: true,
         },
         ClosureNode::Filter { child, filter_fn } => ExecNode::BatchFilter {
-            child: Box::new(lower_to_executable_fallback(child)),
-            filter_fn: Arc::clone(filter_fn),
+            child: Box::new(lower_to_executable_fallback(*child)),
+            filter_fn,
             batch_size: 256,
         },
-        ClosureNode::HashJoin { build, probe, join_kind } => ExecNode::PartitionedHashJoin {
-            build: Box::new(lower_to_executable_fallback(build)),
-            probe: Box::new(lower_to_executable_fallback(probe)),
-            join_kind: *join_kind,
+        ClosureNode::HashJoin {
+            build,
+            probe,
+            join_kind,
+        } => ExecNode::PartitionedHashJoin {
+            build: Box::new(lower_to_executable_fallback(*build)),
+            probe: Box::new(lower_to_executable_fallback(*probe)),
+            join_kind,
             partitions: 1,
         },
-        ClosureNode::NestedLoopJoin { left, right, join_kind } => ExecNode::BatchNestedLoopJoin {
-            left: Box::new(lower_to_executable_fallback(left)),
-            right: Box::new(lower_to_executable_fallback(right)),
-            join_kind: *join_kind,
+        ClosureNode::NestedLoopJoin {
+            left,
+            right,
+            join_kind,
+        } => ExecNode::BatchNestedLoopJoin {
+            left: Box::new(lower_to_executable_fallback(*left)),
+            right: Box::new(lower_to_executable_fallback(*right)),
+            join_kind,
         },
     }
 }
@@ -1401,6 +1457,10 @@ fn scan_matching_entities(world: &World, required: &FixedBitSet) -> Vec<Entity> 
     let mut result = Vec::new();
     for arch in &world.archetypes.archetypes {
         if !arch.is_empty() && required.is_subset(&arch.component_ids) {
+            // Reserve on first match to avoid per-entity push reallocation.
+            if result.is_empty() {
+                result.reserve(arch.entities.len());
+            }
             result.extend_from_slice(&arch.entities);
         }
     }
@@ -1475,15 +1535,16 @@ impl ScanBuilder<'_> {
         let mut warnings = Vec::new();
 
         // Phase 1: Classify predicates — index-driven vs post-filter.
-        let mut index_preds = Vec::new();
+        let mut index_preds: Vec<(Predicate, &IndexDescriptor)> = Vec::new();
         let mut filter_preds = Vec::new();
+        let planner = self.planner;
 
         for pred in self.predicates {
-            if let Some(idx) = self.planner.find_best_index(&pred) {
+            if let Some(idx) = planner.find_best_index(&pred) {
                 index_preds.push((pred, idx));
             } else {
                 // Generate warnings for missing indexes.
-                self.planner.warn_missing_index(&pred, &mut warnings);
+                planner.warn_missing_index(&pred, &mut warnings);
                 filter_preds.push(pred);
             }
         }
@@ -1562,10 +1623,9 @@ impl ScanBuilder<'_> {
                 estimated_rows: self.estimated_rows,
                 cost: Cost::scan(self.estimated_rows),
             };
-            closures = self
-                .scan_fn
-                .as_ref()
-                .map(|f| ClosureNode::Scan { scan_fn: Arc::clone(f) });
+            closures = self.scan_fn.as_ref().map(|f| ClosureNode::Scan {
+                scan_fn: Arc::clone(f),
+            });
         }
 
         // Phase 4: Apply remaining filter predicates.
@@ -1600,10 +1660,9 @@ impl ScanBuilder<'_> {
             let left_cost = node.cost();
             let right_cost = right_node.cost();
 
-            let right_closures = join
-                .right_scan_fn
-                .as_ref()
-                .map(|f| ClosureNode::Scan { scan_fn: Arc::clone(f) });
+            let right_closures = join.right_scan_fn.as_ref().map(|f| ClosureNode::Scan {
+                scan_fn: Arc::clone(f),
+            });
 
             // Choose join strategy based on cardinality.
             let use_hash = left_cost.rows >= 64.0 || right_cost.rows >= 64.0;
@@ -1669,7 +1728,7 @@ impl ScanBuilder<'_> {
         // executable ExecNode tree. This is the key step that ensures
         // execution honors the vectorized plan's decisions (chunk sizes,
         // partition counts, sort-by-archetype, batch sizes).
-        let exec_root = closures.map(|cn| lower_to_executable(&cn, &vec_root));
+        let exec_root = closures.map(|cn| lower_to_executable(cn, &vec_root));
 
         QueryPlanResult {
             root: node,
@@ -1748,7 +1807,9 @@ impl<'w> QueryPlanner<'w> {
             std::any::type_name::<T>()
         );
         // Snapshot index entities at registration time for plan execution.
-        let snapshot: Vec<Entity> = index
+        // Stored as Arc<[Entity]> so the lookup closure returns a cheap
+        // Arc::clone instead of copying the entire entity list on each call.
+        let snapshot: Arc<[Entity]> = index
             .range(..)
             .flat_map(|(_, ents)| ents.iter().copied())
             .collect();
@@ -1758,7 +1819,7 @@ impl<'w> QueryPlanner<'w> {
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::BTree,
                 cardinality: index.len(),
-                all_entities_fn: Some(Arc::new(move || snapshot.clone())),
+                all_entities_fn: Some(Arc::new(move || Arc::clone(&snapshot))),
             },
         );
     }
@@ -1778,7 +1839,8 @@ impl<'w> QueryPlanner<'w> {
             std::any::type_name::<T>()
         );
         // Snapshot index entities at registration time for plan execution.
-        let snapshot: Vec<Entity> = {
+        // Stored as Arc<[Entity]> — see add_btree_index for rationale.
+        let snapshot: Arc<[Entity]> = {
             let (map, _, _) = index.as_raw_parts();
             map.values().flat_map(|ents| ents.iter().copied()).collect()
         };
@@ -1790,7 +1852,7 @@ impl<'w> QueryPlanner<'w> {
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::Hash,
                 cardinality: index.len(),
-                all_entities_fn: Some(Arc::new(move || snapshot.clone())),
+                all_entities_fn: Some(Arc::new(move || Arc::clone(&snapshot))),
             });
     }
 
@@ -1842,24 +1904,13 @@ impl<'w> QueryPlanner<'w> {
     }
 
     /// Find the best index for a predicate, if one exists.
-    fn find_best_index(&self, pred: &Predicate) -> Option<IndexDescriptor> {
+    fn find_best_index(&self, pred: &Predicate) -> Option<&IndexDescriptor> {
         let idx = self.indexes.get(&pred.component_type)?;
 
         match idx.kind {
-            IndexKind::BTree => {
-                if pred.can_use_btree() {
-                    Some(idx.clone())
-                } else {
-                    None
-                }
-            }
-            IndexKind::Hash => {
-                if pred.can_use_hash() {
-                    Some(idx.clone())
-                } else {
-                    None // range predicate on hash index — can't use it
-                }
-            }
+            IndexKind::BTree if pred.can_use_btree() => Some(idx),
+            IndexKind::Hash if pred.can_use_hash() => Some(idx),
+            _ => None,
         }
     }
 
@@ -2028,6 +2079,7 @@ pub enum VecExecNode {
 
 impl VecExecNode {
     /// Cost of this vectorized node.
+    #[inline]
     pub fn cost(&self) -> Cost {
         match self {
             VecExecNode::ChunkedScan { cost, .. }
@@ -2039,7 +2091,10 @@ impl VecExecNode {
     }
 
     fn fmt_indent(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
-        let pad = "  ".repeat(indent);
+        // Write indentation without heap allocation: two spaces per level.
+        for _ in 0..indent {
+            f.write_str("  ")?;
+        }
         match self {
             VecExecNode::ChunkedScan {
                 query_name,
@@ -2049,7 +2104,7 @@ impl VecExecNode {
             } => {
                 writeln!(
                     f,
-                    "{pad}ChunkedScan [{query_name}] rows={estimated_rows} \
+                    "ChunkedScan [{query_name}] rows={estimated_rows} \
                      chunk_size={avg_chunk_size} cpu={:.1}",
                     cost.cpu
                 )
@@ -2063,7 +2118,7 @@ impl VecExecNode {
             } => {
                 writeln!(
                     f,
-                    "{pad}IndexGather [{index_kind:?} on {component_name}] \
+                    "IndexGather [{index_kind:?} on {component_name}] \
                      {predicate} rows={estimated_rows} cpu={:.1}",
                     cost.cpu
                 )
@@ -2082,7 +2137,7 @@ impl VecExecNode {
                 };
                 writeln!(
                     f,
-                    "{pad}SIMDFilter [{predicate}] sel={selectivity:.2} \
+                    "SIMDFilter [{predicate}] sel={selectivity:.2} \
                      mode={mode} rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
@@ -2097,7 +2152,7 @@ impl VecExecNode {
             } => {
                 writeln!(
                     f,
-                    "{pad}PartitionedHashJoin [{join_kind:?}] partitions={partitions} \
+                    "PartitionedHashJoin [{join_kind:?}] partitions={partitions} \
                      rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
@@ -2112,7 +2167,7 @@ impl VecExecNode {
             } => {
                 writeln!(
                     f,
-                    "{pad}BatchNestedLoopJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
+                    "BatchNestedLoopJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
                 left.fmt_indent(f, indent + 1)?;
@@ -3875,11 +3930,7 @@ mod tests {
             .filter(Predicate::custom_fn::<Score>(
                 "even scores",
                 0.5,
-                |world, entity| {
-                    world
-                        .get::<Score>(entity)
-                        .is_some_and(|s| s.0 % 2 == 0)
-                },
+                |world, entity| world.get::<Score>(entity).is_some_and(|s| s.0 % 2 == 0),
             ))
             .build();
         let result = plan.execute(&world);
@@ -4074,7 +4125,11 @@ mod tests {
             .collect();
         // Check monotonicity (sorted)
         for w in archetype_ids.windows(2) {
-            assert!(w[0] <= w[1], "entities not sorted by archetype: {:?}", &archetype_ids[..10]);
+            assert!(
+                w[0] <= w[1],
+                "entities not sorted by archetype: {:?}",
+                &archetype_ids[..10]
+            );
         }
     }
 
