@@ -88,8 +88,12 @@ use std::fmt::{self, Write as _};
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 
-use crate::component::{Component, ComponentId};
+use fixedbitset::FixedBitSet;
+
+use crate::component::{Component, ComponentRegistry};
+use crate::entity::Entity;
 use crate::index::{BTreeIndex, HashIndex};
+use crate::sync::Arc;
 use crate::world::World;
 
 // ── Cost model ───────────────────────────────────────────────────────
@@ -182,14 +186,25 @@ pub enum IndexKind {
 }
 
 /// Type-erased index metadata for the planner.
-#[derive(Clone, Debug)]
-#[expect(dead_code)]
+#[derive(Clone)]
 struct IndexDescriptor {
-    component_type: TypeId,
-    component_id: ComponentId,
     component_name: &'static str,
     kind: IndexKind,
     cardinality: usize, // number of entities in the index
+    /// Type-erased function that returns all entities tracked by this index.
+    /// Captured at registration time when the concrete index type is available.
+    all_entities_fn: Option<IndexLookupFn>,
+}
+
+impl fmt::Debug for IndexDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexDescriptor")
+            .field("component_name", &self.component_name)
+            .field("kind", &self.kind)
+            .field("cardinality", &self.cardinality)
+            .field("has_exec", &self.all_entities_fn.is_some())
+            .finish()
+    }
 }
 
 // ── Predicates ───────────────────────────────────────────────────────
@@ -212,6 +227,9 @@ pub struct Predicate {
     component_name: &'static str,
     kind: PredicateKind,
     selectivity: f64,
+    /// Type-erased filter closure for execution. Captured at predicate
+    /// construction when the concrete value is available.
+    filter_fn: Option<FilterFn>,
 }
 
 enum PredicateKind {
@@ -225,12 +243,17 @@ impl Predicate {
     ///
     /// If a `HashIndex<T>` or `BTreeIndex<T>` is registered, the planner will
     /// use it for an O(1) / O(log n) lookup instead of a full scan.
-    pub fn eq<T: Component + std::fmt::Debug>(value: T) -> Self {
+    pub fn eq<T: Component + PartialEq + std::fmt::Debug>(value: T) -> Self {
+        let value = Arc::new(value);
+        let filter_val = Arc::clone(&value);
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
             kind: PredicateKind::Eq(format!("{value:?}")),
             selectivity: 0.01, // default: 1% selectivity for equality
+            filter_fn: Some(Arc::new(move |world: &World, entity: Entity| {
+                world.get::<T>(entity).is_some_and(|v| *v == *filter_val)
+            })),
         }
     }
 
@@ -238,7 +261,9 @@ impl Predicate {
     ///
     /// If a `BTreeIndex<T>` is registered, the planner will use it for
     /// an O(log n + k) range scan. `HashIndex` cannot serve range predicates.
-    pub fn range<T: Component + std::fmt::Debug, R: RangeBounds<T>>(range: R) -> Self {
+    pub fn range<T: Component + Ord + Clone + std::fmt::Debug, R: RangeBounds<T>>(
+        range: R,
+    ) -> Self {
         fn bound_str<T: std::fmt::Debug>(bound: Bound<&T>) -> String {
             match bound {
                 Bound::Included(v) => format!("{v:?}"),
@@ -251,11 +276,39 @@ impl Predicate {
             bound_str(range.start_bound()),
             bound_str(range.end_bound())
         );
+        // Capture owned bounds for the filter closure.
+        let low: Bound<T> = match range.start_bound() {
+            Bound::Included(v) => Bound::Included(v.clone()),
+            Bound::Excluded(v) => Bound::Excluded(v.clone()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let high: Bound<T> = match range.end_bound() {
+            Bound::Included(v) => Bound::Included(v.clone()),
+            Bound::Excluded(v) => Bound::Excluded(v.clone()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let low = Arc::new(low);
+        let high = Arc::new(high);
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
             kind: PredicateKind::Range(desc),
             selectivity: 0.1, // default: 10% selectivity for ranges
+            filter_fn: Some(Arc::new(move |world: &World, entity: Entity| {
+                world.get::<T>(entity).is_some_and(|v| {
+                    let lo_ok = match low.as_ref() {
+                        Bound::Included(lo) => v >= lo,
+                        Bound::Excluded(lo) => v > lo,
+                        Bound::Unbounded => true,
+                    };
+                    let hi_ok = match high.as_ref() {
+                        Bound::Included(hi) => v <= hi,
+                        Bound::Excluded(hi) => v < hi,
+                        Bound::Unbounded => true,
+                    };
+                    lo_ok && hi_ok
+                })
+            })),
         }
     }
 
@@ -269,6 +322,28 @@ impl Predicate {
             component_name: std::any::type_name::<T>(),
             kind: PredicateKind::Custom(description.into()),
             selectivity: sanitize_selectivity(selectivity),
+            filter_fn: None,
+        }
+    }
+
+    /// Custom predicate with a user-provided filter closure.
+    ///
+    /// The closure receives `(&World, Entity)` and returns `true` if the entity
+    /// passes the predicate. This enables arbitrary filtering logic while still
+    /// participating in the planner's cost model.
+    ///
+    /// NaN selectivity is normalized to 1.0 (worst-case, full scan).
+    pub fn custom_fn<T: Component>(
+        description: &str,
+        selectivity: f64,
+        filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Predicate {
+            component_type: TypeId::of::<T>(),
+            component_name: std::any::type_name::<T>(),
+            kind: PredicateKind::Custom(description.into()),
+            selectivity: sanitize_selectivity(selectivity),
+            filter_fn: Some(Arc::new(filter)),
         }
     }
 
@@ -524,6 +599,7 @@ impl fmt::Display for PlanWarning {
 pub struct QueryPlanResult {
     root: PlanNode,
     vec_root: VecExecNode,
+    exec_root: Option<ExecNode>,
     opts: VectorizeOpts,
     warnings: Vec<PlanWarning>,
 }
@@ -581,6 +657,24 @@ impl QueryPlanResult {
         out
     }
 
+    /// Execute the plan against a live world, returning matching entities.
+    ///
+    /// The execution engine walks the plan tree, using type-erased closures
+    /// captured at build time to perform scans, index lookups, and filters
+    /// against actual world data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the plan was built without execution support (e.g., from a
+    /// `ScanBuilder` created by an older API path that did not capture
+    /// execution closures).
+    pub fn execute(&self, world: &World) -> Vec<Entity> {
+        self.exec_root
+            .as_ref()
+            .expect("plan was built without execution support")
+            .execute(world)
+    }
+
     /// Human-readable logical plan (before vectorized lowering).
     pub fn explain_logical(&self) -> String {
         let mut out = String::new();
@@ -613,6 +707,7 @@ impl fmt::Debug for QueryPlanResult {
         f.debug_struct("QueryPlanResult")
             .field("root", &self.root)
             .field("vec_root", &self.vec_root)
+            .field("has_exec", &self.exec_root.is_some())
             .field("opts", &self.opts)
             .field("warnings", &self.warnings)
             .finish()
@@ -906,6 +1001,96 @@ impl fmt::Debug for SubscriptionPlan {
     }
 }
 
+// ── Execution engine ─────────────────────────────────────────────────
+
+/// Type-erased scan function: given `&World`, return all matching entities.
+type ScanFn = Arc<dyn Fn(&World) -> Vec<Entity> + Send + Sync>;
+
+/// Type-erased index lookup function: return matching entities from the index.
+type IndexLookupFn = Arc<dyn Fn() -> Vec<Entity> + Send + Sync>;
+
+/// Type-erased filter function: given `&World` and `Entity`, return true if
+/// the entity passes the predicate.
+type FilterFn = Arc<dyn Fn(&World, Entity) -> bool + Send + Sync>;
+
+/// Executable plan node — mirrors [`PlanNode`] but carries type-erased closures
+/// captured at build time. Produced alongside the logical/vectorized plan by
+/// [`ScanBuilder::build`] and executed by [`QueryPlanResult::execute`].
+enum ExecNode {
+    /// Full archetype scan — collects all entities matching the query type.
+    Scan { scan_fn: ScanFn },
+    /// Index-driven lookup — point or range query against a registered index.
+    IndexLookup { lookup_fn: IndexLookupFn },
+    /// Post-fetch filter applied to child output.
+    Filter {
+        child: Box<ExecNode>,
+        filter_fn: FilterFn,
+    },
+    /// Hash join: intersect entity sets from both sides.
+    HashJoin {
+        build: Box<ExecNode>,
+        probe: Box<ExecNode>,
+    },
+    /// Nested-loop join for small cardinalities.
+    NestedLoopJoin {
+        left: Box<ExecNode>,
+        right: Box<ExecNode>,
+    },
+}
+
+impl ExecNode {
+    /// Execute this node against the world, returning matching entities.
+    fn execute(&self, world: &World) -> Vec<Entity> {
+        match self {
+            ExecNode::Scan { scan_fn } => scan_fn(world),
+            ExecNode::IndexLookup { lookup_fn } => {
+                lookup_fn()
+                    .into_iter()
+                    .filter(|e| world.is_alive(*e))
+                    .collect()
+            }
+            ExecNode::Filter {
+                child, filter_fn, ..
+            } => {
+                let input = child.execute(world);
+                input
+                    .into_iter()
+                    .filter(|e| filter_fn(world, *e))
+                    .collect()
+            }
+            ExecNode::HashJoin { build, probe } => {
+                let build_set: std::collections::HashSet<Entity> =
+                    build.execute(world).into_iter().collect();
+                probe
+                    .execute(world)
+                    .into_iter()
+                    .filter(|e| build_set.contains(e))
+                    .collect()
+            }
+            ExecNode::NestedLoopJoin { left, right } => {
+                let left_set: std::collections::HashSet<Entity> =
+                    left.execute(world).into_iter().collect();
+                right
+                    .execute(world)
+                    .into_iter()
+                    .filter(|e| left_set.contains(e))
+                    .collect()
+            }
+        }
+    }
+}
+
+/// Collect all entities from archetypes matching a component bitset.
+fn scan_matching_entities(world: &World, required: &FixedBitSet) -> Vec<Entity> {
+    let mut result = Vec::new();
+    for arch in &world.archetypes.archetypes {
+        if !arch.is_empty() && required.is_subset(&arch.component_ids) {
+            result.extend_from_slice(&arch.entities);
+        }
+    }
+    result
+}
+
 // ── Scan builder ─────────────────────────────────────────────────────
 
 /// Builder for a single-table scan with optional predicates and joins.
@@ -915,12 +1100,15 @@ pub struct ScanBuilder<'w> {
     estimated_rows: usize,
     predicates: Vec<Predicate>,
     joins: Vec<JoinSpec>,
+    /// Type-erased scan closure captured from `scan::<Q>()` when Q is known.
+    scan_fn: Option<ScanFn>,
 }
 
 struct JoinSpec {
     right_query_name: &'static str,
     right_estimated_rows: usize,
     join_kind: JoinKind,
+    right_scan_fn: Option<ScanFn>,
 }
 
 impl ScanBuilder<'_> {
@@ -935,13 +1123,20 @@ impl ScanBuilder<'_> {
     ///
     /// The planner will choose between hash join and nested-loop join based
     /// on estimated cardinalities.
-    pub fn join<Q: 'static>(mut self, join_kind: JoinKind) -> Self {
+    pub fn join<Q: crate::query::fetch::WorldQuery + 'static>(
+        mut self,
+        join_kind: JoinKind,
+    ) -> Self {
         // Estimate right-side rows from total entity count (conservative).
         let right_rows = self.planner.total_entities;
+        let required = Q::required_ids(self.planner.components);
         self.joins.push(JoinSpec {
             right_query_name: std::any::type_name::<Q>(),
             right_estimated_rows: right_rows,
             join_kind,
+            right_scan_fn: Some(Arc::new(move |world: &World| {
+                scan_matching_entities(world, &required)
+            })),
         });
         self
     }
@@ -980,8 +1175,9 @@ impl ScanBuilder<'_> {
         // Phase 2: Order index lookups by selectivity (most selective first).
         index_preds.sort_by(|a, b| a.0.selectivity.total_cmp(&b.0.selectivity));
 
-        // Phase 3: Build the plan tree bottom-up.
+        // Phase 3: Build the logical plan tree AND execution tree bottom-up.
         let mut node: PlanNode;
+        let mut exec: Option<ExecNode>;
 
         if let Some((first_pred, first_idx)) = index_preds.first() {
             // Driving access is an index lookup.
@@ -994,8 +1190,40 @@ impl ScanBuilder<'_> {
                 cost: Cost::index_lookup(first_pred.selectivity, self.estimated_rows),
             };
 
-            // Additional index predicates become filters (could be index
-            // intersections in a more advanced planner).
+            // Execution: index lookup returns all entities from index,
+            // filtered by the predicate's filter_fn. We also intersect with the
+            // scan's archetype requirement so that index-driven plans only return
+            // entities that match ALL queried component types, not just the
+            // indexed one.
+            exec = if let Some(lookup) = &first_idx.all_entities_fn {
+                let lookup = Arc::clone(lookup);
+                // Base: index lookup with archetype-match verification.
+                let base: ExecNode = if let Some(scan) = &self.scan_fn {
+                    // Intersect index results with scan results to enforce
+                    // archetype matching. Both sides are pre-computed.
+                    ExecNode::HashJoin {
+                        build: Box::new(ExecNode::Scan {
+                            scan_fn: Arc::clone(scan),
+                        }),
+                        probe: Box::new(ExecNode::IndexLookup { lookup_fn: lookup }),
+                    }
+                } else {
+                    ExecNode::IndexLookup { lookup_fn: lookup }
+                };
+                // Apply the predicate filter on top if present.
+                if let Some(filter) = &first_pred.filter_fn {
+                    Some(ExecNode::Filter {
+                        child: Box::new(base),
+                        filter_fn: Arc::clone(filter),
+                    })
+                } else {
+                    Some(base)
+                }
+            } else {
+                None
+            };
+
+            // Additional index predicates become filters.
             for (pred, _idx) in index_preds.iter().skip(1) {
                 let parent_cost = node.cost();
                 node = PlanNode::Filter {
@@ -1005,6 +1233,12 @@ impl ScanBuilder<'_> {
                     cost: Cost::filter(parent_cost, pred.selectivity),
                     child: Box::new(node),
                 };
+                if let (Some(exec_node), Some(filter_fn)) = (exec.take(), &pred.filter_fn) {
+                    exec = Some(ExecNode::Filter {
+                        child: Box::new(exec_node),
+                        filter_fn: Arc::clone(filter_fn),
+                    });
+                }
             }
         } else {
             // No usable index — full scan.
@@ -1013,6 +1247,10 @@ impl ScanBuilder<'_> {
                 estimated_rows: self.estimated_rows,
                 cost: Cost::scan(self.estimated_rows),
             };
+            exec = self
+                .scan_fn
+                .as_ref()
+                .map(|f| ExecNode::Scan { scan_fn: Arc::clone(f) });
         }
 
         // Phase 4: Apply remaining filter predicates.
@@ -1025,6 +1263,12 @@ impl ScanBuilder<'_> {
                 cost: Cost::filter(parent_cost, pred.selectivity),
                 child: Box::new(node),
             };
+            if let (Some(exec_node), Some(filter_fn)) = (exec.take(), &pred.filter_fn) {
+                exec = Some(ExecNode::Filter {
+                    child: Box::new(exec_node),
+                    filter_fn: Arc::clone(filter_fn),
+                });
+            }
         }
 
         // Phase 5: Join ordering — smallest intermediate result drives the
@@ -1039,16 +1283,16 @@ impl ScanBuilder<'_> {
             let left_cost = node.cost();
             let right_cost = right_node.cost();
 
+            // Build right-side exec node.
+            let right_exec = join
+                .right_scan_fn
+                .as_ref()
+                .map(|f| ExecNode::Scan { scan_fn: Arc::clone(f) });
+
             // Choose join strategy based on cardinality.
-            // Hash join is better when either side is large (>= 64 rows).
-            // Nested loop is better for very small cardinalities.
             let use_hash = left_cost.rows >= 64.0 || right_cost.rows >= 64.0;
 
             if use_hash {
-                // For inner joins, put smaller side on left (build side)
-                // for cache locality. Left joins are not commutative — the
-                // semantic left side must stay on the left to preserve all
-                // its rows, so we only reorder for Inner.
                 let (build, probe) =
                     if join.join_kind == JoinKind::Inner && left_cost.rows > right_cost.rows {
                         (right_node, node)
@@ -1056,12 +1300,27 @@ impl ScanBuilder<'_> {
                         (node, right_node)
                     };
                 let cost = Cost::hash_join(build.cost(), probe.cost());
+
+                // Mirror the reordering for exec nodes.
+                let (build_exec, probe_exec) =
+                    if join.join_kind == JoinKind::Inner && left_cost.rows > right_cost.rows {
+                        (right_exec, exec.take())
+                    } else {
+                        (exec.take(), right_exec)
+                    };
+
                 node = PlanNode::HashJoin {
                     left: Box::new(build),
                     right: Box::new(probe),
                     join_kind: join.join_kind,
                     cost,
                 };
+                if let (Some(be), Some(pe)) = (build_exec, probe_exec) {
+                    exec = Some(ExecNode::HashJoin {
+                        build: Box::new(be),
+                        probe: Box::new(pe),
+                    });
+                }
             } else {
                 if left_cost.rows > right_cost.rows {
                     warnings.push(PlanWarning::UnindexedJoin {
@@ -1076,6 +1335,12 @@ impl ScanBuilder<'_> {
                     join_kind: join.join_kind,
                     cost,
                 };
+                if let (Some(le), Some(re)) = (exec.take(), right_exec) {
+                    exec = Some(ExecNode::NestedLoopJoin {
+                        left: Box::new(le),
+                        right: Box::new(re),
+                    });
+                }
             }
         }
 
@@ -1084,6 +1349,7 @@ impl ScanBuilder<'_> {
         QueryPlanResult {
             root: node,
             vec_root,
+            exec_root: exec,
             opts,
             warnings,
         }
@@ -1123,6 +1389,8 @@ impl ScanBuilder<'_> {
 pub struct QueryPlanner<'w> {
     indexes: HashMap<TypeId, IndexDescriptor>,
     total_entities: usize,
+    /// Component registry for resolving query type → component bitset.
+    components: &'w ComponentRegistry,
     _world: PhantomData<&'w World>,
 }
 
@@ -1135,6 +1403,7 @@ impl<'w> QueryPlanner<'w> {
         QueryPlanner {
             indexes: HashMap::new(),
             total_entities: world.entity_count(),
+            components: &world.components,
             _world: PhantomData,
         }
     }
@@ -1148,20 +1417,23 @@ impl<'w> QueryPlanner<'w> {
         index: &BTreeIndex<T>,
         world: &World,
     ) {
-        let comp_id = world.component_id::<T>().unwrap_or_else(|| {
-            panic!(
-                "QueryPlanner::add_btree_index: component `{}` not registered in this World",
-                std::any::type_name::<T>()
-            )
-        });
+        assert!(
+            world.component_id::<T>().is_some(),
+            "QueryPlanner::add_btree_index: component `{}` not registered in this World",
+            std::any::type_name::<T>()
+        );
+        // Snapshot index entities at registration time for plan execution.
+        let snapshot: Vec<Entity> = index
+            .range(..)
+            .flat_map(|(_, ents)| ents.iter().copied())
+            .collect();
         self.indexes.insert(
             TypeId::of::<T>(),
             IndexDescriptor {
-                component_type: TypeId::of::<T>(),
-                component_id: comp_id,
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::BTree,
                 cardinality: index.len(),
+                all_entities_fn: Some(Arc::new(move || snapshot.clone())),
             },
         );
     }
@@ -1175,33 +1447,40 @@ impl<'w> QueryPlanner<'w> {
         index: &HashIndex<T>,
         world: &World,
     ) {
-        let comp_id = world.component_id::<T>().unwrap_or_else(|| {
-            panic!(
-                "QueryPlanner::add_hash_index: component `{}` not registered in this World",
-                std::any::type_name::<T>()
-            )
-        });
+        assert!(
+            world.component_id::<T>().is_some(),
+            "QueryPlanner::add_hash_index: component `{}` not registered in this World",
+            std::any::type_name::<T>()
+        );
+        // Snapshot index entities at registration time for plan execution.
+        let snapshot: Vec<Entity> = {
+            let (map, _, _) = index.as_raw_parts();
+            map.values().flat_map(|ents| ents.iter().copied()).collect()
+        };
         // Only insert if no BTree index is already registered for this type
         // (BTree is strictly more capable than Hash).
         self.indexes
             .entry(TypeId::of::<T>())
             .or_insert(IndexDescriptor {
-                component_type: TypeId::of::<T>(),
-                component_id: comp_id,
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::Hash,
                 cardinality: index.len(),
+                all_entities_fn: Some(Arc::new(move || snapshot.clone())),
             });
     }
 
     /// Start building a scan plan for query type `Q`.
-    pub fn scan<Q: 'static>(&'w self) -> ScanBuilder<'w> {
+    pub fn scan<Q: crate::query::fetch::WorldQuery + 'static>(&'w self) -> ScanBuilder<'w> {
+        let required = Q::required_ids(self.components);
         ScanBuilder {
             planner: self,
             query_name: std::any::type_name::<Q>(),
             estimated_rows: self.total_entities,
             predicates: Vec::new(),
             joins: Vec::new(),
+            scan_fn: Some(Arc::new(move |world: &World| {
+                scan_matching_entities(world, &required)
+            })),
         }
     }
 
@@ -1209,13 +1488,20 @@ impl<'w> QueryPlanner<'w> {
     ///
     /// Use this when you know the approximate result size from domain
     /// knowledge (e.g., "there are ~500 active players").
-    pub fn scan_with_estimate<Q: 'static>(&'w self, estimated_rows: usize) -> ScanBuilder<'w> {
+    pub fn scan_with_estimate<Q: crate::query::fetch::WorldQuery + 'static>(
+        &'w self,
+        estimated_rows: usize,
+    ) -> ScanBuilder<'w> {
+        let required = Q::required_ids(self.components);
         ScanBuilder {
             planner: self,
             query_name: std::any::type_name::<Q>(),
             estimated_rows,
             predicates: Vec::new(),
             joins: Vec::new(),
+            scan_fn: Some(Arc::new(move |world: &World| {
+                scan_matching_entities(world, &required)
+            })),
         }
     }
 
@@ -1844,14 +2130,17 @@ impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
     /// Start building a scan plan for a query type.
     ///
     /// Delegates to the underlying [`QueryPlanner::scan`].
-    pub fn scan<Q: 'static>(&'w self) -> ScanBuilder<'w> {
+    pub fn scan<Q: crate::query::fetch::WorldQuery + 'static>(&'w self) -> ScanBuilder<'w> {
         self.planner.scan::<Q>()
     }
 
     /// Start building a scan plan with an explicit row estimate.
     ///
     /// Delegates to the underlying [`QueryPlanner::scan_with_estimate`].
-    pub fn scan_with_estimate<Q: 'static>(&'w self, estimated_rows: usize) -> ScanBuilder<'w> {
+    pub fn scan_with_estimate<Q: crate::query::fetch::WorldQuery + 'static>(
+        &'w self,
+        estimated_rows: usize,
+    ) -> ScanBuilder<'w> {
         self.planner.scan_with_estimate::<Q>(estimated_rows)
     }
 
@@ -3102,5 +3391,242 @@ mod tests {
     fn has_hash_index_field_name() {
         use crate::index::HasHashIndex;
         assert_eq!(<IndexedScores as HasHashIndex<Team>>::FIELD_NAME, "team");
+    }
+
+    // ── Plan execution ─────────────────────────────────────────────────
+
+    #[test]
+    fn execute_scan_returns_all_matching_entities() {
+        let mut world = World::new();
+        let mut expected = Vec::new();
+        for i in 0..20 {
+            expected.push(world.spawn((Score(i),)));
+        }
+        // Different archetype — should also be matched
+        for i in 20..30 {
+            expected.push(world.spawn((Score(i), Team(0))));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+        let mut result = plan.execute(&world);
+        result.sort_by_key(|e| e.to_bits());
+        expected.sort_by_key(|e| e.to_bits());
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn execute_scan_excludes_non_matching_archetypes() {
+        let mut world = World::new();
+        // Archetype with Score only
+        let e1 = world.spawn((Score(1),));
+        // Archetype with Team only — should NOT match scan::<(&Score,)>()
+        let _e2 = world.spawn((Team(1),));
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+        let result = plan.execute(&world);
+        assert_eq!(result, vec![e1]);
+    }
+
+    #[test]
+    fn execute_filter_eq() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build();
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 1);
+        assert_eq!(*world.get::<Score>(result[0]).unwrap(), Score(42));
+    }
+
+    #[test]
+    fn execute_filter_range() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(10)..Score(20)))
+            .build();
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 10);
+        for e in &result {
+            let s = world.get::<Score>(*e).unwrap().0;
+            assert!((10..20).contains(&s), "score {s} out of range");
+        }
+    }
+
+    #[test]
+    fn execute_index_driven_eq() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i), Team(i % 5)));
+        }
+        let mut hash = HashIndex::<Team>::new();
+        hash.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index(&hash, &world);
+
+        let plan = planner
+            .scan::<(&Score, &Team)>()
+            .filter(Predicate::eq(Team(2)))
+            .build();
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 20); // 100 / 5 teams
+        for e in &result {
+            assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
+        }
+    }
+
+    #[test]
+    fn execute_multi_predicate() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i), Team(i % 5)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score, &Team)>()
+            .filter(Predicate::eq(Team(2)))
+            .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
+            .build();
+        let result = plan.execute(&world);
+        for e in &result {
+            let s = world.get::<Score>(*e).unwrap().0;
+            let t = world.get::<Team>(*e).unwrap().0;
+            assert!((10..50).contains(&s), "score {s} out of range");
+            assert_eq!(t, 2, "team {t} != 2");
+        }
+        // scores 10..50 with team==2: 12, 17, 22, 27, 32, 37, 42, 47 = 8
+        assert_eq!(result.len(), 8);
+    }
+
+    #[test]
+    fn execute_join_intersects_entity_sets() {
+        let mut world = World::new();
+        // Entities with Score only
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+        // Entities with both Score and Team — only these should survive the join
+        let mut both = Vec::new();
+        for i in 10..20 {
+            both.push(world.spawn((Score(i), Team(i % 3))));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+        let mut result = plan.execute(&world);
+        result.sort_by_key(|e| e.to_bits());
+        both.sort_by_key(|e| e.to_bits());
+        assert_eq!(result, both);
+    }
+
+    #[test]
+    fn execute_custom_fn_filter() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_fn::<Score>(
+                "even scores",
+                0.5,
+                |world, entity| {
+                    world
+                        .get::<Score>(entity)
+                        .is_some_and(|s| s.0 % 2 == 0)
+                },
+            ))
+            .build();
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 25);
+        for e in &result {
+            assert!(world.get::<Score>(*e).unwrap().0.is_multiple_of(2));
+        }
+    }
+
+    #[test]
+    fn execute_empty_world() {
+        let world = World::new();
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+        let result = plan.execute(&world);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn execute_respects_despawned_entities() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(1),));
+        let e2 = world.spawn((Score(2),));
+        let e3 = world.spawn((Score(3),));
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+
+        // Despawn e2 after plan construction
+        world.despawn(e2);
+
+        let result = plan.execute(&world);
+        // Scan walks archetypes — despawned entity is replaced via swap_remove,
+        // so the archetype only contains live entities.
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&e1));
+        assert!(result.contains(&e3));
+    }
+
+    #[test]
+    fn execute_index_driven_respects_query_components() {
+        // Regression: index-driven lookup must only return entities that match
+        // ALL queried components, not just the indexed one.
+        let mut world = World::new();
+        // Entities with Team only (no Score)
+        for i in 0..10 {
+            world.spawn((Team(i % 3),));
+        }
+        // Entities with both Score and Team
+        let mut both = Vec::new();
+        for i in 0..10 {
+            both.push(world.spawn((Score(i), Team(i % 3))));
+        }
+
+        let mut hash = HashIndex::<Team>::new();
+        hash.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index(&hash, &world);
+
+        // scan::<(&Score, &Team)> requires BOTH components
+        let plan = planner
+            .scan::<(&Score, &Team)>()
+            .filter(Predicate::eq(Team(1)))
+            .build();
+        let result = plan.execute(&world);
+        // Only entities with both Score AND Team(1) should appear
+        for e in &result {
+            assert!(world.get::<Score>(*e).is_some(), "missing Score");
+            assert_eq!(*world.get::<Team>(*e).unwrap(), Team(1));
+        }
+        // Team(1) entities with Score: indices 1, 4, 7 = 3
+        assert_eq!(result.len(), 3);
     }
 }

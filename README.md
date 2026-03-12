@@ -118,20 +118,29 @@ world.query::<(&mut Pos, &Vel)>().for_each_chunk(|(positions, velocities)| {
 
 ### Query Planner
 
-`QueryPlanner` compiles queries into optimized execution plans using a [Volcano][volcano]-model optimizer with automatic index selection. Plans are vectorized by default — each node processes data in morsel-sized batches mapped to `for_each_chunk`, enabling SIMD auto-vectorization.
+`QueryPlanner` compiles queries into cost-optimized execution plans using a [Volcano][volcano]-model optimizer with automatic index selection, then executes them against the live world. Plans are vectorized by default — each node processes data in morsel-sized batches mapped to `for_each_chunk`, enabling SIMD auto-vectorization. `plan.execute(&world)` returns the matching entity set.
 
 ```rust
-use minkowski::{QueryPlanner, Predicate};
+use minkowski::{QueryPlanner, Predicate, JoinKind};
 
 let mut planner = QueryPlanner::new(&world);
 planner.add_btree_index::<Score>(&score_index, &world);
+planner.add_hash_index::<Team>(&team_index, &world);
 
 let plan = planner
     .scan::<(&Pos, &Score)>()
     .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
     .build();
 
+// Inspect the plan
 println!("{}", plan.explain());  // shows vectorized execution plan
+
+// Execute the plan against a live world
+let entities = plan.execute(&world);
+for e in &entities {
+    let score = world.get::<Score>(*e).unwrap();
+    // only entities with Score in [10..50) are returned
+}
 ```
 
 `TablePlanner<T>` adds compile-time enforcement: if a table field is annotated with `#[index(btree)]` or `#[index(hash)]`, the planner requires the corresponding index at the type level. Missing indexes are type errors, not runtime warnings. See [Schema & Mutation](#schema--mutation) for the annotation syntax.
