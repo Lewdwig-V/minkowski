@@ -1660,6 +1660,128 @@ fn lower_to_vectorized(node: &PlanNode, opts: &VectorizeOpts) -> VecExecNode {
     }
 }
 
+// ── TablePlanner — compile-time index enforcement for Table types ─────
+
+/// A query planner scoped to a `Table` type, with compile-time enforcement
+/// that required indexes exist.
+///
+/// Unlike [`QueryPlanner`] which emits runtime warnings for missing indexes,
+/// `TablePlanner` uses trait bounds to make missing indexes a **type error**.
+/// If a table field is annotated with `#[index(btree)]` or `#[index(hash)]`
+/// in its `#[derive(Table)]` declaration, the corresponding
+/// [`HasBTreeIndex`](crate::index::HasBTreeIndex) /
+/// [`HasHashIndex`](crate::index::HasHashIndex) marker trait is generated,
+/// and `TablePlanner` methods can require those traits as bounds.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[derive(Table)]
+/// struct Scores {
+///     #[index(btree)]
+///     score: Score,
+///     #[index(hash)]
+///     team: Team,
+/// }
+///
+/// let planner = TablePlanner::<Scores>::new(&world);
+///
+/// // These compile because Scores has the index declarations:
+/// let btree = planner.btree_index::<Score>(&mut world);
+/// let hash = planner.hash_index::<Team>(&mut world);
+///
+/// // This would NOT compile — no #[index(btree)] on a hypothetical field:
+/// // planner.btree_index::<UnindexedComponent>(&mut world);
+/// ```
+pub struct TablePlanner<'w, T> {
+    planner: QueryPlanner<'w>,
+    world: &'w World,
+    _marker: PhantomData<T>,
+}
+
+impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
+    /// Create a new table planner. Captures entity count for cost estimation.
+    pub fn new(world: &'w World) -> Self {
+        Self {
+            planner: QueryPlanner::new(world),
+            world,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Total entities in the world (for cost estimation).
+    pub fn total_entities(&self) -> usize {
+        self.planner.total_entities
+    }
+
+    /// Access the underlying `QueryPlanner` for full planning capabilities.
+    pub fn query_planner(&'w self) -> &'w QueryPlanner<'w> {
+        &self.planner
+    }
+
+    /// Start building a scan plan for a query type.
+    ///
+    /// Delegates to the underlying [`QueryPlanner::scan`].
+    pub fn scan<Q: 'static>(&'w self) -> ScanBuilder<'w> {
+        self.planner.scan::<Q>()
+    }
+
+    /// Start building a scan plan with an explicit row estimate.
+    ///
+    /// Delegates to the underlying [`QueryPlanner::scan_with_estimate`].
+    pub fn scan_with_estimate<Q: 'static>(&'w self, estimated_rows: usize) -> ScanBuilder<'w> {
+        self.planner.scan_with_estimate::<Q>(estimated_rows)
+    }
+
+    /// Register a btree index with the underlying planner for cost-based
+    /// optimization.
+    ///
+    /// **Compile-time enforcement**: requires `T: HasBTreeIndex<C>`.
+    pub fn add_btree_index<C>(&mut self, index: &crate::index::BTreeIndex<C>)
+    where
+        C: Component + Ord + Clone,
+        T: crate::index::HasBTreeIndex<C>,
+    {
+        self.planner.add_btree_index::<C>(index, self.world);
+    }
+
+    /// Register a hash index with the underlying planner for cost-based
+    /// optimization.
+    ///
+    /// **Compile-time enforcement**: requires `T: HasHashIndex<C>`.
+    pub fn add_hash_index<C>(&mut self, index: &crate::index::HashIndex<C>)
+    where
+        C: Component + std::hash::Hash + Eq + Clone,
+        T: crate::index::HasHashIndex<C>,
+    {
+        self.planner.add_hash_index::<C>(index, self.world);
+    }
+
+    /// Get the `Indexed<C>` witness for a btree-indexed field, suitable for
+    /// use with `SubscriptionBuilder`.
+    ///
+    /// **Compile-time enforcement**: requires `T: HasBTreeIndex<C>`.
+    pub fn indexed_btree<C>(&self, index: &crate::index::BTreeIndex<C>) -> Indexed<C>
+    where
+        C: Component + Ord + Clone,
+        T: crate::index::HasBTreeIndex<C>,
+    {
+        Indexed::btree(index)
+    }
+
+    /// Get the `Indexed<C>` witness for a hash-indexed field, suitable for
+    /// use with `SubscriptionBuilder`.
+    ///
+    /// **Compile-time enforcement**: requires `T: HasHashIndex<C>`.
+    pub fn indexed_hash<C>(&self, index: &crate::index::HashIndex<C>) -> Indexed<C>
+    where
+        C: Component + std::hash::Hash + Eq + Clone,
+        T: crate::index::HasHashIndex<C>,
+    {
+        Indexed::hash(index)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2326,9 +2448,7 @@ mod tests {
 
         // vec_root() is available without calling .vectorize()
         match plan.vec_root() {
-            VecExecNode::ChunkedScan {
-                estimated_rows, ..
-            } => {
+            VecExecNode::ChunkedScan { estimated_rows, .. } => {
                 assert_eq!(*estimated_rows, 1000);
             }
             other => panic!("expected ChunkedScan, got {:?}", other),
@@ -2525,5 +2645,152 @@ mod tests {
             }
             other => panic!("expected ChunkedScan, got {:?}", other),
         }
+    }
+
+    // ── TablePlanner tests ───────────────────────────────────────────
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, minkowski_derive::Table)]
+    struct IndexedScores {
+        #[index(btree)]
+        score: Score,
+        #[index(hash)]
+        team: Team,
+    }
+
+    #[test]
+    fn table_planner_creates_btree_index() {
+        use crate::index::HasBTreeIndex;
+
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn(IndexedScores {
+                score: Score(i),
+                team: Team(i % 3),
+            });
+        }
+
+        // HasBTreeIndex trait provides create_btree_index
+        let idx = IndexedScores::create_btree_index(&mut world);
+        assert_eq!(idx.len(), 10);
+        assert_eq!(idx.get(&Score(5)).len(), 1);
+    }
+
+    #[test]
+    fn table_planner_creates_hash_index() {
+        use crate::index::HasHashIndex;
+
+        let mut world = World::new();
+        for i in 0..9 {
+            world.spawn(IndexedScores {
+                score: Score(i),
+                team: Team(i % 3),
+            });
+        }
+
+        let idx = IndexedScores::create_hash_index(&mut world);
+        assert_eq!(idx.len(), 9);
+        // 3 entities per team
+        assert_eq!(idx.get(&Team(0)).len(), 3);
+    }
+
+    #[test]
+    fn table_planner_indexed_witness() {
+        use crate::index::{HasBTreeIndex, HasHashIndex};
+
+        let mut world = World::new();
+        for i in 0..5 {
+            world.spawn(IndexedScores {
+                score: Score(i),
+                team: Team(i % 2),
+            });
+        }
+
+        let btree = IndexedScores::create_btree_index(&mut world);
+        let hash = IndexedScores::create_hash_index(&mut world);
+
+        // TablePlanner provides indexed_* witnesses with compile-time enforcement
+        let planner = TablePlanner::<IndexedScores>::new(&world);
+        let indexed_bt = planner.indexed_btree::<Score>(&btree);
+        let indexed_hs = planner.indexed_hash::<Team>(&hash);
+
+        assert!(matches!(indexed_bt, Indexed { .. }));
+        assert!(matches!(indexed_hs, Indexed { .. }));
+    }
+
+    #[test]
+    fn table_planner_scan_builds_plan() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn(IndexedScores {
+                score: Score(i),
+                team: Team(i % 5),
+            });
+        }
+
+        let planner = TablePlanner::<IndexedScores>::new(&world);
+        let plan = planner.scan::<(&Score, &Team)>().build();
+
+        // Should produce a valid plan with vectorized execution
+        assert!(plan.cost().cpu > 0.0);
+        let explain = plan.explain();
+        assert!(explain.contains("Vectorized"));
+    }
+
+    #[test]
+    fn table_planner_scan_with_index_filter() {
+        use crate::index::HasBTreeIndex;
+
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn(IndexedScores {
+                score: Score(i),
+                team: Team(i % 5),
+            });
+        }
+
+        // Create index first (needs &mut World)
+        let btree = IndexedScores::create_btree_index(&mut world);
+
+        // Then create planner (borrows &World)
+        let mut planner = TablePlanner::<IndexedScores>::new(&world);
+        planner.add_btree_index::<Score>(&btree);
+
+        let plan = planner
+            .scan::<(&Score, &Team)>()
+            .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
+            .build();
+
+        // Should use index (IndexGather in vectorized, IndexLookup in logical)
+        let explain = plan.explain();
+        assert!(
+            explain.contains("IndexGather") || explain.contains("IndexLookup"),
+            "expected index-driven plan, got:\n{explain}"
+        );
+    }
+
+    #[test]
+    fn table_planner_total_entities() {
+        let mut world = World::new();
+        for i in 0..20 {
+            world.spawn(IndexedScores {
+                score: Score(i),
+                team: Team(0),
+            });
+        }
+
+        let planner = TablePlanner::<IndexedScores>::new(&world);
+        assert_eq!(planner.total_entities(), 20);
+    }
+
+    #[test]
+    fn has_btree_index_field_name() {
+        use crate::index::HasBTreeIndex;
+        assert_eq!(<IndexedScores as HasBTreeIndex<Score>>::FIELD_NAME, "score");
+    }
+
+    #[test]
+    fn has_hash_index_field_name() {
+        use crate::index::HasHashIndex;
+        assert_eq!(<IndexedScores as HasHashIndex<Team>>::FIELD_NAME, "team");
     }
 }

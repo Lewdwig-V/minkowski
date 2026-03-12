@@ -2,6 +2,37 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
+/// Index kind parsed from `#[index(btree)]` or `#[index(hash)]` field attributes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexAttr {
+    BTree,
+    Hash,
+}
+
+/// Parse `#[index(btree)]` / `#[index(hash)]` attributes from a field.
+/// Returns all index kinds declared on this field (a field can have both).
+fn parse_index_attrs(field: &syn::Field) -> Vec<IndexAttr> {
+    let mut attrs = Vec::new();
+    for attr in &field.attrs {
+        if !attr.path().is_ident("index") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("btree") {
+                attrs.push(IndexAttr::BTree);
+                Ok(())
+            } else if meta.path.is_ident("hash") {
+                attrs.push(IndexAttr::Hash);
+                Ok(())
+            } else {
+                Err(meta.error("expected `btree` or `hash`"))
+            }
+        })
+        .unwrap_or_else(|e| panic!("{}", e));
+    }
+    attrs
+}
+
 /// Derive macro for Table types.
 ///
 /// Generates:
@@ -9,7 +40,18 @@ use syn::{Data, DeriveInput, Fields, parse_macro_input};
 /// - `unsafe impl Table` (field count, register)
 /// - `FooRef<'w>` and `FooMut<'w>` typed row reference structs
 /// - `unsafe impl TableRow` for both Ref and Mut types
-#[proc_macro_derive(Table)]
+///
+/// ## Index attributes
+///
+/// Fields can be annotated with `#[index(btree)]` and/or `#[index(hash)]`
+/// to declare that the table maintains a secondary index on that component.
+/// This generates:
+/// - `unsafe impl HasBTreeIndex<FieldType> for TableName` (for `btree`)
+/// - `unsafe impl HasHashIndex<FieldType> for TableName` (for `hash`)
+///
+/// These marker traits enable `TablePlanner<T>` to enforce index presence
+/// at compile time, turning missing-index warnings into type errors.
+#[proc_macro_derive(Table, attributes(index))]
 pub fn derive_table(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
@@ -26,6 +68,33 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
     let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
     let field_count = field_names.len();
     let field_indices: Vec<_> = (0..field_count).collect();
+
+    // Parse index attributes
+    let mut index_impls = Vec::new();
+    for field in fields {
+        let field_name = field.ident.as_ref().unwrap();
+        let field_type = &field.ty;
+        let field_name_str = field_name.to_string();
+
+        for idx_attr in parse_index_attrs(field) {
+            match idx_attr {
+                IndexAttr::BTree => {
+                    index_impls.push(quote! {
+                        unsafe impl ::minkowski::index::HasBTreeIndex<#field_type> for #name {
+                            const FIELD_NAME: &'static str = #field_name_str;
+                        }
+                    });
+                }
+                IndexAttr::Hash => {
+                    index_impls.push(quote! {
+                        unsafe impl ::minkowski::index::HasHashIndex<#field_type> for #name {
+                            const FIELD_NAME: &'static str = #field_name_str;
+                        }
+                    });
+                }
+            }
+        }
+    }
 
     // Generate Bundle impl
     let bundle_impl = quote! {
@@ -134,6 +203,7 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
         #mut_struct
         #ref_row_impl
         #mut_row_impl
+        #(#index_impls)*
     };
 
     expanded.into()
