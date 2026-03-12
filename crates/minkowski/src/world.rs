@@ -3502,14 +3502,14 @@ mod loom_tests {
 
             let q1 = queue.clone();
             let t1 = thread::spawn(move || {
-                let mut guard = q1.0.lock();
+                let mut guard = q1.queue.lock();
                 guard.push(Entity::new(10, 0));
                 guard.push(Entity::new(11, 0));
             });
 
             let q2 = queue.clone();
             let t2 = thread::spawn(move || {
-                let mut guard = q2.0.lock();
+                let mut guard = q2.queue.lock();
                 guard.push(Entity::new(20, 0));
                 guard.push(Entity::new(21, 0));
             });
@@ -3517,7 +3517,7 @@ mod loom_tests {
             t1.join().unwrap();
             t2.join().unwrap();
 
-            let mut drained: Vec<u32> = queue.0.lock().drain(..).map(|e| e.index()).collect();
+            let mut drained: Vec<u32> = queue.queue.lock().drain(..).map(|e| e.index()).collect();
             drained.sort();
             assert_eq!(drained, vec![10, 11, 20, 21]);
         });
@@ -3533,21 +3533,21 @@ mod loom_tests {
 
             let q1 = queue.clone();
             let pusher = thread::spawn(move || {
-                q1.0.lock().push(Entity::new(1, 0));
-                q1.0.lock().push(Entity::new(2, 0));
+                q1.queue.lock().push(Entity::new(1, 0));
+                q1.queue.lock().push(Entity::new(2, 0));
             });
 
             let q2 = queue.clone();
             let r = results.clone();
             let drainer = thread::spawn(move || {
-                let batch: Vec<u32> = q2.0.lock().drain(..).map(|e| e.index()).collect();
+                let batch: Vec<u32> = q2.queue.lock().drain(..).map(|e| e.index()).collect();
                 r.lock().push(batch);
             });
 
             pusher.join().unwrap();
             drainer.join().unwrap();
 
-            let remainder: Vec<u32> = queue.0.lock().drain(..).map(|e| e.index()).collect();
+            let remainder: Vec<u32> = queue.queue.lock().drain(..).map(|e| e.index()).collect();
             results.lock().push(remainder);
 
             let mut all: Vec<u32> = results
