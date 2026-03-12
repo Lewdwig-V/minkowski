@@ -1615,6 +1615,18 @@ impl ScanBuilder<'_> {
         // Phase 2: Order index lookups by selectivity (most selective first).
         index_preds.sort_by(|a, b| a.0.selectivity.total_cmp(&b.0.selectivity));
 
+        // Collect all filter closures for compiled scan fusion (Phase 8).
+        // Must happen before Phase 4 consumes filter_preds.
+        let all_filter_fns: Vec<FilterFn> = index_preds
+            .iter()
+            .filter_map(|(p, _)| p.filter_fn.as_ref().map(Arc::clone))
+            .chain(
+                filter_preds
+                    .iter()
+                    .filter_map(|p| p.filter_fn.as_ref().map(Arc::clone)),
+            )
+            .collect();
+
         // Phase 3: Build the logical plan tree AND closure tree bottom-up.
         // The closure tree captures type-erased functions while generic types
         // are still in scope. It will be combined with vectorization parameters
@@ -1794,10 +1806,38 @@ impl ScanBuilder<'_> {
         let exec_root = closures.map(|cn| lower_to_executable(cn, &vec_root));
 
         // Phase 8: Compile zero-alloc for_each for scan-only plans.
-        // Only enabled when there are no joins and no index-driven lookups,
-        // so archetype iteration is the sole access path.
-        let compiled_for_each = if self.joins.is_empty() && index_preds.is_empty() {
-            self.compile_for_each.map(|factory| factory())
+        // Enabled when there are no joins — predicates are fused as
+        // per-entity filters into the scan closure.
+        let compiled_for_each = if self.joins.is_empty() {
+            self.compile_for_each.map(|factory| {
+                let mut scan_fn = factory();
+
+                if all_filter_fns.is_empty() {
+                    scan_fn
+                } else {
+                    Box::new(move |world: &mut World, callback: &mut dyn FnMut(Entity)| {
+                        // SAFETY: The scan closure only reads
+                        // `world.archetypes` (immutable iteration over
+                        // archetype entity lists). The filter closures
+                        // only call `world.get::<T>(entity)` which is a
+                        // read-only accessor into the same archetype
+                        // storage. Neither path performs mutation. The
+                        // `&mut World` in the signature exists for query
+                        // cache mutation in the general case, but the
+                        // compiled scan bypasses the cache entirely.
+                        // Creating a shared `&World` from the mutable
+                        // reference is sound because no mutation occurs
+                        // through either borrow during this call.
+                        let world_ptr: *const World = &*world;
+                        scan_fn(world, &mut |entity: Entity| {
+                            let world_ref = unsafe { &*world_ptr };
+                            if all_filter_fns.iter().all(|f| f(world_ref, entity)) {
+                                callback(entity);
+                            }
+                        });
+                    })
+                }
+            })
         } else {
             None
         };
@@ -4778,5 +4818,68 @@ mod tests {
         found.sort_by_key(|e| e.to_bits());
         expected.sort_by_key(|e| e.to_bits());
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn for_each_with_eq_filter() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build();
+
+        let mut found = Vec::new();
+        plan.for_each(&mut world, |entity: Entity| {
+            found.push(entity);
+        });
+        assert_eq!(found.len(), 1);
+        let score = world.get::<Score>(found[0]).unwrap();
+        assert_eq!(*score, Score(42));
+    }
+
+    #[test]
+    fn for_each_with_range_filter() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(10)..Score(20)))
+            .build();
+
+        let mut found = Vec::new();
+        plan.for_each(&mut world, |entity: Entity| {
+            found.push(entity);
+        });
+        assert_eq!(found.len(), 10); // 10..20 exclusive = 10 entities
+    }
+
+    #[test]
+    fn for_each_with_custom_filter() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom::<Score>(
+                "even scores",
+                0.5,
+                |world, entity| world.get::<Score>(entity).is_some_and(|s| s.0 % 2 == 0),
+            ))
+            .build();
+
+        let mut found = Vec::new();
+        plan.for_each(&mut world, |entity: Entity| {
+            found.push(entity);
+        });
+        assert_eq!(found.len(), 50);
     }
 }
