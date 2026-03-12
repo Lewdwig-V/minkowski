@@ -231,9 +231,9 @@ pub struct Predicate {
 }
 
 enum PredicateKind {
-    Eq(#[expect(dead_code)] String), // debug representation — reserved for enhanced EXPLAIN
-    Range(#[expect(dead_code)] String), // debug representation — reserved for enhanced EXPLAIN
-    Custom(Box<str>),                // description only — always post-filter
+    Eq,
+    Range,
+    Custom(Box<str>), // description only — always post-filter
 }
 
 impl Predicate {
@@ -241,13 +241,13 @@ impl Predicate {
     ///
     /// If a `HashIndex<T>` or `BTreeIndex<T>` is registered, the planner will
     /// use it for an O(1) / O(log n) lookup instead of a full scan.
-    pub fn eq<T: Component + PartialEq + std::fmt::Debug>(value: T) -> Self {
+    pub fn eq<T: Component + PartialEq>(value: T) -> Self {
         let value = Arc::new(value);
         let filter_val = Arc::clone(&value);
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
-            kind: PredicateKind::Eq(format!("{value:?}")),
+            kind: PredicateKind::Eq,
             selectivity: 0.01, // default: 1% selectivity for equality
             filter_fn: Some(Arc::new(move |world: &World, entity: Entity| {
                 world.get::<T>(entity).is_some_and(|v| *v == *filter_val)
@@ -259,21 +259,7 @@ impl Predicate {
     ///
     /// If a `BTreeIndex<T>` is registered, the planner will use it for
     /// an O(log n + k) range scan. `HashIndex` cannot serve range predicates.
-    pub fn range<T: Component + Ord + Clone + std::fmt::Debug, R: RangeBounds<T>>(
-        range: R,
-    ) -> Self {
-        fn bound_str<T: std::fmt::Debug>(bound: Bound<&T>) -> String {
-            match bound {
-                Bound::Included(v) => format!("{v:?}"),
-                Bound::Excluded(v) => format!("{v:?}"),
-                Bound::Unbounded => "..".into(),
-            }
-        }
-        let desc = format!(
-            "{}..{}",
-            bound_str(range.start_bound()),
-            bound_str(range.end_bound())
-        );
+    pub fn range<T: Component + Ord + Clone, R: RangeBounds<T>>(range: R) -> Self {
         // Capture owned bounds for the filter closure.
         let low: Bound<T> = match range.start_bound() {
             Bound::Included(v) => Bound::Included(v.clone()),
@@ -290,7 +276,7 @@ impl Predicate {
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
-            kind: PredicateKind::Range(desc),
+            kind: PredicateKind::Range,
             selectivity: 0.1, // default: 10% selectivity for ranges
             filter_fn: Some(Arc::new(move |world: &World, entity: Entity| {
                 world.get::<T>(entity).is_some_and(|v| {
@@ -354,24 +340,24 @@ impl Predicate {
     }
 
     fn can_use_btree(&self) -> bool {
-        matches!(self.kind, PredicateKind::Eq(_) | PredicateKind::Range(_))
+        matches!(self.kind, PredicateKind::Eq | PredicateKind::Range)
     }
 
     fn can_use_hash(&self) -> bool {
-        matches!(self.kind, PredicateKind::Eq(_))
+        matches!(self.kind, PredicateKind::Eq)
     }
 
     /// Whether this predicate can be lowered to branchless SIMD comparison.
     fn is_branchless_eligible(&self) -> bool {
-        matches!(self.kind, PredicateKind::Eq(_) | PredicateKind::Range(_))
+        matches!(self.kind, PredicateKind::Eq | PredicateKind::Range)
     }
 }
 
 impl fmt::Debug for Predicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            PredicateKind::Eq(_) => write!(f, "Eq({})", self.component_name),
-            PredicateKind::Range(_) => write!(f, "Range({})", self.component_name),
+            PredicateKind::Eq => write!(f, "Eq({})", self.component_name),
+            PredicateKind::Range => write!(f, "Range({})", self.component_name),
             PredicateKind::Custom(desc) => write!(f, "Custom({}: {})", self.component_name, desc),
         }
     }
@@ -1023,6 +1009,9 @@ type IndexLookupFn = Arc<dyn Fn() -> Arc<[Entity]> + Send + Sync>;
 
 /// Type-erased filter function: given `&World` and `Entity`, return true if
 /// the entity passes the predicate.
+// PERF: Arc<dyn Fn> prevents SIMD vectorization of filter loops (per-entity
+// vtable call). Inherent to type-erased plan composition — monomorphic
+// filters would require codegen per plan.
 type FilterFn = Arc<dyn Fn(&World, Entity) -> bool + Send + Sync>;
 
 /// Partitioned or single-bucket hash set for probe-side lookups.
@@ -1067,11 +1056,13 @@ enum ExecNode {
         /// Sort entities by archetype ID for cache-friendly sequential access.
         sort_by_archetype: bool,
     },
-    /// Batch filter — processes child output in batches rather than one entity
-    /// at a time. Maps to `VecExecNode::SIMDFilter`.
+    /// Filter — applies a type-erased predicate per entity. `batch_size` is
+    /// advisory metadata from the vectorized plan (for test introspection).
+    /// Maps to `VecExecNode::SIMDFilter`.
     BatchFilter {
         child: Box<ExecNode>,
         filter_fn: FilterFn,
+        #[cfg_attr(not(test), expect(dead_code))]
         batch_size: usize,
     },
     /// Partitioned hash join — build side split into `partitions` hash maps
@@ -1093,6 +1084,10 @@ enum ExecNode {
 
 impl ExecNode {
     /// Execute this node against the world, returning matching entities.
+    // PERF: Returns Vec<Entity> per node — recursive calls create temporary
+    // Vecs at each tree level. An iterator model would avoid this but requires
+    // GATs or self-referential types. Acceptable for the planner's use case
+    // (plans executed infrequently, not per-entity).
     fn execute(&self, world: &World) -> Vec<Entity> {
         match self {
             ExecNode::ChunkedScan {
@@ -1115,31 +1110,42 @@ impl ExecNode {
                     .filter(|e| world.is_alive(*e))
                     .collect();
                 if *sort_by_archetype {
-                    // Sort by archetype ID for sequential column access.
-                    entities.sort_unstable_by_key(|e| {
-                        let idx = e.index() as usize;
-                        world
-                            .entity_locations
-                            .get(idx)
-                            .and_then(|loc| loc.as_ref())
-                            .map_or(usize::MAX, |loc| loc.archetype_id.0)
-                    });
+                    // Pre-compute archetype IDs into a parallel array so the
+                    // sort does O(N) lookups instead of O(N log N). Each
+                    // comparison is then a plain usize compare with no
+                    // pointer chasing into entity_locations.
+                    let mut keyed: Vec<(usize, Entity)> = entities
+                        .iter()
+                        .map(|e| {
+                            let idx = e.index() as usize;
+                            let arch = world
+                                .entity_locations
+                                .get(idx)
+                                .and_then(|loc| loc.as_ref())
+                                .map_or(usize::MAX, |loc| loc.archetype_id.0);
+                            (arch, *e)
+                        })
+                        .collect();
+                    keyed.sort_unstable_by_key(|(arch, _)| *arch);
+                    entities = keyed.into_iter().map(|(_, e)| e).collect();
                 }
                 entities
             }
             ExecNode::BatchFilter {
                 child,
                 filter_fn,
-                batch_size,
+                batch_size: _,
             } => {
+                // PERF: Per-entity dyn Fn call through FilterFn prevents
+                // SIMD vectorization of the filter loop. Inherent to the
+                // type-erased plan composition model — monomorphic filters
+                // would require codegen per plan. The previous chunk loop
+                // provided no benefit since the inner call is scalar.
                 let input = child.execute(world);
-                // Process in morsel-sized batches for cache locality.
                 let mut result = Vec::with_capacity(input.len() / 2);
-                for chunk in input.chunks(*batch_size) {
-                    for &e in chunk {
-                        if filter_fn(world, e) {
-                            result.push(e);
-                        }
+                for &e in &input {
+                    if filter_fn(world, e) {
+                        result.push(e);
                     }
                 }
                 result
@@ -1150,6 +1156,8 @@ impl ExecNode {
                 join_kind,
                 partitions,
             } => {
+                // PERF: Allocates P HashSets per execution. Caching across
+                // calls would require mutable ExecNode, breaking &self execute.
                 // build = left side (semantic "from" table)
                 // probe = right side (joined table)
                 // Inner: entities present in both sides.
@@ -1920,7 +1928,7 @@ impl<'w> QueryPlanner<'w> {
             PredicateKind::Custom(_) => {
                 // Custom predicates never use indexes — no warning needed.
             }
-            PredicateKind::Eq(_) => {
+            PredicateKind::Eq => {
                 if self.indexes.contains_key(&pred.component_type) {
                     // We have an index but it wasn't usable — shouldn't happen
                     // for Eq since both BTree and Hash support it.
@@ -1937,7 +1945,7 @@ impl<'w> QueryPlanner<'w> {
                     });
                 }
             }
-            PredicateKind::Range(_) => {
+            PredicateKind::Range => {
                 if let Some(idx) = self.indexes.get(&pred.component_type) {
                     if idx.kind == IndexKind::Hash {
                         warnings.push(PlanWarning::IndexKindMismatch {
