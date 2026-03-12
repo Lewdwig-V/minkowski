@@ -12,6 +12,8 @@
 //! - EXPLAIN output for plan inspection
 //! - Plan execution against a live World
 
+use std::sync::Arc;
+
 use minkowski::{
     BTreeIndex, CardinalityConstraint, HashIndex, Indexed, JoinKind, Predicate, QueryPlanner,
     SpatialIndex, VectorizeOpts, World,
@@ -69,8 +71,10 @@ fn main() {
     // Build indexes
     let mut score_btree = BTreeIndex::<Score>::new();
     score_btree.rebuild(&mut world);
+    let score_btree = Arc::new(score_btree);
     let mut team_hash = HashIndex::<Team>::new();
     team_hash.rebuild(&mut world);
+    let team_hash = Arc::new(team_hash);
 
     println!("=== 1. Index Selection ===\n");
 

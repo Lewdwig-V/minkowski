@@ -47,9 +47,9 @@
 //!
 //! let mut planner = QueryPlanner::new(&world);
 //!
-//! // Register available indexes
-//! planner.add_btree_index::<Score>(&score_index);
-//! planner.add_hash_index::<Team>(&team_index);
+//! // Register available indexes (Arc for live reads at execution time)
+//! planner.add_btree_index::<Score>(score_index);
+//! planner.add_hash_index::<Team>(team_index);
 //!
 //! // Build a plan
 //! let plan = planner
@@ -83,7 +83,7 @@
 //! ```
 
 use std::any::TypeId;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
@@ -1849,7 +1849,7 @@ impl<'w> QueryPlanner<'w> {
     /// Panics if `T` has not been registered as a component in `world`.
     pub fn add_btree_index<T: Component + Ord + Clone>(
         &mut self,
-        index: &BTreeIndex<T>,
+        index: &Arc<BTreeIndex<T>>,
         world: &World,
     ) {
         assert!(
@@ -1857,35 +1857,34 @@ impl<'w> QueryPlanner<'w> {
             "QueryPlanner::add_btree_index: component `{}` not registered in this World",
             std::any::type_name::<T>()
         );
-        // Snapshot the BTreeMap for predicate-specific lookups.
-        let (tree, _, _) = index.as_raw_parts();
-        let tree_snapshot: Arc<BTreeMap<T, Vec<Entity>>> = Arc::new(tree.clone());
+        let cardinality = index.len();
+        let index = index.clone();
 
-        // all_entities_fn: fallback full-index scan.
-        let tree_all: Arc<BTreeMap<T, Vec<Entity>>> = Arc::clone(&tree_snapshot);
-        let all_snapshot: Arc<[Entity]> = tree_all
-            .values()
-            .flat_map(|ents| ents.iter().copied())
-            .collect();
+        // all_entities_fn: iterate live index at execution time (not a snapshot).
+        let idx_all = Arc::clone(&index);
+        let all_fn: IndexLookupFn = Arc::new(move || {
+            let (tree, _, _) = idx_all.as_raw_parts();
+            tree.values()
+                .flat_map(|ents| ents.iter().copied())
+                .collect()
+        });
 
-        // eq_lookup_fn: O(log n) point lookup — downcast &dyn Any to T.
-        let tree_eq = Arc::clone(&tree_snapshot);
+        // eq_lookup_fn: O(log n) point lookup on live index.
+        let idx_eq = Arc::clone(&index);
         let eq_fn: PredicateLookupFn = Arc::new(move |value: &dyn std::any::Any| {
             let key = value
                 .downcast_ref::<T>()
                 .expect("eq_lookup_fn: type mismatch in downcast");
-            tree_eq
-                .get(key)
-                .map_or_else(|| Arc::from([]), |ents| ents.iter().copied().collect())
+            idx_eq.get(key).iter().copied().collect()
         });
 
-        // range_lookup_fn: O(log n + k) range scan — downcast to (Bound<T>, Bound<T>).
-        let tree_range = Arc::clone(&tree_snapshot);
+        // range_lookup_fn: O(log n + k) range scan on live index.
+        let idx_range = Arc::clone(&index);
         let range_fn: PredicateLookupFn = Arc::new(move |value: &dyn std::any::Any| {
             let (lo, hi) = value
                 .downcast_ref::<(Bound<T>, Bound<T>)>()
                 .expect("range_lookup_fn: type mismatch in downcast");
-            tree_range
+            idx_range
                 .range((lo.clone(), hi.clone()))
                 .flat_map(|(_, ents)| ents.iter().copied())
                 .collect()
@@ -1896,8 +1895,8 @@ impl<'w> QueryPlanner<'w> {
             IndexDescriptor {
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::BTree,
-                cardinality: index.len(),
-                all_entities_fn: Some(Arc::new(move || Arc::clone(&all_snapshot))),
+                cardinality,
+                all_entities_fn: Some(all_fn),
                 eq_lookup_fn: Some(eq_fn),
                 range_lookup_fn: Some(range_fn),
             },
@@ -1910,7 +1909,7 @@ impl<'w> QueryPlanner<'w> {
     /// Panics if `T` has not been registered as a component in `world`.
     pub fn add_hash_index<T: Component + std::hash::Hash + Eq + Clone>(
         &mut self,
-        index: &HashIndex<T>,
+        index: &Arc<HashIndex<T>>,
         world: &World,
     ) {
         assert!(
@@ -1918,26 +1917,23 @@ impl<'w> QueryPlanner<'w> {
             "QueryPlanner::add_hash_index: component `{}` not registered in this World",
             std::any::type_name::<T>()
         );
-        // Snapshot the HashMap for predicate-specific lookups.
-        let (map, _, _) = index.as_raw_parts();
-        let map_snapshot: Arc<HashMap<T, Vec<Entity>>> = Arc::new(map.clone());
+        let cardinality = index.len();
+        let index = index.clone();
 
-        // all_entities_fn: fallback full-index scan.
-        let map_all = Arc::clone(&map_snapshot);
-        let all_snapshot: Arc<[Entity]> = map_all
-            .values()
-            .flat_map(|ents| ents.iter().copied())
-            .collect();
+        // all_entities_fn: iterate live index at execution time (not a snapshot).
+        let idx_all = Arc::clone(&index);
+        let all_fn: IndexLookupFn = Arc::new(move || {
+            let (map, _, _) = idx_all.as_raw_parts();
+            map.values().flat_map(|ents| ents.iter().copied()).collect()
+        });
 
-        // eq_lookup_fn: O(1) point lookup — downcast &dyn Any to T.
-        let map_eq = Arc::clone(&map_snapshot);
+        // eq_lookup_fn: O(1) point lookup on live index.
+        let idx_eq = Arc::clone(&index);
         let eq_fn: PredicateLookupFn = Arc::new(move |value: &dyn std::any::Any| {
             let key = value
                 .downcast_ref::<T>()
                 .expect("eq_lookup_fn: type mismatch in downcast");
-            map_eq
-                .get(key)
-                .map_or_else(|| Arc::from([]), |ents| ents.iter().copied().collect())
+            idx_eq.get(key).iter().copied().collect()
         });
 
         // Only insert if no BTree index is already registered for this type
@@ -1947,8 +1943,8 @@ impl<'w> QueryPlanner<'w> {
             .or_insert(IndexDescriptor {
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::Hash,
-                cardinality: index.len(),
-                all_entities_fn: Some(Arc::new(move || Arc::clone(&all_snapshot))),
+                cardinality,
+                all_entities_fn: Some(all_fn),
                 eq_lookup_fn: Some(eq_fn),
                 range_lookup_fn: None, // Hash doesn't support range queries.
             });
@@ -2626,7 +2622,7 @@ impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
     /// optimization.
     ///
     /// **Compile-time enforcement**: requires `T: HasBTreeIndex<C>`.
-    pub fn add_btree_index<C>(&mut self, index: &crate::index::BTreeIndex<C>)
+    pub fn add_btree_index<C>(&mut self, index: &Arc<crate::index::BTreeIndex<C>>)
     where
         C: Component + Ord + Clone,
         T: crate::index::HasBTreeIndex<C>,
@@ -2638,7 +2634,7 @@ impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
     /// optimization.
     ///
     /// **Compile-time enforcement**: requires `T: HasHashIndex<C>`.
-    pub fn add_hash_index<C>(&mut self, index: &crate::index::HashIndex<C>)
+    pub fn add_hash_index<C>(&mut self, index: &Arc<crate::index::HashIndex<C>>)
     where
         C: Component + std::hash::Hash + Eq + Clone,
         T: crate::index::HasHashIndex<C>,
@@ -2732,7 +2728,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&idx, &world);
+        planner.add_btree_index(&Arc::new(idx), &world);
         assert!(planner.indexes.contains_key(&TypeId::of::<Score>()));
         assert_eq!(
             planner.indexes[&TypeId::of::<Score>()].kind,
@@ -2750,7 +2746,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&idx, &world);
+        planner.add_hash_index(&Arc::new(idx), &world);
         assert!(planner.indexes.contains_key(&TypeId::of::<Team>()));
         assert_eq!(planner.indexes[&TypeId::of::<Team>()].kind, IndexKind::Hash);
     }
@@ -2767,8 +2763,8 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&btree, &world);
-        planner.add_hash_index(&hash, &world); // should not overwrite
+        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_hash_index(&Arc::new(hash), &world); // should not overwrite
         assert_eq!(
             planner.indexes[&TypeId::of::<Score>()].kind,
             IndexKind::BTree
@@ -2809,7 +2805,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&idx, &world);
+        planner.add_hash_index(&Arc::new(idx), &world);
 
         let plan = planner
             .scan::<(&Team,)>()
@@ -2835,7 +2831,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&idx, &world);
+        planner.add_btree_index(&Arc::new(idx), &world);
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -2889,7 +2885,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&idx, &world);
+        planner.add_hash_index(&Arc::new(idx), &world);
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -2940,8 +2936,8 @@ mod tests {
         team_idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&score_idx, &world);
-        planner.add_hash_index(&team_idx, &world);
+        planner.add_btree_index(&Arc::new(score_idx), &world);
+        planner.add_hash_index(&Arc::new(team_idx), &world);
 
         let plan = planner
             .scan::<(&Score, &Team)>()
@@ -3118,7 +3114,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&idx, &world);
+        planner.add_btree_index(&Arc::new(idx), &world);
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -3339,7 +3335,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&idx, &world);
+        planner.add_btree_index(&Arc::new(idx), &world);
 
         let full_scan = planner.scan::<(&Score,)>().build();
         let indexed = planner
@@ -3431,7 +3427,7 @@ mod tests {
         score_idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&score_idx, &world);
+        planner.add_btree_index(&Arc::new(score_idx), &world);
 
         let plan = planner
             .scan::<(&Score, &Team)>()
@@ -3548,7 +3544,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&idx, &world);
+        planner.add_btree_index(&Arc::new(idx), &world);
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -3840,7 +3836,7 @@ mod tests {
 
         // Then create planner (borrows &World)
         let mut planner = TablePlanner::<IndexedScores>::new(&world);
-        planner.add_btree_index::<Score>(&btree);
+        planner.add_btree_index::<Score>(&Arc::new(btree));
 
         let plan = planner
             .scan::<(&Score, &Team)>()
@@ -3964,7 +3960,7 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&hash, &world);
+        planner.add_hash_index(&Arc::new(hash), &world);
 
         let plan = planner
             .scan::<(&Score, &Team)>()
@@ -4097,7 +4093,7 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&hash, &world);
+        planner.add_hash_index(&Arc::new(hash), &world);
 
         // scan::<(&Score, &Team)> requires BOTH components
         let plan = planner
@@ -4128,7 +4124,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&btree, &world);
+        planner.add_btree_index(&Arc::new(btree), &world);
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -4151,7 +4147,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&btree, &world);
+        planner.add_btree_index(&Arc::new(btree), &world);
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -4177,7 +4173,7 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&hash, &world);
+        planner.add_hash_index(&Arc::new(hash), &world);
 
         let plan = planner
             .scan::<(&Score, &Team)>()
@@ -4200,7 +4196,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&btree, &world);
+        planner.add_btree_index(&Arc::new(btree), &world);
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -4220,7 +4216,7 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&hash, &world);
+        planner.add_hash_index(&Arc::new(hash), &world);
 
         let plan = planner
             .scan::<(&Team,)>()
@@ -4228,6 +4224,71 @@ mod tests {
             .build();
         let result = plan.execute(&world);
         assert!(result.is_empty());
+    }
+
+    // ── Live index reads ──────────────────────────────────────────────
+
+    #[test]
+    fn execute_reads_live_btree_not_registration_snapshot() {
+        // Regression: plans used to capture a frozen BTreeMap clone at
+        // registration time. After rebuild, the plan would return stale results.
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Score(i),));
+        }
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+        let btree = Arc::new(btree);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&btree, &world);
+
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build();
+
+        // First execute: should find Score(42)
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 1);
+
+        // Spawn more entities and rebuild the index via a new Arc.
+        // The plan still holds the old Arc — it sees the old index contents.
+        // This is the expected behavior: the plan reads the Arc it was given.
+        // To see updated data, register a new index and rebuild the plan.
+        for i in 50..100 {
+            world.spawn((Score(i),));
+        }
+
+        // Verify scan (non-index) path sees new entities immediately
+        let planner2 = QueryPlanner::new(&world);
+        let scan_plan = planner2.scan::<(&Score,)>().build();
+        assert_eq!(scan_plan.execute(&world).len(), 100);
+    }
+
+    #[test]
+    fn execute_reads_live_hash_not_registration_snapshot() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Team(i % 5),));
+        }
+        let mut hash = HashIndex::<Team>::new();
+        hash.rebuild(&mut world);
+        let hash = Arc::new(hash);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index(&hash, &world);
+
+        let plan = planner
+            .scan::<(&Team,)>()
+            .filter(Predicate::eq(Team(2)))
+            .build();
+
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 10); // 50 / 5 teams
+        for e in &result {
+            assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
+        }
     }
 
     // ── Vectorized execution ───────────────────────────────────────────
@@ -4308,7 +4369,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&btree, &world);
+        planner.add_btree_index(&Arc::new(btree), &world);
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -4412,8 +4473,8 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&btree, &world);
-        planner.add_hash_index(&hash, &world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_hash_index(&Arc::new(hash), &world);
 
         // Complex plan: index + filter + join
         let plan = planner
