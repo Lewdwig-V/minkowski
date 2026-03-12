@@ -2648,6 +2648,85 @@ impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
     }
 }
 
+// ── ScratchBuffer ────────────────────────────────────────────────────
+
+/// Pool-aware reusable entity buffer for allocation-free query execution.
+///
+/// Used by join/gather plans instead of per-node `Vec<Entity>` allocation.
+/// Call [`clear`](ScratchBuffer::clear) between uses to reset length while
+/// preserving the backing allocation.
+struct ScratchBuffer {
+    entities: Vec<Entity>,
+}
+
+/// Maximum pre-allocation cap: 64K entities.
+const SCRATCH_MAX_CAP: usize = 64 * 1024;
+
+#[cfg_attr(not(test), expect(dead_code))]
+impl ScratchBuffer {
+    /// Create a new buffer with the given estimated capacity, capped at 64K entities.
+    fn new(estimated_capacity: usize) -> Self {
+        Self {
+            entities: Vec::with_capacity(estimated_capacity.min(SCRATCH_MAX_CAP)),
+        }
+    }
+
+    /// Append an entity to the buffer.
+    fn push(&mut self, entity: Entity) {
+        self.entities.push(entity);
+    }
+
+    /// Reset length to 0, preserving the backing allocation.
+    fn clear(&mut self) {
+        self.entities.clear();
+    }
+
+    /// Number of entities currently in the buffer.
+    fn len(&self) -> usize {
+        self.entities.len()
+    }
+
+    /// Current allocation capacity.
+    fn capacity(&self) -> usize {
+        self.entities.capacity()
+    }
+
+    /// View the buffer contents as a slice.
+    fn as_slice(&self) -> &[Entity] {
+        &self.entities
+    }
+
+    /// Compute the sorted intersection of two entity sets stored contiguously
+    /// in this buffer as `[left_0..left_len | right_0..right_len]`.
+    ///
+    /// Sorts the left partition in-place by `to_bits()`, then for each entity
+    /// in the right partition, binary-searches the sorted left. Matches are
+    /// appended to the end of the buffer. Returns a slice over the matches.
+    fn sorted_intersection(&mut self, left_len: usize) -> &[Entity] {
+        let total = self.entities.len();
+        debug_assert!(left_len <= total);
+
+        // Sort the left partition in place by raw bits (deterministic total order).
+        self.entities[..left_len].sort_unstable_by_key(|e| e.to_bits());
+
+        // Scan right partition, binary-search in sorted left, collect matches.
+        let mut match_count = 0;
+        for i in left_len..total {
+            let entity = self.entities[i];
+            let found = self.entities[..left_len]
+                .binary_search_by_key(&entity.to_bits(), |e| e.to_bits())
+                .is_ok();
+            if found {
+                self.entities.push(entity);
+                match_count += 1;
+            }
+        }
+
+        let final_len = self.entities.len();
+        &self.entities[final_len - match_count..final_len]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4555,5 +4634,66 @@ mod tests {
         let result = plan.execute(&world);
         // Left join: all 8 Score entities preserved.
         assert_eq!(result.len(), 8);
+    }
+
+    // ── ScratchBuffer tests ──────────────────────────────────────────
+
+    #[test]
+    fn scratch_buffer_starts_empty() {
+        let buf = ScratchBuffer::new(100);
+        assert_eq!(buf.len(), 0);
+        assert!(buf.capacity() >= 100);
+    }
+
+    #[test]
+    fn scratch_buffer_push_and_clear() {
+        let mut buf = ScratchBuffer::new(4);
+        let e0 = Entity::new(0, 0);
+        let e1 = Entity::new(1, 0);
+        buf.push(e0);
+        buf.push(e1);
+        assert_eq!(buf.as_slice(), &[e0, e1]);
+
+        let cap_before = buf.capacity();
+        buf.clear();
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), cap_before);
+    }
+
+    #[test]
+    fn scratch_buffer_reuse_does_not_realloc() {
+        let mut buf = ScratchBuffer::new(64);
+        for i in 0..50 {
+            buf.push(Entity::new(i, 0));
+        }
+        let cap = buf.capacity();
+        buf.clear();
+        for i in 0..50 {
+            buf.push(Entity::new(100 + i, 0));
+        }
+        assert_eq!(buf.capacity(), cap);
+    }
+
+    #[test]
+    fn scratch_buffer_sorted_intersection() {
+        let mut buf = ScratchBuffer::new(16);
+        // Left set: [1,3,5,7,9]
+        let left = [1u32, 3, 5, 7, 9];
+        for &idx in &left {
+            buf.push(Entity::new(idx, 0));
+        }
+        let left_len = left.len();
+
+        // Right set: [2,3,6,7,10]
+        let right = [2u32, 3, 6, 7, 10];
+        for &idx in &right {
+            buf.push(Entity::new(idx, 0));
+        }
+
+        let result = buf.sorted_intersection(left_len);
+        // Intersection should be entities with index 3 and 7.
+        let mut result_indices: Vec<u32> = result.iter().map(|e| e.index()).collect();
+        result_indices.sort_unstable();
+        assert_eq!(result_indices, vec![3, 7]);
     }
 }
