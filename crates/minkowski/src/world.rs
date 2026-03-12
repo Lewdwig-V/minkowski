@@ -208,9 +208,13 @@ impl World {
         for entity in queue.drain(..) {
             self.entities.dealloc(entity);
         }
-        self.orphan_queue
-            .has_items
-            .store(false, crate::sync::Ordering::Release);
+        // Clear flag while holding the lock so a concurrent Tx::drop
+        // pushing between drain and this store won't lose its flag.
+        if queue.is_empty() {
+            self.orphan_queue
+                .has_items
+                .store(false, crate::sync::Ordering::Release);
+        }
     }
 
     /// Clone the orphan queue handle. Strategies capture this at construction
