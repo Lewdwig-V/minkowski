@@ -78,12 +78,21 @@ pub(crate) struct QueryCacheEntry {
 
 /// Shared queue for entity IDs orphaned by aborted transactions.
 /// World owns the canonical instance; strategies clone the Arc handle.
+///
+/// Uses an `AtomicBool` flag to skip the mutex lock when the queue is empty,
+/// which is the common case during spawn-heavy workloads.
 #[derive(Clone)]
-pub(crate) struct OrphanQueue(pub(crate) Arc<Mutex<Vec<Entity>>>);
+pub(crate) struct OrphanQueue {
+    pub(crate) queue: Arc<Mutex<Vec<Entity>>>,
+    pub(crate) has_items: Arc<crate::sync::AtomicBool>,
+}
 
 impl OrphanQueue {
     fn new() -> Self {
-        Self(Arc::new(Mutex::new(Vec::new())))
+        Self {
+            queue: Arc::new(Mutex::new(Vec::new())),
+            has_items: Arc::new(crate::sync::AtomicBool::new(false)),
+        }
     }
 }
 
@@ -146,7 +155,7 @@ pub struct World {
     pub(crate) sparse: SparseStorage,
     pub(crate) entity_locations: Vec<Option<EntityLocation>>,
     pub(crate) table_cache: TableCache,
-    pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
+    pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry, crate::component::TypeIdBuildHasher>,
     pub(crate) current_tick: Tick,
     pub(crate) orphan_queue: OrphanQueue,
     pub(crate) pool: SharedPool,
@@ -166,7 +175,7 @@ impl World {
             sparse: SparseStorage::new(pool.clone()),
             entity_locations: Vec::new(),
             table_cache: TableCache::new(),
-            query_cache: HashMap::new(),
+            query_cache: HashMap::with_hasher(crate::component::TypeIdBuildHasher),
             current_tick: Tick::default(),
             orphan_queue: OrphanQueue::new(),
             pool,
@@ -188,10 +197,20 @@ impl World {
     /// Called automatically at the top of every &mut self entry point.
     fn drain_orphans(&mut self) {
         self.entities.materialize_reserved();
-        let mut queue = self.orphan_queue.0.lock();
+        if !self
+            .orphan_queue
+            .has_items
+            .load(crate::sync::Ordering::Acquire)
+        {
+            return;
+        }
+        let mut queue = self.orphan_queue.queue.lock();
         for entity in queue.drain(..) {
             self.entities.dealloc(entity);
         }
+        self.orphan_queue
+            .has_items
+            .store(false, crate::sync::Ordering::Release);
     }
 
     /// Clone the orphan queue handle. Strategies capture this at construction

@@ -426,7 +426,13 @@ impl Drop for Tx<'_> {
         if !self.committed {
             self.cleanup.abort();
             if !self.allocated.is_empty() {
-                self.orphan_queue.0.lock().extend(self.allocated.drain(..));
+                self.orphan_queue
+                    .queue
+                    .lock()
+                    .extend(self.allocated.drain(..));
+                self.orphan_queue
+                    .has_items
+                    .store(true, crate::sync::Ordering::Release);
             }
         }
     }

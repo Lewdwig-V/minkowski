@@ -13,7 +13,9 @@
 //!
 //! Compare time spent in each to identify where the overhead lives.
 
-use minkowski::{DynamicCtx, Optimistic, QueryMut, QueryWriter, ReducerRegistry, World};
+use minkowski::{
+    DynamicCtx, EnumChangeSet, Optimistic, QueryMut, QueryWriter, ReducerRegistry, World,
+};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -132,6 +134,49 @@ fn run_dynamic(world: &mut World, registry: &mut ReducerRegistry) {
     }
 }
 
+/// Baseline: direct spawn via world.spawn().
+#[inline(never)]
+fn run_spawn_direct() -> World {
+    let mut world = World::new();
+    for i in 0..ENTITY_COUNT {
+        let f = i as f32;
+        world.spawn((
+            Position { x: f, y: f, z: f },
+            Velocity {
+                dx: 1.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        ));
+    }
+    world
+}
+
+/// Subject: changeset spawn via alloc_entity + spawn_bundle + apply.
+#[inline(never)]
+fn run_spawn_changeset() -> World {
+    let mut world = World::new();
+    let mut cs = EnumChangeSet::new();
+    for i in 0..ENTITY_COUNT {
+        let f = i as f32;
+        let entity = world.alloc_entity();
+        cs.spawn_bundle(
+            &mut world,
+            entity,
+            (
+                Position { x: f, y: f, z: f },
+                Velocity {
+                    dx: 1.0,
+                    dy: 0.0,
+                    dz: 0.0,
+                },
+            ),
+        );
+    }
+    cs.apply(&mut world).unwrap();
+    world
+}
+
 fn main() {
     // Phase 1: QueryMut baseline
     let mut world = setup_world();
@@ -150,4 +195,14 @@ fn main() {
     let mut registry = ReducerRegistry::new();
     run_dynamic(&mut world, &mut registry);
     std::hint::black_box(&world);
+
+    // Phase 4: Direct spawn baseline
+    for _ in 0..ITERATIONS {
+        std::hint::black_box(run_spawn_direct());
+    }
+
+    // Phase 5: Changeset spawn subject
+    for _ in 0..ITERATIONS {
+        std::hint::black_box(run_spawn_changeset());
+    }
 }

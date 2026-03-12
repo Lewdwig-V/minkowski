@@ -2,6 +2,36 @@ use fixedbitset::FixedBitSet;
 use std::alloc::Layout;
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
+
+/// Identity hasher for `TypeId` keys. `TypeId` is internally a `u64` that
+/// the compiler already distributes well — SipHash is unnecessary overhead.
+#[derive(Default)]
+pub(crate) struct TypeIdHasher(u64);
+
+impl Hasher for TypeIdHasher {
+    fn write(&mut self, _bytes: &[u8]) {
+        unreachable!("TypeIdHasher only supports write_u64");
+    }
+
+    fn write_u64(&mut self, val: u64) {
+        self.0 = val;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct TypeIdBuildHasher;
+
+impl BuildHasher for TypeIdBuildHasher {
+    type Hasher = TypeIdHasher;
+    fn build_hasher(&self) -> Self::Hasher {
+        TypeIdHasher(0)
+    }
+}
 
 /// Marker trait for ECS components. Blanket-implemented for all eligible types.
 pub trait Component: 'static + Send + Sync {}
@@ -23,7 +53,7 @@ pub(crate) struct ComponentInfo {
 
 #[doc(hidden)]
 pub struct ComponentRegistry {
-    by_type: HashMap<TypeId, ComponentId>,
+    by_type: HashMap<TypeId, ComponentId, TypeIdBuildHasher>,
     infos: Vec<ComponentInfo>,
     sparse_set: FixedBitSet,
     /// Monotonic counter bumped on every registration. Enables query cache
@@ -34,7 +64,7 @@ pub struct ComponentRegistry {
 impl ComponentRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            by_type: HashMap::new(),
+            by_type: HashMap::with_hasher(TypeIdBuildHasher),
             infos: Vec::new(),
             sparse_set: FixedBitSet::new(),
             version: 0,
