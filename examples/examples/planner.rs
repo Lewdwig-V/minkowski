@@ -180,23 +180,22 @@ fn main() {
         .build();
     println!("{}", plan.explain());
 
-    println!("=== 7. Vectorized Execution ===\n");
+    println!("=== 7. Vectorized Execution (Default) ===\n");
 
-    // Lower the logical plan to vectorized execution.
+    // build() compiles to vectorized execution by default.
     // Scans become chunked, filters become SIMD-friendly, joins are partitioned.
     let plan = planner
         .scan::<(&Score, &Pos)>()
         .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
         .join::<(&Team,)>(JoinKind::Inner)
         .build();
-    let vec_plan = plan.vectorize(VectorizeOpts::default());
-    println!("{}", vec_plan.explain());
+    println!("{}", plan.explain());
 
-    // Compare scalar vs vectorized cost
-    println!("Scalar plan cost:     {:.1}", plan.cost().total());
-    println!("Vectorized plan cost: {:.1}", vec_plan.cost().total());
+    // Compare vectorized (default) vs logical cost
+    println!("Logical plan cost:    {:.1}", plan.logical_cost().total());
+    println!("Vectorized plan cost: {:.1}", plan.cost().total());
 
-    // Custom opts for different cache hierarchy
+    // Re-lower with custom opts for a different cache hierarchy
     let small_cache_opts = VectorizeOpts {
         l2_cache_bytes: 128 * 1024,
         avg_component_bytes: 32,

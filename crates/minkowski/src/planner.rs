@@ -522,17 +522,30 @@ impl fmt::Display for PlanWarning {
 /// A compiled query execution plan.
 pub struct QueryPlanResult {
     root: PlanNode,
+    vec_root: VecExecNode,
+    opts: VectorizeOpts,
     warnings: Vec<PlanWarning>,
 }
 
 impl QueryPlanResult {
-    /// The root node of the execution plan tree.
+    /// The logical plan root. Use this for introspection (matching on
+    /// `PlanNode` variants to inspect index selection, join strategy, etc.).
     pub fn root(&self) -> &PlanNode {
         &self.root
     }
 
-    /// Total estimated cost of the plan.
+    /// The vectorized execution root — the plan that will actually run.
+    pub fn vec_root(&self) -> &VecExecNode {
+        &self.vec_root
+    }
+
+    /// Total estimated cost of the vectorized execution plan.
     pub fn cost(&self) -> Cost {
+        self.vec_root.cost()
+    }
+
+    /// Cost of the logical plan before vectorized lowering.
+    pub fn logical_cost(&self) -> Cost {
         self.root.cost()
     }
 
@@ -541,10 +554,36 @@ impl QueryPlanResult {
         &self.warnings
     }
 
-    /// Human-readable execution plan (Volcano EXPLAIN output).
+    /// Human-readable execution plan showing the vectorized plan tree.
     pub fn explain(&self) -> String {
         let mut out = String::new();
-        out.push_str("=== Query Plan ===\n");
+        out.push_str("=== Vectorized Execution Plan ===\n");
+        let _ = write!(out, "{}", self.vec_root);
+        if !self.warnings.is_empty() {
+            out.push_str("\nWarnings:\n");
+            for w in &self.warnings {
+                let _ = writeln!(out, "  - {w}");
+            }
+        }
+        let _ = write!(
+            out,
+            "\nL2 cache budget: {} KiB, target chunk: {} rows\n",
+            self.opts.l2_cache_bytes / 1024,
+            self.opts.target_chunk_rows,
+        );
+        let _ = writeln!(
+            out,
+            "Estimated: {:.0} rows, {:.1} cpu",
+            self.vec_root.cost().rows,
+            self.vec_root.cost().cpu
+        );
+        out
+    }
+
+    /// Human-readable logical plan (before vectorized lowering).
+    pub fn explain_logical(&self) -> String {
+        let mut out = String::new();
+        out.push_str("=== Logical Plan ===\n");
         let _ = write!(out, "{}", self.root);
         if !self.warnings.is_empty() {
             out.push_str("\nWarnings:\n");
@@ -572,6 +611,8 @@ impl fmt::Debug for QueryPlanResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryPlanResult")
             .field("root", &self.root)
+            .field("vec_root", &self.vec_root)
+            .field("opts", &self.opts)
             .field("warnings", &self.warnings)
             .finish()
     }
@@ -950,8 +991,12 @@ impl ScanBuilder<'_> {
             }
         }
 
+        let opts = VectorizeOpts::default();
+        let vec_root = lower_to_vectorized(&node, &opts);
         QueryPlanResult {
             root: node,
+            vec_root,
+            opts,
             warnings,
         }
     }
@@ -1215,9 +1260,10 @@ pub fn choose_cheaper<'a>(a: &'a QueryPlanResult, b: &'a QueryPlanResult) -> &'a
 /// `&[T]` / `&mut [T]` slices. LLVM can auto-vectorize loops over these
 /// contiguous, 64-byte-aligned columns.
 ///
-/// The vectorized plan is a **lowered representation** of the logical
-/// [`PlanNode`] tree. The planner decides the execution strategy during
-/// [`QueryPlanResult::vectorize`]; users inspect it via `explain()`.
+/// The vectorized plan is the **default execution representation**.
+/// `build()` automatically lowers the logical [`PlanNode`] tree to
+/// vectorized form. Users inspect it via `explain()` and can access
+/// the logical plan via `root()` or `explain_logical()`.
 #[derive(Debug)]
 pub enum VecExecNode {
     /// Chunked scan: yields one batch per archetype.
@@ -1460,12 +1506,12 @@ impl fmt::Debug for VectorizedPlan {
 }
 
 impl QueryPlanResult {
-    /// Lower the logical plan to a vectorized execution plan.
+    /// Re-lower the logical plan with custom vectorization options.
     ///
-    /// The vectorized plan processes data in archetype-chunk-sized batches,
-    /// enabling SIMD auto-vectorization. Scan nodes become chunked scans,
-    /// filters become SIMD-friendly batch filters, and hash joins are
-    /// partitioned for L2 cache residency.
+    /// By default, `build()` compiles to vectorized execution with
+    /// `VectorizeOpts::default()`. Use this method to re-lower with
+    /// different cache/chunk parameters (e.g., for a different cache
+    /// hierarchy).
     pub fn vectorize(&self, opts: VectorizeOpts) -> VectorizedPlan {
         let root = lower_to_vectorized(&self.root, &opts);
         VectorizedPlan { root, opts }
@@ -1992,11 +2038,18 @@ mod tests {
             .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
             .build();
 
+        // Default explain shows vectorized plan
         let explain = plan.explain();
-        assert!(explain.contains("Query Plan"));
-        assert!(explain.contains("IndexLookup"));
+        assert!(explain.contains("Vectorized Execution Plan"));
+        assert!(explain.contains("IndexGather"));
         assert!(explain.contains("BTree"));
         assert!(explain.contains("Score"));
+        assert!(explain.contains("L2 cache budget"));
+
+        // Logical explain shows the original plan tree
+        let logical = plan.explain_logical();
+        assert!(logical.contains("Logical Plan"));
+        assert!(logical.contains("IndexLookup"));
     }
 
     // ── Subscription plans ──────────────────────────────────────────
@@ -2260,7 +2313,30 @@ mod tests {
         assert_eq!(w1.kind, w2.kind);
     }
 
-    // ── Vectorized execution ────────────────────────────────────────
+    // ── Vectorized execution (default) ────────────────────────────────
+
+    #[test]
+    fn build_produces_vectorized_by_default() {
+        let mut world = World::new();
+        for i in 0..1000 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+
+        // vec_root() is available without calling .vectorize()
+        match plan.vec_root() {
+            VecExecNode::ChunkedScan {
+                estimated_rows, ..
+            } => {
+                assert_eq!(*estimated_rows, 1000);
+            }
+            other => panic!("expected ChunkedScan, got {:?}", other),
+        }
+
+        // cost() returns vectorized cost (cheaper than logical)
+        assert!(plan.cost().cpu < plan.logical_cost().cpu);
+    }
 
     #[test]
     fn vectorize_scan_produces_chunked_scan() {
@@ -2390,20 +2466,20 @@ mod tests {
     }
 
     #[test]
-    fn vectorized_scan_cheaper_than_scalar() {
+    fn vectorized_cost_cheaper_than_logical() {
         let mut world = World::new();
         for i in 0..10_000 {
             world.spawn((Score(i),));
         }
         let planner = QueryPlanner::new(&world);
         let plan = planner.scan::<(&Score,)>().build();
-        let vec_plan = plan.vectorize(VectorizeOpts::default());
 
+        // cost() returns vectorized (default), logical_cost() returns pre-lowering
         assert!(
-            vec_plan.cost().cpu < plan.cost().cpu,
-            "vectorized ({:.1}) should be cheaper than scalar ({:.1})",
-            vec_plan.cost().cpu,
-            plan.cost().cpu
+            plan.cost().cpu < plan.logical_cost().cpu,
+            "vectorized ({:.1}) should be cheaper than logical ({:.1})",
+            plan.cost().cpu,
+            plan.logical_cost().cpu
         );
     }
 
