@@ -710,7 +710,10 @@ impl QueryPlanResult {
             });
             scratch.as_slice()
         } else {
-            scratch.as_slice()
+            panic!(
+                "execute() called on a plan with no join executor and no compiled scan — \
+                 this indicates a bug in plan compilation"
+            );
         }
     }
 
@@ -722,10 +725,10 @@ impl QueryPlanResult {
     /// # Panics
     /// Panics if the plan was not compiled with scan support.
     pub fn for_each(&mut self, world: &mut World, mut callback: impl FnMut(Entity)) {
-        let compiled = self
-            .compiled_for_each
-            .as_mut()
-            .expect("for_each requires a scan-compiled plan");
+        let compiled = self.compiled_for_each.as_mut().expect(
+            "for_each() is only available for scan-only plans (no joins). \
+                 For plans with joins, use execute() which returns &[Entity].",
+        );
         // Reborrow as &World — the compiled closure only reads archetype data.
         // &mut World is taken for query cache management (future use).
         compiled(&*world, &mut callback);
@@ -740,10 +743,10 @@ impl QueryPlanResult {
     /// # Panics
     /// Panics if the plan was not compiled with scan support.
     pub fn for_each_raw(&mut self, world: &World, mut callback: impl FnMut(Entity)) {
-        let compiled = self
-            .compiled_for_each_raw
-            .as_mut()
-            .expect("for_each_raw requires a scan-compiled plan");
+        let compiled = self.compiled_for_each_raw.as_mut().expect(
+            "for_each_raw() is only available for scan-only plans (no joins). \
+                 For plans with joins, use execute() which returns &[Entity].",
+        );
         compiled(world, &mut callback);
     }
 
@@ -1218,6 +1221,21 @@ impl ScanBuilder<'_> {
 
         // Collect all filter closures for compiled scan fusion.
         // Must happen before Phase 4 consumes filter_preds.
+        // Debug-assert that no Eq/Range predicate has filter_fn: None — if
+        // a predicate appears in the plan but has no executable filter, the
+        // plan's EXPLAIN would show a filter node that doesn't actually run.
+        debug_assert!(
+            index_preds
+                .iter()
+                .all(|(p, _)| p.filter_fn.is_some() || matches!(p.kind, PredicateKind::Custom(_))),
+            "Eq/Range predicate with filter_fn: None — plan would show filter but not apply it"
+        );
+        debug_assert!(
+            filter_preds
+                .iter()
+                .all(|p| p.filter_fn.is_some() || matches!(p.kind, PredicateKind::Custom(_))),
+            "Eq/Range predicate with filter_fn: None — plan would show filter but not apply it"
+        );
         let all_filter_fns: Vec<FilterFn> = index_preds
             .iter()
             .filter_map(|(p, _)| p.filter_fn.as_ref().map(Arc::clone))
@@ -2408,7 +2426,10 @@ impl ScratchBuffer {
     /// appended to the end of the buffer. Returns a slice over the matches.
     fn sorted_intersection(&mut self, left_len: usize) -> &[Entity] {
         let total = self.entities.len();
-        debug_assert!(left_len <= total);
+        assert!(
+            left_len <= total,
+            "sorted_intersection: left_len ({left_len}) exceeds buffer length ({total})"
+        );
 
         // Sort the left partition in place by raw bits (deterministic total order).
         self.entities[..left_len].sort_unstable_by_key(|e| e.to_bits());
@@ -4233,6 +4254,58 @@ mod tests {
         assert_eq!(result_indices, vec![3, 7]);
     }
 
+    #[test]
+    fn scratch_buffer_sorted_intersection_empty_left() {
+        let mut buf = ScratchBuffer::new(10);
+        let left_len = 0; // empty left
+        for idx in [2, 3, 6] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let result = buf.sorted_intersection(left_len);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scratch_buffer_sorted_intersection_empty_right() {
+        let mut buf = ScratchBuffer::new(10);
+        for idx in [1, 3, 5] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let left_len = buf.len(); // right partition is empty
+        let result = buf.sorted_intersection(left_len);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scratch_buffer_sorted_intersection_complete_overlap() {
+        let mut buf = ScratchBuffer::new(10);
+        for idx in [1, 2, 3] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let left_len = buf.len();
+        for idx in [1, 2, 3] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let result = buf.sorted_intersection(left_len);
+        let mut ids: Vec<u32> = result.iter().map(|e| e.index()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn scratch_buffer_sorted_intersection_no_overlap() {
+        let mut buf = ScratchBuffer::new(10);
+        for idx in [1, 3, 5] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let left_len = buf.len();
+        for idx in [2, 4, 6] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let result = buf.sorted_intersection(left_len);
+        assert!(result.is_empty());
+    }
+
     // ── Execute with ScratchBuffer ─────────────────────────────────
 
     #[test]
@@ -4290,6 +4363,52 @@ mod tests {
 
         let mut found = Vec::new();
         plan.for_each(&mut world, |entity: Entity| {
+            found.push(entity);
+        });
+        found.sort_by_key(|e| e.to_bits());
+        expected.sort_by_key(|e| e.to_bits());
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn for_each_iterates_multiple_archetypes() {
+        let mut world = World::new();
+        let mut expected = Vec::new();
+        // Archetype 1: (Score,)
+        for i in 0..5u32 {
+            expected.push(world.spawn((Score(i),)));
+        }
+        // Archetype 2: (Score, Team)
+        for i in 5..10u32 {
+            expected.push(world.spawn((Score(i), Team(i % 3))));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        let mut found = Vec::new();
+        plan.for_each(&mut world, |entity: Entity| {
+            found.push(entity);
+        });
+        found.sort_by_key(|e| e.to_bits());
+        expected.sort_by_key(|e| e.to_bits());
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn for_each_raw_iterates_multiple_archetypes() {
+        let mut world = World::new();
+        let mut expected = Vec::new();
+        for i in 0..5u32 {
+            expected.push(world.spawn((Score(i),)));
+        }
+        for i in 5..10u32 {
+            expected.push(world.spawn((Score(i), Team(i % 3))));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        let mut found = Vec::new();
+        plan.for_each_raw(&world, |entity: Entity| {
             found.push(entity);
         });
         found.sort_by_key(|e| e.to_bits());
