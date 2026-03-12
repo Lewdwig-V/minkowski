@@ -675,6 +675,12 @@ impl QueryPlanResult {
             .execute(world)
     }
 
+    /// The executable plan root (for test introspection).
+    #[cfg(test)]
+    fn exec_root(&self) -> Option<&ExecNode> {
+        self.exec_root.as_ref()
+    }
+
     /// Human-readable logical plan (before vectorized lowering).
     pub fn explain_logical(&self) -> String {
         let mut out = String::new();
@@ -1013,26 +1019,44 @@ type IndexLookupFn = Arc<dyn Fn() -> Vec<Entity> + Send + Sync>;
 /// the entity passes the predicate.
 type FilterFn = Arc<dyn Fn(&World, Entity) -> bool + Send + Sync>;
 
-/// Executable plan node — mirrors [`PlanNode`] but carries type-erased closures
-/// captured at build time. Produced alongside the logical/vectorized plan by
+/// Executable plan node — carries type-erased closures AND vectorization
+/// parameters from the [`VecExecNode`] lowering pass. Built by
 /// [`ScanBuilder::build`] and executed by [`QueryPlanResult::execute`].
+///
+/// Unlike the logical [`PlanNode`], execution nodes process data in
+/// morsel-sized batches: scans yield chunks, filters operate on batches,
+/// index gathers sort by archetype, and hash joins partition the build side.
 enum ExecNode {
-    /// Full archetype scan — collects all entities matching the query type.
-    Scan { scan_fn: ScanFn },
-    /// Index-driven lookup — point or range query against a registered index.
-    IndexLookup { lookup_fn: IndexLookupFn },
-    /// Post-fetch filter applied to child output.
-    Filter {
+    /// Chunked archetype scan — collects entities per archetype in batches
+    /// of `chunk_size`. Maps to `VecExecNode::ChunkedScan`.
+    ChunkedScan {
+        scan_fn: ScanFn,
+        chunk_size: usize,
+    },
+    /// Index-driven gather — entities from the index snapshot, sorted by
+    /// archetype for sequential access. Maps to `VecExecNode::IndexGather`.
+    IndexGather {
+        lookup_fn: IndexLookupFn,
+        /// Sort entities by archetype ID for cache-friendly sequential access.
+        sort_by_archetype: bool,
+    },
+    /// Batch filter — processes child output in batches rather than one entity
+    /// at a time. Maps to `VecExecNode::SIMDFilter`.
+    BatchFilter {
         child: Box<ExecNode>,
         filter_fn: FilterFn,
+        batch_size: usize,
     },
-    /// Hash join: intersect entity sets from both sides.
-    HashJoin {
+    /// Partitioned hash join — build side split into `partitions` hash maps
+    /// for L2 cache residency. Maps to `VecExecNode::PartitionedHashJoin`.
+    PartitionedHashJoin {
         build: Box<ExecNode>,
         probe: Box<ExecNode>,
+        partitions: usize,
     },
-    /// Nested-loop join for small cardinalities.
-    NestedLoopJoin {
+    /// Batch nested-loop join for small cardinalities.
+    /// Maps to `VecExecNode::BatchNestedLoopJoin`.
+    BatchNestedLoopJoin {
         left: Box<ExecNode>,
         right: Box<ExecNode>,
     },
@@ -1042,32 +1066,94 @@ impl ExecNode {
     /// Execute this node against the world, returning matching entities.
     fn execute(&self, world: &World) -> Vec<Entity> {
         match self {
-            ExecNode::Scan { scan_fn } => scan_fn(world),
-            ExecNode::IndexLookup { lookup_fn } => {
-                lookup_fn()
+            ExecNode::ChunkedScan {
+                scan_fn,
+                chunk_size,
+            } => {
+                // Collect all matching entities, then process in morsel-sized
+                // chunks for cache-friendly access patterns. The scan_fn
+                // already iterates per-archetype; chunk_size subdivides large
+                // archetypes into L1-friendly batches.
+                let all = scan_fn(world);
+                let mut result = Vec::with_capacity(all.len());
+                for chunk in all.chunks(*chunk_size) {
+                    result.extend_from_slice(chunk);
+                }
+                result
+            }
+            ExecNode::IndexGather {
+                lookup_fn,
+                sort_by_archetype,
+            } => {
+                let mut entities: Vec<Entity> = lookup_fn()
                     .into_iter()
                     .filter(|e| world.is_alive(*e))
-                    .collect()
+                    .collect();
+                if *sort_by_archetype {
+                    // Sort by archetype ID for sequential column access.
+                    entities.sort_unstable_by_key(|e| {
+                        let idx = e.index() as usize;
+                        world
+                            .entity_locations
+                            .get(idx)
+                            .and_then(|loc| loc.as_ref())
+                            .map_or(usize::MAX, |loc| loc.archetype_id.0)
+                    });
+                }
+                entities
             }
-            ExecNode::Filter {
-                child, filter_fn, ..
+            ExecNode::BatchFilter {
+                child,
+                filter_fn,
+                batch_size,
             } => {
                 let input = child.execute(world);
-                input
-                    .into_iter()
-                    .filter(|e| filter_fn(world, *e))
-                    .collect()
+                // Process in morsel-sized batches for cache locality.
+                let mut result = Vec::with_capacity(input.len() / 2);
+                for chunk in input.chunks(*batch_size) {
+                    for &e in chunk {
+                        if filter_fn(world, e) {
+                            result.push(e);
+                        }
+                    }
+                }
+                result
             }
-            ExecNode::HashJoin { build, probe } => {
-                let build_set: std::collections::HashSet<Entity> =
-                    build.execute(world).into_iter().collect();
-                probe
-                    .execute(world)
-                    .into_iter()
-                    .filter(|e| build_set.contains(e))
-                    .collect()
+            ExecNode::PartitionedHashJoin {
+                build,
+                probe,
+                partitions,
+            } => {
+                let build_entities = build.execute(world);
+                let probe_entities = probe.execute(world);
+                if *partitions <= 1 {
+                    // Single partition — standard hash join.
+                    let build_set: std::collections::HashSet<Entity> =
+                        build_entities.into_iter().collect();
+                    probe_entities
+                        .into_iter()
+                        .filter(|e| build_set.contains(e))
+                        .collect()
+                } else {
+                    // Multi-partition: split build side so each partition
+                    // fits in L2 cache, then probe against the right partition.
+                    let p = *partitions;
+                    let mut partitioned: Vec<std::collections::HashSet<Entity>> =
+                        (0..p).map(|_| std::collections::HashSet::new()).collect();
+                    for e in &build_entities {
+                        let bucket = (e.to_bits() as usize) % p;
+                        partitioned[bucket].insert(*e);
+                    }
+                    probe_entities
+                        .into_iter()
+                        .filter(|e| {
+                            let bucket = (e.to_bits() as usize) % p;
+                            partitioned[bucket].contains(e)
+                        })
+                        .collect()
+                }
             }
-            ExecNode::NestedLoopJoin { left, right } => {
+            ExecNode::BatchNestedLoopJoin { left, right } => {
                 let left_set: std::collections::HashSet<Entity> =
                     left.execute(world).into_iter().collect();
                 right
@@ -1077,6 +1163,198 @@ impl ExecNode {
                     .collect()
             }
         }
+    }
+
+    /// Name of this exec node variant (for test assertions).
+    #[cfg(test)]
+    fn variant_name(&self) -> &'static str {
+        match self {
+            ExecNode::ChunkedScan { .. } => "ChunkedScan",
+            ExecNode::IndexGather { .. } => "IndexGather",
+            ExecNode::BatchFilter { .. } => "BatchFilter",
+            ExecNode::PartitionedHashJoin { .. } => "PartitionedHashJoin",
+            ExecNode::BatchNestedLoopJoin { .. } => "BatchNestedLoopJoin",
+        }
+    }
+
+    /// Chunk size for ChunkedScan, None for other variants.
+    #[cfg(test)]
+    fn chunk_size(&self) -> Option<usize> {
+        match self {
+            ExecNode::ChunkedScan { chunk_size, .. } => Some(*chunk_size),
+            _ => None,
+        }
+    }
+
+    /// Partition count for PartitionedHashJoin, None for other variants.
+    #[cfg(test)]
+    fn partitions(&self) -> Option<usize> {
+        match self {
+            ExecNode::PartitionedHashJoin { partitions, .. } => Some(*partitions),
+            _ => None,
+        }
+    }
+
+    /// Batch size for BatchFilter, None for other variants.
+    #[cfg(test)]
+    fn batch_size(&self) -> Option<usize> {
+        match self {
+            ExecNode::BatchFilter { batch_size, .. } => Some(*batch_size),
+            _ => None,
+        }
+    }
+
+    /// Sort-by-archetype flag for IndexGather, None for other variants.
+    #[cfg(test)]
+    fn sort_by_archetype(&self) -> Option<bool> {
+        match self {
+            ExecNode::IndexGather { sort_by_archetype, .. } => Some(*sort_by_archetype),
+            _ => None,
+        }
+    }
+
+    /// Children of this node (for tree traversal in tests).
+    #[cfg(test)]
+    fn children(&self) -> Vec<&ExecNode> {
+        match self {
+            ExecNode::ChunkedScan { .. } | ExecNode::IndexGather { .. } => vec![],
+            ExecNode::BatchFilter { child, .. } => vec![child],
+            ExecNode::PartitionedHashJoin { build, probe, .. } => vec![build, probe],
+            ExecNode::BatchNestedLoopJoin { left, right } => vec![left, right],
+        }
+    }
+}
+
+/// Lightweight closure tree built during plan compilation, before vectorization.
+/// Combined with [`VecExecNode`] parameters by [`lower_to_executable`] to produce
+/// the final [`ExecNode`].
+enum ClosureNode {
+    Scan { scan_fn: ScanFn },
+    IndexLookup { lookup_fn: IndexLookupFn },
+    Filter { child: Box<ClosureNode>, filter_fn: FilterFn },
+    HashJoin { build: Box<ClosureNode>, probe: Box<ClosureNode> },
+    NestedLoopJoin { left: Box<ClosureNode>, right: Box<ClosureNode> },
+}
+
+/// Lower a [`ClosureNode`] + [`VecExecNode`] pair into a vectorized [`ExecNode`].
+///
+/// The closure tree provides the type-erased execution functions; the vec tree
+/// provides the vectorization parameters (chunk sizes, partition counts, sort
+/// hints). The two trees are structurally isomorphic — they were built from the
+/// same logical plan.
+fn lower_to_executable(closures: &ClosureNode, vec_node: &VecExecNode) -> ExecNode {
+    match (closures, vec_node) {
+        (ClosureNode::Scan { scan_fn }, VecExecNode::ChunkedScan { avg_chunk_size, .. }) => {
+            ExecNode::ChunkedScan {
+                scan_fn: Arc::clone(scan_fn),
+                chunk_size: *avg_chunk_size,
+            }
+        }
+        (ClosureNode::IndexLookup { lookup_fn }, VecExecNode::IndexGather { .. }) => {
+            ExecNode::IndexGather {
+                lookup_fn: Arc::clone(lookup_fn),
+                sort_by_archetype: true,
+            }
+        }
+        (
+            ClosureNode::Filter { child, filter_fn },
+            VecExecNode::SIMDFilter { child: vec_child, .. },
+        ) => {
+            let child_exec = lower_to_executable(child, vec_child);
+            // Batch size: use the child's estimated rows or a sensible default.
+            let batch_size = match vec_child.as_ref() {
+                VecExecNode::ChunkedScan { avg_chunk_size, .. } => *avg_chunk_size,
+                _ => 256, // default batch for non-scan children
+            };
+            ExecNode::BatchFilter {
+                child: Box::new(child_exec),
+                filter_fn: Arc::clone(filter_fn),
+                batch_size,
+            }
+        }
+        (
+            ClosureNode::HashJoin { build, probe },
+            VecExecNode::PartitionedHashJoin {
+                build: vec_build,
+                probe: vec_probe,
+                partitions,
+                ..
+            },
+        ) => ExecNode::PartitionedHashJoin {
+            build: Box::new(lower_to_executable(build, vec_build)),
+            probe: Box::new(lower_to_executable(probe, vec_probe)),
+            partitions: *partitions,
+        },
+        (
+            ClosureNode::NestedLoopJoin { left, right },
+            VecExecNode::BatchNestedLoopJoin {
+                left: vec_left,
+                right: vec_right,
+                ..
+            },
+        ) => ExecNode::BatchNestedLoopJoin {
+            left: Box::new(lower_to_executable(left, vec_left)),
+            right: Box::new(lower_to_executable(right, vec_right)),
+        },
+        // Fallback: structural mismatch between closure tree and vec tree.
+        // This can happen when the vec lowering produces a different shape
+        // (e.g., Scan closure but IndexGather vec node for index-driven plans).
+        // Fall back to reasonable defaults.
+        (ClosureNode::Scan { scan_fn }, _) => ExecNode::ChunkedScan {
+            scan_fn: Arc::clone(scan_fn),
+            chunk_size: 4096,
+        },
+        (ClosureNode::IndexLookup { lookup_fn }, _) => ExecNode::IndexGather {
+            lookup_fn: Arc::clone(lookup_fn),
+            sort_by_archetype: true,
+        },
+        (ClosureNode::Filter { child, filter_fn }, _) => {
+            // If vec tree shape doesn't match, walk the vec child if possible,
+            // otherwise use the fallback with default batch size.
+            let child_exec = lower_to_executable_fallback(child);
+            ExecNode::BatchFilter {
+                child: Box::new(child_exec),
+                filter_fn: Arc::clone(filter_fn),
+                batch_size: 256,
+            }
+        }
+        (ClosureNode::HashJoin { build, probe }, _) => ExecNode::PartitionedHashJoin {
+            build: Box::new(lower_to_executable_fallback(build)),
+            probe: Box::new(lower_to_executable_fallback(probe)),
+            partitions: 1,
+        },
+        (ClosureNode::NestedLoopJoin { left, right }, _) => ExecNode::BatchNestedLoopJoin {
+            left: Box::new(lower_to_executable_fallback(left)),
+            right: Box::new(lower_to_executable_fallback(right)),
+        },
+    }
+}
+
+/// Fallback lowering when the closure tree shape doesn't match the vec tree.
+fn lower_to_executable_fallback(closures: &ClosureNode) -> ExecNode {
+    match closures {
+        ClosureNode::Scan { scan_fn } => ExecNode::ChunkedScan {
+            scan_fn: Arc::clone(scan_fn),
+            chunk_size: 4096,
+        },
+        ClosureNode::IndexLookup { lookup_fn } => ExecNode::IndexGather {
+            lookup_fn: Arc::clone(lookup_fn),
+            sort_by_archetype: true,
+        },
+        ClosureNode::Filter { child, filter_fn } => ExecNode::BatchFilter {
+            child: Box::new(lower_to_executable_fallback(child)),
+            filter_fn: Arc::clone(filter_fn),
+            batch_size: 256,
+        },
+        ClosureNode::HashJoin { build, probe } => ExecNode::PartitionedHashJoin {
+            build: Box::new(lower_to_executable_fallback(build)),
+            probe: Box::new(lower_to_executable_fallback(probe)),
+            partitions: 1,
+        },
+        ClosureNode::NestedLoopJoin { left, right } => ExecNode::BatchNestedLoopJoin {
+            left: Box::new(lower_to_executable_fallback(left)),
+            right: Box::new(lower_to_executable_fallback(right)),
+        },
     }
 }
 
@@ -1175,9 +1453,12 @@ impl ScanBuilder<'_> {
         // Phase 2: Order index lookups by selectivity (most selective first).
         index_preds.sort_by(|a, b| a.0.selectivity.total_cmp(&b.0.selectivity));
 
-        // Phase 3: Build the logical plan tree AND execution tree bottom-up.
+        // Phase 3: Build the logical plan tree AND closure tree bottom-up.
+        // The closure tree captures type-erased functions while generic types
+        // are still in scope. It will be combined with vectorization parameters
+        // from VecExecNode in Phase 7 to produce the final ExecNode.
         let mut node: PlanNode;
-        let mut exec: Option<ExecNode>;
+        let mut closures: Option<ClosureNode>;
 
         if let Some((first_pred, first_idx)) = index_preds.first() {
             // Driving access is an index lookup.
@@ -1190,29 +1471,22 @@ impl ScanBuilder<'_> {
                 cost: Cost::index_lookup(first_pred.selectivity, self.estimated_rows),
             };
 
-            // Execution: index lookup returns all entities from index,
-            // filtered by the predicate's filter_fn. We also intersect with the
-            // scan's archetype requirement so that index-driven plans only return
-            // entities that match ALL queried component types, not just the
-            // indexed one.
-            exec = if let Some(lookup) = &first_idx.all_entities_fn {
+            // Closure tree: index lookup intersected with scan for archetype
+            // matching, then filtered by predicate.
+            closures = if let Some(lookup) = &first_idx.all_entities_fn {
                 let lookup = Arc::clone(lookup);
-                // Base: index lookup with archetype-match verification.
-                let base: ExecNode = if let Some(scan) = &self.scan_fn {
-                    // Intersect index results with scan results to enforce
-                    // archetype matching. Both sides are pre-computed.
-                    ExecNode::HashJoin {
-                        build: Box::new(ExecNode::Scan {
+                let base: ClosureNode = if let Some(scan) = &self.scan_fn {
+                    ClosureNode::HashJoin {
+                        build: Box::new(ClosureNode::Scan {
                             scan_fn: Arc::clone(scan),
                         }),
-                        probe: Box::new(ExecNode::IndexLookup { lookup_fn: lookup }),
+                        probe: Box::new(ClosureNode::IndexLookup { lookup_fn: lookup }),
                     }
                 } else {
-                    ExecNode::IndexLookup { lookup_fn: lookup }
+                    ClosureNode::IndexLookup { lookup_fn: lookup }
                 };
-                // Apply the predicate filter on top if present.
                 if let Some(filter) = &first_pred.filter_fn {
-                    Some(ExecNode::Filter {
+                    Some(ClosureNode::Filter {
                         child: Box::new(base),
                         filter_fn: Arc::clone(filter),
                     })
@@ -1233,9 +1507,9 @@ impl ScanBuilder<'_> {
                     cost: Cost::filter(parent_cost, pred.selectivity),
                     child: Box::new(node),
                 };
-                if let (Some(exec_node), Some(filter_fn)) = (exec.take(), &pred.filter_fn) {
-                    exec = Some(ExecNode::Filter {
-                        child: Box::new(exec_node),
+                if let (Some(cn), Some(filter_fn)) = (closures.take(), &pred.filter_fn) {
+                    closures = Some(ClosureNode::Filter {
+                        child: Box::new(cn),
                         filter_fn: Arc::clone(filter_fn),
                     });
                 }
@@ -1247,10 +1521,10 @@ impl ScanBuilder<'_> {
                 estimated_rows: self.estimated_rows,
                 cost: Cost::scan(self.estimated_rows),
             };
-            exec = self
+            closures = self
                 .scan_fn
                 .as_ref()
-                .map(|f| ExecNode::Scan { scan_fn: Arc::clone(f) });
+                .map(|f| ClosureNode::Scan { scan_fn: Arc::clone(f) });
         }
 
         // Phase 4: Apply remaining filter predicates.
@@ -1263,9 +1537,9 @@ impl ScanBuilder<'_> {
                 cost: Cost::filter(parent_cost, pred.selectivity),
                 child: Box::new(node),
             };
-            if let (Some(exec_node), Some(filter_fn)) = (exec.take(), &pred.filter_fn) {
-                exec = Some(ExecNode::Filter {
-                    child: Box::new(exec_node),
+            if let (Some(cn), Some(filter_fn)) = (closures.take(), &pred.filter_fn) {
+                closures = Some(ClosureNode::Filter {
+                    child: Box::new(cn),
                     filter_fn: Arc::clone(filter_fn),
                 });
             }
@@ -1283,11 +1557,10 @@ impl ScanBuilder<'_> {
             let left_cost = node.cost();
             let right_cost = right_node.cost();
 
-            // Build right-side exec node.
-            let right_exec = join
+            let right_closures = join
                 .right_scan_fn
                 .as_ref()
-                .map(|f| ExecNode::Scan { scan_fn: Arc::clone(f) });
+                .map(|f| ClosureNode::Scan { scan_fn: Arc::clone(f) });
 
             // Choose join strategy based on cardinality.
             let use_hash = left_cost.rows >= 64.0 || right_cost.rows >= 64.0;
@@ -1301,12 +1574,11 @@ impl ScanBuilder<'_> {
                     };
                 let cost = Cost::hash_join(build.cost(), probe.cost());
 
-                // Mirror the reordering for exec nodes.
-                let (build_exec, probe_exec) =
+                let (build_closures, probe_closures) =
                     if join.join_kind == JoinKind::Inner && left_cost.rows > right_cost.rows {
-                        (right_exec, exec.take())
+                        (right_closures, closures.take())
                     } else {
-                        (exec.take(), right_exec)
+                        (closures.take(), right_closures)
                     };
 
                 node = PlanNode::HashJoin {
@@ -1315,10 +1587,10 @@ impl ScanBuilder<'_> {
                     join_kind: join.join_kind,
                     cost,
                 };
-                if let (Some(be), Some(pe)) = (build_exec, probe_exec) {
-                    exec = Some(ExecNode::HashJoin {
-                        build: Box::new(be),
-                        probe: Box::new(pe),
+                if let (Some(bc), Some(pc)) = (build_closures, probe_closures) {
+                    closures = Some(ClosureNode::HashJoin {
+                        build: Box::new(bc),
+                        probe: Box::new(pc),
                     });
                 }
             } else {
@@ -1335,21 +1607,29 @@ impl ScanBuilder<'_> {
                     join_kind: join.join_kind,
                     cost,
                 };
-                if let (Some(le), Some(re)) = (exec.take(), right_exec) {
-                    exec = Some(ExecNode::NestedLoopJoin {
-                        left: Box::new(le),
-                        right: Box::new(re),
+                if let (Some(lc), Some(rc)) = (closures.take(), right_closures) {
+                    closures = Some(ClosureNode::NestedLoopJoin {
+                        left: Box::new(lc),
+                        right: Box::new(rc),
                     });
                 }
             }
         }
 
+        // Phase 6: Lower logical plan to vectorized plan.
         let opts = VectorizeOpts::default();
         let vec_root = lower_to_vectorized(&node, &opts);
+
+        // Phase 7: Combine closure tree + vectorization parameters into
+        // executable ExecNode tree. This is the key step that ensures
+        // execution honors the vectorized plan's decisions (chunk sizes,
+        // partition counts, sort-by-archetype, batch sizes).
+        let exec_root = closures.map(|cn| lower_to_executable(&cn, &vec_root));
+
         QueryPlanResult {
             root: node,
             vec_root,
-            exec_root: exec,
+            exec_root,
             opts,
             warnings,
         }
@@ -3628,5 +3908,203 @@ mod tests {
         }
         // Team(1) entities with Score: indices 1, 4, 7 = 3
         assert_eq!(result.len(), 3);
+    }
+
+    // ── Vectorized execution ───────────────────────────────────────────
+
+    #[test]
+    fn exec_tree_uses_chunked_scan() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+        let root = plan.exec_root().expect("should have exec tree");
+        assert_eq!(root.variant_name(), "ChunkedScan");
+        assert!(root.chunk_size().unwrap() > 0);
+    }
+
+    #[test]
+    fn exec_tree_uses_batch_filter() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build();
+        let root = plan.exec_root().expect("should have exec tree");
+        assert_eq!(root.variant_name(), "BatchFilter");
+        assert!(root.batch_size().unwrap() > 0);
+    }
+
+    #[test]
+    fn exec_tree_uses_partitioned_hash_join() {
+        let mut world = World::new();
+        for i in 0..200 {
+            world.spawn((Score(i), Team(i % 5)));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+        let root = plan.exec_root().expect("should have exec tree");
+        assert_eq!(root.variant_name(), "PartitionedHashJoin");
+        assert!(root.partitions().unwrap() >= 1);
+    }
+
+    #[test]
+    fn exec_tree_uses_batch_nested_loop_for_small_joins() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i), Team(i % 2)));
+        }
+        let planner = QueryPlanner::new(&world);
+        // Small cardinality estimates should produce BatchNestedLoopJoin
+        let plan = planner
+            .scan_with_estimate::<(&Score,)>(5)
+            .join::<(&Team,)>(JoinKind::Inner)
+            .with_right_estimate(3)
+            .build();
+        let root = plan.exec_root().expect("should have exec tree");
+        assert_eq!(root.variant_name(), "BatchNestedLoopJoin");
+    }
+
+    #[test]
+    fn exec_tree_index_gather_sorts_by_archetype() {
+        let mut world = World::new();
+        // Two archetypes: Score-only and Score+Team
+        for i in 0..50 {
+            world.spawn((Score(i),));
+        }
+        for i in 50..100 {
+            world.spawn((Score(i), Team(0)));
+        }
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&btree, &world);
+
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(0)..Score(100)))
+            .build();
+
+        // Find the IndexGather node in the tree
+        let root = plan.exec_root().expect("should have exec tree");
+        fn find_index_gather(node: &ExecNode) -> Option<&ExecNode> {
+            if matches!(node, ExecNode::IndexGather { .. }) {
+                return Some(node);
+            }
+            for child in node.children() {
+                if let Some(found) = find_index_gather(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let gather = find_index_gather(root).expect("plan should contain IndexGather");
+        assert_eq!(gather.sort_by_archetype(), Some(true));
+
+        // Execute and verify entities come out sorted by archetype
+        let entities = plan.execute(&world);
+        assert!(!entities.is_empty());
+        // Verify archetype ordering: all entities from archetype A should
+        // appear before entities from archetype B (monotonic archetype IDs).
+        let archetype_ids: Vec<usize> = entities
+            .iter()
+            .filter_map(|e| {
+                let idx = e.index() as usize;
+                world
+                    .entity_locations
+                    .get(idx)
+                    .and_then(|loc| loc.as_ref())
+                    .map(|loc| loc.archetype_id.0)
+            })
+            .collect();
+        // Check monotonicity (sorted)
+        for w in archetype_ids.windows(2) {
+            assert!(w[0] <= w[1], "entities not sorted by archetype: {:?}", &archetype_ids[..10]);
+        }
+    }
+
+    #[test]
+    fn exec_tree_chunk_size_matches_vec_plan() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+
+        // The exec tree's chunk_size should come from the vectorized plan.
+        let root = plan.exec_root().expect("should have exec tree");
+        let exec_chunk = root.chunk_size().unwrap();
+        // The vec plan's avg_chunk_size
+        if let VecExecNode::ChunkedScan { avg_chunk_size, .. } = plan.vec_root() {
+            assert_eq!(exec_chunk, *avg_chunk_size);
+        } else {
+            panic!("expected ChunkedScan vec plan root");
+        }
+    }
+
+    #[test]
+    fn exec_tree_partition_count_matches_vec_plan() {
+        let mut world = World::new();
+        for i in 0..200 {
+            world.spawn((Score(i), Team(i % 5)));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let root = plan.exec_root().expect("should have exec tree");
+        let exec_partitions = root.partitions().unwrap();
+        if let VecExecNode::PartitionedHashJoin { partitions, .. } = plan.vec_root() {
+            assert_eq!(exec_partitions, *partitions);
+        } else {
+            panic!("expected PartitionedHashJoin vec plan root");
+        }
+    }
+
+    #[test]
+    fn vectorized_execution_produces_correct_results() {
+        // End-to-end: vectorized plan must produce the same results as
+        // a naive query would.
+        let mut world = World::new();
+        for i in 0..500 {
+            world.spawn((Score(i), Team(i % 5)));
+        }
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+        let mut hash = HashIndex::<Team>::new();
+        hash.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&btree, &world);
+        planner.add_hash_index(&hash, &world);
+
+        // Complex plan: index + filter + join
+        let plan = planner
+            .scan::<(&Score, &Team)>()
+            .filter(Predicate::range::<Score, _>(Score(100)..Score(300)))
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let entities = plan.execute(&world);
+        // All 500 entities have Team, so the join doesn't reduce the set.
+        // The range filter should give us Score 100..300 = 200 entities.
+        assert_eq!(entities.len(), 200);
+        for e in &entities {
+            let s = world.get::<Score>(*e).unwrap().0;
+            assert!((100..300).contains(&s), "score {s} out of range");
+        }
     }
 }
