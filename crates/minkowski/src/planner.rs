@@ -1546,7 +1546,9 @@ impl ScanBuilder<'_> {
                     cost: Cost::filter(parent_cost, pred.selectivity),
                     child: Box::new(node),
                 };
-                if let (Some(cn), Some(filter_fn)) = (closures.take(), &pred.filter_fn) {
+                if let Some(filter_fn) = &pred.filter_fn
+                    && let Some(cn) = closures.take()
+                {
                     closures = Some(ClosureNode::Filter {
                         child: Box::new(cn),
                         filter_fn: Arc::clone(filter_fn),
@@ -1576,7 +1578,9 @@ impl ScanBuilder<'_> {
                 cost: Cost::filter(parent_cost, pred.selectivity),
                 child: Box::new(node),
             };
-            if let (Some(cn), Some(filter_fn)) = (closures.take(), &pred.filter_fn) {
+            if let Some(filter_fn) = &pred.filter_fn
+                && let Some(cn) = closures.take()
+            {
                 closures = Some(ClosureNode::Filter {
                     child: Box::new(cn),
                     filter_fn: Arc::clone(filter_fn),
