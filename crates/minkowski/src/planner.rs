@@ -99,9 +99,21 @@ use crate::world::World;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cost {
     /// Estimated number of rows this node will produce.
-    pub rows: f64,
+    rows: f64,
     /// Estimated CPU cost (comparison/hash operations).
-    pub cpu: f64,
+    cpu: f64,
+}
+
+impl Cost {
+    /// Estimated number of rows this node will produce.
+    pub fn rows(&self) -> f64 {
+        self.rows
+    }
+
+    /// Estimated CPU cost (comparison/hash operations).
+    pub fn cpu(&self) -> f64 {
+        self.cpu
+    }
 }
 
 impl Cost {
@@ -171,7 +183,7 @@ pub enum IndexKind {
 
 /// Type-erased index metadata for the planner.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct IndexDescriptor {
     component_type: TypeId,
     component_id: ComponentId,
@@ -191,24 +203,10 @@ pub struct Predicate {
     selectivity: f64,
 }
 
-#[allow(dead_code)]
 enum PredicateKind {
-    Eq(Vec<u8>),      // raw bytes of the comparison value
-    Range(RawRange),  // raw bytes of lo/hi bounds
-    Custom(Box<str>), // description only — always post-filter
-}
-
-#[allow(dead_code)]
-struct RawRange {
-    lo: RawBound,
-    hi: RawBound,
-}
-
-#[allow(dead_code)]
-enum RawBound {
-    Included(Vec<u8>),
-    Excluded(Vec<u8>),
-    Unbounded,
+    Eq(#[expect(dead_code)] String), // debug representation — reserved for enhanced EXPLAIN
+    Range(#[expect(dead_code)] String), // debug representation — reserved for enhanced EXPLAIN
+    Custom(Box<str>),                // description only — always post-filter
 }
 
 impl Predicate {
@@ -216,16 +214,11 @@ impl Predicate {
     ///
     /// If a `HashIndex<T>` or `BTreeIndex<T>` is registered, the planner will
     /// use it for an O(1) / O(log n) lookup instead of a full scan.
-    pub fn eq<T: Component + Clone>(value: T) -> Self {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(&value as *const T as *const u8, std::mem::size_of::<T>())
-                .to_vec()
-        };
-        std::mem::forget(value);
+    pub fn eq<T: Component + std::fmt::Debug>(value: T) -> Self {
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
-            kind: PredicateKind::Eq(bytes),
+            kind: PredicateKind::Eq(format!("{value:?}")),
             selectivity: 0.01, // default: 1% selectivity for equality
         }
     }
@@ -234,40 +227,23 @@ impl Predicate {
     ///
     /// If a `BTreeIndex<T>` is registered, the planner will use it for
     /// an O(log n + k) range scan. `HashIndex` cannot serve range predicates.
-    pub fn range<T: Component + Clone, R: RangeBounds<T>>(range: R) -> Self {
-        fn encode_bound<T>(bound: Bound<&T>) -> RawBound {
+    pub fn range<T: Component + std::fmt::Debug, R: RangeBounds<T>>(range: R) -> Self {
+        fn bound_str<T: std::fmt::Debug>(bound: Bound<&T>) -> String {
             match bound {
-                Bound::Included(v) => {
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            v as *const T as *const u8,
-                            std::mem::size_of::<T>(),
-                        )
-                        .to_vec()
-                    };
-                    RawBound::Included(bytes)
-                }
-                Bound::Excluded(v) => {
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            v as *const T as *const u8,
-                            std::mem::size_of::<T>(),
-                        )
-                        .to_vec()
-                    };
-                    RawBound::Excluded(bytes)
-                }
-                Bound::Unbounded => RawBound::Unbounded,
+                Bound::Included(v) => format!("{v:?}"),
+                Bound::Excluded(v) => format!("{v:?}"),
+                Bound::Unbounded => "..".into(),
             }
         }
-
-        let lo = encode_bound(range.start_bound());
-        let hi = encode_bound(range.end_bound());
-
+        let desc = format!(
+            "{}..{}",
+            bound_str(range.start_bound()),
+            bound_str(range.end_bound())
+        );
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
-            kind: PredicateKind::Range(RawRange { lo, hi }),
+            kind: PredicateKind::Range(desc),
             selectivity: 0.1, // default: 10% selectivity for ranges
         }
     }
@@ -295,6 +271,11 @@ impl Predicate {
 
     fn can_use_hash(&self) -> bool {
         matches!(self.kind, PredicateKind::Eq(_))
+    }
+
+    /// Whether this predicate can be lowered to branchless SIMD comparison.
+    fn is_branchless_eligible(&self) -> bool {
+        matches!(self.kind, PredicateKind::Eq(_) | PredicateKind::Range(_))
     }
 }
 
@@ -341,6 +322,9 @@ pub enum PlanNode {
         child: Box<PlanNode>,
         predicate: String,
         selectivity: f64,
+        /// Whether this filter can be lowered to branchless SIMD comparison.
+        /// True for Eq/Range predicates on numeric types, false for Custom.
+        branchless_eligible: bool,
         cost: Cost,
     },
     /// Hash join: build table on left, probe with right.
@@ -408,6 +392,7 @@ impl PlanNode {
                 predicate,
                 selectivity,
                 cost,
+                ..
             } => {
                 writeln!(
                     f,
@@ -696,14 +681,10 @@ pub enum SubscriptionError {
     /// `where_range` was called with a Hash index witness.
     /// Hash indexes support only exact-match lookups and cannot answer range
     /// queries. Use a `BTreeIndex` instead.
-    HashIndexOnRange {
-        component_name: &'static str,
-    },
+    HashIndexOnRange { component_name: &'static str },
     /// A selectivity value was NaN. Selectivity must be a finite number in
     /// `[0.0, 1.0]`.
-    NanSelectivity {
-        component_name: &'static str,
-    },
+    NanSelectivity { component_name: &'static str },
 }
 
 impl fmt::Display for SubscriptionError {
@@ -728,7 +709,7 @@ impl fmt::Display for SubscriptionError {
 
 impl std::error::Error for SubscriptionError {}
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct IndexedPredicate {
     component_name: &'static str,
     index_kind: IndexKind,
@@ -798,11 +779,11 @@ impl SubscriptionBuilder<'_> {
     ///
     /// # Errors
     ///
-    /// Returns the first [`SubscriptionError`] if any predicate was invalid
+    /// Returns all [`SubscriptionError`]s if any predicates were invalid
     /// (e.g. a Hash index used with `where_range`, or a NaN selectivity).
-    pub fn build(self) -> Result<SubscriptionPlan, SubscriptionError> {
-        if let Some(err) = self.errors.into_iter().next() {
-            return Err(err);
+    pub fn build(self) -> Result<SubscriptionPlan, Vec<SubscriptionError>> {
+        if !self.errors.is_empty() {
+            return Err(self.errors);
         }
 
         let mut node: PlanNode = PlanNode::Scan {
@@ -834,6 +815,7 @@ impl SubscriptionBuilder<'_> {
                 node = PlanNode::Filter {
                     predicate: pred.predicate_desc.clone(),
                     selectivity: pred.selectivity,
+                    branchless_eligible: true, // indexed predicates are always Eq/Range
                     cost: Cost {
                         rows: est_rows.max(0.0),
                         cpu: parent_cost.cpu
@@ -936,10 +918,15 @@ impl ScanBuilder<'_> {
     }
 
     /// Set explicit row estimate for the most recently added join's right side.
+    ///
+    /// # Panics
+    /// Panics if called before any `join()`.
     pub fn with_right_estimate(mut self, rows: usize) -> Self {
-        if let Some(j) = self.joins.last_mut() {
-            j.right_estimated_rows = rows;
-        }
+        assert!(
+            !self.joins.is_empty(),
+            "with_right_estimate() called before any join() — call join() first"
+        );
+        self.joins.last_mut().unwrap().right_estimated_rows = rows;
         self
     }
 
@@ -962,11 +949,7 @@ impl ScanBuilder<'_> {
         }
 
         // Phase 2: Order index lookups by selectivity (most selective first).
-        index_preds.sort_by(|a, b| {
-            a.0.selectivity
-                .partial_cmp(&b.0.selectivity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        index_preds.sort_by(|a, b| a.0.selectivity.total_cmp(&b.0.selectivity));
 
         // Phase 3: Build the plan tree bottom-up.
         let mut node: PlanNode;
@@ -989,6 +972,7 @@ impl ScanBuilder<'_> {
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
                     selectivity: pred.selectivity,
+                    branchless_eligible: pred.is_branchless_eligible(),
                     cost: Cost::filter(parent_cost, pred.selectivity),
                     child: Box::new(node),
                 };
@@ -1008,6 +992,7 @@ impl ScanBuilder<'_> {
             node = PlanNode::Filter {
                 predicate: format!("{:?}", pred),
                 selectivity: pred.selectivity,
+                branchless_eligible: pred.is_branchless_eligible(),
                 cost: Cost::filter(parent_cost, pred.selectivity),
                 child: Box::new(node),
             };
@@ -1126,14 +1111,20 @@ impl<'w> QueryPlanner<'w> {
     }
 
     /// Register a `BTreeIndex` for cost-based index selection.
+    ///
+    /// # Panics
+    /// Panics if `T` has not been registered as a component in `world`.
     pub fn add_btree_index<T: Component + Ord + Clone>(
         &mut self,
         index: &BTreeIndex<T>,
         world: &World,
     ) {
-        let Some(comp_id) = world.component_id::<T>() else {
-            return;
-        };
+        let comp_id = world.component_id::<T>().unwrap_or_else(|| {
+            panic!(
+                "QueryPlanner::add_btree_index: component `{}` not registered in this World",
+                std::any::type_name::<T>()
+            )
+        });
         self.indexes.insert(
             TypeId::of::<T>(),
             IndexDescriptor {
@@ -1147,14 +1138,20 @@ impl<'w> QueryPlanner<'w> {
     }
 
     /// Register a `HashIndex` for cost-based index selection.
+    ///
+    /// # Panics
+    /// Panics if `T` has not been registered as a component in `world`.
     pub fn add_hash_index<T: Component + std::hash::Hash + Eq + Clone>(
         &mut self,
         index: &HashIndex<T>,
         world: &World,
     ) {
-        let Some(comp_id) = world.component_id::<T>() else {
-            return;
-        };
+        let comp_id = world.component_id::<T>().unwrap_or_else(|| {
+            panic!(
+                "QueryPlanner::add_hash_index: component `{}` not registered in this World",
+                std::any::type_name::<T>()
+            )
+        });
         // Only insert if no BTree index is already registered for this type
         // (BTree is strictly more capable than Hash).
         self.indexes
@@ -1233,10 +1230,14 @@ impl<'w> QueryPlanner<'w> {
                 // Custom predicates never use indexes — no warning needed.
             }
             PredicateKind::Eq(_) => {
-                if let Some(idx) = self.indexes.get(&pred.component_type) {
+                if self.indexes.contains_key(&pred.component_type) {
                     // We have an index but it wasn't usable — shouldn't happen
-                    // for Eq since both BTree and Hash support it. Internal error.
-                    let _ = idx;
+                    // for Eq since both BTree and Hash support it.
+                    debug_assert!(
+                        false,
+                        "index for `{}` exists but could not serve Eq predicate",
+                        pred.component_name
+                    );
                 } else {
                     warnings.push(PlanWarning::MissingIndex {
                         component_name: pred.component_name,
@@ -1281,7 +1282,23 @@ pub enum CardinalityConstraint {
     /// Expect at least N results.
     AtLeast(usize),
     /// Expect between lo and hi results (inclusive).
+    ///
+    /// Use [`CardinalityConstraint::between`] for validated construction.
     Between(usize, usize),
+}
+
+impl CardinalityConstraint {
+    /// Create a `Between` constraint with validation that `lo <= hi`.
+    ///
+    /// # Panics
+    /// Panics if `lo > hi`.
+    pub fn between(lo: usize, hi: usize) -> Self {
+        assert!(
+            lo <= hi,
+            "CardinalityConstraint::between: lo ({lo}) > hi ({hi})"
+        );
+        Self::Between(lo, hi)
+    }
 }
 
 impl CardinalityConstraint {
@@ -1295,34 +1312,6 @@ impl CardinalityConstraint {
                 estimated_rows >= *lo as f64 - 0.5 && estimated_rows <= *hi as f64 + 0.5
             }
         }
-    }
-}
-
-/// Validate a plan against cardinality constraints.
-///
-/// Returns a list of constraint violations (empty = plan is valid).
-pub fn validate_constraints(
-    plan: &QueryPlanResult,
-    constraints: &[(&str, CardinalityConstraint)],
-) -> Vec<String> {
-    let mut violations = Vec::new();
-    let est = plan.root().estimated_rows();
-    for (name, constraint) in constraints {
-        if !constraint.satisfied_by(est) {
-            violations.push(format!(
-                "constraint `{name}` violated: estimated {est:.0} rows, expected {constraint:?}"
-            ));
-        }
-    }
-    violations
-}
-
-/// Compare two plans and return the cheaper one.
-pub fn choose_cheaper<'a>(a: &'a QueryPlanResult, b: &'a QueryPlanResult) -> &'a QueryPlanResult {
-    if a.cost().total() <= b.cost().total() {
-        a
-    } else {
-        b
     }
 }
 
@@ -1592,6 +1581,34 @@ impl QueryPlanResult {
         let root = lower_to_vectorized(&self.root, &opts);
         VectorizedPlan { root, opts }
     }
+
+    /// Validate this plan against cardinality constraints.
+    ///
+    /// Returns a list of constraint violations (empty = plan is valid).
+    pub fn validate_constraints(
+        &self,
+        constraints: &[(&str, CardinalityConstraint)],
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+        let est = self.root().estimated_rows();
+        for (name, constraint) in constraints {
+            if !constraint.satisfied_by(est) {
+                violations.push(format!(
+                    "constraint `{name}` violated: estimated {est:.0} rows, expected {constraint:?}"
+                ));
+            }
+        }
+        violations
+    }
+
+    /// Compare this plan with another and return a reference to the cheaper one.
+    pub fn cheaper<'a>(&'a self, other: &'a Self) -> &'a Self {
+        if self.cost().total() <= other.cost().total() {
+            self
+        } else {
+            other
+        }
+    }
 }
 
 /// Recursively lower a logical plan node to a vectorized execution node.
@@ -1650,14 +1667,12 @@ fn lower_to_vectorized(node: &PlanNode, opts: &VectorizeOpts) -> VecExecNode {
             child,
             predicate,
             selectivity,
+            branchless_eligible,
             cost,
         } => {
             let vec_child = lower_to_vectorized(child, opts);
 
-            // Determine if the filter can be branchless.
-            // Eq/Range on numeric types → branchless SIMD comparison.
-            // Custom predicates → branched.
-            let branchless = predicate.contains("Eq(") || predicate.contains("Range(");
+            let branchless = *branchless_eligible;
 
             // Branchless filters are ~2x cheaper on contiguous data.
             let speedup = if branchless { 0.5 } else { 0.85 };
@@ -1871,21 +1886,21 @@ mod tests {
     struct Team(u32);
 
     #[derive(Clone, Copy, Debug)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
     #[derive(Clone, Copy, Debug)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Vel {
         dx: f32,
         dy: f32,
     }
 
     #[derive(Clone, Copy, Debug)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Health(u32);
 
     // ── Basic planner construction ──────────────────────────────────
@@ -2433,7 +2448,10 @@ mod tests {
             .where_range(witness, 0.1)
             .build();
         match result {
-            Err(SubscriptionError::HashIndexOnRange { .. }) => {}
+            Err(errs)
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, SubscriptionError::HashIndexOnRange { .. })) => {}
             other => panic!("expected HashIndexOnRange error, got {:?}", other),
         }
     }
@@ -2455,7 +2473,10 @@ mod tests {
             .where_eq(witness, f64::NAN)
             .build();
         match result {
-            Err(SubscriptionError::NanSelectivity { .. }) => {}
+            Err(errs)
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, SubscriptionError::NanSelectivity { .. })) => {}
             other => panic!("expected NanSelectivity error, got {:?}", other),
         }
     }
@@ -2496,11 +2517,11 @@ mod tests {
         let plan = planner.scan::<(&Score,)>().build();
 
         let violations =
-            validate_constraints(&plan, &[("max_100", CardinalityConstraint::AtMost(100))]);
+            plan.validate_constraints(&[("max_100", CardinalityConstraint::AtMost(100))]);
         assert!(violations.is_empty());
 
         let violations =
-            validate_constraints(&plan, &[("max_10", CardinalityConstraint::AtMost(10))]);
+            plan.validate_constraints(&[("max_10", CardinalityConstraint::AtMost(10))]);
         assert_eq!(violations.len(), 1);
     }
 
@@ -2524,7 +2545,7 @@ mod tests {
             .filter(Predicate::eq(Score(42)))
             .build();
 
-        let chosen = choose_cheaper(&full_scan, &indexed);
+        let chosen = full_scan.cheaper(&indexed);
         assert!(chosen.cost().total() <= full_scan.cost().total());
     }
 

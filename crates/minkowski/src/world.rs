@@ -331,7 +331,7 @@ impl World {
     ///
     /// Used by transaction abort to clean up entity IDs that were allocated
     /// via `alloc_entity()` but never placed (changeset was discarded).
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) fn dealloc_entity(&mut self, entity: Entity) {
         self.drain_orphans();
         self.entities.dealloc(entity);
@@ -618,7 +618,6 @@ impl World {
     /// Get a component by pre-resolved ComponentId. Same as `get::<T>()` but
     /// skips the TypeId → ComponentId lookup. No sparse check (reducer
     /// components are always archetype-stored).
-    #[allow(dead_code)]
     pub(crate) fn get_by_id<T: Component>(
         &self,
         entity: Entity,
@@ -1434,7 +1433,7 @@ impl World {
     /// Read all component data for an entity as raw bytes.
     /// Returns (ComponentId, *const u8, Layout) per component.
     /// The pointers are valid until the next structural mutation.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn read_all_components(
         &self,
         entity: Entity,
@@ -1462,7 +1461,6 @@ impl World {
     /// Snapshot the `changed_tick` of every column matching the given component
     /// bitset. Returns a Vec of (ArchetypeId index, ComponentId, Tick) triples.
     /// Used by optimistic transactions for read-set validation.
-    #[allow(dead_code)]
     pub(crate) fn snapshot_column_ticks(
         &self,
         component_ids: &FixedBitSet,
@@ -1480,7 +1478,6 @@ impl World {
 
     /// Check if any column in the snapshot has been modified since the
     /// recorded tick. Returns a FixedBitSet of conflicting ComponentIds.
-    #[allow(dead_code)]
     pub(crate) fn check_column_conflicts(
         &self,
         snapshot: &[(usize, ComponentId, crate::tick::Tick)],
@@ -1509,7 +1506,6 @@ impl World {
     /// (transactions have their own tick-based conflict model).
     ///
     /// `archetype_count` freezes the archetype set to what existed at begin time.
-    #[allow(dead_code)]
     pub(crate) fn query_raw<Q: crate::query::fetch::ReadOnlyWorldQuery + 'static>(
         &self,
         archetype_count: usize,
@@ -2236,13 +2232,13 @@ mod tests {
         }
         struct PosVelMut<'w> {
             pos: &'w mut Pos,
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             vel: &'w mut Vel,
         }
         struct PosVelRef<'w> {
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             pos: &'w Pos,
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             vel: &'w Vel,
         }
         unsafe impl<'w> TableRow<'w> for PosVelMut<'w> {

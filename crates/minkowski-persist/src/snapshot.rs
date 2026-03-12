@@ -757,7 +757,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
 
         #[derive(Clone, Copy)]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         struct Hidden(u32);
         world.register_component::<Hidden>();
 

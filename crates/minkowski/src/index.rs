@@ -372,10 +372,9 @@ impl<T: Component + Hash + Eq + Clone> SpatialIndex for HashIndex<T> {
 /// Used by [`TablePlanner`](crate::planner::TablePlanner) to enforce index
 /// presence at compile time.
 ///
-/// # Safety
-/// Implementors must ensure that `create_btree_index` returns a correctly
-/// typed `BTreeIndex<C>` that matches the table's component column.
-pub unsafe trait HasBTreeIndex<C: Component + Ord + Clone> {
+/// The type system enforces that `create_btree_index` returns `BTreeIndex<C>`
+/// matching the declared component type — no unsafe invariant is needed.
+pub trait HasBTreeIndex<C: Component + Ord + Clone> {
     /// Field name that carries this index (for diagnostics).
     const FIELD_NAME: &'static str;
 
@@ -393,10 +392,9 @@ pub unsafe trait HasBTreeIndex<C: Component + Ord + Clone> {
 /// Used by [`TablePlanner`](crate::planner::TablePlanner) to enforce index
 /// presence at compile time.
 ///
-/// # Safety
-/// Implementors must ensure that `create_hash_index` returns a correctly
-/// typed `HashIndex<C>` that matches the table's component column.
-pub unsafe trait HasHashIndex<C: Component + Hash + Eq + Clone> {
+/// The type system enforces that `create_hash_index` returns `HashIndex<C>`
+/// matching the declared component type — no unsafe invariant is needed.
+pub trait HasHashIndex<C: Component + Hash + Eq + Clone> {
     /// Field name that carries this index (for diagnostics).
     const FIELD_NAME: &'static str;
 
@@ -414,7 +412,7 @@ mod tests {
     use crate::Entity;
 
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Pos {
         x: f32,
         y: f32,

@@ -3,7 +3,7 @@ use minkowski_bench::Position;
 
 macro_rules! define_fragments {
     ($($name:ident),*) => {
-        $( #[derive(Clone, Copy)] #[allow(dead_code)] struct $name(f32); )*
+        $( #[derive(Clone, Copy)] #[expect(dead_code)] struct $name(f32); )*
     };
 }
 

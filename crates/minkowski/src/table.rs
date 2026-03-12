@@ -258,7 +258,7 @@ mod tests {
     }
     struct PosVelMut<'w> {
         pos: &'w mut Pos,
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         vel: &'w mut Vel,
     }
     unsafe impl<'w> TableRow<'w> for PosVelRef<'w> {

@@ -58,7 +58,7 @@ struct UnitType(u8); // 0=Infantry, 1=Armor, 2=Recon
 
 // -- Sparse components --------------------------------------------------------
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct IntelReport {
     spotted_tick: u64,
     confidence: f32,

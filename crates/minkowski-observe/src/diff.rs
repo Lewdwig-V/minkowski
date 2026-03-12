@@ -124,14 +124,14 @@ mod tests {
     use minkowski::World;
 
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Vel {
         dx: f32,
         dy: f32,

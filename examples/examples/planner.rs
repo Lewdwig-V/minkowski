@@ -11,26 +11,26 @@
 //! - Constraint-based validation
 //! - EXPLAIN output for plan inspection
 
-use minkowski::planner::{CardinalityConstraint, Predicate, choose_cheaper, validate_constraints};
 use minkowski::{
-    BTreeIndex, HashIndex, Indexed, JoinKind, QueryPlanner, SpatialIndex, VectorizeOpts, World,
+    BTreeIndex, CardinalityConstraint, HashIndex, Indexed, JoinKind, Predicate, QueryPlanner,
+    SpatialIndex, VectorizeOpts, World,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Score(u32);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Team(u32);
 
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+#[expect(dead_code)]
 struct Pos {
     x: f32,
     y: f32,
 }
 
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+#[expect(dead_code)]
 struct Vel {
     dx: f32,
     dy: f32,
@@ -150,19 +150,16 @@ fn main() {
         .scan::<(&Score,)>()
         .filter(Predicate::eq(Score(42)))
         .build();
-    let chosen = choose_cheaper(&full_scan, &indexed);
+    let chosen = full_scan.cheaper(&indexed);
     println!("Full scan cost:   {:.1}", full_scan.cost().total());
     println!("Indexed cost:     {:.1}", indexed.cost().total());
     println!("Chosen plan cost: {:.1}\n", chosen.cost().total());
 
     // Validate cardinality constraints
-    let violations = validate_constraints(
-        &full_scan,
-        &[
-            ("under_500", CardinalityConstraint::AtMost(500)),
-            ("at_least_100", CardinalityConstraint::AtLeast(100)),
-        ],
-    );
+    let violations = full_scan.validate_constraints(&[
+        ("under_500", CardinalityConstraint::AtMost(500)),
+        ("at_least_100", CardinalityConstraint::AtLeast(100)),
+    ]);
     if violations.is_empty() {
         println!("All constraints satisfied for full scan plan");
     } else {

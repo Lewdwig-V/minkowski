@@ -80,7 +80,6 @@ pub(crate) fn write_index_file(path: &Path, payload: &[u8]) -> Result<(), IndexP
 }
 
 /// Read and validate an index file. Returns the verified payload bytes.
-#[allow(dead_code)]
 pub(crate) fn read_index_file(path: &Path) -> Result<Vec<u8>, IndexPersistError> {
     let bytes = std::fs::read(path)?;
     if bytes.len() < INDEX_HEADER_SIZE {

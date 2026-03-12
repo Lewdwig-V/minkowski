@@ -20,7 +20,7 @@ pub(crate) struct BlobVec {
 unsafe impl Send for BlobVec {}
 unsafe impl Sync for BlobVec {}
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 impl BlobVec {
     /// Minimum allocation alignment for all BlobVec columns.
     /// 64 bytes = cache line on x86-64 and Apple Silicon.
@@ -522,7 +522,7 @@ mod tests {
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         #[derive(Debug)]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         struct Tracked(u32);
         impl Drop for Tracked {
             fn drop(&mut self) {
@@ -548,7 +548,7 @@ mod tests {
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         #[derive(Debug)]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         struct Tracked(u32);
         impl Drop for Tracked {
             fn drop(&mut self) {
@@ -660,7 +660,7 @@ mod tests {
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         #[derive(Debug)]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         struct Tracked(u32);
         impl Drop for Tracked {
             fn drop(&mut self) {

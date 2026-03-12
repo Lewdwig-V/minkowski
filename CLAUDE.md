@@ -231,7 +231,7 @@ Typed reducers narrow what a closure *can* touch so that conflict freedom is pro
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
-- `#[allow(dead_code)]` on fields/methods reserved for future phases.
+- `#[expect(dead_code)]` on fields/methods reserved for future phases.
 - **Change detection invariant**: every path that hands out a mutable pointer to column data must either use `BlobVec::get_ptr_mut(row, tick)` (marks the column changed) or mark via the entry-point method (`World::query` for `&mut T`, `query_table_mut`, `query_table_raw`, `get_batch_mut`). `BlobVec::get_ptr` is the read path — writing through it silently bypasses `Changed<T>`. If you add a new mutable accessor, it must go through one of these two mechanisms.
 - **Semantic review checklist**: every new primitive that touches concurrency, entity lifecycle, or cross-system state gets a "what can go wrong" review before implementation. The type system catches syntax; these catch design:
   1. Can this be called with the wrong World?

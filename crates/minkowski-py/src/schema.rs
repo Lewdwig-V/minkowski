@@ -71,7 +71,7 @@ impl SchemaRegistry {
         names
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn name_for_id(&self, id: ComponentId) -> Option<&'static str> {
         self.id_to_name.get(&id).copied()
     }

@@ -151,7 +151,6 @@ pub trait Contains<T: Component, const INDEX: usize> {}
 
 /// Pre-resolved ComponentIds created once at registration time.
 /// `Contains<T, INDEX>` positions index into the inner Vec.
-#[allow(dead_code)]
 pub(crate) struct ResolvedComponents(pub(crate) Vec<ComponentId>);
 
 /// Pre-resolved component lookup for dynamic reducers.
@@ -582,7 +581,7 @@ pub struct EntityRef<'a, C: ComponentSet> {
 }
 
 impl<'a, C: ComponentSet> EntityRef<'a, C> {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // TODO: wire up via ReducerRegistry::register_entity_ref
     pub(crate) fn new(entity: Entity, resolved: &'a ResolvedComponents, world: &'a World) -> Self {
         Self {
             entity,
@@ -636,7 +635,6 @@ pub struct EntityMut<'a, C: ComponentSet> {
 }
 
 impl<'a, C: ComponentSet> EntityMut<'a, C> {
-    #[allow(dead_code)]
     pub(crate) fn new(
         entity: Entity,
         resolved: &'a ResolvedComponents,
@@ -719,7 +717,6 @@ pub struct Spawner<'a, B: Bundle> {
 }
 
 impl<'a, B: Bundle> Spawner<'a, B> {
-    #[allow(dead_code)]
     pub(crate) fn new(
         changeset: &'a mut EnumChangeSet,
         allocated: &'a mut Vec<Entity>,
@@ -752,7 +749,6 @@ impl<'a, B: Bundle> Spawner<'a, B> {
 /// in a tuple query need shared write access to the same changeset.
 /// `PhantomData<&'a EnumChangeSet>` ties the lifetime without falsely
 /// claiming exclusive access (multiple WritableRefs coexist).
-#[allow(dead_code)]
 pub struct WritableRef<'a, T: Component> {
     entity: Entity,
     current: &'a T,
@@ -762,7 +758,6 @@ pub struct WritableRef<'a, T: Component> {
 }
 
 impl<'a, T: Component> WritableRef<'a, T> {
-    #[allow(dead_code)]
     pub(crate) fn new(
         entity: Entity,
         current: &'a T,
@@ -779,13 +774,11 @@ impl<'a, T: Component> WritableRef<'a, T> {
     }
 
     /// Read the current (pre-transaction) value.
-    #[allow(dead_code)]
     pub fn get(&self) -> &T {
         self.current
     }
 
     /// Buffer a write. The value is stored in the changeset and applied on commit.
-    #[allow(dead_code)]
     #[inline]
     pub fn set(&mut self, value: T) {
         // Safety: the raw pointer is valid for the lifetime of the transaction.
@@ -797,7 +790,6 @@ impl<'a, T: Component> WritableRef<'a, T> {
     }
 
     /// Clone the current value, apply `f`, and buffer the result.
-    #[allow(dead_code)]
     #[inline]
     pub fn modify(&mut self, f: impl FnOnce(&mut T))
     where
@@ -819,7 +811,6 @@ impl<'a, T: Component> WritableRef<'a, T> {
 /// Implementors must guarantee that `init_writer_fetch` returns valid state
 /// for the archetype, and `fetch_writer` returns valid items for any
 /// row < archetype.len().
-#[allow(dead_code)]
 pub unsafe trait WriterQuery: WorldQuery {
     type WriterItem<'a>;
     type WriterFetch<'a>: Send + Sync;
@@ -1154,7 +1145,6 @@ pub struct QueryRef<'a, Q: ReadOnlyWorldQuery> {
 }
 
 impl<'a, Q: ReadOnlyWorldQuery + 'static> QueryRef<'a, Q> {
-    #[allow(dead_code)]
     pub(crate) fn new(world: &'a mut World) -> Self {
         Self {
             world,
@@ -1199,7 +1189,6 @@ pub struct QueryMut<'a, Q: WorldQuery> {
 }
 
 impl<'a, Q: WorldQuery + 'static> QueryMut<'a, Q> {
-    #[allow(dead_code)]
     pub(crate) fn new(world: &'a mut World) -> Self {
         Self {
             world,
@@ -1287,12 +1276,6 @@ impl TransactionalWorld<'_> {
     pub(crate) fn as_ref(&self) -> &World {
         self.0
     }
-
-    /// Advance the tick counter.
-    #[allow(dead_code)]
-    pub(crate) fn next_tick(&mut self) -> crate::tick::Tick {
-        self.0.next_tick()
-    }
 }
 
 impl std::ops::Deref for TransactionalWorld<'_> {
@@ -1330,7 +1313,6 @@ enum ReducerKind {
 }
 
 struct ReducerEntry {
-    #[allow(dead_code)]
     name: &'static str,
     access: Access,
     resolved: ResolvedComponents,
@@ -1343,7 +1325,6 @@ struct ReducerEntry {
 }
 
 struct DynamicReducerEntry {
-    #[allow(dead_code)]
     name: &'static str,
     resolved: DynamicResolved,
     closure: DynamicAdapter,
@@ -2182,13 +2163,10 @@ mod tests {
     use super::*;
 
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
     struct Pos(f32);
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
     struct Vel(f32);
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
     struct Health(u32);
 
     // ── DynamicResolved tests ────────────────────────────────────

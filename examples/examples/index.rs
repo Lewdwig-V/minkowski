@@ -15,7 +15,7 @@ use minkowski::{BTreeIndex, HashIndex, SpatialIndex, World};
 struct Score(u32);
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Name(&'static str);
 
 fn main() {

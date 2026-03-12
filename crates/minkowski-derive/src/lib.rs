@@ -11,7 +11,7 @@ enum IndexAttr {
 
 /// Parse `#[index(btree)]` / `#[index(hash)]` attributes from a field.
 /// Returns all index kinds declared on this field (a field can have both).
-fn parse_index_attrs(field: &syn::Field) -> Vec<IndexAttr> {
+fn parse_index_attrs(field: &syn::Field) -> Result<Vec<IndexAttr>, syn::Error> {
     let mut attrs = Vec::new();
     for attr in &field.attrs {
         if !attr.path().is_ident("index") {
@@ -27,10 +27,9 @@ fn parse_index_attrs(field: &syn::Field) -> Vec<IndexAttr> {
             } else {
                 Err(meta.error("expected `btree` or `hash`"))
             }
-        })
-        .unwrap_or_else(|e| panic!("{}", e));
+        })?;
     }
-    attrs
+    Ok(attrs)
 }
 
 /// Derive macro for Table types.
@@ -76,18 +75,22 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
         let field_type = &field.ty;
         let field_name_str = field_name.to_string();
 
-        for idx_attr in parse_index_attrs(field) {
+        let idx_attrs = match parse_index_attrs(field) {
+            Ok(attrs) => attrs,
+            Err(e) => return e.to_compile_error().into(),
+        };
+        for idx_attr in idx_attrs {
             match idx_attr {
                 IndexAttr::BTree => {
                     index_impls.push(quote! {
-                        unsafe impl ::minkowski::index::HasBTreeIndex<#field_type> for #name {
+                        impl ::minkowski::index::HasBTreeIndex<#field_type> for #name {
                             const FIELD_NAME: &'static str = #field_name_str;
                         }
                     });
                 }
                 IndexAttr::Hash => {
                     index_impls.push(quote! {
-                        unsafe impl ::minkowski::index::HasHashIndex<#field_type> for #name {
+                        impl ::minkowski::index::HasHashIndex<#field_type> for #name {
                             const FIELD_NAME: &'static str = #field_name_str;
                         }
                     });

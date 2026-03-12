@@ -168,13 +168,13 @@ mod tests {
     use crate::entity::Entity;
 
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Pos(f32);
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Vel(f32);
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Health(u32);
 
     #[test]
