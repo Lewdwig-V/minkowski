@@ -1019,6 +1019,24 @@ type IndexLookupFn = Arc<dyn Fn() -> Vec<Entity> + Send + Sync>;
 /// the entity passes the predicate.
 type FilterFn = Arc<dyn Fn(&World, Entity) -> bool + Send + Sync>;
 
+/// Partitioned or single-bucket hash set for probe-side lookups.
+enum ProbeSet {
+    Single(std::collections::HashSet<Entity>),
+    Partitioned(Vec<std::collections::HashSet<Entity>>),
+}
+
+impl ProbeSet {
+    fn contains(&self, e: Entity) -> bool {
+        match self {
+            ProbeSet::Single(set) => set.contains(&e),
+            ProbeSet::Partitioned(parts) => {
+                let bucket = (e.to_bits() as usize) % parts.len();
+                parts[bucket].contains(&e)
+            }
+        }
+    }
+}
+
 /// Executable plan node — carries type-erased closures AND vectorization
 /// parameters from the [`VecExecNode`] lowering pass. Built by
 /// [`ScanBuilder::build`] and executed by [`QueryPlanResult::execute`].
@@ -1052,6 +1070,7 @@ enum ExecNode {
     PartitionedHashJoin {
         build: Box<ExecNode>,
         probe: Box<ExecNode>,
+        join_kind: JoinKind,
         partitions: usize,
     },
     /// Batch nested-loop join for small cardinalities.
@@ -1059,6 +1078,7 @@ enum ExecNode {
     BatchNestedLoopJoin {
         left: Box<ExecNode>,
         right: Box<ExecNode>,
+        join_kind: JoinKind,
     },
 }
 
@@ -1122,45 +1142,57 @@ impl ExecNode {
             ExecNode::PartitionedHashJoin {
                 build,
                 probe,
+                join_kind,
                 partitions,
             } => {
+                // build = left side (semantic "from" table)
+                // probe = right side (joined table)
+                // Inner: entities present in both sides.
+                // Left: all build entities, whether or not they appear in probe.
                 let build_entities = build.execute(world);
                 let probe_entities = probe.execute(world);
-                if *partitions <= 1 {
-                    // Single partition — standard hash join.
-                    let build_set: std::collections::HashSet<Entity> =
-                        build_entities.into_iter().collect();
-                    probe_entities
-                        .into_iter()
-                        .filter(|e| build_set.contains(e))
-                        .collect()
+                let probe_set = if *partitions <= 1 {
+                    ProbeSet::Single(probe_entities.iter().copied().collect())
                 } else {
-                    // Multi-partition: split build side so each partition
-                    // fits in L2 cache, then probe against the right partition.
                     let p = *partitions;
-                    let mut partitioned: Vec<std::collections::HashSet<Entity>> =
+                    let mut parts: Vec<std::collections::HashSet<Entity>> =
                         (0..p).map(|_| std::collections::HashSet::new()).collect();
-                    for e in &build_entities {
-                        let bucket = (e.to_bits() as usize) % p;
-                        partitioned[bucket].insert(*e);
+                    for &e in &probe_entities {
+                        parts[(e.to_bits() as usize) % p].insert(e);
                     }
-                    probe_entities
+                    ProbeSet::Partitioned(parts)
+                };
+                match join_kind {
+                    JoinKind::Inner => build_entities
                         .into_iter()
-                        .filter(|e| {
-                            let bucket = (e.to_bits() as usize) % p;
-                            partitioned[bucket].contains(e)
-                        })
-                        .collect()
+                        .filter(|e| probe_set.contains(*e))
+                        .collect(),
+                    JoinKind::Left => {
+                        // All build (left) entities are preserved.
+                        build_entities
+                    }
                 }
             }
-            ExecNode::BatchNestedLoopJoin { left, right } => {
-                let left_set: std::collections::HashSet<Entity> =
-                    left.execute(world).into_iter().collect();
-                right
-                    .execute(world)
-                    .into_iter()
-                    .filter(|e| left_set.contains(e))
-                    .collect()
+            ExecNode::BatchNestedLoopJoin {
+                left,
+                right,
+                join_kind,
+            } => {
+                let left_entities = left.execute(world);
+                match join_kind {
+                    JoinKind::Inner => {
+                        let right_set: std::collections::HashSet<Entity> =
+                            right.execute(world).into_iter().collect();
+                        left_entities
+                            .into_iter()
+                            .filter(|e| right_set.contains(e))
+                            .collect()
+                    }
+                    JoinKind::Left => {
+                        // All left entities preserved regardless of right side.
+                        left_entities
+                    }
+                }
             }
         }
     }
@@ -1220,7 +1252,7 @@ impl ExecNode {
             ExecNode::ChunkedScan { .. } | ExecNode::IndexGather { .. } => vec![],
             ExecNode::BatchFilter { child, .. } => vec![child],
             ExecNode::PartitionedHashJoin { build, probe, .. } => vec![build, probe],
-            ExecNode::BatchNestedLoopJoin { left, right } => vec![left, right],
+            ExecNode::BatchNestedLoopJoin { left, right, .. } => vec![left, right],
         }
     }
 }
@@ -1232,8 +1264,8 @@ enum ClosureNode {
     Scan { scan_fn: ScanFn },
     IndexLookup { lookup_fn: IndexLookupFn },
     Filter { child: Box<ClosureNode>, filter_fn: FilterFn },
-    HashJoin { build: Box<ClosureNode>, probe: Box<ClosureNode> },
-    NestedLoopJoin { left: Box<ClosureNode>, right: Box<ClosureNode> },
+    HashJoin { build: Box<ClosureNode>, probe: Box<ClosureNode>, join_kind: JoinKind },
+    NestedLoopJoin { left: Box<ClosureNode>, right: Box<ClosureNode>, join_kind: JoinKind },
 }
 
 /// Lower a [`ClosureNode`] + [`VecExecNode`] pair into a vectorized [`ExecNode`].
@@ -1273,7 +1305,7 @@ fn lower_to_executable(closures: &ClosureNode, vec_node: &VecExecNode) -> ExecNo
             }
         }
         (
-            ClosureNode::HashJoin { build, probe },
+            ClosureNode::HashJoin { build, probe, join_kind },
             VecExecNode::PartitionedHashJoin {
                 build: vec_build,
                 probe: vec_probe,
@@ -1283,10 +1315,11 @@ fn lower_to_executable(closures: &ClosureNode, vec_node: &VecExecNode) -> ExecNo
         ) => ExecNode::PartitionedHashJoin {
             build: Box::new(lower_to_executable(build, vec_build)),
             probe: Box::new(lower_to_executable(probe, vec_probe)),
+            join_kind: *join_kind,
             partitions: *partitions,
         },
         (
-            ClosureNode::NestedLoopJoin { left, right },
+            ClosureNode::NestedLoopJoin { left, right, join_kind },
             VecExecNode::BatchNestedLoopJoin {
                 left: vec_left,
                 right: vec_right,
@@ -1295,6 +1328,7 @@ fn lower_to_executable(closures: &ClosureNode, vec_node: &VecExecNode) -> ExecNo
         ) => ExecNode::BatchNestedLoopJoin {
             left: Box::new(lower_to_executable(left, vec_left)),
             right: Box::new(lower_to_executable(right, vec_right)),
+            join_kind: *join_kind,
         },
         // Fallback: structural mismatch between closure tree and vec tree.
         // This can happen when the vec lowering produces a different shape
@@ -1318,14 +1352,16 @@ fn lower_to_executable(closures: &ClosureNode, vec_node: &VecExecNode) -> ExecNo
                 batch_size: 256,
             }
         }
-        (ClosureNode::HashJoin { build, probe }, _) => ExecNode::PartitionedHashJoin {
+        (ClosureNode::HashJoin { build, probe, join_kind }, _) => ExecNode::PartitionedHashJoin {
             build: Box::new(lower_to_executable_fallback(build)),
             probe: Box::new(lower_to_executable_fallback(probe)),
+            join_kind: *join_kind,
             partitions: 1,
         },
-        (ClosureNode::NestedLoopJoin { left, right }, _) => ExecNode::BatchNestedLoopJoin {
+        (ClosureNode::NestedLoopJoin { left, right, join_kind }, _) => ExecNode::BatchNestedLoopJoin {
             left: Box::new(lower_to_executable_fallback(left)),
             right: Box::new(lower_to_executable_fallback(right)),
+            join_kind: *join_kind,
         },
     }
 }
@@ -1346,14 +1382,16 @@ fn lower_to_executable_fallback(closures: &ClosureNode) -> ExecNode {
             filter_fn: Arc::clone(filter_fn),
             batch_size: 256,
         },
-        ClosureNode::HashJoin { build, probe } => ExecNode::PartitionedHashJoin {
+        ClosureNode::HashJoin { build, probe, join_kind } => ExecNode::PartitionedHashJoin {
             build: Box::new(lower_to_executable_fallback(build)),
             probe: Box::new(lower_to_executable_fallback(probe)),
+            join_kind: *join_kind,
             partitions: 1,
         },
-        ClosureNode::NestedLoopJoin { left, right } => ExecNode::BatchNestedLoopJoin {
+        ClosureNode::NestedLoopJoin { left, right, join_kind } => ExecNode::BatchNestedLoopJoin {
             left: Box::new(lower_to_executable_fallback(left)),
             right: Box::new(lower_to_executable_fallback(right)),
+            join_kind: *join_kind,
         },
     }
 }
@@ -1481,6 +1519,7 @@ impl ScanBuilder<'_> {
                             scan_fn: Arc::clone(scan),
                         }),
                         probe: Box::new(ClosureNode::IndexLookup { lookup_fn: lookup }),
+                        join_kind: JoinKind::Inner, // archetype intersection is always inner
                     }
                 } else {
                     ClosureNode::IndexLookup { lookup_fn: lookup }
@@ -1591,6 +1630,7 @@ impl ScanBuilder<'_> {
                     closures = Some(ClosureNode::HashJoin {
                         build: Box::new(bc),
                         probe: Box::new(pc),
+                        join_kind: join.join_kind,
                     });
                 }
             } else {
@@ -1611,6 +1651,7 @@ impl ScanBuilder<'_> {
                     closures = Some(ClosureNode::NestedLoopJoin {
                         left: Box::new(lc),
                         right: Box::new(rc),
+                        join_kind: join.join_kind,
                     });
                 }
             }
@@ -4106,5 +4147,88 @@ mod tests {
             let s = world.get::<Score>(*e).unwrap().0;
             assert!((100..300).contains(&s), "score {s} out of range");
         }
+    }
+
+    // ── Left join execution ────────────────────────────────────────────
+
+    #[test]
+    fn execute_left_join_preserves_all_left_entities() {
+        let mut world = World::new();
+        // 20 entities with Score only (no Team)
+        let mut score_only = Vec::new();
+        for i in 0..20 {
+            score_only.push(world.spawn((Score(i),)));
+        }
+        // 10 entities with both Score and Team
+        let mut both = Vec::new();
+        for i in 20..30 {
+            both.push(world.spawn((Score(i), Team(i % 3))));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        // Left join: all Score entities should appear, even those without Team.
+        let plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Left)
+            .build();
+        let result = plan.execute(&world);
+        // All 30 Score entities must be present.
+        assert_eq!(result.len(), 30);
+        for e in &score_only {
+            assert!(result.contains(e), "left join dropped Score-only entity");
+        }
+        for e in &both {
+            assert!(result.contains(e), "left join dropped Score+Team entity");
+        }
+    }
+
+    #[test]
+    fn execute_inner_join_excludes_unmatched() {
+        let mut world = World::new();
+        // 20 entities with Score only (no Team)
+        for i in 0..20 {
+            world.spawn((Score(i),));
+        }
+        // 10 entities with both Score and Team
+        let mut both = Vec::new();
+        for i in 20..30 {
+            both.push(world.spawn((Score(i), Team(i % 3))));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        // Inner join: only entities with both Score and Team.
+        let plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+        let result = plan.execute(&world);
+        assert_eq!(result.len(), 10);
+        for e in &both {
+            assert!(result.contains(e));
+        }
+    }
+
+    #[test]
+    fn execute_left_join_small_cardinality_nested_loop() {
+        let mut world = World::new();
+        // Score-only entities
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        // Score+Team entities
+        for i in 5..8 {
+            world.spawn((Score(i), Team(0)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        // Small estimates → nested-loop join path.
+        let plan = planner
+            .scan_with_estimate::<(&Score,)>(8)
+            .join::<(&Team,)>(JoinKind::Left)
+            .with_right_estimate(3)
+            .build();
+        let result = plan.execute(&world);
+        // Left join: all 8 Score entities preserved.
+        assert_eq!(result.len(), 8);
     }
 }
