@@ -2,8 +2,8 @@
 //! and full scans into optimized execution plans.
 //!
 //! The planner is designed for an in-memory ECS where data already lives in L1/L2
-//! cache. Planning overhead is kept to O(indexes + predicates) — no heap
-//! allocations during plan compilation, no dynamic dispatch during execution.
+//! cache. Planning overhead is kept to O(indexes + predicates). Plans are
+//! executable against live world data via type-erased closure dispatch.
 //!
 //! # Volcano Model
 //!
@@ -47,9 +47,9 @@
 //!
 //! let mut planner = QueryPlanner::new(&world);
 //!
-//! // Register available indexes (Arc for live reads at execution time)
-//! planner.add_btree_index::<Score>(score_index);
-//! planner.add_hash_index::<Team>(team_index);
+//! // Register available indexes (Arc-wrapped for live reads at execution time)
+//! planner.add_btree_index::<Score>(&score_index, &world);
+//! planner.add_hash_index::<Team>(&team_index, &world);
 //!
 //! // Build a plan
 //! let plan = planner
@@ -196,7 +196,6 @@ type PredicateLookupFn = Arc<dyn Fn(&dyn std::any::Any) -> Arc<[Entity]> + Send 
 struct IndexDescriptor {
     component_name: &'static str,
     kind: IndexKind,
-    cardinality: usize, // number of entities in the index
     /// Type-erased function that returns all entities tracked by this index.
     /// Captured at registration time when the concrete index type is available.
     /// Used as a fallback when no predicate-specific lookup is available.
@@ -214,7 +213,6 @@ impl fmt::Debug for IndexDescriptor {
         f.debug_struct("IndexDescriptor")
             .field("component_name", &self.component_name)
             .field("kind", &self.kind)
-            .field("cardinality", &self.cardinality)
             .field("has_exec", &self.all_entities_fn.is_some())
             .field("has_eq_lookup", &self.eq_lookup_fn.is_some())
             .field("has_range_lookup", &self.range_lookup_fn.is_some())
@@ -280,6 +278,10 @@ impl Predicate {
     ///
     /// If a `HashIndex<T>` or `BTreeIndex<T>` is registered, the planner will
     /// use it for an O(1) / O(log n) lookup instead of a full scan.
+    ///
+    /// Only requires `PartialEq` (not `Eq + Hash`) because the filter closure
+    /// does a simple `==` comparison. Index registration enforces stronger bounds
+    /// (`Hash + Eq` for HashIndex, `Ord` for BTreeIndex) separately.
     pub fn eq<T: Component + PartialEq>(value: T) -> Self {
         let value = Arc::new(value);
         let filter_val = Arc::clone(&value);
@@ -362,16 +364,6 @@ impl Predicate {
             filter_fn: Some(Arc::new(filter)),
             lookup_value: None,
         }
-    }
-
-    /// Deprecated: use [`Predicate::custom`] instead (identical signature).
-    #[deprecated(since = "0.1.0", note = "renamed to `custom`")]
-    pub fn custom_fn<T: Component>(
-        description: &str,
-        selectivity: f64,
-        filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        Self::custom::<T>(description, selectivity, filter)
     }
 
     /// Override the default selectivity estimate.
@@ -867,13 +859,11 @@ impl fmt::Display for SubscriptionError {
 
 impl std::error::Error for SubscriptionError {}
 
-#[expect(dead_code)]
 struct IndexedPredicate {
     component_name: &'static str,
     index_kind: IndexKind,
     predicate_desc: String,
     selectivity: f64,
-    cardinality: usize,
 }
 
 impl SubscriptionBuilder<'_> {
@@ -891,7 +881,6 @@ impl SubscriptionBuilder<'_> {
             index_kind: witness.kind,
             predicate_desc: format!("Eq({})", name),
             selectivity: selectivity.clamp(0.0, 1.0),
-            cardinality: witness.cardinality,
         });
         self
     }
@@ -927,7 +916,6 @@ impl SubscriptionBuilder<'_> {
             index_kind: witness.kind,
             predicate_desc: format!("Range({})", name),
             selectivity: selectivity.clamp(0.0, 1.0),
-            cardinality: witness.cardinality,
         });
         self
     }
@@ -1797,9 +1785,8 @@ impl ScanBuilder<'_> {
 /// into cost-optimized execution plans.
 ///
 /// The planner operates on metadata only — it never touches actual component
-/// data. Registering indexes is O(1) (captures cardinality + kind), and plan
-/// compilation is O(predicates × indexes) with no heap allocation beyond the
-/// plan tree itself.
+/// data during planning. Registering indexes captures type-erased lookup
+/// closures. Plan compilation is O(predicates × indexes).
 ///
 /// # Index Selection
 ///
@@ -1857,7 +1844,6 @@ impl<'w> QueryPlanner<'w> {
             "QueryPlanner::add_btree_index: component `{}` not registered in this World",
             std::any::type_name::<T>()
         );
-        let cardinality = index.len();
         let index = index.clone();
 
         // all_entities_fn: iterate live index at execution time (not a snapshot).
@@ -1895,7 +1881,6 @@ impl<'w> QueryPlanner<'w> {
             IndexDescriptor {
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::BTree,
-                cardinality,
                 all_entities_fn: Some(all_fn),
                 eq_lookup_fn: Some(eq_fn),
                 range_lookup_fn: Some(range_fn),
@@ -1917,7 +1902,6 @@ impl<'w> QueryPlanner<'w> {
             "QueryPlanner::add_hash_index: component `{}` not registered in this World",
             std::any::type_name::<T>()
         );
-        let cardinality = index.len();
         let index = index.clone();
 
         // all_entities_fn: iterate live index at execution time (not a snapshot).
@@ -1943,7 +1927,6 @@ impl<'w> QueryPlanner<'w> {
             .or_insert(IndexDescriptor {
                 component_name: std::any::type_name::<T>(),
                 kind: IndexKind::Hash,
-                cardinality,
                 all_entities_fn: Some(all_fn),
                 eq_lookup_fn: Some(eq_fn),
                 range_lookup_fn: None, // Hash doesn't support range queries.
@@ -2084,9 +2067,7 @@ impl CardinalityConstraint {
         );
         Self::Between(lo, hi)
     }
-}
 
-impl CardinalityConstraint {
     /// Check whether an estimated row count satisfies this constraint.
     pub fn satisfied_by(&self, estimated_rows: f64) -> bool {
         match self {

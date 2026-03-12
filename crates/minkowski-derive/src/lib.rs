@@ -45,8 +45,8 @@ fn parse_index_attrs(field: &syn::Field) -> Result<Vec<IndexAttr>, syn::Error> {
 /// Fields can be annotated with `#[index(btree)]` and/or `#[index(hash)]`
 /// to declare that the table maintains a secondary index on that component.
 /// This generates:
-/// - `unsafe impl HasBTreeIndex<FieldType> for TableName` (for `btree`)
-/// - `unsafe impl HasHashIndex<FieldType> for TableName` (for `hash`)
+/// - `impl HasBTreeIndex<FieldType> for TableName` (for `btree`)
+/// - `impl HasHashIndex<FieldType> for TableName` (for `hash`)
 ///
 /// These marker traits enable `TablePlanner<T>` to enforce index presence
 /// at compile time, turning missing-index warnings into type errors.
