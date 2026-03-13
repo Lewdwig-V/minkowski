@@ -22,7 +22,7 @@ use crate::world::World;
 #[non_exhaustive]
 pub enum SpatialExpr {
     /// Point-radius proximity test: entities within `radius` of
-    /// `(x, y)`. Corresponds to `ST_Within(point, distance)`.
+    /// `(x, y)`. Corresponds to `ST_Within((x, y), radius)`.
     Within {
         /// X coordinate of the query center.
         x: f64,
@@ -85,8 +85,8 @@ pub struct SpatialCost {
 ///   components.
 ///
 /// The result is that structurally different algorithms (uniform grids,
-/// quadtrees, BVH, k-d trees) all implement the same two-method trait
-/// without friction — see the `boids` and `nbody` examples.
+/// quadtrees, BVH, k-d trees) all implement the same single-required-method
+/// trait without friction — see the `boids` and `nbody` examples.
 ///
 /// # Capability discovery
 ///

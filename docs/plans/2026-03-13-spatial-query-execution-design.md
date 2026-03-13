@@ -13,7 +13,7 @@ via `SpatialIndex::supports`, and index-driven entity gathering during
 
 ## Problem
 
-PR #96 added spatial predicates to the planner's IR and capability discovery
+PR #97 added spatial predicates to the planner's IR and capability discovery
 to the `SpatialIndex` trait. The planner correctly emits `SpatialLookup` /
 `SpatialGather` nodes in EXPLAIN output and uses the index's reported cost for
 plan selection. However, the execution engine does not invoke the spatial

@@ -14,6 +14,7 @@
 //!
 //! - **Scan**: full archetype iteration via `world.query()`
 //! - **IndexLookup**: point or range lookup on a `BTreeIndex` / `HashIndex`
+//! - **SpatialLookup**: spatial index query (within, intersects)
 //! - **Filter**: predicate pushdown (applied per-entity after fetch)
 //! - **HashJoin**: join two entity streams on a shared component value
 //! - **NestedLoopJoin**: fallback join for small cardinalities
@@ -151,6 +152,16 @@ impl Cost {
     }
 
     fn spatial_lookup(spatial_cost: &SpatialCost) -> Self {
+        debug_assert!(
+            spatial_cost.estimated_rows.is_finite() && spatial_cost.estimated_rows >= 0.0,
+            "SpatialCost::estimated_rows must be finite and non-negative, got {}",
+            spatial_cost.estimated_rows
+        );
+        debug_assert!(
+            spatial_cost.cpu.is_finite() && spatial_cost.cpu >= 0.0,
+            "SpatialCost::cpu must be finite and non-negative, got {}",
+            spatial_cost.cpu
+        );
         Cost {
             rows: spatial_cost.estimated_rows,
             cpu: spatial_cost.cpu,
@@ -197,8 +208,6 @@ pub enum IndexKind {
     BTree,
     /// HashIndex — supports exact match only.
     Hash,
-    /// SpatialIndex — supports spatial predicates (within, intersects).
-    Spatial,
 }
 
 /// A spatial predicate recognized by the query planner's IR.
@@ -234,10 +243,9 @@ pub enum SpatialPredicate {
     },
 }
 
-impl SpatialPredicate {
-    /// Convert to the type-erased `SpatialExpr` used by capability discovery.
-    pub fn to_expr(&self) -> SpatialExpr {
-        match *self {
+impl From<&SpatialPredicate> for SpatialExpr {
+    fn from(sp: &SpatialPredicate) -> Self {
+        match *sp {
             SpatialPredicate::Within { x, y, radius } => SpatialExpr::Within { x, y, radius },
             SpatialPredicate::Intersects {
                 min_x,
@@ -445,15 +453,25 @@ impl Predicate {
     /// [`supports`](SpatialIndex::supports) method returns `Some` for this
     /// expression, the planner emits a `SpatialLookup` node. Otherwise it
     /// falls back to a scan + post-filter using the provided closure.
+    ///
+    /// The default selectivity heuristic assumes a unit-square world
+    /// (`PI * r²`). For real-world coordinate systems where coordinates
+    /// are much larger than 1.0, override with
+    /// [`.with_selectivity()`](Self::with_selectivity).
     pub fn within<T: Component>(
         x: f64,
         y: f64,
         radius: f64,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
     ) -> Self {
-        // Rough selectivity: area ratio of circle to a notional unit world.
-        // Clamped so the planner doesn't underestimate for small radii.
-        let selectivity = (std::f64::consts::PI * radius * radius).clamp(0.001, 1.0);
+        debug_assert!(
+            radius >= 0.0 && radius.is_finite(),
+            "Predicate::within: radius must be finite and non-negative, got {radius}"
+        );
+        // Heuristic selectivity assuming a unit-square world. Override via
+        // .with_selectivity() for non-unit coordinate systems.
+        let selectivity =
+            sanitize_selectivity((std::f64::consts::PI * radius * radius).clamp(0.001, 1.0));
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
@@ -469,7 +487,12 @@ impl Predicate {
     /// The component type `T` identifies which column holds the spatial data.
     /// If a `SpatialIndex` is registered for `T` and its
     /// [`supports`](SpatialIndex::supports) method returns `Some` for this
-    /// expression, the planner emits a `SpatialLookup` node.
+    /// expression, the planner emits a `SpatialLookup` node. Otherwise it
+    /// falls back to a scan + post-filter using the provided closure.
+    ///
+    /// The default selectivity heuristic uses the AABB area, assuming a
+    /// unit-square world. For real-world coordinate systems, override with
+    /// [`.with_selectivity()`](Self::with_selectivity).
     pub fn intersects<T: Component>(
         min_x: f64,
         min_y: f64,
@@ -477,8 +500,13 @@ impl Predicate {
         max_y: f64,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
     ) -> Self {
+        debug_assert!(
+            min_x <= max_x && min_y <= max_y,
+            "Predicate::intersects: inverted AABB (min must be <= max), \
+             got ({min_x},{min_y})->({max_x},{max_y})"
+        );
         let area = (max_x - min_x) * (max_y - min_y);
-        let selectivity = area.abs().clamp(0.001, 1.0);
+        let selectivity = sanitize_selectivity(area.clamp(0.001, 1.0));
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
@@ -724,6 +752,13 @@ pub enum PlanWarning {
         have: &'static str,
         need: &'static str,
     },
+    /// A spatial index is registered but declined the expression
+    /// ([`SpatialIndex::supports`] returned `None`). The predicate falls
+    /// back to a scan + post-filter.
+    SpatialIndexDeclined {
+        component_name: &'static str,
+        expression: String,
+    },
     /// Join has no index on either side — will use nested loop.
     UnindexedJoin {
         left_name: &'static str,
@@ -753,6 +788,16 @@ impl fmt::Display for PlanWarning {
                 write!(
                     f,
                     "`{component_name}` has {have} index but predicate needs {need} — \
+                     falling back to scan + filter"
+                )
+            }
+            PlanWarning::SpatialIndexDeclined {
+                component_name,
+                expression,
+            } => {
+                write!(
+                    f,
+                    "spatial index for `{component_name}` does not support {expression} — \
                      falling back to scan + filter"
                 )
             }
@@ -1439,12 +1484,21 @@ impl ScanBuilder<'_> {
 
         for pred in self.predicates {
             if pred.can_use_spatial() {
-                // Spatial predicate — check if a spatial index can accelerate it.
-                if let Some((_name, cost)) = planner.find_spatial_index(&pred) {
-                    spatial_preds.push((pred, cost));
-                } else {
-                    planner.warn_missing_index(&pred, &mut warnings);
-                    filter_preds.push(pred);
+                match planner.find_spatial_index(&pred) {
+                    SpatialLookupResult::Accelerated(_name, cost) => {
+                        spatial_preds.push((pred, cost));
+                    }
+                    SpatialLookupResult::Declined(expression) => {
+                        warnings.push(PlanWarning::SpatialIndexDeclined {
+                            component_name: pred.component_name,
+                            expression,
+                        });
+                        filter_preds.push(pred);
+                    }
+                    SpatialLookupResult::NoIndex => {
+                        planner.warn_missing_index(&pred, &mut warnings);
+                        filter_preds.push(pred);
+                    }
                 }
             } else if let Some(idx) = planner.find_best_index(&pred) {
                 index_preds.push((pred, idx));
@@ -1483,6 +1537,10 @@ impl ScanBuilder<'_> {
                 .all(|p| p.filter_fn.is_some() || matches!(p.kind, PredicateKind::Custom(_))),
             "Eq/Range predicate with filter_fn: None — plan would show filter but not apply it"
         );
+        debug_assert!(
+            spatial_preds.iter().all(|(p, _)| p.filter_fn.is_some()),
+            "Spatial predicate with filter_fn: None — plan would show filter but not apply it"
+        );
         let all_filter_fns: Vec<FilterFn> = index_preds
             .iter()
             .filter_map(|(p, _)| p.filter_fn.as_ref().map(Arc::clone))
@@ -1500,9 +1558,9 @@ impl ScanBuilder<'_> {
 
         // Phase 3: Build the logical plan tree.
         //
-        // Priority: spatial index → BTree/Hash index → full scan.
-        // We pick the driving access by lowest estimated cost among all
-        // index-eligible predicates.
+        // Cost-based selection: compare best spatial index cost against
+        // best BTree/Hash index cost, and use whichever is cheaper as the
+        // driving access. Remaining predicates become post-filters.
         let mut node: PlanNode;
 
         // Determine driving access: compare best spatial vs best BTree/Hash.
@@ -1578,26 +1636,6 @@ impl ScanBuilder<'_> {
 
             // Spatial predicates that aren't the driver become filters.
             for (pred, _) in &spatial_preds {
-                let parent_cost = node.cost();
-                node = PlanNode::Filter {
-                    predicate: format!("{:?}", pred),
-                    selectivity: pred.selectivity,
-                    branchless_eligible: false,
-                    cost: Cost::filter(parent_cost, pred.selectivity),
-                    child: Box::new(node),
-                };
-            }
-        } else if let Some((first_pred, first_cost)) = spatial_preds.first() {
-            // No BTree/Hash but we have a spatial index.
-            let est = first_cost.estimated_rows.max(1.0) as usize;
-            node = PlanNode::SpatialLookup {
-                component_name: first_pred.component_name,
-                predicate: format!("{:?}", first_pred),
-                estimated_rows: est,
-                cost: Cost::spatial_lookup(first_cost),
-            };
-
-            for (pred, _) in spatial_preds.iter().skip(1) {
                 let parent_cost = node.cost();
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
@@ -1822,6 +1860,31 @@ impl ScanBuilder<'_> {
 
 // ── QueryPlanner ─────────────────────────────────────────────────────
 
+/// Descriptor for a registered spatial index.
+struct SpatialIndexDescriptor {
+    component_name: &'static str,
+    /// The spatial index, behind Arc for shared access at execution time.
+    index: Arc<dyn SpatialIndex + Send + Sync>,
+}
+
+impl fmt::Debug for SpatialIndexDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpatialIndexDescriptor")
+            .field("component_name", &self.component_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of checking whether a spatial index can accelerate a predicate.
+enum SpatialLookupResult {
+    /// The index can accelerate the expression at the given cost.
+    Accelerated(&'static str, SpatialCost),
+    /// A spatial index is registered but it declined the expression.
+    Declined(String),
+    /// No spatial index is registered for this component type.
+    NoIndex,
+}
+
 /// Volcano-model query planner that composes index lookups, filters, and joins
 /// into cost-optimized execution plans.
 ///
@@ -1849,21 +1912,6 @@ impl ScanBuilder<'_> {
 ///
 /// Join order is determined by intermediate result size — the smallest
 /// intermediate result drives subsequent joins.
-/// Descriptor for a registered spatial index.
-struct SpatialIndexDescriptor {
-    component_name: &'static str,
-    /// The spatial index, behind Arc for shared access at execution time.
-    index: Arc<dyn SpatialIndex + Send + Sync>,
-}
-
-impl fmt::Debug for SpatialIndexDescriptor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SpatialIndexDescriptor")
-            .field("component_name", &self.component_name)
-            .finish_non_exhaustive()
-    }
-}
-
 pub struct QueryPlanner<'w> {
     indexes: HashMap<TypeId, IndexDescriptor>,
     spatial_indexes: HashMap<TypeId, SpatialIndexDescriptor>,
@@ -2166,16 +2214,19 @@ impl<'w> QueryPlanner<'w> {
 
     /// Check if a spatial predicate can be accelerated by a registered spatial index.
     ///
-    /// Returns the cost reported by the index if it supports the expression,
-    /// along with the component name for plan node construction.
-    fn find_spatial_index(&self, pred: &Predicate) -> Option<(&'static str, SpatialCost)> {
-        if let PredicateKind::Spatial(sp) = &pred.kind {
-            let desc = self.spatial_indexes.get(&pred.component_type)?;
-            let expr = sp.to_expr();
-            let cost = desc.index.supports(&expr)?;
-            Some((desc.component_name, cost))
-        } else {
-            None
+    /// Returns a three-state result distinguishing "accelerated", "index
+    /// exists but declined", and "no index registered".
+    fn find_spatial_index(&self, pred: &Predicate) -> SpatialLookupResult {
+        let PredicateKind::Spatial(sp) = &pred.kind else {
+            return SpatialLookupResult::NoIndex;
+        };
+        let Some(desc) = self.spatial_indexes.get(&pred.component_type) else {
+            return SpatialLookupResult::NoIndex;
+        };
+        let expr: SpatialExpr = sp.into();
+        match desc.index.supports(&expr) {
+            Some(cost) => SpatialLookupResult::Accelerated(desc.component_name, cost),
+            None => SpatialLookupResult::Declined(sp.to_string()),
         }
     }
 
@@ -2220,16 +2271,13 @@ impl<'w> QueryPlanner<'w> {
                 }
             }
             PredicateKind::Spatial(_) => {
-                if !self.spatial_indexes.contains_key(&pred.component_type) {
-                    warnings.push(PlanWarning::MissingIndex {
-                        component_name: pred.component_name,
-                        predicate_kind: "spatial",
-                        suggestion: "add a SpatialIndex via add_spatial_index::<T>()",
-                    });
-                }
-                // If the spatial index exists but doesn't support the expression,
-                // the predicate will fall back to a filter. No warning needed —
-                // the index simply can't accelerate this particular expression.
+                // Only called for NoIndex — Declined is handled by the caller
+                // with a distinct SpatialIndexDeclined warning.
+                warnings.push(PlanWarning::MissingIndex {
+                    component_name: pred.component_name,
+                    predicate_kind: "spatial",
+                    suggestion: "add a SpatialIndex via add_spatial_index::<T>()",
+                });
             }
         }
     }
@@ -5506,6 +5554,17 @@ mod tests {
             },
             other => panic!("expected Filter, got {:?}", other),
         }
+
+        // SpatialIndexDeclined warning should be emitted (not MissingIndex).
+        assert_eq!(plan.warnings().len(), 1);
+        assert!(
+            matches!(
+                &plan.warnings()[0],
+                PlanWarning::SpatialIndexDeclined { .. }
+            ),
+            "expected SpatialIndexDeclined warning, got {:?}",
+            plan.warnings()[0]
+        );
     }
 
     #[test]
@@ -5697,7 +5756,7 @@ mod tests {
             y: 2.0,
             radius: 3.0,
         };
-        let expr = sp.to_expr();
+        let expr = crate::index::SpatialExpr::from(&sp);
         match expr {
             crate::index::SpatialExpr::Within { x, y, radius } => {
                 assert!((x - 1.0).abs() < f64::EPSILON);
@@ -5713,7 +5772,7 @@ mod tests {
             max_x: 2.0,
             max_y: 3.0,
         };
-        let expr2 = sp2.to_expr();
+        let expr2 = crate::index::SpatialExpr::from(&sp2);
         match expr2 {
             crate::index::SpatialExpr::Intersects {
                 min_x,
@@ -5728,5 +5787,193 @@ mod tests {
             }
             other => panic!("expected Intersects, got {:?}", other),
         }
+    }
+
+    // ── Additional spatial coverage tests ────────────────────────
+
+    /// Spatial index with very high cost — BTree should win the cost comparison.
+    struct ExpensiveSpatialIndex;
+
+    impl SpatialIndex for ExpensiveSpatialIndex {
+        fn rebuild(&mut self, _world: &mut World) {}
+
+        fn supports(&self, expr: &crate::index::SpatialExpr) -> Option<crate::index::SpatialCost> {
+            match expr {
+                crate::index::SpatialExpr::Within { .. } => Some(crate::index::SpatialCost {
+                    estimated_rows: 500.0,
+                    cpu: 500.0,
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_vs_btree_cheaper_btree_wins() {
+        let mut world = World::new();
+        for i in 0..1000 {
+            world.spawn((
+                Pos {
+                    x: i as f32,
+                    y: i as f32,
+                },
+                Score(i),
+            ));
+        }
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(ExpensiveSpatialIndex), &world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+
+        // BTree with high selectivity (0.01) → cost ~ 5 + 10 = 15.
+        // Spatial index reports cpu=500. BTree should win.
+        let plan = planner
+            .scan::<(&Pos, &Score)>()
+            .filter(Predicate::within::<Pos>(500.0, 500.0, 5.0, |_, _| true))
+            .filter(Predicate::eq::<Score>(Score(42)))
+            .build();
+
+        // Driving access should be IndexLookup (BTree), not SpatialLookup.
+        fn has_index_lookup(node: &PlanNode) -> bool {
+            match node {
+                PlanNode::IndexLookup { .. } => true,
+                PlanNode::Filter { child, .. } => has_index_lookup(child),
+                _ => false,
+            }
+        }
+        assert!(
+            has_index_lookup(plan.root()),
+            "expected IndexLookup as driver, got {:?}",
+            plan.root()
+        );
+    }
+
+    /// Spatial index that only supports `Within`, not `Intersects`.
+    struct WithinOnlyIndex {
+        entity_count: usize,
+    }
+
+    impl SpatialIndex for WithinOnlyIndex {
+        fn rebuild(&mut self, world: &mut World) {
+            self.entity_count = world.query::<(Entity, &Pos)>().count();
+        }
+
+        fn supports(&self, expr: &crate::index::SpatialExpr) -> Option<crate::index::SpatialCost> {
+            match expr {
+                crate::index::SpatialExpr::Within { .. } => Some(crate::index::SpatialCost {
+                    estimated_rows: (self.entity_count as f64 * 0.1).max(1.0),
+                    cpu: 5.0,
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_partial_capability_within_supported_intersects_declined() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut idx = WithinOnlyIndex { entity_count: 0 };
+        idx.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(idx), &world);
+
+        // Within should get a SpatialLookup.
+        let within_plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>(25.0, 25.0, 5.0, |_, _| true))
+            .build();
+        assert!(
+            matches!(within_plan.root(), PlanNode::SpatialLookup { .. }),
+            "Within should produce SpatialLookup, got {:?}",
+            within_plan.root()
+        );
+        assert!(within_plan.warnings().is_empty());
+
+        // Intersects should fall back with a SpatialIndexDeclined warning.
+        let intersects_plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::intersects::<Pos>(
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                |_, _| true,
+            ))
+            .build();
+        match intersects_plan.root() {
+            PlanNode::Filter { child, .. } => {
+                assert!(matches!(child.as_ref(), PlanNode::Scan { .. }));
+            }
+            other => panic!("expected Filter, got {:?}", other),
+        }
+        assert_eq!(intersects_plan.warnings().len(), 1);
+        assert!(matches!(
+            &intersects_plan.warnings()[0],
+            PlanWarning::SpatialIndexDeclined { .. }
+        ));
+    }
+
+    #[test]
+    fn multiple_spatial_predicates_first_drives_rest_filter() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((
+                Pos {
+                    x: i as f32,
+                    y: i as f32,
+                },
+                Health(100),
+            ));
+        }
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+
+        // Two spatial predicates on the same component.
+        let plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>(50.0, 50.0, 5.0, |_, _| true))
+            .filter(Predicate::intersects::<Pos>(0.0, 0.0, 0.5, 0.5, |_, _| {
+                true
+            }))
+            .build();
+
+        // One should be the driver (SpatialLookup), the other a Filter.
+        fn find_spatial_lookup(node: &PlanNode) -> bool {
+            match node {
+                PlanNode::SpatialLookup { .. } => true,
+                PlanNode::Filter { child, .. } => find_spatial_lookup(child),
+                _ => false,
+            }
+        }
+        fn count_filters(node: &PlanNode) -> usize {
+            match node {
+                PlanNode::Filter { child, .. } => 1 + count_filters(child),
+                _ => 0,
+            }
+        }
+        assert!(
+            find_spatial_lookup(plan.root()),
+            "expected SpatialLookup in plan tree"
+        );
+        assert!(
+            count_filters(plan.root()) >= 1,
+            "expected at least one Filter wrapping the SpatialLookup"
+        );
+        assert!(plan.warnings().is_empty());
     }
 }
