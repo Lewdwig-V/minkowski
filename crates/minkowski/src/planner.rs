@@ -4797,4 +4797,79 @@ mod tests {
         plan.for_each(&mut world, |_| count += 1);
         assert_eq!(count, 5);
     }
+
+    #[test]
+    fn execute_join_changed_left_only() {
+        let mut world = World::new();
+        for i in 0..5u32 {
+            world.spawn((Score(i), Team(i % 2)));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(Changed<Score>, &Score)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+        assert_eq!(plan.execute(&mut world).len(), 5);
+        assert_eq!(plan.execute(&mut world).len(), 0);
+    }
+
+    #[test]
+    fn execute_join_changed_right_only() {
+        let mut world = World::new();
+        for i in 0..5u32 {
+            world.spawn((Score(i), Team(i % 2)));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(Changed<Team>, &Team)>(JoinKind::Inner)
+            .build();
+        // First: all changed
+        assert_eq!(plan.execute(&mut world).len(), 5);
+        // Second: right side not changed, right yields 0 entities.
+        // Inner join of 5 and 0 = 0.
+        assert_eq!(plan.execute(&mut world).len(), 0);
+    }
+
+    #[test]
+    fn for_each_raw_then_for_each_advances() {
+        let mut world = World::new();
+        for i in 0..3u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
+        // for_each_raw: sees everything, doesn't advance tick
+        let mut count = 0;
+        plan.for_each_raw(&world, |_| count += 1);
+        assert_eq!(count, 3);
+        // for_each: also sees everything (tick still at 0), and advances
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 3);
+        // for_each again: tick advanced, nothing changed
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn for_each_changed_multiple_archetypes_partial() {
+        let mut world = World::new();
+        // Archetype 1: (Score,)
+        let e1 = world.spawn((Score(1),));
+        // Archetype 2: (Score, Team)
+        let _e2 = world.spawn((Score(2), Team(0)));
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
+        // Consume initial changes
+        plan.for_each(&mut world, |_| {});
+        // Mutate only archetype 1
+        let _ = world.get_mut::<Score>(e1);
+        // Only archetype 1 should be returned
+        let mut found = Vec::new();
+        plan.for_each(&mut world, |entity| found.push(entity));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0], e1);
+    }
 }
