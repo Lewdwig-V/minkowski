@@ -17,7 +17,7 @@ A plan built from `scan::<(Changed<Pos>, &Vel)>()` should skip archetypes where 
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Tick state location | Per-plan-instance `AtomicU64` on `QueryPlanResult` | Independent of `world.query()` tick state. Two plan instances for the same query type track changes independently. Consistent with QueryWriter's per-reducer `Arc<AtomicU64>` pattern. |
+| Tick state location | Per-plan-instance `Tick` on `QueryPlanResult` | Independent of `world.query()` tick state. Two plan instances for the same query type track changes independently. All methods take `&mut self`, so no atomics needed. |
 | Changed component extraction | New `WorldQuery::changed_ids()` trait method returning `FixedBitSet` | Extracts component IDs as static data while `Q` is in scope at `scan::<Q>()` time. No trait-object overhead at runtime. Consistent with existing `required_ids`/`mutable_ids` pattern. |
 | Tick threading | Closure parameter `Tick` | Simpler than shared atomic. Tick loaded once by caller, passed through. No atomic loads in the hot loop. |
 | `for_each` tick advancement | Immediate after scan completes | `for_each` always runs to completion (no droppable iterator), so lazy advancement solves a problem that can't happen. |
@@ -59,13 +59,14 @@ loop, after the `required.is_subset` check:
 // Fast path: no Changed<T> terms — skip entirely
 if !changed.is_clear() {
     let dominated = changed.ones().all(|bit| {
-        let comp_id = ComponentId(bit);
-        arch.column_index(comp_id)
+        arch.column_index(bit)
             .map_or(false, |col| arch.columns[col].changed_tick.is_newer_than(tick))
     });
     if !dominated { continue; }
 }
 ```
+
+Note: `ComponentId` is a type alias for `usize`, so bitset indices map directly.
 
 The `changed.is_clear()` guard means queries without `Changed<T>` pay zero cost.
 
@@ -93,11 +94,13 @@ Callers load `self.last_read_tick` once and pass it through. The `Tick` type is 
 `QueryPlanResult` gains one field:
 
 ```rust
-last_read_tick: AtomicU64,  // initialized to 0
+last_read_tick: Tick,  // initialized to Tick::default() (0)
 ```
 
-Initialized to 0 because `World` ticks start at 1, so the first call sees everything as
-"changed" — same behavior as `world.query()` starting with `Tick::default()`.
+Initialized to `Tick::default()` (0) because `World` ticks start at 1, so the first call
+sees everything as "changed" — same behavior as `world.query()` starting with
+`Tick::default()`. A plain `Tick` field suffices because all methods take `&mut self` — no
+concurrent access.
 
 ### Advancement Rules
 
@@ -109,7 +112,8 @@ Initialized to 0 because `World` ticks start at 1, so the first call sees everyt
 
 ## Join Behavior
 
-Each `scan::<Q>()` call captures its own `changed_ids` from its own `Q`. In a join plan:
+Each `scan::<Q>()` call captures its own `changed_ids` from its own `Q`. The `join::<R>()`
+method similarly captures `R::changed_ids()` for the right side. In a join plan:
 
 ```rust
 planner.scan::<(Changed<Pos>, &Vel)>()     // left: changed_ids = {Pos}
@@ -122,12 +126,23 @@ planner.scan::<(Changed<Pos>, &Vel)>()     // left: changed_ids = {Pos}
 - All collectors share the plan's single `last_read_tick`
 - Join intersection happens after both sides are collected and filtered
 
+### Collector capture detail
+
+The left collector closure is built in `build()` using `left_required` — this also needs
+`left_changed` (captured from the scan's `changed_ids`). The `JoinSpec` struct gains a
+`right_changed: FixedBitSet` field, populated by `join::<R>()` from `R::changed_ids()`.
+Right collector closures close over both `right_required` and `right_changed`.
+
+Both collectors receive the `Tick` parameter from `execute()`, which loads
+`self.last_read_tick` once before any collector runs and advances it once after all
+collectors and intersection complete.
+
 ## What Changes
 
 - **`query/fetch.rs`**: Add `changed_ids` to `WorldQuery` trait + all impls + tuple macro
-- **`planner.rs`**: Capture `changed_ids` in scan closures, add `Tick` parameter to
-  closure types, add `last_read_tick: AtomicU64` to `QueryPlanResult`, advance tick in
-  `for_each`/`execute`
+- **`planner.rs`**: Capture `changed_ids` in scan closures and join collectors, add
+  `right_changed: FixedBitSet` to `JoinSpec`, add `Tick` parameter to closure types, add
+  `last_read_tick: Tick` to `QueryPlanResult`, advance tick in `for_each`/`execute`
 
 ## What Doesn't Change
 
