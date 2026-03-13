@@ -1108,12 +1108,13 @@ impl fmt::Debug for SubscriptionPlan {
 /// Type-erased scan execution captured at `build()` time.
 /// The monomorphic `Q` iteration code is baked in at compile time.
 /// Takes `&World` (shared ref) because the compiled scan only reads archetype
-/// data. The outer `for_each` method takes `&mut World` for query cache
-/// management, then reborrows as `&World` for the closure.
+/// data. The outer `for_each` method takes `&mut World` for tick advancement
+/// (via `next_tick()`), then reborrows as `&World` for the closure.
 type CompiledForEach = Box<dyn FnMut(&World, Tick, &mut dyn FnMut(Entity))>;
 
 /// Read-only variant for transactional reads via `query_raw`.
-/// Takes `&World` (shared ref) — no cache mutation, no tick advancement.
+/// Receives the plan's `last_read_tick` for `Changed<T>` filtering but does
+/// not advance it — repeated calls see the same change window.
 type CompiledForEachRaw = Box<dyn FnMut(&World, Tick, &mut dyn FnMut(Entity))>;
 
 /// Type-erased index lookup function: return matching entities from the index.
@@ -1149,8 +1150,10 @@ struct JoinExec {
     steps: Vec<JoinStep>,
 }
 
-/// Returns true if all columns in `changed` have a tick newer than `tick`.
-/// When `changed` is empty (no `Changed<T>` terms), returns true immediately.
+/// Returns true if every component in `changed` has a column in the archetype
+/// whose tick is newer than `tick`. When `changed` is empty (no `Changed<T>`
+/// terms), returns true immediately. For well-formed queries the column will
+/// always be present because `required` is checked before this function.
 #[inline]
 fn passes_change_filter(
     arch: &crate::storage::archetype::Archetype,
@@ -4879,5 +4882,69 @@ mod tests {
         let mut count = 0;
         plan.for_each(&mut world, |_| count += 1);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn execute_changed_detects_partial_mutation() {
+        let mut world = World::new();
+        // Two archetypes so column-level change detection can distinguish them
+        let e = world.spawn((Score(1),));
+        world.spawn((Score(2), Team(0)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
+
+        // Drain initial changes
+        let _ = plan.execute(&mut world);
+
+        // Mutate only the (Score,) archetype
+        let _ = world.get_mut::<Score>(e);
+
+        // execute path (scratch buffer) should see only the changed archetype
+        let result = plan.execute(&mut world);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn for_each_changed_sees_entities_spawned_after_plan_creation() {
+        let mut world = World::new();
+        world.spawn((Score(1),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
+
+        // Drain initial changes
+        plan.for_each(&mut world, |_| {});
+
+        // Spawn new entities into a new archetype AFTER plan was built.
+        // The compiled scan iterates world.archetypes at execution time,
+        // so new archetypes should be visible. Their column ticks will be
+        // newer than last_read_tick.
+        world.spawn((Score(2), Team(0)));
+        world.spawn((Score(3), Team(1)));
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn execute_left_join_changed_right_preserves_left() {
+        let mut world = World::new();
+        for i in 0..5u32 {
+            world.spawn((Score(i), Team(i % 2)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(Changed<Team>, &Team)>(JoinKind::Left)
+            .build();
+
+        // First call: all changed, left join preserves left = 5
+        assert_eq!(plan.execute(&mut world).len(), 5);
+
+        // Second call: right side stale, but Left join keeps all left entities
+        assert_eq!(plan.execute(&mut world).len(), 5);
     }
 }

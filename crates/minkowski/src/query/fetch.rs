@@ -75,8 +75,10 @@ pub unsafe trait WorldQuery {
     }
 
     /// Returns ComponentIds that have `Changed<T>` filtering.
-    /// Used by the query planner to capture which components have
-    /// archetype-level change filters at scan compilation time.
+    /// Used by the query planner to capture archetype-level change
+    /// filters at scan compilation time. Defaults to empty — correct
+    /// for non-filter query terms. `Changed<T>` overrides to include T.
+    /// Tuple impls union all terms.
     fn changed_ids(_registry: &ComponentRegistry) -> FixedBitSet {
         FixedBitSet::new()
     }
