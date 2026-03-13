@@ -94,6 +94,7 @@ use fixedbitset::FixedBitSet;
 use crate::component::{Component, ComponentRegistry};
 use crate::entity::Entity;
 use crate::index::{BTreeIndex, HashIndex};
+use crate::tick::Tick;
 // Use std Arc directly — the planner has no concurrent code, so it does not
 // need loom's Arc (which lacks unsized coercion for Arc<dyn Fn> type erasure).
 use crate::world::World;
@@ -618,6 +619,7 @@ pub struct QueryPlanResult {
     scratch: Option<ScratchBuffer>,
     opts: VectorizeOpts,
     warnings: Vec<PlanWarning>,
+    last_read_tick: Tick,
 }
 
 impl QueryPlanResult {
@@ -695,16 +697,17 @@ impl QueryPlanResult {
             .as_mut()
             .expect("execute() requires a plan with a scratch buffer");
         scratch.clear();
+        let tick = self.last_read_tick;
 
         if let Some(join) = &mut self.join_exec {
             // Collect initial left-side entities.
-            (join.left_collector)(&*world, scratch);
+            (join.left_collector)(&*world, tick, scratch);
 
             // Apply each join step. After each step the result becomes the
             // left side for the next step, enabling A JOIN B JOIN C chains.
             for step in &mut join.steps {
                 let left_len = scratch.len();
-                (step.right_collector)(&*world, scratch);
+                (step.right_collector)(&*world, tick, scratch);
                 match step.join_kind {
                     JoinKind::Inner => {
                         let match_count = scratch.sorted_intersection(left_len).len();
@@ -720,12 +723,14 @@ impl QueryPlanResult {
                     }
                 }
             }
+            self.last_read_tick = world.next_tick();
             scratch.as_slice()
         } else if let Some(compiled) = &mut self.compiled_for_each {
             // Scan-only plan: use the compiled scan closure to collect entities.
-            compiled(&*world, &mut |entity: Entity| {
+            compiled(&*world, tick, &mut |entity: Entity| {
                 scratch.push(entity);
             });
+            self.last_read_tick = world.next_tick();
             scratch.as_slice()
         } else {
             panic!(
@@ -747,9 +752,9 @@ impl QueryPlanResult {
             "for_each() is only available for scan-only plans (no joins). \
                  For plans with joins, use execute() which returns &[Entity].",
         );
-        // Reborrow as &World — the compiled closure only reads archetype data.
-        // &mut World is taken for query cache management (future use).
-        compiled(&*world, &mut callback);
+        let tick = self.last_read_tick;
+        compiled(&*world, tick, &mut callback);
+        self.last_read_tick = world.next_tick();
     }
 
     /// Execute the compiled scan with read-only world access.
@@ -765,7 +770,8 @@ impl QueryPlanResult {
             "for_each_raw() is only available for scan-only plans (no joins). \
                  For plans with joins, use execute() which returns &[Entity].",
         );
-        compiled(world, &mut callback);
+        let tick = self.last_read_tick;
+        compiled(world, tick, &mut callback);
     }
 
     /// Human-readable logical plan (before vectorized lowering).
@@ -809,6 +815,7 @@ impl fmt::Debug for QueryPlanResult {
             .field("has_scratch", &self.scratch.is_some())
             .field("opts", &self.opts)
             .field("warnings", &self.warnings)
+            .field("last_read_tick", &self.last_read_tick)
             .finish()
     }
 }
@@ -1103,11 +1110,11 @@ impl fmt::Debug for SubscriptionPlan {
 /// Takes `&World` (shared ref) because the compiled scan only reads archetype
 /// data. The outer `for_each` method takes `&mut World` for query cache
 /// management, then reborrows as `&World` for the closure.
-type CompiledForEach = Box<dyn FnMut(&World, &mut dyn FnMut(Entity))>;
+type CompiledForEach = Box<dyn FnMut(&World, Tick, &mut dyn FnMut(Entity))>;
 
 /// Read-only variant for transactional reads via `query_raw`.
 /// Takes `&World` (shared ref) — no cache mutation, no tick advancement.
-type CompiledForEachRaw = Box<dyn FnMut(&World, &mut dyn FnMut(Entity))>;
+type CompiledForEachRaw = Box<dyn FnMut(&World, Tick, &mut dyn FnMut(Entity))>;
 
 /// Type-erased index lookup function: return matching entities from the index.
 /// Returns `Arc<[Entity]>` to avoid cloning the entity list on every call —
@@ -1124,7 +1131,7 @@ type FilterFn = Arc<dyn Fn(&World, Entity) -> bool + Send + Sync>;
 
 /// Type-erased closure that collects entities from a scan/index into a
 /// [`ScratchBuffer`]. Used by join plans to gather left and right entity sets.
-type EntityCollector = Box<dyn FnMut(&World, &mut ScratchBuffer)>;
+type EntityCollector = Box<dyn FnMut(&World, Tick, &mut ScratchBuffer)>;
 
 /// A single join step: collect right-side entities and intersect with the
 /// accumulated left result.
@@ -1143,13 +1150,29 @@ struct JoinExec {
 }
 
 /// Collect all entities from archetypes matching a component bitset
-/// into a scratch buffer.
-fn collect_matching_entities(world: &World, required: &FixedBitSet, scratch: &mut ScratchBuffer) {
+/// into a scratch buffer, skipping archetypes whose changed columns
+/// are not newer than `tick`.
+fn collect_matching_entities(
+    world: &World,
+    required: &FixedBitSet,
+    changed: &FixedBitSet,
+    tick: Tick,
+    scratch: &mut ScratchBuffer,
+) {
     for arch in &world.archetypes.archetypes {
-        if !arch.is_empty() && required.is_subset(&arch.component_ids) {
-            for &entity in &arch.entities {
-                scratch.push(entity);
-            }
+        if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+            continue;
+        }
+        if !changed.is_clear()
+            && !changed.ones().all(|bit| {
+                arch.column_index(bit)
+                    .is_some_and(|col| arch.columns[col].changed_tick.is_newer_than(tick))
+            })
+        {
+            continue;
+        }
+        for &entity in &arch.entities {
+            scratch.push(entity);
         }
     }
 }
@@ -1171,6 +1194,8 @@ pub struct ScanBuilder<'w> {
     compile_for_each_raw: Option<Box<dyn FnOnce() -> CompiledForEachRaw>>,
     /// Required component bitset for left-side entity collection in join plans.
     left_required: Option<FixedBitSet>,
+    /// Changed component bitset for left-side change detection in join plans.
+    left_changed: Option<FixedBitSet>,
 }
 
 struct JoinSpec {
@@ -1179,6 +1204,8 @@ struct JoinSpec {
     join_kind: JoinKind,
     /// Required component bitset for right-side entity collection.
     right_required: FixedBitSet,
+    /// Changed component bitset for right-side change detection.
+    right_changed: FixedBitSet,
 }
 
 impl ScanBuilder<'_> {
@@ -1200,11 +1227,13 @@ impl ScanBuilder<'_> {
         // Estimate right-side rows from total entity count (conservative).
         let right_rows = self.planner.total_entities;
         let required = Q::required_ids(self.planner.components);
+        let changed = Q::changed_ids(self.planner.components);
         self.joins.push(JoinSpec {
             right_query_name: std::any::type_name::<Q>(),
             right_estimated_rows: right_rows,
             join_kind,
             right_required: required,
+            right_changed: changed,
         });
         self
     }
@@ -1376,33 +1405,58 @@ impl ScanBuilder<'_> {
                 .left_required
                 .clone()
                 .expect("join plan requires left_required bitset");
+            let left_changed = self.left_changed.clone().unwrap_or_default();
             let left_filters: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
-            let left_collector: EntityCollector =
-                Box::new(move |world: &World, scratch: &mut ScratchBuffer| {
+            let left_collector: EntityCollector = Box::new(
+                move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
                     if left_filters.is_empty() {
-                        collect_matching_entities(world, &left_required, scratch);
+                        collect_matching_entities(
+                            world,
+                            &left_required,
+                            &left_changed,
+                            tick,
+                            scratch,
+                        );
                     } else {
                         for arch in &world.archetypes.archetypes {
-                            if !arch.is_empty() && left_required.is_subset(&arch.component_ids) {
-                                for &entity in &arch.entities {
-                                    if left_filters.iter().all(|f| f(world, entity)) {
-                                        scratch.push(entity);
-                                    }
+                            if arch.is_empty() || !left_required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !left_changed.is_clear()
+                                && !left_changed.ones().all(|bit| {
+                                    arch.column_index(bit).is_some_and(|col| {
+                                        arch.columns[col].changed_tick.is_newer_than(tick)
+                                    })
+                                })
+                            {
+                                continue;
+                            }
+                            for &entity in &arch.entities {
+                                if left_filters.iter().all(|f| f(world, entity)) {
+                                    scratch.push(entity);
                                 }
                             }
                         }
                     }
-                });
+                },
+            );
 
             let steps: Vec<JoinStep> = self
                 .joins
                 .iter()
                 .map(|join| {
                     let right_required = join.right_required.clone();
+                    let right_changed = join.right_changed.clone();
                     JoinStep {
                         right_collector: Box::new(
-                            move |world: &World, scratch: &mut ScratchBuffer| {
-                                collect_matching_entities(world, &right_required, scratch);
+                            move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
+                                collect_matching_entities(
+                                    world,
+                                    &right_required,
+                                    &right_changed,
+                                    tick,
+                                    scratch,
+                                );
                             },
                         ),
                         join_kind: join.join_kind,
@@ -1431,13 +1485,15 @@ impl ScanBuilder<'_> {
                 if all_filter_fns.is_empty() {
                     scan_fn
                 } else {
-                    Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
-                        scan_fn(world, &mut |entity: Entity| {
-                            if all_filter_fns.iter().all(|f| f(world, entity)) {
-                                callback(entity);
-                            }
-                        });
-                    })
+                    Box::new(
+                        move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                            scan_fn(world, tick, &mut |entity: Entity| {
+                                if all_filter_fns.iter().all(|f| f(world, entity)) {
+                                    callback(entity);
+                                }
+                            });
+                        },
+                    )
                 }
             })
         } else {
@@ -1451,13 +1507,15 @@ impl ScanBuilder<'_> {
                 if all_filter_fns_raw.is_empty() {
                     scan_fn
                 } else {
-                    Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
-                        scan_fn(world, &mut |entity: Entity| {
-                            if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
-                                callback(entity);
-                            }
-                        });
-                    })
+                    Box::new(
+                        move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                            scan_fn(world, tick, &mut |entity: Entity| {
+                                if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
+                                    callback(entity);
+                                }
+                            });
+                        },
+                    )
                 }
             })
         } else {
@@ -1481,6 +1539,7 @@ impl ScanBuilder<'_> {
             scratch,
             opts,
             warnings,
+            last_read_tick: Tick::default(),
         }
     }
 }
@@ -1642,9 +1701,13 @@ impl<'w> QueryPlanner<'w> {
     /// Start building a scan plan for query type `Q`.
     pub fn scan<Q: crate::query::fetch::WorldQuery + 'static>(&'w self) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
+        let changed = Q::changed_ids(self.components);
         let required_for_each = required.clone();
+        let changed_for_each = changed.clone();
         let required_for_each_raw = required.clone();
+        let changed_for_each_raw = changed.clone();
         let left_required = required.clone();
+        let left_changed = changed.clone();
         ScanBuilder {
             planner: self,
             query_name: std::any::type_name::<Q>(),
@@ -1653,29 +1716,56 @@ impl<'w> QueryPlanner<'w> {
             joins: Vec::new(),
             compile_for_each: Some(Box::new(move || {
                 let required = required_for_each;
-                Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
-                    for arch in &world.archetypes.archetypes {
-                        if !arch.is_empty() && required.is_subset(&arch.component_ids) {
+                let changed = changed_for_each;
+                Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        for arch in &world.archetypes.archetypes {
+                            if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear()
+                                && !changed.ones().all(|bit| {
+                                    arch.column_index(bit).is_some_and(|col| {
+                                        arch.columns[col].changed_tick.is_newer_than(tick)
+                                    })
+                                })
+                            {
+                                continue;
+                            }
                             for &entity in &arch.entities {
                                 callback(entity);
                             }
                         }
-                    }
-                })
+                    },
+                )
             })),
             compile_for_each_raw: Some(Box::new(move || {
                 let required = required_for_each_raw;
-                Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
-                    for arch in &world.archetypes.archetypes {
-                        if !arch.is_empty() && required.is_subset(&arch.component_ids) {
+                let changed = changed_for_each_raw;
+                Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        for arch in &world.archetypes.archetypes {
+                            if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear()
+                                && !changed.ones().all(|bit| {
+                                    arch.column_index(bit).is_some_and(|col| {
+                                        arch.columns[col].changed_tick.is_newer_than(tick)
+                                    })
+                                })
+                            {
+                                continue;
+                            }
                             for &entity in &arch.entities {
                                 callback(entity);
                             }
                         }
-                    }
-                })
+                    },
+                )
             })),
             left_required: Some(left_required),
+            left_changed: Some(left_changed),
         }
     }
 
@@ -1688,9 +1778,13 @@ impl<'w> QueryPlanner<'w> {
         estimated_rows: usize,
     ) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
+        let changed = Q::changed_ids(self.components);
         let required_for_each = required.clone();
+        let changed_for_each = changed.clone();
         let required_for_each_raw = required.clone();
+        let changed_for_each_raw = changed.clone();
         let left_required = required.clone();
+        let left_changed = changed.clone();
         ScanBuilder {
             planner: self,
             query_name: std::any::type_name::<Q>(),
@@ -1699,29 +1793,56 @@ impl<'w> QueryPlanner<'w> {
             joins: Vec::new(),
             compile_for_each: Some(Box::new(move || {
                 let required = required_for_each;
-                Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
-                    for arch in &world.archetypes.archetypes {
-                        if !arch.is_empty() && required.is_subset(&arch.component_ids) {
+                let changed = changed_for_each;
+                Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        for arch in &world.archetypes.archetypes {
+                            if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear()
+                                && !changed.ones().all(|bit| {
+                                    arch.column_index(bit).is_some_and(|col| {
+                                        arch.columns[col].changed_tick.is_newer_than(tick)
+                                    })
+                                })
+                            {
+                                continue;
+                            }
                             for &entity in &arch.entities {
                                 callback(entity);
                             }
                         }
-                    }
-                })
+                    },
+                )
             })),
             compile_for_each_raw: Some(Box::new(move || {
                 let required = required_for_each_raw;
-                Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
-                    for arch in &world.archetypes.archetypes {
-                        if !arch.is_empty() && required.is_subset(&arch.component_ids) {
+                let changed = changed_for_each_raw;
+                Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        for arch in &world.archetypes.archetypes {
+                            if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear()
+                                && !changed.ones().all(|bit| {
+                                    arch.column_index(bit).is_some_and(|col| {
+                                        arch.columns[col].changed_tick.is_newer_than(tick)
+                                    })
+                                })
+                            {
+                                continue;
+                            }
                             for &entity in &arch.entities {
                                 callback(entity);
                             }
                         }
-                    }
-                })
+                    },
+                )
             })),
             left_required: Some(left_required),
+            left_changed: Some(left_changed),
         }
     }
 
@@ -2489,6 +2610,7 @@ impl ScratchBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Changed;
     use crate::World;
     use crate::index::SpatialIndex;
 
@@ -4579,5 +4701,100 @@ mod tests {
             found.push(entity);
         });
         assert_eq!(found.len(), 1);
+    }
+
+    // ── Changed<T> filtering ──────────────────────────────────────────
+
+    #[test]
+    fn for_each_changed_skips_stale_archetypes() {
+        let mut world = World::new();
+        for i in 0..5u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
+
+        // First call: everything is new (changed since tick 0).
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 5);
+
+        // Second call: nothing changed since the last read tick.
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn for_each_changed_detects_mutation() {
+        let mut world = World::new();
+        let e = world.spawn((Score(1),));
+        world.spawn((Score(2), Team(0)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
+
+        // Drain initial changes.
+        plan.for_each(&mut world, |_| {});
+
+        // Mutate one archetype's Score column via get_mut.
+        let _ = world.get_mut::<Score>(e);
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        // Only the archetype containing `e` was mutated.
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn for_each_raw_changed_reads_tick_but_does_not_advance() {
+        let mut world = World::new();
+        for i in 0..3u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
+
+        // for_each_raw does not advance the tick.
+        let mut count = 0;
+        plan.for_each_raw(&world, |_| count += 1);
+        assert_eq!(count, 3);
+
+        // Same tick — still sees changes.
+        let mut count = 0;
+        plan.for_each_raw(&world, |_| count += 1);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn execute_changed_skips_stale_archetypes() {
+        let mut world = World::new();
+        for i in 0..5u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
+
+        assert_eq!(plan.execute(&mut world).len(), 5);
+        assert_eq!(plan.execute(&mut world).len(), 0);
+    }
+
+    #[test]
+    fn for_each_no_changed_pays_zero_cost() {
+        let mut world = World::new();
+        for i in 0..5u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        // Without Changed<T>, every call sees all entities.
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 5);
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 5);
     }
 }
