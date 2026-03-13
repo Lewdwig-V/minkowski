@@ -74,6 +74,13 @@ pub unsafe trait WorldQuery {
         FixedBitSet::new()
     }
 
+    /// Returns ComponentIds that have `Changed<T>` filtering.
+    /// Used by the query planner to capture which components have
+    /// archetype-level change filters at scan compilation time.
+    fn changed_ids(_registry: &ComponentRegistry) -> FixedBitSet {
+        FixedBitSet::new()
+    }
+
     /// Archetype-level filter. Returns false to skip this archetype entirely.
     /// Used by `Changed<T>` to skip archetypes whose column tick is stale.
     fn matches_filters(
@@ -282,6 +289,10 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
 
     unsafe fn as_slice<'w>(_fetch: &Self::Fetch<'w>, _len: usize) -> Self::Slice<'w> {}
 
+    fn changed_ids(registry: &ComponentRegistry) -> FixedBitSet {
+        <&T>::required_ids(registry)
+    }
+
     fn matches_filters(
         archetype: &Archetype,
         registry: &ComponentRegistry,
@@ -336,6 +347,16 @@ macro_rules! impl_world_query_tuple {
                 let mut bits = FixedBitSet::new();
                 $(
                     let sub = $name::mutable_ids(registry);
+                    bits.grow(sub.len());
+                    bits.union_with(&sub);
+                )*
+                bits
+            }
+
+            fn changed_ids(registry: &ComponentRegistry) -> FixedBitSet {
+                let mut bits = FixedBitSet::new();
+                $(
+                    let sub = $name::changed_ids(registry);
                     bits.grow(sub.len());
                     bits.union_with(&sub);
                 )*
@@ -412,6 +433,13 @@ mod tests {
         x: f32,
         y: f32,
     }
+
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    struct Vel {
+        dx: f32,
+        dy: f32,
+    }
+
     fn make_archetype_with_data(
         reg: &ComponentRegistry,
         ids: &[crate::component::ComponentId],
@@ -496,5 +524,70 @@ mod tests {
         reg.register::<Pos>();
         let bits = <Option<&Pos>>::required_ids(&reg);
         assert_eq!(bits.len(), 0);
+    }
+
+    #[test]
+    fn changed_ids_for_ref_is_empty() {
+        let mut reg = ComponentRegistry::new();
+        reg.register::<Pos>();
+        let bits = <&Pos as WorldQuery>::changed_ids(&reg);
+        assert!(bits.is_clear());
+    }
+
+    #[test]
+    fn changed_ids_for_mut_ref_is_empty() {
+        let mut reg = ComponentRegistry::new();
+        reg.register::<Pos>();
+        let bits = <&mut Pos as WorldQuery>::changed_ids(&reg);
+        assert!(bits.is_clear());
+    }
+
+    #[test]
+    fn changed_ids_for_entity_is_empty() {
+        let reg = ComponentRegistry::new();
+        let bits = <Entity as WorldQuery>::changed_ids(&reg);
+        assert!(bits.is_clear());
+    }
+
+    #[test]
+    fn changed_ids_for_option_is_empty() {
+        let mut reg = ComponentRegistry::new();
+        reg.register::<Pos>();
+        let bits = <Option<&Pos> as WorldQuery>::changed_ids(&reg);
+        assert!(bits.is_clear());
+    }
+
+    #[test]
+    fn changed_ids_for_changed_contains_component() {
+        let mut reg = ComponentRegistry::new();
+        reg.register::<Pos>();
+        let bits = <Changed<Pos> as WorldQuery>::changed_ids(&reg);
+        let comp_id = reg.id::<Pos>().unwrap();
+        assert!(bits.contains(comp_id));
+        assert_eq!(bits.count_ones(..), 1);
+    }
+
+    #[test]
+    fn changed_ids_tuple_unions_terms() {
+        let mut reg = ComponentRegistry::new();
+        reg.register::<Pos>();
+        reg.register::<Vel>();
+        let bits = <(Changed<Pos>, &Vel)>::changed_ids(&reg);
+        let pos_id = reg.id::<Pos>().unwrap();
+        assert!(bits.contains(pos_id));
+        assert_eq!(bits.count_ones(..), 1);
+    }
+
+    #[test]
+    fn changed_ids_tuple_multiple_changed() {
+        let mut reg = ComponentRegistry::new();
+        reg.register::<Pos>();
+        reg.register::<Vel>();
+        let bits = <(Changed<Pos>, Changed<Vel>)>::changed_ids(&reg);
+        let pos_id = reg.id::<Pos>().unwrap();
+        let vel_id = reg.id::<Vel>().unwrap();
+        assert!(bits.contains(pos_id));
+        assert!(bits.contains(vel_id));
+        assert_eq!(bits.count_ones(..), 2);
     }
 }
