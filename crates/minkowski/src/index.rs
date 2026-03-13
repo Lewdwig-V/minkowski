@@ -7,6 +7,55 @@ use crate::entity::Entity;
 use crate::tick::ChangeTick;
 use crate::world::World;
 
+// ── Spatial capability discovery ──────────────────────────────────────
+
+/// A spatial expression that an index may be asked to evaluate.
+///
+/// Used by [`SpatialIndex::supports`] for capability discovery: the
+/// query planner passes a `SpatialExpr` to an index and asks whether it
+/// can accelerate it and at what estimated cost.
+///
+/// The variants mirror the spatial predicates in the planner's IR
+/// ([`SpatialPredicate`](crate::planner::SpatialPredicate)), but are
+/// type-erased to work through the `dyn SpatialIndex` interface.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum SpatialExpr {
+    /// Point-radius proximity test: entities within `radius` of
+    /// `(x, y)`. Corresponds to `ST_Within((x, y), radius)`.
+    Within {
+        /// X coordinate of the query center.
+        x: f64,
+        /// Y coordinate of the query center.
+        y: f64,
+        /// Search radius.
+        radius: f64,
+    },
+    /// Axis-aligned bounding box intersection test. Corresponds to
+    /// `ST_Intersects(aabb)`.
+    Intersects {
+        /// Minimum X of the query rectangle.
+        min_x: f64,
+        /// Minimum Y of the query rectangle.
+        min_y: f64,
+        /// Maximum X of the query rectangle.
+        max_x: f64,
+        /// Maximum Y of the query rectangle.
+        max_y: f64,
+    },
+}
+
+/// Result of [`SpatialIndex::supports`]: the index can handle the
+/// expression with the given estimated cost.
+#[derive(Clone, Copy, Debug)]
+pub struct SpatialCost {
+    /// Estimated number of entities the expression will return.
+    pub estimated_rows: f64,
+    /// Dimensionless CPU cost for the lookup (comparable to
+    /// [`Cost`](crate::planner::Cost) units).
+    pub cpu: f64,
+}
+
 /// A secondary spatial index that can be rebuilt from world state.
 ///
 /// Indexes are fully user-owned — the World has no awareness of them.
@@ -36,8 +85,18 @@ use crate::world::World;
 ///   components.
 ///
 /// The result is that structurally different algorithms (uniform grids,
-/// quadtrees, BVH, k-d trees) all implement the same two-method trait
-/// without friction — see the `boids` and `nbody` examples.
+/// quadtrees, BVH, k-d trees) all implement the same single-required-method
+/// trait without friction — see the `boids` and `nbody` examples.
+///
+/// # Capability discovery
+///
+/// The [`supports`](SpatialIndex::supports) method enables the query
+/// planner to ask an index whether it can accelerate a given spatial
+/// expression, and at what cost. The default returns `None` (not
+/// supported), so existing implementations remain compatible. Override
+/// this to advertise spatial acceleration capabilities — the planner
+/// will compare the reported cost against a full scan and choose the
+/// cheaper path.
 pub trait SpatialIndex {
     /// Reconstruct the index from scratch by scanning all matching entities.
     fn rebuild(&mut self, world: &mut World);
@@ -51,6 +110,19 @@ pub trait SpatialIndex {
     /// returns false.
     fn update(&mut self, world: &mut World) {
         self.rebuild(world);
+    }
+
+    /// Ask the index whether it can accelerate `expr`.
+    ///
+    /// Returns `Some(cost)` if the index can handle the expression,
+    /// with an estimated row count and CPU cost. Returns `None` if
+    /// the index cannot accelerate the expression (the planner will
+    /// fall back to a scan + post-filter).
+    ///
+    /// The default implementation returns `None`, keeping backward
+    /// compatibility for indexes that predate capability discovery.
+    fn supports(&self, _expr: &SpatialExpr) -> Option<SpatialCost> {
+        None
     }
 }
 
@@ -412,7 +484,6 @@ mod tests {
     use crate::Entity;
 
     #[derive(Clone, Copy)]
-    #[expect(dead_code)]
     struct Pos {
         x: f32,
         y: f32,
@@ -861,5 +932,163 @@ mod tests {
         assert!(restored.get(&Score(10)).contains(&e1));
         assert_eq!(restored.get(&Score(20)).len(), 1);
         assert!(restored.get(&Score(20)).contains(&e2));
+    }
+
+    // ── Capability discovery tests ───────────────────────────────
+
+    #[test]
+    fn default_supports_returns_none() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let mut idx = EntityCollector::new();
+        idx.rebuild(&mut world);
+
+        let expr = SpatialExpr::Within {
+            x: 0.0,
+            y: 0.0,
+            radius: 10.0,
+        };
+        assert!(idx.supports(&expr).is_none());
+    }
+
+    /// A spatial index that advertises support for `Within` queries.
+    struct GridIndex {
+        entities: Vec<(Entity, f32, f32)>,
+    }
+
+    impl GridIndex {
+        fn new() -> Self {
+            Self {
+                entities: Vec::new(),
+            }
+        }
+    }
+
+    impl SpatialIndex for GridIndex {
+        fn rebuild(&mut self, world: &mut World) {
+            self.entities = world
+                .query::<(Entity, &Pos)>()
+                .map(|(e, p)| (e, p.x, p.y))
+                .collect();
+        }
+
+        fn supports(&self, expr: &SpatialExpr) -> Option<SpatialCost> {
+            match expr {
+                SpatialExpr::Within { .. } => Some(SpatialCost {
+                    estimated_rows: (self.entities.len() as f64 * 0.1).max(1.0),
+                    cpu: 5.0,
+                }),
+                SpatialExpr::Intersects { .. } => Some(SpatialCost {
+                    estimated_rows: (self.entities.len() as f64 * 0.2).max(1.0),
+                    cpu: 8.0,
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn custom_index_supports_within() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut idx = GridIndex::new();
+        idx.rebuild(&mut world);
+
+        let expr = SpatialExpr::Within {
+            x: 50.0,
+            y: 50.0,
+            radius: 10.0,
+        };
+        let cost = idx.supports(&expr).expect("should support Within");
+        assert!(cost.estimated_rows > 0.0);
+        assert!(cost.cpu > 0.0);
+    }
+
+    #[test]
+    fn custom_index_supports_intersects() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut idx = GridIndex::new();
+        idx.rebuild(&mut world);
+
+        let expr = SpatialExpr::Intersects {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 25.0,
+            max_y: 25.0,
+        };
+        let cost = idx.supports(&expr).expect("should support Intersects");
+        assert!(cost.estimated_rows > 0.0);
+    }
+
+    #[test]
+    fn btree_index_default_supports_returns_none() {
+        let mut world = World::new();
+        world.spawn((Score(10),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let expr = SpatialExpr::Within {
+            x: 0.0,
+            y: 0.0,
+            radius: 5.0,
+        };
+        assert!(idx.supports(&expr).is_none());
+    }
+
+    #[test]
+    fn spatial_expr_debug_display() {
+        let w = SpatialExpr::Within {
+            x: 1.0,
+            y: 2.0,
+            radius: 3.0,
+        };
+        let dbg = format!("{:?}", w);
+        assert!(dbg.contains("Within"));
+
+        let i = SpatialExpr::Intersects {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 10.0,
+            max_y: 10.0,
+        };
+        let dbg = format!("{:?}", i);
+        assert!(dbg.contains("Intersects"));
+    }
+
+    #[test]
+    fn spatial_index_dyn_with_supports() {
+        let mut world = World::new();
+        for i in 0..20 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut grid = GridIndex::new();
+        grid.rebuild(&mut world);
+
+        // Use as dyn SpatialIndex
+        let dyn_idx: &dyn SpatialIndex = &grid;
+        let expr = SpatialExpr::Within {
+            x: 10.0,
+            y: 10.0,
+            radius: 5.0,
+        };
+        assert!(dyn_idx.supports(&expr).is_some());
     }
 }
