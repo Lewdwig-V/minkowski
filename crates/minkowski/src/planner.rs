@@ -2006,6 +2006,65 @@ fn passes_change_filter(
         })
 }
 
+/// Index-gather validation pipeline: validate candidate entities from an index
+/// lookup, filtering by liveness, required components, change detection, and
+/// user predicates. Calls `emit` for each surviving entity.
+///
+/// Uses a 1-element archetype cache to amortise the `is_subset` and
+/// `passes_change_filter` checks when consecutive candidates share the same
+/// archetype — common in spatial indexes that return physically clustered
+/// entities. Cache hit turns those per-entity bitset operations into a single
+/// `ArchetypeId` integer comparison.
+#[inline]
+fn gather_index_candidates(
+    world: &World,
+    candidates: &[Entity],
+    required: &FixedBitSet,
+    changed: &FixedBitSet,
+    tick: Tick,
+    filters: &[FilterFn],
+    mut emit: impl FnMut(Entity),
+) {
+    // Archetype cache: (archetype_id, passed_required, passed_changed).
+    // Avoids re-checking the same archetype when consecutive entities share one.
+    let mut cached_arch: Option<(usize, bool)> = None;
+    let has_changed = !changed.is_clear();
+
+    for &entity in candidates {
+        let Some(loc) = world.validate_entity(entity) else {
+            continue;
+        };
+        let arch_idx = loc.archetype_id.0;
+
+        // Check archetype cache: if we've already validated this archetype,
+        // skip the bitset subset and change-filter checks entirely.
+        let arch_ok = if let Some((cached_id, cached_ok)) = cached_arch {
+            if cached_id == arch_idx {
+                cached_ok
+            } else {
+                let arch = &world.archetypes.archetypes[arch_idx];
+                let ok = required.is_subset(&arch.component_ids)
+                    && (!has_changed || passes_change_filter(arch, changed, tick));
+                cached_arch = Some((arch_idx, ok));
+                ok
+            }
+        } else {
+            let arch = &world.archetypes.archetypes[arch_idx];
+            let ok = required.is_subset(&arch.component_ids)
+                && (!has_changed || passes_change_filter(arch, changed, tick));
+            cached_arch = Some((arch_idx, ok));
+            ok
+        };
+
+        if !arch_ok {
+            continue;
+        }
+        if filters.is_empty() || filters.iter().all(|f| f(world, entity)) {
+            emit(entity);
+        }
+    }
+}
+
 /// Collect all entities from archetypes matching a component bitset
 /// into a scratch buffer, skipping archetypes whose changed columns
 /// are not newer than `tick`.
@@ -2471,23 +2530,15 @@ impl ScanBuilder<'_> {
                 Box::new(
                     move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
                         let candidates = lookup_fn(&expr);
-                        for entity in candidates {
-                            let Some(loc) = world.validate_entity(entity) else {
-                                continue;
-                            };
-                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
-                            if !left_required_for_index.is_subset(&arch.component_ids) {
-                                continue;
-                            }
-                            if !left_changed_for_index.is_clear()
-                                && !passes_change_filter(arch, &left_changed_for_index, tick)
-                            {
-                                continue;
-                            }
-                            if left_filters.iter().all(|f| f(world, entity)) {
-                                scratch.push(entity);
-                            }
-                        }
+                        gather_index_candidates(
+                            world,
+                            &candidates,
+                            &left_required_for_index,
+                            &left_changed_for_index,
+                            tick,
+                            &left_filters,
+                            |entity| scratch.push(entity),
+                        );
                     },
                 )
             } else if let Some(ref driver) = index_driver {
@@ -2502,23 +2553,15 @@ impl ScanBuilder<'_> {
                 Box::new(
                     move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
                         let candidates = lookup_fn();
-                        for &entity in candidates.iter() {
-                            let Some(loc) = world.validate_entity(entity) else {
-                                continue;
-                            };
-                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
-                            if !left_required_for_index.is_subset(&arch.component_ids) {
-                                continue;
-                            }
-                            if !left_changed_for_index.is_clear()
-                                && !passes_change_filter(arch, &left_changed_for_index, tick)
-                            {
-                                continue;
-                            }
-                            if left_filters_for_index.iter().all(|f| f(world, entity)) {
-                                scratch.push(entity);
-                            }
-                        }
+                        gather_index_candidates(
+                            world,
+                            &candidates,
+                            &left_required_for_index,
+                            &left_changed_for_index,
+                            tick,
+                            &left_filters_for_index,
+                            |entity| scratch.push(entity),
+                        );
                     },
                 )
             } else {
@@ -2618,21 +2661,15 @@ impl ScanBuilder<'_> {
                 Some(Box::new(
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
                         let candidates = lookup_fn(&expr);
-                        for entity in candidates {
-                            let Some(loc) = world.validate_entity(entity) else {
-                                continue;
-                            };
-                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
-                            if !required.is_subset(&arch.component_ids) {
-                                continue;
-                            }
-                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
-                                continue;
-                            }
-                            if all_filter_fns.iter().all(|f| f(world, entity)) {
-                                callback(entity);
-                            }
-                        }
+                        gather_index_candidates(
+                            world,
+                            &candidates,
+                            &required,
+                            &changed,
+                            tick,
+                            &all_filter_fns,
+                            callback,
+                        );
                     },
                 ) as CompiledForEach)
             } else if let Some(ref driver) = index_driver {
@@ -2644,21 +2681,15 @@ impl ScanBuilder<'_> {
                 Some(Box::new(
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
                         let candidates = lookup_fn();
-                        for &entity in candidates.iter() {
-                            let Some(loc) = world.validate_entity(entity) else {
-                                continue;
-                            };
-                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
-                            if !required.is_subset(&arch.component_ids) {
-                                continue;
-                            }
-                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
-                                continue;
-                            }
-                            if all_filter_fns.iter().all(|f| f(world, entity)) {
-                                callback(entity);
-                            }
-                        }
+                        gather_index_candidates(
+                            world,
+                            &candidates,
+                            &required,
+                            &changed,
+                            tick,
+                            &all_filter_fns,
+                            callback,
+                        );
                     },
                 ) as CompiledForEach)
             } else {
@@ -2695,21 +2726,15 @@ impl ScanBuilder<'_> {
                 Some(Box::new(
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
                         let candidates = lookup_fn(&expr);
-                        for entity in candidates {
-                            let Some(loc) = world.validate_entity(entity) else {
-                                continue;
-                            };
-                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
-                            if !required.is_subset(&arch.component_ids) {
-                                continue;
-                            }
-                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
-                                continue;
-                            }
-                            if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
-                                callback(entity);
-                            }
-                        }
+                        gather_index_candidates(
+                            world,
+                            &candidates,
+                            &required,
+                            &changed,
+                            tick,
+                            &all_filter_fns_raw,
+                            callback,
+                        );
                     },
                 ) as CompiledForEachRaw)
             } else if let Some(ref driver) = index_driver {
@@ -2720,21 +2745,15 @@ impl ScanBuilder<'_> {
                 Some(Box::new(
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
                         let candidates = lookup_fn();
-                        for &entity in candidates.iter() {
-                            let Some(loc) = world.validate_entity(entity) else {
-                                continue;
-                            };
-                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
-                            if !required.is_subset(&arch.component_ids) {
-                                continue;
-                            }
-                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
-                                continue;
-                            }
-                            if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
-                                callback(entity);
-                            }
-                        }
+                        gather_index_candidates(
+                            world,
+                            &candidates,
+                            &required,
+                            &changed,
+                            tick,
+                            &all_filter_fns_raw,
+                            callback,
+                        );
                     },
                 ) as CompiledForEachRaw)
             } else {
