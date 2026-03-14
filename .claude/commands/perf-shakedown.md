@@ -127,9 +127,10 @@ Agents should verify these invariants are maintained when modifying the listed f
    `DynamicCtx::write` and `DynamicResolved::lookup` must remain `#[inline]`.
    Benchmark: `reducer/dynamic_for_each_10k`.
 
-5. **Query planner `#[inline]` on cost accessors** (`planner.rs`):
-   `Cost::rows`, `Cost::cpu`, `Cost::total`, `PlanNode::cost`, `VecExecNode::cost`
-   must remain `#[inline]`. These are called during plan build and cost comparison.
+5. **Query planner `#[inline]` on accessors** (`planner.rs`):
+   `Cost::rows`, `Cost::cpu`, `Cost::total`, `PlanNode::cost`, `PlanNode::estimated_rows`,
+   `ProbeSet::contains` must remain `#[inline]`. These are called during plan build and
+   cost comparison.
    Benchmark: none yet — exercise via `cargo run -p minkowski-examples --example planner --release`.
 
 6. **Query planner `PredicateKind` is fieldless for `Eq`/`Range`** (`planner.rs`):
@@ -165,17 +166,13 @@ These have been analyzed and are documented here to prevent re-discovery:
    reducers — can't inline writes during iteration because the type is resolved at
    runtime) plus the `assert!` write-permission check per `ctx.write()` call.
 
-3. **`par_for_each` / parallel overhead** — rayon's thread pool spawn + work stealing amortizes poorly below ~50K entities. At 10K entities, sequential `for_each_chunk` is 430x faster. This is a rayon characteristic, not a Minkowski bug. Users should use `par_for_each` only for large entity counts or expensive per-entity work (like `heavy_compute`).
+3. **`par_for_each` / parallel overhead** — rayon's thread pool spawn + work stealing amortizes poorly below ~50K entities. At 10K entities, sequential `for_each` (slice-based) is 430x faster. This is a rayon characteristic, not a Minkowski bug. Users should use `par_for_each` only for large entity counts or expensive per-entity work (like `heavy_compute`).
 
-4. **`for_each` vs `for_each_chunk` 9x gap** — per-element callback prevents SIMD auto-vectorization. `for_each_chunk` yields contiguous `&[T]` slices. This is the single biggest "free win" for users switching iteration style. Not an engine optimization — it's API choice.
+4. **Changeset spawn ~1.5x direct** — arena allocation + mutation log overhead on top of the same archetype push work. Inherent to the data-driven mutation model.
 
-5. **Changeset spawn ~1.5x direct** — arena allocation + mutation log overhead on top of the same archetype push work. Inherent to the data-driven mutation model.
+5. **Query planner `CompiledForEach` is `Box<dyn FnMut>`** — per-entity callback through `&mut dyn FnMut(Entity)` prevents SIMD vectorization. Inherent to type-erased plan composition — the plan is compiled once and re-executed with different callbacks. Custom predicates (`Predicate::custom`) also use `Arc<dyn Fn>` for per-entity filtering. Annotated with `// PERF:` at the type alias.
 
-6. **Query planner `CompiledForEach` is `Box<dyn FnMut>`** — per-entity callback through `&mut dyn FnMut(Entity)` prevents SIMD vectorization. Inherent to type-erased plan composition — the plan is compiled once and re-executed with different callbacks. Custom predicates (`Predicate::custom`) also use `Arc<dyn Fn>` for per-entity filtering. Annotated with `// PERF:` at the type alias.
-
-7. **Aggregate extractors do per-entity `world.get::<T>(entity)`** — `make_extractor` creates a closure that calls `world.get()` per entity per aggregate, which is an entity_locations lookup + archetype column access each time. The scan that drives the aggregate already has column pointers, but plumbing them through the type-erased extractor interface would couple aggregates to archetype internals. Non-trivial to fix without breaking the clean `AggregateExpr` API.
-
-8. **`MaterializedView::refresh` copies the entity list** — `extend_from_slice` from the plan's scratch buffer into the view's owned `Vec<Entity>` on every re-materialization. Borrowing the scratch directly would tie `entities()` lifetime to `&mut self` from refresh, breaking the common pattern of `view.refresh(); for e in view.entities() { world.get(e) }`. The copy is O(N) where N is result size, typically small for subscription queries.
+6. **`MaterializedView::refresh` copies the entity list** — `extend_from_slice` from the plan's scratch buffer into the view's owned `Vec<Entity>` on every re-materialization. Borrowing the scratch directly would tie `entities()` lifetime to `&mut self` from refresh, breaking the common pattern of `view.refresh(); for e in view.entities() { world.get(e) }`. The copy is O(N) where N is result size, typically small for subscription queries.
 
 ## Phase 2 — Analysis
 

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use minkowski::{
     BTreeIndex, CardinalityConstraint, Changed, Entity, HashIndex, Indexed, JoinKind, Predicate,
-    QueryPlanner, SpatialCost, SpatialExpr, SpatialIndex, VectorizeOpts, World,
+    QueryPlanner, SpatialCost, SpatialExpr, SpatialIndex, World,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -194,30 +194,18 @@ fn main() {
         .build();
     println!("{}", plan.explain());
 
-    println!("=== 7. Vectorized Execution (Default) ===\n");
+    println!("=== 7. Plan Details ===\n");
 
-    // build() compiles to vectorized execution by default.
-    // Scans become chunked, filters become SIMD-friendly, joins are partitioned.
+    // build() produces a single execution plan — chunked scans, branchless
+    // filters, and partitioned joins. No separate "scalar" or "vectorized"
+    // paths: LLVM auto-vectorizes the contiguous 64-byte-aligned slices.
     let plan = planner
         .scan::<(&Score, &Pos)>()
         .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
         .join::<(&Team,)>(JoinKind::Inner)
         .build();
     println!("{}", plan.explain());
-
-    // Compare vectorized (default) vs logical cost
-    println!("Logical plan cost:    {:.1}", plan.logical_cost().total());
-    println!("Vectorized plan cost: {:.1}", plan.cost().total());
-
-    // Re-lower with custom opts for a different cache hierarchy
-    let small_cache_opts = VectorizeOpts {
-        l2_cache_bytes: 128 * 1024,
-        avg_component_bytes: 32,
-        target_chunk_rows: 1024,
-    };
-    let vec_plan_small = plan.vectorize(small_cache_opts);
-    println!("\nWith 128 KiB L2 cache, 32-byte components:");
-    println!("{}", vec_plan_small.explain());
+    println!("Plan cost: {:.1}", plan.cost().total());
 
     // Drop planner to release the &world borrow before execute() needs &mut world.
     drop(planner);
