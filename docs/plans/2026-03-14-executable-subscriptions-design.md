@@ -255,30 +255,31 @@ rather than silently degrading to a scan.
 10. Update lib.rs re-exports (remove `SubscriptionPlan`)
 11. Update CLAUDE.md
 
-## Future Phases (Brief)
+## Future Phases — Not Needed
 
-### Phase 2: Mutation Delta Tracking
+Phases 2-4 (mutation delta tracking, incremental subscription evaluation,
+subscription cache) were originally planned as the path toward a
+SpacetimeDB-style push-based subscription system. They are **not needed**.
 
-Hook into every mutation path (spawn, insert, remove, despawn, changeset
-apply) to capture deltas as `Vec<(Entity, ComponentId, DeltaOp)>` where
-`DeltaOp` is `Insert | Update | Delete`. Emitted after each mutation
-batch (e.g., after `CommandBuffer::apply`, after `Tx::commit`). The delta
-is the raw material for incremental subscription evaluation.
+The existing `Changed<T>` filter already provides incremental change
+detection at the archetype column level. A subscription query built with
+`Changed<T>` in the query type:
 
-### Phase 3: Incremental Subscription Evaluation
+```rust
+planner.subscribe::<(Changed<Score>, &Score)>()
+    .where_eq(witness, Predicate::eq(Score(42)))
+    .build()
+```
 
-Given a delta from Phase 2, determine which active subscriptions' result
-sets changed. For each affected subscription, compute the row-level delta
-(entity entered/left the result set) by evaluating only the changed
-entities against the subscription's predicates using the registered
-indexes. Push deltas to registered callbacks. This is where the
-`Indexed<T>` guarantee pays off — every predicate can be evaluated via
-index lookup, never a full scan.
+...automatically yields only entities whose `Score` column was mutated
+since the last call. Combined with `IndexDriver` execution (no full
+scan), this gives the framework everything it needs:
 
-### Phase 4: Subscription Cache (minkowski-persist)
+- **"What changed?"** → `Changed<T>` filters unchanged entities
+- **"Don't scan everything"** → `IndexDriver` uses the registered index
+- **"Is it fast?"** → `Indexed<T>` witness proves at compile time
 
-A `SubscriptionCache` in the `-persist` crate that maintains a local
-mirror of subscribed rows, applies deltas from Phase 3, and provides
-typed query access. Handles WAL-backed durability for offline scenarios
-and replication convergence. The cache is the client-side half of the
-SpacetimeDB subscription model.
+A framework that wants full event sourcing (delta logs, projections,
+CQRS) can build it on top by accumulating the entities yielded by
+`for_each` into their own data structures. That is framework policy,
+not storage engine mechanism.
