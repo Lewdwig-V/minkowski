@@ -849,7 +849,49 @@ mod tests {
     }
 
     #[test]
-    fn slab_pool_concurrent_allocate() {
+    fn slab_pool_concurrent_allocate_no_duplicates() {
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        let all_ptrs: Vec<Vec<usize>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let pool = Arc::clone(&pool);
+                    s.spawn(move || {
+                        let mut ptrs = Vec::new();
+                        for _ in 0..200 {
+                            if let Ok(ptr) = pool.allocate(layout) {
+                                ptrs.push(ptr.as_ptr() as usize);
+                            }
+                        }
+                        ptrs
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Verify no duplicates across all threads.
+        let mut all: Vec<usize> = all_ptrs.iter().flatten().copied().collect();
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            total,
+            "duplicate pointers returned across threads"
+        );
+
+        // Deallocate all.
+        for addr in all_ptrs.iter().flatten() {
+            let ptr = NonNull::new(*addr as *mut u8).unwrap();
+            unsafe { pool.deallocate(ptr, layout) };
+        }
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_concurrent_alloc_dealloc_interleaved() {
         let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
         let layout = Layout::from_size_align(64, 64).unwrap();
 
@@ -857,20 +899,16 @@ mod tests {
             for _ in 0..4 {
                 let pool = Arc::clone(&pool);
                 s.spawn(move || {
-                    let mut ptrs = Vec::new();
-                    for _ in 0..100 {
-                        if let Ok(ptr) = pool.allocate(layout) {
-                            ptrs.push(ptr);
-                        }
-                    }
-                    for ptr in ptrs {
-                        // SAFETY: each ptr was returned by `allocate` and is
-                        // only deallocated once by this thread.
+                    for _ in 0..1000 {
+                        let ptr = pool.allocate(layout).unwrap();
+                        // SAFETY: ptr was just allocated.
                         unsafe { pool.deallocate(ptr, layout) };
                     }
                 });
             }
         });
+
+        assert_eq!(pool.used(), Some(0));
     }
 
     #[test]
