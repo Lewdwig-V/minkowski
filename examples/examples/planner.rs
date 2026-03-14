@@ -139,14 +139,21 @@ fn main() {
 
     println!("=== 4. Subscription Queries (Compiler-Enforced Indexes) ===\n");
 
-    // Every predicate must provide an Indexed<T> witness — no full scans
+    // Every predicate must provide an Indexed<T> witness — no full scans.
+    // Predicates carry the actual value and selectivity estimate.
     let score_witness = Indexed::btree(&score_btree);
     let team_witness = Indexed::hash(&team_hash);
 
     let sub = planner
         .subscribe::<(&Score, &Team)>()
-        .where_eq(score_witness, 0.001) // very selective
-        .where_eq(team_witness, 0.2) // less selective
+        .where_eq(
+            score_witness,
+            Predicate::eq(Score(42)).with_selectivity(0.001), // very selective
+        )
+        .where_eq(
+            team_witness,
+            Predicate::eq(Team(2)).with_selectivity(0.2), // less selective
+        )
         .build()
         .unwrap();
     println!("{}", sub.explain());

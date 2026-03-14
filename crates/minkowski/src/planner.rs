@@ -71,17 +71,17 @@
 //!
 //! # Subscription Queries
 //!
-//! [`SubscriptionPlan`] requires that every predicate is backed by an index,
+//! [`SubscriptionBuilder`] requires that every predicate is backed by an index,
 //! enforced at compile time via the `Indexed<T>` witness type. This ensures
-//! the database can push updates to clients in real-time without scanning
-//! entire tables.
+//! the database can push updates without scanning entire tables. The result is
+//! a [`QueryPlanResult`] with full execution support.
 //!
 //! ```rust,ignore
 //! let sub = planner
 //!     .subscribe::<(&Pos, &Score)>()
-//!     .require_index(Indexed::<Score>::from(&score_index))
-//!     .on_change(|entity, pos, score| { /* push to client */ })
-//!     .build();
+//!     .where_eq(Indexed::btree(&score_index), Predicate::eq(Score(42)))
+//!     .build()
+//!     .unwrap();
 //! ```
 
 use std::any::TypeId;
@@ -1162,15 +1162,18 @@ impl<T: Component> fmt::Debug for Indexed<T> {
 /// Builder for subscription queries that enforces every predicate has an index.
 ///
 /// Unlike `ScanBuilder`, this uses the type system to guarantee that the
-/// resulting plan can push updates to clients in real-time. Every call to
+/// resulting plan can push updates without full table scans. Every call to
 /// `where_eq` or `where_range` requires an `Indexed<T>` witness, which can
 /// only be obtained from an actual index instance.
+///
+/// Produces a [`QueryPlanResult`] with full execution support (`execute`,
+/// `for_each`, `for_each_raw`), backed by `IndexDriver` for index-gather
+/// execution.
 pub struct SubscriptionBuilder<'w> {
-    total_entities: usize,
-    query_name: &'static str,
-    indexed_predicates: Vec<IndexedPredicate>,
+    scan: ScanBuilder<'w>,
     errors: Vec<SubscriptionError>,
-    _world: PhantomData<&'w World>,
+    has_predicates: bool,
+    attempted_predicates: bool,
 }
 
 /// Errors from [`SubscriptionBuilder::build`].
@@ -1180,12 +1183,27 @@ pub enum SubscriptionError {
     /// Hash indexes support only exact-match lookups and cannot answer range
     /// queries. Use a `BTreeIndex` instead.
     HashIndexOnRange { component_name: &'static str },
-    /// A selectivity value was NaN. Selectivity must be a finite number in
-    /// `[0.0, 1.0]`.
-    NanSelectivity { component_name: &'static str },
+    /// The predicate kind does not match what this method expects.
+    /// For example, passing a `Range` predicate to `where_eq`.
+    PredicateKindMismatch {
+        expected: &'static str,
+        component_name: &'static str,
+    },
+    /// The `Indexed<T>` witness type does not match the component type of the
+    /// predicate. The predicate's component type and the witness type must be
+    /// the same.
+    ComponentMismatch {
+        witness_type: &'static str,
+        predicate_type: &'static str,
+    },
     /// No predicates were added. A subscription with zero predicates is a
     /// full scan, which defeats the "all predicates indexed" guarantee.
     NoPredicates,
+    /// An `Indexed<T>` witness was provided but the index was not registered
+    /// with the planner via `add_btree_index` / `add_hash_index`. The plan
+    /// would silently degrade to a full scan, violating the subscription's
+    /// no-full-scan guarantee.
+    IndexNotRegistered { component_name: &'static str },
 }
 
 impl fmt::Display for SubscriptionError {
@@ -1198,10 +1216,22 @@ impl fmt::Display for SubscriptionError {
                      Hash indexes cannot answer range queries — use a BTreeIndex instead."
                 )
             }
-            SubscriptionError::NanSelectivity { component_name } => {
+            SubscriptionError::PredicateKindMismatch {
+                expected,
+                component_name,
+            } => {
                 write!(
                     f,
-                    "selectivity for `{component_name}` is NaN — must be a finite number in [0.0, 1.0]"
+                    "expected {expected} predicate for `{component_name}`, got a different kind"
+                )
+            }
+            SubscriptionError::ComponentMismatch {
+                witness_type,
+                predicate_type,
+            } => {
+                write!(
+                    f,
+                    "Indexed<{witness_type}> witness used with predicate on `{predicate_type}`"
                 )
             }
             SubscriptionError::NoPredicates => {
@@ -1210,35 +1240,48 @@ impl fmt::Display for SubscriptionError {
                     "subscription has no predicates — add at least one where_eq or where_range"
                 )
             }
+            SubscriptionError::IndexNotRegistered { component_name } => {
+                write!(
+                    f,
+                    "Indexed<{component_name}> witness provided but the index was not registered \
+                     with the planner — call add_btree_index or add_hash_index first"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for SubscriptionError {}
 
-struct IndexedPredicate {
-    component_name: &'static str,
-    index_kind: IndexKind,
-    predicate_desc: String,
-    selectivity: f64,
-}
-
 impl SubscriptionBuilder<'_> {
     /// Add an equality predicate backed by a proven index.
-    pub fn where_eq<T: Component>(mut self, witness: Indexed<T>, selectivity: f64) -> Self {
-        let name = std::any::type_name::<T>();
-        if selectivity.is_nan() {
-            self.errors.push(SubscriptionError::NanSelectivity {
-                component_name: name,
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::ComponentMismatch`] (via [`build`](Self::build))
+    /// if the predicate's component type does not match the witness type `T`.
+    ///
+    /// Returns [`SubscriptionError::PredicateKindMismatch`] (via [`build`](Self::build))
+    /// if the predicate is not an equality predicate.
+    pub fn where_eq<T: Component>(mut self, _witness: Indexed<T>, predicate: Predicate) -> Self {
+        self.attempted_predicates = true;
+        let witness_type = std::any::type_name::<T>();
+        if predicate.component_type != TypeId::of::<T>() {
+            self.errors.push(SubscriptionError::ComponentMismatch {
+                witness_type,
+                predicate_type: predicate.component_name,
             });
             return self;
         }
-        self.indexed_predicates.push(IndexedPredicate {
-            component_name: name,
-            index_kind: witness.kind,
-            predicate_desc: format!("Eq({})", name),
-            selectivity: selectivity.clamp(0.0, 1.0),
-        });
+        if !matches!(predicate.kind, PredicateKind::Eq) {
+            self.errors.push(SubscriptionError::PredicateKindMismatch {
+                expected: "Eq",
+                component_name: witness_type,
+            });
+            return self;
+        }
+        self.has_predicates = true;
+        self.scan = self.scan.filter(predicate);
         self
     }
 
@@ -1250,30 +1293,41 @@ impl SubscriptionBuilder<'_> {
     /// if `witness` was created from a `HashIndex`. Hash indexes support only
     /// exact-match lookups — they cannot answer range queries. Use a
     /// `BTreeIndex` instead.
+    ///
+    /// Returns [`SubscriptionError::ComponentMismatch`] (via [`build`](Self::build))
+    /// if the predicate's component type does not match the witness type `T`.
+    ///
+    /// Returns [`SubscriptionError::PredicateKindMismatch`] (via [`build`](Self::build))
+    /// if the predicate is not a range predicate.
     pub fn where_range<T: Component + Ord + Clone>(
         mut self,
         witness: Indexed<T>,
-        selectivity: f64,
+        predicate: Predicate,
     ) -> Self {
-        let name = std::any::type_name::<T>();
+        self.attempted_predicates = true;
+        let witness_type = std::any::type_name::<T>();
         if witness.kind == IndexKind::Hash {
             self.errors.push(SubscriptionError::HashIndexOnRange {
-                component_name: name,
+                component_name: witness_type,
             });
             return self;
         }
-        if selectivity.is_nan() {
-            self.errors.push(SubscriptionError::NanSelectivity {
-                component_name: name,
+        if predicate.component_type != TypeId::of::<T>() {
+            self.errors.push(SubscriptionError::ComponentMismatch {
+                witness_type,
+                predicate_type: predicate.component_name,
             });
             return self;
         }
-        self.indexed_predicates.push(IndexedPredicate {
-            component_name: name,
-            index_kind: witness.kind,
-            predicate_desc: format!("Range({})", name),
-            selectivity: selectivity.clamp(0.0, 1.0),
-        });
+        if !matches!(predicate.kind, PredicateKind::Range) {
+            self.errors.push(SubscriptionError::PredicateKindMismatch {
+                expected: "Range",
+                component_name: witness_type,
+            });
+            return self;
+        }
+        self.has_predicates = true;
+        self.scan = self.scan.filter(predicate);
         self
     }
 
@@ -1283,104 +1337,37 @@ impl SubscriptionBuilder<'_> {
     /// # Errors
     ///
     /// Returns all [`SubscriptionError`]s if any predicates were invalid
-    /// (e.g. a Hash index used with `where_range`, or a NaN selectivity).
-    pub fn build(self) -> Result<SubscriptionPlan, Vec<SubscriptionError>> {
-        let mut errors = self.errors;
-        if self.indexed_predicates.is_empty() {
-            errors.push(SubscriptionError::NoPredicates);
+    /// (e.g. a Hash index used with `where_range`, or a type mismatch).
+    pub fn build(mut self) -> Result<QueryPlanResult, Vec<SubscriptionError>> {
+        // Only report NoPredicates if the user never attempted to add any.
+        // If they attempted but all failed validation, the specific errors
+        // are already in self.errors — NoPredicates would be spurious.
+        if !self.has_predicates && !self.attempted_predicates {
+            self.errors.push(SubscriptionError::NoPredicates);
         }
-        if !errors.is_empty() {
-            return Err(errors);
+        if !self.errors.is_empty() {
+            return Err(self.errors);
         }
-
-        let mut node: PlanNode = PlanNode::Scan {
-            query_name: self.query_name,
-            estimated_rows: self.total_entities,
-            cost: Cost::scan(self.total_entities),
-        };
-
-        // Sort predicates by selectivity (most selective first) for optimal
-        // index intersection ordering.
-        let mut preds = self.indexed_predicates;
-        preds.sort_by(|a, b| a.selectivity.total_cmp(&b.selectivity));
-
-        // The most selective predicate becomes the driving index lookup.
-        // Remaining predicates become chained index lookups / filters.
-        if let Some(first) = preds.first() {
-            let est = (self.total_entities as f64 * first.selectivity).max(1.0) as usize;
-            node = PlanNode::IndexLookup {
-                index_kind: first.index_kind,
-                component_name: first.component_name,
-                predicate: first.predicate_desc.clone(),
-                estimated_rows: est,
-                cost: Cost::index_lookup(first.selectivity, self.total_entities),
-            };
-
-            for pred in preds.iter().skip(1) {
-                let parent_cost = node.cost();
-                let est_rows = parent_cost.rows * pred.selectivity;
-                node = PlanNode::Filter {
-                    predicate: pred.predicate_desc.clone(),
-                    selectivity: pred.selectivity,
-                    branchless_eligible: true, // indexed predicates are always Eq/Range
-                    cost: Cost {
-                        rows: est_rows.max(0.0),
-                        cpu: parent_cost.cpu
-                            + parent_cost.rows * Cost::FILTER_PER_ROW
-                            + Cost::INDEX_LOOKUP, // re-validate via index
-                    },
-                    child: Box::new(node),
-                };
-            }
+        let result = self.scan.build();
+        // Enforce the "all predicates indexed" guarantee. The Indexed<T>
+        // witness proves an index object exists, but ScanBuilder only uses
+        // indexes registered with the planner. If the user forgot to call
+        // add_btree_index/add_hash_index, the plan silently degrades to a
+        // full scan — catch this here and fail loudly.
+        let index_errors: Vec<SubscriptionError> = result
+            .warnings()
+            .iter()
+            .filter_map(|w| match w {
+                PlanWarning::MissingIndex { component_name, .. } => {
+                    Some(SubscriptionError::IndexNotRegistered { component_name })
+                }
+                _ => None,
+            })
+            .collect();
+        if !index_errors.is_empty() {
+            return Err(index_errors);
         }
-
-        Ok(SubscriptionPlan { root: node })
-    }
-}
-
-/// A compiled subscription plan. Guaranteed to have an index for every
-/// predicate — the database can push updates without full table scans.
-pub struct SubscriptionPlan {
-    root: PlanNode,
-}
-
-impl SubscriptionPlan {
-    /// The root node of the subscription plan.
-    pub fn root(&self) -> &PlanNode {
-        &self.root
-    }
-
-    /// Total estimated cost.
-    pub fn cost(&self) -> Cost {
-        self.root.cost()
-    }
-
-    /// Human-readable plan.
-    pub fn explain(&self) -> String {
-        let mut out = String::new();
-        out.push_str("=== Subscription Plan (all predicates indexed) ===\n");
-        let _ = write!(out, "{}", self.root);
-        let _ = write!(
-            out,
-            "\nEstimated: {:.0} rows, {:.1} cpu\n",
-            self.root.cost().rows,
-            self.root.cost().cpu
-        );
-        out
-    }
-}
-
-impl fmt::Display for SubscriptionPlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.explain())
-    }
-}
-
-impl fmt::Debug for SubscriptionPlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SubscriptionPlan")
-            .field("root", &self.root)
-            .finish()
+        Ok(result)
     }
 }
 
@@ -2641,13 +2628,14 @@ impl<'w> QueryPlanner<'w> {
     }
 
     /// Start building a subscription plan (compiler-enforced indexes).
-    pub fn subscribe<Q: 'static>(&'w self) -> SubscriptionBuilder<'w> {
+    pub fn subscribe<Q: crate::query::fetch::WorldQuery + 'static>(
+        &'w self,
+    ) -> SubscriptionBuilder<'w> {
         SubscriptionBuilder {
-            total_entities: self.total_entities,
-            query_name: std::any::type_name::<Q>(),
-            indexed_predicates: Vec::new(),
+            scan: self.scan::<Q>(),
             errors: Vec::new(),
-            _world: PhantomData,
+            has_predicates: false,
+            attempted_predicates: false,
         }
     }
 
@@ -3986,22 +3974,24 @@ mod tests {
     #[test]
     fn subscription_requires_indexed_witness() {
         let mut world = World::new();
-        for i in 0..1000 {
+        for i in 0..1000u32 {
             world.spawn((Score(i),));
         }
         let mut idx = BTreeIndex::<Score>::new();
         idx.rebuild(&mut world);
+        let idx = std::sync::Arc::new(idx);
 
-        let planner = QueryPlanner::new(&world);
-        let witness = Indexed::btree(&idx);
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&idx, &world).unwrap();
+        let witness = Indexed::btree(&*idx);
 
         let sub = planner
             .subscribe::<(&Score,)>()
-            .where_eq(witness, 0.001)
+            .where_eq(witness, Predicate::eq(Score(42)))
             .build()
             .unwrap();
 
-        // Subscription plans have no warnings (all predicates are indexed).
+        // The index is registered, so the planner should emit an IndexLookup.
         match sub.root() {
             PlanNode::IndexLookup { index_kind, .. } => {
                 assert_eq!(*index_kind, IndexKind::BTree);
@@ -4014,22 +4004,27 @@ mod tests {
     #[test]
     fn subscription_multiple_predicates_ordered_by_selectivity() {
         let mut world = World::new();
-        for i in 0..1000 {
+        for i in 0..1000u32 {
             world.spawn((Score(i), Team(i % 5)));
         }
         let mut score_idx = BTreeIndex::<Score>::new();
         score_idx.rebuild(&mut world);
-        let mut team_idx = HashIndex::<Team>::new();
+        let score_idx = std::sync::Arc::new(score_idx);
+        let mut team_idx = BTreeIndex::<Team>::new();
         team_idx.rebuild(&mut world);
+        let team_idx = std::sync::Arc::new(team_idx);
 
-        let planner = QueryPlanner::new(&world);
-        let score_w = Indexed::btree(&score_idx);
-        let team_w = Indexed::hash(&team_idx);
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&score_idx, &world).unwrap();
+        planner.add_btree_index(&team_idx, &world).unwrap();
+        let score_w = Indexed::btree(&*score_idx);
+        let team_w = Indexed::btree(&*team_idx);
 
+        // Score predicate gets lower selectivity (more selective) → should drive.
         let sub = planner
             .subscribe::<(&Score, &Team)>()
-            .where_eq(team_w, 0.2) // less selective
-            .where_eq(score_w, 0.001) // more selective — should drive
+            .where_eq(team_w, Predicate::eq(Team(2)).with_selectivity(0.2))
+            .where_eq(score_w, Predicate::eq(Score(42)).with_selectivity(0.001))
             .build()
             .unwrap();
 
@@ -4051,18 +4046,20 @@ mod tests {
     #[test]
     fn subscription_where_range_accepts_btree_witness() {
         let mut world = World::new();
-        for i in 0..100 {
+        for i in 0..100u32 {
             world.spawn((Score(i),));
         }
         let mut idx = BTreeIndex::<Score>::new();
         idx.rebuild(&mut world);
+        let idx = std::sync::Arc::new(idx);
 
-        let planner = QueryPlanner::new(&world);
-        let witness = Indexed::btree(&idx);
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&idx, &world).unwrap();
+        let witness = Indexed::btree(&*idx);
 
         let sub = planner
             .subscribe::<(&Score,)>()
-            .where_range(witness, 0.1)
+            .where_range(witness, Predicate::range(Score(10)..Score(50)))
             .build()
             .unwrap();
 
@@ -4077,7 +4074,7 @@ mod tests {
     #[test]
     fn subscription_where_range_rejects_hash_witness() {
         let mut world = World::new();
-        for i in 0..100 {
+        for i in 0..100u32 {
             world.spawn((Score(i),));
         }
         let mut idx = HashIndex::<Score>::new();
@@ -4089,7 +4086,7 @@ mod tests {
         // Hash indexes cannot serve range queries — build returns an error.
         let result = planner
             .subscribe::<(&Score,)>()
-            .where_range(witness, 0.1)
+            .where_range(witness, Predicate::range(Score(10)..Score(50)))
             .build();
         match result {
             Err(errs)
@@ -4101,27 +4098,222 @@ mod tests {
     }
 
     #[test]
-    fn subscription_nan_selectivity_returns_error() {
+    fn subscription_no_predicates_returns_error() {
         let mut world = World::new();
-        for i in 0..100 {
+        for i in 0..100u32 {
             world.spawn((Score(i),));
         }
         let mut idx = BTreeIndex::<Score>::new();
         idx.rebuild(&mut world);
 
         let planner = QueryPlanner::new(&world);
-        let witness = Indexed::btree(&idx);
 
+        let result = planner.subscribe::<(&Score,)>().build();
+        match result {
+            Err(errs)
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, SubscriptionError::NoPredicates)) => {}
+            other => panic!("expected NoPredicates error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subscription_component_mismatch_returns_error() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i), Team(i % 5)));
+        }
+        let mut score_idx = BTreeIndex::<Score>::new();
+        score_idx.rebuild(&mut world);
+        let score_idx = std::sync::Arc::new(score_idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&score_idx, &world).unwrap();
+        let score_w = Indexed::btree(&*score_idx);
+
+        // Witness is for Score but predicate is for Team — should error.
         let result = planner
-            .subscribe::<(&Score,)>()
-            .where_eq(witness, f64::NAN)
+            .subscribe::<(&Score, &Team)>()
+            .where_eq(score_w, Predicate::eq(Team(2)))
             .build();
         match result {
             Err(errs)
                 if errs
                     .iter()
-                    .any(|e| matches!(e, SubscriptionError::NanSelectivity { .. })) => {}
-            other => panic!("expected NanSelectivity error, got {:?}", other),
+                    .any(|e| matches!(e, SubscriptionError::ComponentMismatch { .. })) => {}
+            other => panic!("expected ComponentMismatch error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subscription_predicate_kind_mismatch_returns_error() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i),));
+        }
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let idx = std::sync::Arc::new(idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&idx, &world).unwrap();
+        let witness = Indexed::btree(&*idx);
+
+        // where_eq expects an Eq predicate, but we pass a Range.
+        let result = planner
+            .subscribe::<(&Score,)>()
+            .where_eq(witness, Predicate::range(Score(10)..Score(50)))
+            .build();
+        match result {
+            Err(errs)
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, SubscriptionError::PredicateKindMismatch { .. })) => {}
+            other => panic!("expected PredicateKindMismatch error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subscription_plan_is_executable() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42),));
+        let _e2 = world.spawn((Score(99),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let idx = Arc::new(idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&idx, &world).unwrap();
+        let witness = Indexed::btree(&*idx);
+
+        let mut plan = planner
+            .subscribe::<(&Score,)>()
+            .where_eq(witness, Predicate::eq(Score(42)))
+            .build()
+            .unwrap();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn subscription_plan_for_each_raw_works() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42),));
+        let _e2 = world.spawn((Score(99),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let idx = Arc::new(idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&idx, &world).unwrap();
+        let witness = Indexed::btree(&*idx);
+
+        let mut plan = planner
+            .subscribe::<(&Score,)>()
+            .where_eq(witness, Predicate::eq(Score(42)))
+            .build()
+            .unwrap();
+
+        let mut results = Vec::new();
+        plan.for_each_raw(&world, |entity| results.push(entity))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn subscription_where_range_rejects_eq_predicate() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i),));
+        }
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let idx = Arc::new(idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&idx, &world).unwrap();
+        let witness = Indexed::btree(&*idx);
+
+        // where_range expects a Range predicate, but we pass Eq.
+        let result = planner
+            .subscribe::<(&Score,)>()
+            .where_range(witness, Predicate::eq(Score(42)))
+            .build();
+        assert!(matches!(
+            result,
+            Err(ref errs) if errs.iter().any(|e| matches!(e, SubscriptionError::PredicateKindMismatch { expected: "Range", .. }))
+        ));
+    }
+
+    #[test]
+    fn subscription_unregistered_index_returns_error() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i),));
+        }
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let witness = Indexed::btree(&idx);
+
+        // Witness exists but index NOT registered with planner.
+        let planner = QueryPlanner::new(&world);
+        let result = planner
+            .subscribe::<(&Score,)>()
+            .where_eq(witness, Predicate::eq(Score(42)))
+            .build();
+        assert!(
+            matches!(
+                result,
+                Err(ref errs) if errs.iter().any(|e| matches!(e, SubscriptionError::IndexNotRegistered { .. }))
+            ),
+            "expected IndexNotRegistered error when index not registered with planner, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn subscription_validation_failure_does_not_produce_spurious_no_predicates() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i), Team(i % 5)));
+        }
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let idx = Arc::new(idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&idx, &world).unwrap();
+        let witness = Indexed::btree(&*idx);
+
+        // Pass a Team predicate with a Score witness — ComponentMismatch.
+        // Should NOT also get NoPredicates.
+        let result = planner
+            .subscribe::<(&Score, &Team)>()
+            .where_eq(witness, Predicate::eq(Team(2)).with_selectivity(0.2))
+            .build();
+        match result {
+            Err(errs) => {
+                assert!(
+                    errs.iter()
+                        .any(|e| matches!(e, SubscriptionError::ComponentMismatch { .. })),
+                    "expected ComponentMismatch"
+                );
+                assert!(
+                    !errs
+                        .iter()
+                        .any(|e| matches!(e, SubscriptionError::NoPredicates)),
+                    "should NOT get spurious NoPredicates when predicates were attempted"
+                );
+            }
+            Ok(_) => panic!("expected error"),
         }
     }
 
