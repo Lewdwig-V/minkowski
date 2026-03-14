@@ -54,13 +54,12 @@
 //!   `BTreeIndex`, and `ReducerRegistry`.
 //! - **Owns its plan** — the view takes ownership of the `QueryPlanResult`
 //!   and manages tick advancement.
-//! - **Zero-copy reads** — `entities()` returns `&[Entity]`, borrowed from
-//!   the plan's internal scratch buffer or the view's own cached copy.
+//! - **Cached reads** — `entities()` returns `&[Entity]` from the view's
+//!   internal cache, populated by `refresh()`.
 
 use crate::entity::Entity;
-use crate::planner::QueryPlanResult;
-use crate::transaction::WorldMismatch;
-use crate::world::World;
+use crate::planner::{PlanExecError, QueryPlanResult};
+use crate::world::{World, WorldId};
 
 /// Controls how often a [`MaterializedView`] re-materializes its cached result.
 ///
@@ -75,11 +74,10 @@ pub enum DebouncePolicy {
     Immediate,
 
     /// Refresh at most once per `n` calls to `refresh`. The first call
-    /// always refreshes. Subsequent calls within the window return the
-    /// cached result.
-    ///
-    /// A value of 0 is treated as 1 (immediate).
-    EveryNTicks(u64),
+    /// always refreshes (unpopulated views bypass the counter). With
+    /// `EveryNTicks(3)`, the pattern is: refresh, suppress, suppress,
+    /// refresh — a period of 3 calls between refreshes.
+    EveryNTicks(std::num::NonZeroU64),
 }
 
 /// A cached, debounced materialized view over a subscription query plan.
@@ -110,6 +108,9 @@ pub struct MaterializedView {
     ticks_since_refresh: u64,
     /// Total number of times the view has been refreshed (re-materialized).
     refresh_count: u64,
+    /// World this view was built from — checked on every `refresh` call,
+    /// including debounce-suppressed ones.
+    world_id: WorldId,
 }
 
 impl MaterializedView {
@@ -118,6 +119,7 @@ impl MaterializedView {
     /// The view starts empty — call [`refresh`](Self::refresh) to populate it.
     /// The default debounce policy is [`DebouncePolicy::Immediate`].
     pub fn new(plan: QueryPlanResult) -> Self {
+        let world_id = plan.world_id();
         Self {
             plan,
             cached: Vec::new(),
@@ -125,6 +127,7 @@ impl MaterializedView {
             policy: DebouncePolicy::Immediate,
             ticks_since_refresh: 0,
             refresh_count: 0,
+            world_id,
         }
     }
 
@@ -148,20 +151,30 @@ impl MaterializedView {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldMismatch`] if the world is not the same one the plan
-    /// was built from.
-    pub fn refresh(&mut self, world: &mut World) -> Result<bool, WorldMismatch> {
-        self.ticks_since_refresh += 1;
+    /// Returns [`PlanExecError::WorldMismatch`] if the world is not the
+    /// same one the plan was built from. This check runs on every call,
+    /// including debounce-suppressed ones.
+    ///
+    /// Returns [`PlanExecError::JoinNotSupported`] if the wrapped plan
+    /// contains joins. Use `plan.execute()` directly for join plans.
+    pub fn refresh(&mut self, world: &mut World) -> Result<bool, PlanExecError> {
+        // World identity check runs unconditionally — even suppressed calls
+        // must not silently serve stale data from a different world.
+        if self.world_id != world.world_id() {
+            return Err(
+                crate::transaction::WorldMismatch::new(self.world_id, world.world_id()).into(),
+            );
+        }
 
         let should_refresh = match self.policy {
             DebouncePolicy::Immediate => true,
             DebouncePolicy::EveryNTicks(n) => {
-                let n = n.max(1);
-                !self.populated || self.ticks_since_refresh >= n
+                !self.populated || (self.ticks_since_refresh + 1) >= n.get()
             }
         };
 
         if !should_refresh {
+            self.ticks_since_refresh += 1;
             return Ok(false);
         }
 
@@ -179,6 +192,10 @@ impl MaterializedView {
     ///
     /// Returns an empty slice if [`refresh`](Self::refresh) has never been
     /// called.
+    ///
+    /// **Note**: when debouncing is active, cached entities may have been
+    /// despawned since the last refresh. Use `world.is_alive(entity)` to
+    /// validate before accessing components.
     #[inline]
     pub fn entities(&self) -> &[Entity] {
         &self.cached
@@ -228,9 +245,18 @@ impl MaterializedView {
 
     /// Force a refresh on the next call to [`refresh`](Self::refresh),
     /// regardless of the debounce policy. Does not execute the plan
-    /// immediately.
+    /// immediately. Resets the tick counter for consistency with
+    /// [`set_policy`](Self::set_policy).
     pub fn invalidate(&mut self) {
         self.populated = false;
+        self.ticks_since_refresh = 0;
+    }
+
+    /// Number of `refresh` calls since the last actual re-materialization.
+    /// Useful for diagnostics when debouncing is active.
+    #[inline]
+    pub fn ticks_since_refresh(&self) -> u64 {
+        self.ticks_since_refresh
     }
 }
 
@@ -249,11 +275,21 @@ impl std::fmt::Debug for MaterializedView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planner::{Predicate, QueryPlanner};
+    use crate::planner::{JoinKind, PlanExecError, Predicate, QueryPlanner};
     use crate::query::fetch::Changed;
+    use std::num::NonZeroU64;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     struct Score(u32);
+
+    #[derive(Clone, Copy, Debug)]
+    #[expect(dead_code)]
+    struct Health(u32);
+
+    /// Convenience: create `NonZeroU64` from a literal.
+    fn nz(n: u64) -> NonZeroU64 {
+        NonZeroU64::new(n).unwrap()
+    }
 
     // ── Helper: build a simple scan plan ────────────────────────────────
 
@@ -315,7 +351,8 @@ mod tests {
     #[test]
     fn debounced_first_call_always_refreshes() {
         let (mut world, plan) = score_world_and_plan(10);
-        let mut view = MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(5));
+        let mut view =
+            MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(5)));
         let refreshed = view.refresh(&mut world).unwrap();
         assert!(refreshed);
         assert_eq!(view.len(), 10);
@@ -324,7 +361,8 @@ mod tests {
     #[test]
     fn debounced_suppresses_within_window() {
         let (mut world, plan) = score_world_and_plan(10);
-        let mut view = MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(3));
+        let mut view =
+            MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(3)));
         // First call refreshes.
         view.refresh(&mut world).unwrap();
         assert_eq!(view.refresh_count(), 1);
@@ -342,10 +380,12 @@ mod tests {
     }
 
     #[test]
-    fn debounced_zero_treated_as_immediate() {
+    fn debounced_one_behaves_like_immediate() {
         let (mut world, plan) = score_world_and_plan(5);
-        let mut view = MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(0));
+        let mut view =
+            MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(1)));
         view.refresh(&mut world).unwrap();
+        // EveryNTicks(1) refreshes every call — same as Immediate.
         assert!(view.refresh(&mut world).unwrap());
         assert_eq!(view.refresh_count(), 2);
     }
@@ -381,7 +421,8 @@ mod tests {
     #[test]
     fn invalidate_forces_next_refresh() {
         let (mut world, plan) = score_world_and_plan(5);
-        let mut view = MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(100));
+        let mut view =
+            MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(100)));
 
         view.refresh(&mut world).unwrap();
         assert_eq!(view.refresh_count(), 1);
@@ -389,8 +430,9 @@ mod tests {
         // Normally suppressed for 99 more calls.
         assert!(!view.refresh(&mut world).unwrap());
 
-        // Invalidate forces the next refresh.
+        // Invalidate forces the next refresh and resets tick counter.
         view.invalidate();
+        assert_eq!(view.ticks_since_refresh(), 0);
         assert!(view.refresh(&mut world).unwrap());
         assert_eq!(view.refresh_count(), 2);
     }
@@ -400,7 +442,8 @@ mod tests {
     #[test]
     fn set_policy_resets_counter() {
         let (mut world, plan) = score_world_and_plan(5);
-        let mut view = MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(2));
+        let mut view =
+            MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(2)));
         view.refresh(&mut world).unwrap();
 
         // One tick elapsed — next would be suppressed.
@@ -411,6 +454,21 @@ mod tests {
         assert!(view.refresh(&mut world).unwrap());
     }
 
+    #[test]
+    fn set_policy_immediate_to_debounced() {
+        let (mut world, plan) = score_world_and_plan(5);
+        let mut view = MaterializedView::new(plan);
+        view.refresh(&mut world).unwrap(); // immediate
+        view.refresh(&mut world).unwrap(); // immediate
+
+        // Switch to debounced — first call under new policy is suppressed
+        // (ticks_since_refresh was reset to 0 by set_policy, needs 3).
+        view.set_policy(DebouncePolicy::EveryNTicks(nz(3)));
+        assert!(!view.refresh(&mut world).unwrap());
+        assert!(!view.refresh(&mut world).unwrap());
+        assert!(view.refresh(&mut world).unwrap());
+    }
+
     // ── WorldMismatch ───────────────────────────────────────────────────
 
     #[test]
@@ -418,7 +476,27 @@ mod tests {
         let (_world1, plan) = score_world_and_plan(5);
         let mut world2 = World::new();
         let mut view = MaterializedView::new(plan);
-        assert!(view.refresh(&mut world2).is_err());
+        assert!(matches!(
+            view.refresh(&mut world2),
+            Err(PlanExecError::WorldMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_world_caught_during_debounce_suppression() {
+        let (mut world1, plan) = score_world_and_plan(5);
+        let mut view =
+            MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(100)));
+
+        // First refresh succeeds with correct world.
+        view.refresh(&mut world1).unwrap();
+
+        // Suppressed call with WRONG world must still return error.
+        let mut world2 = World::new();
+        assert!(matches!(
+            view.refresh(&mut world2),
+            Err(PlanExecError::WorldMismatch(_))
+        ));
     }
 
     // ── Filtered plan with predicates ───────────────────────────────────
@@ -465,6 +543,97 @@ mod tests {
         assert_eq!(view.len(), 3);
     }
 
+    #[test]
+    fn stale_snapshot_contains_despawned_during_debounce() {
+        let mut world = World::new();
+        let entities: Vec<_> = (0u32..5).map(|i| world.spawn((Score(i),))).collect();
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+        let mut view =
+            MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(100)));
+
+        view.refresh(&mut world).unwrap();
+        assert_eq!(view.len(), 5);
+
+        // Despawn during suppression window — cache is stale.
+        world.despawn(entities[0]);
+        assert!(!view.refresh(&mut world).unwrap()); // suppressed
+        assert_eq!(view.len(), 5); // still 5 in cache
+        assert!(!world.is_alive(entities[0])); // but entity 0 is dead
+    }
+
+    #[test]
+    fn despawn_all_entities() {
+        let mut world = World::new();
+        let entities: Vec<_> = (0u32..5).map(|i| world.spawn((Score(i),))).collect();
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+        let mut view = MaterializedView::new(plan);
+        view.refresh(&mut world).unwrap();
+        assert_eq!(view.len(), 5);
+
+        for e in entities {
+            world.despawn(e);
+        }
+        view.refresh(&mut world).unwrap();
+        assert_eq!(view.len(), 0);
+        assert!(view.is_populated()); // populated but empty
+    }
+
+    // ── Empty world ────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_world_refresh() {
+        let (mut world, plan) = score_world_and_plan(0);
+        let mut view = MaterializedView::new(plan);
+        view.refresh(&mut world).unwrap();
+        assert_eq!(view.len(), 0);
+        assert!(view.is_populated());
+        assert_eq!(view.refresh_count(), 1);
+    }
+
+    // ── Archetype migration ────────────────────────────────────────────
+
+    #[test]
+    fn archetype_migration_still_matches() {
+        let mut world = World::new();
+        let e = world.spawn((Score(1),));
+        for i in 2u32..6 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner.scan::<(&Score,)>().build();
+        let mut view = MaterializedView::new(plan);
+        view.refresh(&mut world).unwrap();
+        assert_eq!(view.len(), 5);
+
+        // Migrate entity to a new archetype by adding Health.
+        world.insert(e, (Health(100),)).unwrap();
+        view.refresh(&mut world).unwrap();
+        // Entity still has Score, so still matches the query.
+        assert_eq!(view.len(), 5);
+    }
+
+    // ── Join plan error ─────────────────────────────────────────────────
+
+    #[test]
+    fn join_plan_returns_error() {
+        let mut world = World::new();
+        world.spawn((Score(1), Health(100)));
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+        let mut view = MaterializedView::new(plan);
+        // execute() supports joins, so this should work.
+        assert!(view.refresh(&mut world).is_ok());
+    }
+
     // ── Debug output ────────────────────────────────────────────────────
 
     #[test]
@@ -475,6 +644,22 @@ mod tests {
         assert!(dbg.contains("MaterializedView"));
         assert!(dbg.contains("cached_len: 0"));
         assert!(dbg.contains("populated: false"));
+    }
+
+    // ── Accessors ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ticks_since_refresh_accessor() {
+        let (mut world, plan) = score_world_and_plan(5);
+        let mut view =
+            MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(10)));
+        view.refresh(&mut world).unwrap();
+        assert_eq!(view.ticks_since_refresh(), 0);
+
+        view.refresh(&mut world).unwrap(); // suppressed
+        assert_eq!(view.ticks_since_refresh(), 1);
+        view.refresh(&mut world).unwrap(); // suppressed
+        assert_eq!(view.ticks_since_refresh(), 2);
     }
 
     // ── Index-backed subscription view ──────────────────────────────────

@@ -11,6 +11,7 @@
 //! - Invalidation for forced refresh
 //! - Using the view as a real-time computed data source
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use minkowski::{
@@ -120,7 +121,8 @@ fn main() {
     {
         let planner = QueryPlanner::new(&world);
         let plan = planner.scan::<(&Score,)>().build();
-        let mut view = MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(5));
+        let mut view = MaterializedView::new(plan)
+            .with_debounce(DebouncePolicy::EveryNTicks(NonZeroU64::new(5).unwrap()));
 
         // First call always refreshes.
         let refreshed = view.refresh(&mut world).unwrap();
@@ -150,7 +152,8 @@ fn main() {
     {
         let planner = QueryPlanner::new(&world);
         let plan = planner.scan::<(&Score,)>().build();
-        let mut view = MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(100));
+        let mut view = MaterializedView::new(plan)
+            .with_debounce(DebouncePolicy::EveryNTicks(NonZeroU64::new(100).unwrap()));
 
         view.refresh(&mut world).unwrap();
         println!(
@@ -204,7 +207,8 @@ fn main() {
             .build()
             .unwrap();
 
-        let mut view = MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(3));
+        let mut view = MaterializedView::new(plan)
+            .with_debounce(DebouncePolicy::EveryNTicks(NonZeroU64::new(3).unwrap()));
 
         view.refresh(&mut world).unwrap();
         println!(
@@ -228,7 +232,8 @@ fn main() {
     {
         let planner = QueryPlanner::new(&world);
         let plan = planner.scan::<(&Score,)>().build();
-        let mut view = MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(10));
+        let mut view = MaterializedView::new(plan)
+            .with_debounce(DebouncePolicy::EveryNTicks(NonZeroU64::new(10).unwrap()));
 
         view.refresh(&mut world).unwrap();
         println!("EveryNTicks(10): refresh_count={}", view.refresh_count());
