@@ -130,6 +130,44 @@ impl fmt::Display for PlannerError {
 
 impl std::error::Error for PlannerError {}
 
+/// Error returned by plan execution methods (`execute`, `for_each`,
+/// `for_each_raw`, `execute_aggregates`, `execute_aggregates_raw`).
+#[derive(Clone, Debug)]
+pub enum PlanExecError {
+    /// Plan was built from a different World.
+    WorldMismatch(WorldMismatch),
+    /// `for_each` / `for_each_raw` called on a plan that contains joins.
+    /// Use `execute()` instead, which collects entities into a scratch buffer.
+    JoinNotSupported,
+}
+
+impl fmt::Display for PlanExecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanExecError::WorldMismatch(e) => write!(f, "{e}"),
+            PlanExecError::JoinNotSupported => write!(
+                f,
+                "for_each/for_each_raw do not support join plans — use execute() instead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlanExecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PlanExecError::WorldMismatch(e) => Some(e),
+            PlanExecError::JoinNotSupported => None,
+        }
+    }
+}
+
+impl From<WorldMismatch> for PlanExecError {
+    fn from(e: WorldMismatch) -> Self {
+        PlanExecError::WorldMismatch(e)
+    }
+}
+
 // ── Cost model ───────────────────────────────────────────────────────
 
 /// Cost estimate for a plan node. All values are dimensionless relative units
@@ -1263,16 +1301,16 @@ impl QueryPlanResult {
     /// Prefer [`for_each`](Self::for_each) for scan-only plans to avoid the
     /// intermediate buffer entirely.
     ///
-    /// Returns `Err(WorldMismatch)` if `world` is not the same World this
-    /// plan was built from.
+    /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
+    /// same World this plan was built from.
     ///
     /// # Panics
     ///
     /// Panics if the plan has no scratch buffer (should not happen for plans
     /// built via [`ScanBuilder::build`]).
-    pub fn execute(&mut self, world: &mut World) -> Result<&[Entity], WorldMismatch> {
+    pub fn execute(&mut self, world: &mut World) -> Result<&[Entity], PlanExecError> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new(self.world_id, world.world_id()));
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
         let scratch = self
             .scratch
@@ -1329,23 +1367,23 @@ impl QueryPlanResult {
     /// When a spatial driver is present, the lookup function allocates
     /// a candidate list per call.
     ///
-    /// Returns `Err(WorldMismatch)` if `world` is not the same World this
-    /// plan was built from.
+    /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
+    /// same World this plan was built from.
     ///
-    /// # Panics
-    /// Panics if the plan was not compiled with scan support.
+    /// Returns `Err(PlanExecError::JoinNotSupported)` if the plan contains
+    /// joins. Use [`execute`](Self::execute) instead, which collects entities
+    /// into a scratch buffer.
     pub fn for_each(
         &mut self,
         world: &mut World,
         mut callback: impl FnMut(Entity),
-    ) -> Result<(), WorldMismatch> {
+    ) -> Result<(), PlanExecError> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new(self.world_id, world.world_id()));
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
-        let compiled = self.compiled_for_each.as_mut().expect(
-            "for_each() is only available for scan-only plans (no joins). \
-                 For plans with joins, use execute() which returns &[Entity].",
-        );
+        let Some(compiled) = self.compiled_for_each.as_mut() else {
+            return Err(PlanExecError::JoinNotSupported);
+        };
         let tick = self.last_read_tick;
         compiled(&*world, tick, &mut callback);
         self.last_read_tick = world.next_tick();
@@ -1358,23 +1396,22 @@ impl QueryPlanResult {
     /// No query cache mutation, no tick advancement. Requires the plan's
     /// query to be `ReadOnlyWorldQuery`.
     ///
-    /// Returns `Err(WorldMismatch)` if `world` is not the same World this
-    /// plan was built from.
+    /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
+    /// same World this plan was built from.
     ///
-    /// # Panics
-    /// Panics if the plan was not compiled with scan support.
+    /// Returns `Err(PlanExecError::JoinNotSupported)` if the plan contains
+    /// joins. Use [`execute`](Self::execute) instead.
     pub fn for_each_raw(
         &mut self,
         world: &World,
         mut callback: impl FnMut(Entity),
-    ) -> Result<(), WorldMismatch> {
+    ) -> Result<(), PlanExecError> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new(self.world_id, world.world_id()));
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
-        let compiled = self.compiled_for_each_raw.as_mut().expect(
-            "for_each_raw() is only available for scan-only plans (no joins). \
-                 For plans with joins, use execute() which returns &[Entity].",
-        );
+        let Some(compiled) = self.compiled_for_each_raw.as_mut() else {
+            return Err(PlanExecError::JoinNotSupported);
+        };
         let tick = self.last_read_tick;
         compiled(world, tick, &mut callback);
         Ok(())
@@ -1393,14 +1430,14 @@ impl QueryPlanResult {
     /// Returns an empty [`AggregateResult`] if no aggregate expressions were
     /// added during plan construction.
     ///
-    /// Returns `Err(WorldMismatch)` if `world` is not the same World this
-    /// plan was built from.
+    /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
+    /// same World this plan was built from.
     pub fn execute_aggregates(
         &mut self,
         world: &mut World,
-    ) -> Result<AggregateResult, WorldMismatch> {
+    ) -> Result<AggregateResult, PlanExecError> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new(self.world_id, world.world_id()));
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
         if self.aggregate_exprs.is_empty() {
             return Ok(AggregateResult { values: Vec::new() });
@@ -1495,14 +1532,14 @@ impl QueryPlanResult {
     /// Returns an empty [`AggregateResult`] if no aggregate expressions were
     /// added during plan construction.
     ///
-    /// Returns `Err(WorldMismatch)` if `world` is not the same World this
-    /// plan was built from.
+    /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
+    /// same World this plan was built from.
     pub fn execute_aggregates_raw(
         &mut self,
         world: &World,
-    ) -> Result<AggregateResult, WorldMismatch> {
+    ) -> Result<AggregateResult, PlanExecError> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new(self.world_id, world.world_id()));
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
         if self.aggregate_exprs.is_empty() {
             return Ok(AggregateResult { values: Vec::new() });
@@ -8133,6 +8170,34 @@ mod tests {
         let result = plan.execute(&mut world);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn for_each_returns_err_on_join_plan() {
+        let mut world = World::new();
+        world.spawn((Score(1), Health(100)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+        let result = plan.for_each(&mut world, |_| {});
+        assert!(matches!(result, Err(PlanExecError::JoinNotSupported)));
+    }
+
+    #[test]
+    fn for_each_raw_returns_err_on_join_plan() {
+        let mut world = World::new();
+        world.spawn((Score(1), Health(100)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+        let result = plan.for_each_raw(&world, |_| {});
+        assert!(matches!(result, Err(PlanExecError::JoinNotSupported)));
     }
 
     #[test]

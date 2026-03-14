@@ -103,9 +103,9 @@ pub use index::{
 pub use minkowski_derive::Table;
 pub use planner::{
     AggregateExpr, AggregateOp, AggregateResult, CardinalityConstraint, Cost, IndexKind, Indexed,
-    JoinKind, PlanNode, PlanWarning, PlannerError, Predicate, QueryPlanResult, QueryPlanner,
-    SpatialLookupFn, SpatialPredicate, SubscriptionBuilder, SubscriptionError, TablePlanner,
-    VecExecNode, VectorizeOpts, VectorizedPlan,
+    JoinKind, PlanExecError, PlanNode, PlanWarning, PlannerError, Predicate, QueryPlanResult,
+    QueryPlanner, SpatialLookupFn, SpatialPredicate, SubscriptionBuilder, SubscriptionError,
+    TablePlanner, VecExecNode, VectorizeOpts, VectorizedPlan,
 };
 pub use pool::{HugePages, PoolExhausted};
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
