@@ -151,7 +151,7 @@ plan.for_each(&mut world, |entity| {
 
 `TablePlanner<T>` adds compile-time enforcement: if a table field is annotated with `#[index(btree)]` or `#[index(hash)]`, the planner requires the corresponding index at the type level. Missing indexes are type errors, not runtime warnings. See [Schema & Mutation](#schema--mutation) for the annotation syntax.
 
-**Subscription queries** guarantee at compile time that every predicate is index-backed via `Indexed<T>` witnesses. Combined with `Changed<T>`, subscriptions yield only entities mutated since the last call — no delta tracking, caching, or event sourcing needed:
+**Subscription queries** guarantee at compile time that every predicate is index-backed via `Indexed<T>` witnesses. Combined with `Changed<T>`, subscriptions skip archetypes whose indexed column has not been written since the last call — no delta tracking, caching, or event sourcing needed. (`Changed<T>` is archetype-granular: mutating one entity marks the entire column, so unchanged siblings in the same archetype may also pass.)
 
 ```rust
 use minkowski::{Changed, Indexed, Predicate};
