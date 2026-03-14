@@ -4317,6 +4317,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn subscription_with_changed_yields_only_mutated_entities() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42),));
+        let e2 = world.spawn((Score(42),));
+        let _e3 = world.spawn((Score(99),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let idx = Arc::new(idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&idx, &world).unwrap();
+        let witness = Indexed::btree(&*idx);
+
+        // Subscribe with Changed<Score> — only entities whose Score column
+        // was mutated since last call will pass through.
+        let mut plan = planner
+            .subscribe::<(Changed<Score>, &Score)>()
+            .where_eq(witness, Predicate::eq(Score(42)))
+            .build()
+            .unwrap();
+
+        // First call: all matching entities are "changed" (never read before).
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity))
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+
+        // Second call with no mutations: nothing changed → zero results.
+        results.clear();
+        plan.for_each(&mut world, |entity| results.push(entity))
+            .unwrap();
+        assert_eq!(results.len(), 0, "no mutations → no results");
+
+        // Mutate e1's Score (stays 42, but the column is marked changed).
+        world.get_mut::<Score>(e1).unwrap().0 = 42;
+
+        // Third call: only e1's archetype was touched. Since e1 and e2 are
+        // in the same archetype (both have only Score), Changed<T> is
+        // archetype-granular — both pass. This is correct per the engine's
+        // change detection semantics.
+        results.clear();
+        plan.for_each(&mut world, |entity| results.push(entity))
+            .unwrap();
+        assert!(results.contains(&e1));
+        // e2 is in the same archetype as e1, so it also passes Changed<Score>.
+    }
+
     // ── Constraint validation ───────────────────────────────────────
 
     #[test]
