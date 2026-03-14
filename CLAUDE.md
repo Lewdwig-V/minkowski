@@ -12,7 +12,7 @@ cargo test -p minkowski -- entity      # Run tests matching a filter
 cargo clippy --workspace --all-targets -- -D warnings   # Lint (strict, warnings are errors)
 cargo fmt --all                                          # Format
 
-cargo bench -p minkowski-bench                      # All standardized benchmarks (simple_insert, simple_iter, fragmented_iter, heavy_compute, add_remove, schedule, serialize, reducer)
+cargo bench -p minkowski-bench                      # All standardized benchmarks (simple_insert, simple_iter, fragmented_iter, heavy_compute, add_remove, schedule, serialize, reducer, planner)
 cargo bench -p minkowski-bench -- simple_iter       # Single scenario
 cargo bench -p minkowski-bench -- simple_iter/par   # Sub-benchmark filter
 cargo bench -p minkowski-persist       # Persistence benchmarks (snapshot save/load/zero-copy, WAL append)
