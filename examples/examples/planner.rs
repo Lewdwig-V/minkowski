@@ -662,5 +662,39 @@ fn main() {
         assert_eq!(count, 100);
     }
 
+    // ── 14. Subscription with Changed<T> ──────────────────────────────
+    //
+    // Separate scope: QueryPlanner borrows &world, but for_each needs &mut world.
+    // Build the plan, drop the planner, then execute.
+    println!("\n=== 14. Subscription with Changed<T> ===\n");
+    {
+        let mut score_idx = BTreeIndex::<Score>::new();
+        score_idx.rebuild(&mut world);
+        let score_idx = Arc::new(score_idx);
+        let witness = Indexed::btree(&*score_idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&score_idx, &world).unwrap();
+
+        // Changed<Score> in the query type means: only yield entities whose
+        // Score column was mutated since the last call to this plan.
+        let mut sub = planner
+            .subscribe::<(Changed<Score>, &Score)>()
+            .where_eq(witness, Predicate::eq(Score(42)).with_selectivity(0.001))
+            .build()
+            .unwrap();
+
+        // First call: everything is "new" (never read before).
+        let mut first_count = 0;
+        sub.for_each(&mut world, |_| first_count += 1).unwrap();
+        println!("First call (all new):     {first_count} entities");
+
+        // Second call: nothing changed → zero results.
+        let mut second_count = 0;
+        sub.for_each(&mut world, |_| second_count += 1).unwrap();
+        println!("Second call (no changes): {second_count} entities");
+        assert_eq!(second_count, 0);
+    }
+
     println!("\nDone.");
 }

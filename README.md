@@ -151,6 +151,23 @@ plan.for_each(&mut world, |entity| {
 
 `TablePlanner<T>` adds compile-time enforcement: if a table field is annotated with `#[index(btree)]` or `#[index(hash)]`, the planner requires the corresponding index at the type level. Missing indexes are type errors, not runtime warnings. See [Schema & Mutation](#schema--mutation) for the annotation syntax.
 
+**Subscription queries** guarantee at compile time that every predicate is index-backed via `Indexed<T>` witnesses. Combined with `Changed<T>`, subscriptions yield only entities mutated since the last call — no delta tracking, caching, or event sourcing needed:
+
+```rust
+use minkowski::{Changed, Indexed, Predicate};
+
+let witness = Indexed::btree(&score_index);
+let mut sub = planner
+    .subscribe::<(Changed<Score>, &Score)>()
+    .where_eq(witness, Predicate::eq(Score(42)))
+    .build()?;
+
+// Each call yields only entities whose Score changed since last call.
+sub.for_each(&mut world, |entity| {
+    // React to changes — framework decides what to do
+})?;
+```
+
 ## Typed Reducers
 
 Reducers are closures registered with the `ReducerRegistry`. The type signature declares exactly what the closure can access, and the registry extracts `Access` metadata at registration time for conflict detection.

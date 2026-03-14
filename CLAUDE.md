@@ -178,7 +178,7 @@ BTree and Hash index lookup functions (`eq_lookup_fn`, `range_lookup_fn`) captur
 
 `Indexed<T>` is a compile-time witness that an index exists for component `T`. Cannot be constructed directly — only via `Indexed::btree(&index)` or `Indexed::hash(&index)`. Used by `SubscriptionBuilder` to enforce that every predicate in a subscription query is backed by an index.
 
-`SubscriptionBuilder` wraps `ScanBuilder` with compile-time index enforcement via `Indexed<T>` witnesses. `where_eq(witness, predicate)` and `where_range(witness, predicate)` require an `Indexed<T>` proof that an index exists for the predicate's component. `build()` returns `QueryPlanResult` with full execution support — subscription plans use `IndexDriver` for index-gather execution, never a full archetype scan.
+`SubscriptionBuilder` wraps `ScanBuilder` with compile-time index enforcement via `Indexed<T>` witnesses. `where_eq(witness, predicate)` and `where_range(witness, predicate)` require an `Indexed<T>` proof that an index exists for the predicate's component. `build()` returns `QueryPlanResult` with full execution support — subscription plans use `IndexDriver` for index-gather execution, never a full archetype scan. Combined with `Changed<T>` in the query type (e.g., `subscribe::<(Changed<Score>, &Score)>()`), subscriptions yield only entities mutated since the last call — no delta tracking, caching, or event sourcing infrastructure needed.
 
 `TablePlanner<'w, T>` wraps `QueryPlanner` with compile-time index enforcement via `HasBTreeIndex`/`HasHashIndex` trait bounds. See "Compile-Time Index Enforcement" section.
 
