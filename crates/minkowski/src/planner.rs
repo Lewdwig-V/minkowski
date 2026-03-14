@@ -3,7 +3,7 @@
 //!
 //! The planner is designed for an in-memory ECS where data already lives in L1/L2
 //! cache. Planning overhead is kept to O(indexes + predicates). Plans are
-//! executable against live world data: scan-only plans use zero-alloc `for_each`
+//! executable against live world data: scan-only plans without a spatial driver use zero-alloc `for_each`
 //! with fused filter closures; join plans use a scratch-buffer intersection model.
 //!
 //! # Volcano Model
@@ -152,20 +152,28 @@ impl Cost {
     }
 
     fn spatial_lookup(spatial_cost: &SpatialCost) -> Self {
-        debug_assert!(
-            spatial_cost.estimated_rows.is_finite() && spatial_cost.estimated_rows >= 0.0,
-            "SpatialCost::estimated_rows must be finite and non-negative, got {}",
+        let rows = if spatial_cost.estimated_rows.is_finite() && spatial_cost.estimated_rows >= 0.0
+        {
             spatial_cost.estimated_rows
-        );
-        debug_assert!(
-            spatial_cost.cpu.is_finite() && spatial_cost.cpu >= 0.0,
-            "SpatialCost::cpu must be finite and non-negative, got {}",
+        } else {
+            debug_assert!(
+                false,
+                "SpatialCost::estimated_rows must be finite and non-negative, got {}",
+                spatial_cost.estimated_rows
+            );
+            1.0
+        };
+        let cpu = if spatial_cost.cpu.is_finite() && spatial_cost.cpu >= 0.0 {
             spatial_cost.cpu
-        );
-        Cost {
-            rows: spatial_cost.estimated_rows,
-            cpu: spatial_cost.cpu,
-        }
+        } else {
+            debug_assert!(
+                false,
+                "SpatialCost::cpu must be finite and non-negative, got {}",
+                spatial_cost.cpu
+            );
+            10.0
+        };
+        Cost { rows, cpu }
     }
 
     fn filter(input: Cost, selectivity: f64) -> Self {
@@ -219,44 +227,36 @@ pub enum IndexKind {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum SpatialPredicate {
-    /// Point-radius proximity: entities within `radius` of `(x, y)`.
+    /// Proximity: entities within `radius` of `center`.
     /// Maps to `SpatialExpr::Within` for capability discovery.
+    /// Dimensionality and metric are defined by the index implementation.
     Within {
-        /// X coordinate of the query center.
-        x: f64,
-        /// Y coordinate of the query center.
-        y: f64,
-        /// Search radius.
+        /// Center coordinates (dimensionality defined by the index).
+        center: Vec<f64>,
+        /// Search radius (interpretation defined by the index).
         radius: f64,
     },
-    /// AABB intersection: entities whose spatial extent overlaps the
-    /// given rectangle. Maps to `SpatialExpr::Intersects`.
+    /// Bounding-box intersection: entities whose spatial extent overlaps
+    /// the box from `min` to `max`. Maps to `SpatialExpr::Intersects`.
+    /// Dimensionality is defined by the index implementation.
     Intersects {
-        /// Minimum X of the query rectangle.
-        min_x: f64,
-        /// Minimum Y of the query rectangle.
-        min_y: f64,
-        /// Maximum X of the query rectangle.
-        max_x: f64,
-        /// Maximum Y of the query rectangle.
-        max_y: f64,
+        /// Minimum corner coordinates.
+        min: Vec<f64>,
+        /// Maximum corner coordinates.
+        max: Vec<f64>,
     },
 }
 
 impl From<&SpatialPredicate> for SpatialExpr {
     fn from(sp: &SpatialPredicate) -> Self {
-        match *sp {
-            SpatialPredicate::Within { x, y, radius } => SpatialExpr::Within { x, y, radius },
-            SpatialPredicate::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-            } => SpatialExpr::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
+        match sp {
+            SpatialPredicate::Within { center, radius } => SpatialExpr::Within {
+                center: center.clone(),
+                radius: *radius,
+            },
+            SpatialPredicate::Intersects { min, max } => SpatialExpr::Intersects {
+                min: min.clone(),
+                max: max.clone(),
             },
         }
     }
@@ -265,16 +265,11 @@ impl From<&SpatialPredicate> for SpatialExpr {
 impl fmt::Display for SpatialPredicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SpatialPredicate::Within { x, y, radius } => {
-                write!(f, "ST_Within(({x}, {y}), {radius})")
+            SpatialPredicate::Within { center, radius } => {
+                write!(f, "ST_Within({center:?}, {radius})")
             }
-            SpatialPredicate::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-            } => {
-                write!(f, "ST_Intersects(({min_x}, {min_y}), ({max_x}, {max_y}))")
+            SpatialPredicate::Intersects { min, max } => {
+                write!(f, "ST_Intersects({min:?}, {max:?})")
             }
         }
     }
@@ -446,76 +441,90 @@ impl Predicate {
         }
     }
 
-    /// Spatial proximity predicate: entities within `radius` of `(x, y)`.
+    /// Spatial proximity predicate: entities within `radius` of `center`.
     ///
     /// The component type `T` identifies which column holds the spatial data.
+    /// The planner makes no assumptions about dimensionality or coordinate
+    /// system — `center` is an opaque coordinate vector whose meaning is
+    /// defined by the [`SpatialIndex`] implementation.
+    ///
     /// If a `SpatialIndex` is registered for `T` and its
     /// [`supports`](SpatialIndex::supports) method returns `Some` for this
     /// expression, the planner emits a `SpatialLookup` node. Otherwise it
     /// falls back to a scan + post-filter using the provided closure.
     ///
-    /// The default selectivity heuristic assumes a unit-square world
-    /// (`PI * r²`). For real-world coordinate systems where coordinates
-    /// are much larger than 1.0, override with
-    /// [`.with_selectivity()`](Self::with_selectivity).
+    /// The default selectivity is a conservative 0.1 (10% of entities).
+    /// Override with [`.with_selectivity()`](Self::with_selectivity) if
+    /// you know your data distribution.
     pub fn within<T: Component>(
-        x: f64,
-        y: f64,
+        center: impl Into<Vec<f64>>,
         radius: f64,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
     ) -> Self {
-        debug_assert!(
+        assert!(
             radius >= 0.0 && radius.is_finite(),
             "Predicate::within: radius must be finite and non-negative, got {radius}"
         );
-        // Heuristic selectivity assuming a unit-square world. Override via
-        // .with_selectivity() for non-unit coordinate systems.
-        let selectivity =
-            sanitize_selectivity((std::f64::consts::PI * radius * radius).clamp(0.001, 1.0));
+        let center = center.into();
+        assert!(
+            !center.is_empty(),
+            "Predicate::within: center must have at least one coordinate"
+        );
+        // Conservative default — override via .with_selectivity().
+        let selectivity = sanitize_selectivity(0.1);
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
-            kind: PredicateKind::Spatial(SpatialPredicate::Within { x, y, radius }),
+            kind: PredicateKind::Spatial(SpatialPredicate::Within { center, radius }),
             selectivity,
             filter_fn: Some(Arc::new(filter)),
             lookup_value: None,
         }
     }
 
-    /// Spatial AABB intersection predicate.
+    /// Spatial bounding-box intersection predicate.
     ///
     /// The component type `T` identifies which column holds the spatial data.
+    /// The planner makes no assumptions about dimensionality or coordinate
+    /// system — `min` and `max` are opaque coordinate vectors whose meaning
+    /// is defined by the [`SpatialIndex`] implementation.
+    ///
     /// If a `SpatialIndex` is registered for `T` and its
     /// [`supports`](SpatialIndex::supports) method returns `Some` for this
     /// expression, the planner emits a `SpatialLookup` node. Otherwise it
     /// falls back to a scan + post-filter using the provided closure.
     ///
-    /// The default selectivity heuristic uses the AABB area, assuming a
-    /// unit-square world. For real-world coordinate systems, override with
-    /// [`.with_selectivity()`](Self::with_selectivity).
+    /// The default selectivity is a conservative 0.1 (10% of entities).
+    /// Override with [`.with_selectivity()`](Self::with_selectivity) if
+    /// you know your data distribution.
     pub fn intersects<T: Component>(
-        min_x: f64,
-        min_y: f64,
-        max_x: f64,
-        max_y: f64,
+        min: impl Into<Vec<f64>>,
+        max: impl Into<Vec<f64>>,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
     ) -> Self {
-        debug_assert!(
-            min_x <= max_x && min_y <= max_y,
-            "Predicate::intersects: inverted AABB (min must be <= max), \
-             got ({min_x},{min_y})->({max_x},{max_y})"
+        let min = min.into();
+        let max = max.into();
+        assert!(
+            min.len() == max.len(),
+            "Predicate::intersects: min and max must have the same dimensionality, \
+             got {} vs {}",
+            min.len(),
+            max.len()
         );
-        let area = (max_x - min_x) * (max_y - min_y);
-        let selectivity = sanitize_selectivity(area.clamp(0.001, 1.0));
+        assert!(
+            !min.is_empty(),
+            "Predicate::intersects: coordinates must have at least one dimension"
+        );
+        assert!(
+            min.iter().zip(max.iter()).all(|(lo, hi)| lo <= hi),
+            "Predicate::intersects: min must be <= max in all dimensions"
+        );
+        // Conservative default — override via .with_selectivity().
+        let selectivity = sanitize_selectivity(0.1);
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
-            kind: PredicateKind::Spatial(SpatialPredicate::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-            }),
+            kind: PredicateKind::Spatial(SpatialPredicate::Intersects { min, max }),
             selectivity,
             filter_fn: Some(Arc::new(filter)),
             lookup_value: None,
@@ -950,8 +959,10 @@ impl QueryPlanResult {
 
     /// Execute the compiled scan, calling `callback` for each matching entity.
     ///
-    /// For scan-only plans (no joins), this compiles to archetype iteration
-    /// with no intermediate allocation. Zero-alloc during execution.
+    /// For scan-only plans (no joins) without a spatial index driver, this
+    /// compiles to archetype iteration with no intermediate allocation.
+    /// When a spatial driver is present, the lookup function allocates
+    /// a candidate list per call.
     ///
     /// # Panics
     /// Panics if the plan was not compiled with scan support.
@@ -1360,8 +1371,10 @@ struct JoinExec {
 
 /// Returns true if every component in `changed` has a column in the archetype
 /// whose tick is newer than `tick`. When `changed` is empty (no `Changed<T>`
-/// terms), returns true immediately. For well-formed queries the column will
-/// always be present because `required` is checked before this function.
+/// terms), returns true immediately. For archetype-scan paths the column will
+/// always be present because `required` is checked first. For index-gather
+/// paths, the column may be absent if the entity's archetype does not contain
+/// the component; `is_some_and` handles this by returning false.
 #[inline]
 fn passes_change_filter(
     arch: &crate::storage::archetype::Archetype,
@@ -1400,6 +1413,13 @@ fn collect_matching_entities(
 
 // ── Scan builder ─────────────────────────────────────────────────────
 
+/// Carries the spatial lookup function and expression resolved during Phase 3
+/// (driver selection) to Phase 7 (join collectors) and Phase 8 (closure compilation).
+struct SpatialDriver {
+    expr: SpatialExpr,
+    lookup_fn: SpatialLookupFn,
+}
+
 /// Builder for a single-table scan with optional predicates and joins.
 pub struct ScanBuilder<'w> {
     planner: &'w QueryPlanner<'w>,
@@ -1417,6 +1437,10 @@ pub struct ScanBuilder<'w> {
     left_required: Option<FixedBitSet>,
     /// Changed component bitset for left-side change detection in join plans.
     left_changed: Option<FixedBitSet>,
+    /// Required component bitset for spatial index-gather path.
+    required_for_spatial: Option<FixedBitSet>,
+    /// Changed component bitset for spatial index-gather path.
+    changed_for_spatial: Option<FixedBitSet>,
 }
 
 struct JoinSpec {
@@ -1473,20 +1497,20 @@ impl ScanBuilder<'_> {
     }
 
     /// Compile the scan into an optimized execution plan.
-    pub fn build(self) -> QueryPlanResult {
+    pub fn build(mut self) -> QueryPlanResult {
         let mut warnings = Vec::new();
 
         // Phase 1: Classify predicates — index-driven vs spatial vs post-filter.
         let mut index_preds: Vec<(Predicate, &IndexDescriptor)> = Vec::new();
-        let mut spatial_preds: Vec<(Predicate, SpatialCost)> = Vec::new();
+        let mut spatial_preds: Vec<(Predicate, SpatialCost, Option<SpatialLookupFn>)> = Vec::new();
         let mut filter_preds = Vec::new();
         let planner = self.planner;
 
         for pred in self.predicates {
             if pred.can_use_spatial() {
                 match planner.find_spatial_index(&pred) {
-                    SpatialLookupResult::Accelerated(_name, cost) => {
-                        spatial_preds.push((pred, cost));
+                    SpatialLookupResult::Accelerated(_name, cost, lookup) => {
+                        spatial_preds.push((pred, cost, lookup));
                     }
                     SpatialLookupResult::Declined(expression) => {
                         warnings.push(PlanWarning::SpatialIndexDeclined {
@@ -1538,7 +1562,7 @@ impl ScanBuilder<'_> {
             "Eq/Range predicate with filter_fn: None — plan would show filter but not apply it"
         );
         debug_assert!(
-            spatial_preds.iter().all(|(p, _)| p.filter_fn.is_some()),
+            spatial_preds.iter().all(|(p, _, _)| p.filter_fn.is_some()),
             "Spatial predicate with filter_fn: None — plan would show filter but not apply it"
         );
         let all_filter_fns: Vec<FilterFn> = index_preds
@@ -1547,7 +1571,7 @@ impl ScanBuilder<'_> {
             .chain(
                 spatial_preds
                     .iter()
-                    .filter_map(|(p, _)| p.filter_fn.as_ref().map(Arc::clone)),
+                    .filter_map(|(p, _, _)| p.filter_fn.as_ref().map(Arc::clone)),
             )
             .chain(
                 filter_preds
@@ -1563,23 +1587,59 @@ impl ScanBuilder<'_> {
         // driving access. Remaining predicates become post-filters.
         let mut node: PlanNode;
 
-        // Determine driving access: compare best spatial vs best BTree/Hash.
-        let best_spatial_cost = spatial_preds
-            .first()
-            .map(|(_, sc)| Cost::spatial_lookup(sc).total());
-        let best_index_cost = index_preds
-            .first()
-            .map(|(p, _)| Cost::index_lookup(p.selectivity, self.estimated_rows).total());
+        // Determine driving access: compare full candidate plan costs
+        // including downstream filters, not just the driving access alone.
+        // A spatial index with high estimated_rows but low CPU can still lose
+        // to a selective BTree if the BTree's post-filter cost is lower overall.
+        let spatial_plan_cost = spatial_preds.first().map(|(_, first_sc, _)| {
+            let mut cost = Cost::spatial_lookup(first_sc);
+            for (pred, _, _) in spatial_preds.iter().skip(1) {
+                cost = Cost::filter(cost, pred.selectivity);
+            }
+            for (pred, _) in &index_preds {
+                cost = Cost::filter(cost, pred.selectivity);
+            }
+            cost.total()
+        });
 
-        let use_spatial_driver = match (best_spatial_cost, best_index_cost) {
+        let index_plan_cost = index_preds.first().map(|(first_pred, _)| {
+            let mut cost = Cost::index_lookup(first_pred.selectivity, self.estimated_rows);
+            for (pred, _) in index_preds.iter().skip(1) {
+                cost = Cost::filter(cost, pred.selectivity);
+            }
+            for (pred, _, _) in &spatial_preds {
+                cost = Cost::filter(cost, pred.selectivity);
+            }
+            cost.total()
+        });
+
+        let use_spatial_driver = match (spatial_plan_cost, index_plan_cost) {
             (Some(sc), Some(ic)) => sc <= ic,
             (Some(_), None) => true,
             _ => false,
         };
 
+        // Compute spatial driver if spatial is the best driving access.
+        let spatial_driver = if use_spatial_driver && !spatial_preds.is_empty() {
+            let (first_pred, _, first_lookup) = &spatial_preds[0];
+            if let Some(lookup_fn) = first_lookup {
+                let PredicateKind::Spatial(sp) = &first_pred.kind else {
+                    unreachable!("spatial_preds only contains Spatial predicates");
+                };
+                Some(SpatialDriver {
+                    expr: sp.into(),
+                    lookup_fn: Arc::clone(lookup_fn),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if use_spatial_driver && !spatial_preds.is_empty() {
             // Driving access is a spatial lookup.
-            let (first_pred, first_cost) = &spatial_preds[0];
+            let (first_pred, first_cost, _) = &spatial_preds[0];
             let est = first_cost.estimated_rows.max(1.0) as usize;
             node = PlanNode::SpatialLookup {
                 component_name: first_pred.component_name,
@@ -1589,7 +1649,7 @@ impl ScanBuilder<'_> {
             };
 
             // Additional spatial predicates become filters.
-            for (pred, _) in spatial_preds.iter().skip(1) {
+            for (pred, _, _) in spatial_preds.iter().skip(1) {
                 let parent_cost = node.cost();
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
@@ -1635,7 +1695,7 @@ impl ScanBuilder<'_> {
             }
 
             // Spatial predicates that aren't the driver become filters.
-            for (pred, _) in &spatial_preds {
+            for (pred, _, _) in &spatial_preds {
                 let parent_cost = node.cost();
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
@@ -1727,33 +1787,75 @@ impl ScanBuilder<'_> {
                 .expect("join plan requires left_required bitset");
             let left_changed = self.left_changed.clone().unwrap_or_default();
             let left_filters: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
-            let left_collector: EntityCollector = Box::new(
-                move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
-                    if left_filters.is_empty() {
-                        collect_matching_entities(
-                            world,
-                            &left_required,
-                            &left_changed,
-                            tick,
-                            scratch,
-                        );
-                    } else {
-                        for arch in &world.archetypes.archetypes {
-                            if arch.is_empty() || !left_required.is_subset(&arch.component_ids) {
+            let left_collector: EntityCollector = if let Some(ref driver) = spatial_driver {
+                // Index-gather path: use the spatial lookup function instead of
+                // archetype scanning. Mirrors the Phase 8 index-gather closure.
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let expr = driver.expr.clone();
+                let left_required_for_index = left_required.clone();
+                let left_changed_for_index = left_changed.clone();
+                Box::new(
+                    move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
+                        let candidates = lookup_fn(&expr);
+                        for entity in candidates {
+                            if !world.is_alive(entity) {
                                 continue;
                             }
-                            if !passes_change_filter(arch, &left_changed, tick) {
+                            // Look up archetype — skip unplaced entities and check
+                            // required components.
+                            let idx = entity.index() as usize;
+                            let Some(loc) = (idx < world.entity_locations.len())
+                                .then(|| world.entity_locations[idx].as_ref())
+                                .flatten()
+                            else {
+                                continue; // alive but unplaced — no archetype
+                            };
+                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                            if !left_required_for_index.is_subset(&arch.component_ids) {
                                 continue;
                             }
-                            for &entity in &arch.entities {
-                                if left_filters.iter().all(|f| f(world, entity)) {
-                                    scratch.push(entity);
+                            if !left_changed_for_index.is_clear()
+                                && !passes_change_filter(arch, &left_changed_for_index, tick)
+                            {
+                                continue;
+                            }
+                            if left_filters.iter().all(|f| f(world, entity)) {
+                                scratch.push(entity);
+                            }
+                        }
+                    },
+                )
+            } else {
+                // Archetype-scan path (unchanged).
+                Box::new(
+                    move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
+                        if left_filters.is_empty() {
+                            collect_matching_entities(
+                                world,
+                                &left_required,
+                                &left_changed,
+                                tick,
+                                scratch,
+                            );
+                        } else {
+                            for arch in &world.archetypes.archetypes {
+                                if arch.is_empty() || !left_required.is_subset(&arch.component_ids)
+                                {
+                                    continue;
+                                }
+                                if !passes_change_filter(arch, &left_changed, tick) {
+                                    continue;
+                                }
+                                for &entity in &arch.entities {
+                                    if left_filters.iter().all(|f| f(world, entity)) {
+                                        scratch.push(entity);
+                                    }
                                 }
                             }
                         }
-                    }
-                },
-            );
+                    },
+                )
+            };
 
             let steps: Vec<JoinStep> = self
                 .joins
@@ -1786,52 +1888,140 @@ impl ScanBuilder<'_> {
             None
         };
 
-        // Phase 8: Compile zero-alloc for_each / for_each_raw for scan-only plans.
+        // Phase 8: Compile for_each / for_each_raw closures for scan-only plans.
         // Enabled when there are no joins — predicates are fused as
         // per-entity filters into the scan closure.
+        //
+        // When a spatial driver is available, an index-gather path is compiled
+        // instead of the usual archetype scan: the lookup function is called to
+        // obtain candidate entities, which are then filtered for liveness,
+        // Changed<T> compliance, and any remaining post-filter predicates.
         // Clone filter fns for the raw variant (Arc clone is a ref-count bump).
         let all_filter_fns_raw: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
 
-        let compiled_for_each = if self.joins.is_empty() {
-            self.compile_for_each.map(|factory| {
-                let mut scan_fn = factory();
+        // Take the required and changed bitsets; clone for the raw variant.
+        let required_for_index = self.required_for_spatial.take().unwrap_or_default();
+        let required_for_index_raw = required_for_index.clone();
+        let changed_for_index = self.changed_for_spatial.take().unwrap_or_default();
+        let changed_for_index_raw = changed_for_index.clone();
 
-                if all_filter_fns.is_empty() {
-                    scan_fn
-                } else {
-                    Box::new(
-                        move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
-                            scan_fn(world, tick, &mut |entity: Entity| {
-                                if all_filter_fns.iter().all(|f| f(world, entity)) {
-                                    callback(entity);
-                                }
-                            });
-                        },
-                    )
-                }
-            })
+        let compiled_for_each = if self.joins.is_empty() {
+            if let Some(ref driver) = spatial_driver {
+                // Index-gather path: call the lookup function instead of
+                // scanning archetypes.
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let expr = driver.expr.clone();
+                let required = required_for_index;
+                let changed = changed_for_index;
+                Some(Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        let candidates = lookup_fn(&expr);
+                        for entity in candidates {
+                            if !world.is_alive(entity) {
+                                continue;
+                            }
+                            // Look up archetype — skip unplaced entities and check
+                            // required components.
+                            let idx = entity.index() as usize;
+                            let Some(loc) = (idx < world.entity_locations.len())
+                                .then(|| world.entity_locations[idx].as_ref())
+                                .flatten()
+                            else {
+                                continue; // alive but unplaced — no archetype
+                            };
+                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                            if !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
+                                continue;
+                            }
+                            if all_filter_fns.iter().all(|f| f(world, entity)) {
+                                callback(entity);
+                            }
+                        }
+                    },
+                ) as CompiledForEach)
+            } else {
+                // Existing archetype-scan path (unchanged).
+                self.compile_for_each.map(|factory| {
+                    let mut scan_fn = factory();
+
+                    if all_filter_fns.is_empty() {
+                        scan_fn
+                    } else {
+                        Box::new(
+                            move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                                scan_fn(world, tick, &mut |entity: Entity| {
+                                    if all_filter_fns.iter().all(|f| f(world, entity)) {
+                                        callback(entity);
+                                    }
+                                });
+                            },
+                        )
+                    }
+                })
+            }
         } else {
             None
         };
 
         let compiled_for_each_raw = if self.joins.is_empty() {
-            self.compile_for_each_raw.map(|factory| {
-                let mut scan_fn = factory();
+            if let Some(ref driver) = spatial_driver {
+                // Index-gather path for the raw (transactional read) variant.
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let expr = driver.expr.clone();
+                let required = required_for_index_raw;
+                let changed = changed_for_index_raw;
+                Some(Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        let candidates = lookup_fn(&expr);
+                        for entity in candidates {
+                            if !world.is_alive(entity) {
+                                continue;
+                            }
+                            // Look up archetype — skip unplaced entities and check
+                            // required components.
+                            let idx = entity.index() as usize;
+                            let Some(loc) = (idx < world.entity_locations.len())
+                                .then(|| world.entity_locations[idx].as_ref())
+                                .flatten()
+                            else {
+                                continue; // alive but unplaced — no archetype
+                            };
+                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                            if !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
+                                continue;
+                            }
+                            if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
+                                callback(entity);
+                            }
+                        }
+                    },
+                ) as CompiledForEachRaw)
+            } else {
+                // Existing archetype-scan path for the raw variant (unchanged).
+                self.compile_for_each_raw.map(|factory| {
+                    let mut scan_fn = factory();
 
-                if all_filter_fns_raw.is_empty() {
-                    scan_fn
-                } else {
-                    Box::new(
-                        move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
-                            scan_fn(world, tick, &mut |entity: Entity| {
-                                if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
-                                    callback(entity);
-                                }
-                            });
-                        },
-                    )
-                }
-            })
+                    if all_filter_fns_raw.is_empty() {
+                        scan_fn
+                    } else {
+                        Box::new(
+                            move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                                scan_fn(world, tick, &mut |entity: Entity| {
+                                    if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
+                                        callback(entity);
+                                    }
+                                });
+                            },
+                        )
+                    }
+                })
+            }
         } else {
             None
         };
@@ -1860,11 +2050,17 @@ impl ScanBuilder<'_> {
 
 // ── QueryPlanner ─────────────────────────────────────────────────────
 
+/// Type-erased spatial lookup: takes a `SpatialExpr`, returns candidate entities.
+/// Provided by the user at registration time to bridge between the planner's
+/// expression protocol and the index's concrete query API.
+pub type SpatialLookupFn = Arc<dyn Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync>;
+
 /// Descriptor for a registered spatial index.
 struct SpatialIndexDescriptor {
     component_name: &'static str,
     /// The spatial index, behind Arc for shared access at execution time.
     index: Arc<dyn SpatialIndex + Send + Sync>,
+    lookup_fn: Option<SpatialLookupFn>,
 }
 
 impl fmt::Debug for SpatialIndexDescriptor {
@@ -1878,7 +2074,7 @@ impl fmt::Debug for SpatialIndexDescriptor {
 /// Result of checking whether a spatial index can accelerate a predicate.
 enum SpatialLookupResult {
     /// The index can accelerate the expression at the given cost.
-    Accelerated(&'static str, SpatialCost),
+    Accelerated(&'static str, SpatialCost, Option<SpatialLookupFn>),
     /// A spatial index is registered but it declined the expression.
     Declined(String),
     /// No spatial index is registered for this component type.
@@ -2062,6 +2258,37 @@ impl<'w> QueryPlanner<'w> {
             SpatialIndexDescriptor {
                 component_name: std::any::type_name::<T>(),
                 index,
+                lookup_fn: None,
+            },
+        );
+    }
+
+    /// Register a spatial index with both cost discovery and execution-time lookup.
+    ///
+    /// The `lookup` closure bridges between the planner's [`SpatialExpr`]
+    /// protocol and the index's concrete query API. The planner makes no
+    /// assumptions about how the index answers queries — the closure is the
+    /// adapter.
+    ///
+    /// # Panics
+    /// Panics if `T` has not been registered as a component in `world`.
+    pub fn add_spatial_index_with_lookup<T: Component>(
+        &mut self,
+        index: Arc<dyn SpatialIndex + Send + Sync>,
+        world: &World,
+        lookup: impl Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync + 'static,
+    ) {
+        assert!(
+            world.component_id::<T>().is_some(),
+            "QueryPlanner::add_spatial_index_with_lookup: component `{}` not registered",
+            std::any::type_name::<T>()
+        );
+        self.spatial_indexes.insert(
+            TypeId::of::<T>(),
+            SpatialIndexDescriptor {
+                component_name: std::any::type_name::<T>(),
+                index,
+                lookup_fn: Some(Arc::new(lookup)),
             },
         );
     }
@@ -2070,6 +2297,8 @@ impl<'w> QueryPlanner<'w> {
     pub fn scan<Q: crate::query::fetch::WorldQuery + 'static>(&'w self) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
         let changed = Q::changed_ids(self.components);
+        let required_for_spatial = required.clone();
+        let changed_for_spatial = changed.clone();
         let required_for_each = required.clone();
         let changed_for_each = changed.clone();
         let required_for_each_raw = required.clone();
@@ -2122,6 +2351,8 @@ impl<'w> QueryPlanner<'w> {
             })),
             left_required: Some(left_required),
             left_changed: Some(left_changed),
+            required_for_spatial: Some(required_for_spatial),
+            changed_for_spatial: Some(changed_for_spatial),
         }
     }
 
@@ -2135,6 +2366,8 @@ impl<'w> QueryPlanner<'w> {
     ) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
         let changed = Q::changed_ids(self.components);
+        let required_for_spatial = required.clone();
+        let changed_for_spatial = changed.clone();
         let required_for_each = required.clone();
         let changed_for_each = changed.clone();
         let required_for_each_raw = required.clone();
@@ -2187,6 +2420,8 @@ impl<'w> QueryPlanner<'w> {
             })),
             left_required: Some(left_required),
             left_changed: Some(left_changed),
+            required_for_spatial: Some(required_for_spatial),
+            changed_for_spatial: Some(changed_for_spatial),
         }
     }
 
@@ -2225,7 +2460,11 @@ impl<'w> QueryPlanner<'w> {
         };
         let expr: SpatialExpr = sp.into();
         match desc.index.supports(&expr) {
-            Some(cost) => SpatialLookupResult::Accelerated(desc.component_name, cost),
+            Some(cost) => SpatialLookupResult::Accelerated(
+                desc.component_name,
+                cost,
+                desc.lookup_fn.as_ref().map(Arc::clone),
+            ),
             None => SpatialLookupResult::Declined(sp.to_string()),
         }
     }
@@ -2914,6 +3153,27 @@ impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
         T: crate::index::HasHashIndex<C>,
     {
         self.planner.add_hash_index::<C>(index, self.world);
+    }
+
+    /// Register a spatial index with cost discovery and execution-time lookup.
+    ///
+    /// Delegates to [`QueryPlanner::add_spatial_index_with_lookup`].
+    /// No compile-time index enforcement — spatial indexes are orthogonal to
+    /// table schemas.
+    pub fn add_spatial_index_with_lookup<C: Component>(
+        &mut self,
+        index: Arc<dyn SpatialIndex + Send + Sync>,
+        lookup: impl Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync + 'static,
+    ) {
+        self.planner
+            .add_spatial_index_with_lookup::<C>(index, self.world, lookup);
+    }
+
+    /// Register a spatial index for cost discovery only (no execution-time lookup).
+    ///
+    /// Delegates to [`QueryPlanner::add_spatial_index`].
+    pub fn add_spatial_index<C: Component>(&mut self, index: Arc<dyn SpatialIndex + Send + Sync>) {
+        self.planner.add_spatial_index::<C>(index, self.world);
     }
 
     /// Get the `Indexed<C>` witness for a btree-indexed field, suitable for
@@ -5439,7 +5699,7 @@ mod tests {
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         // The root of the logical plan should be a SpatialLookup.
@@ -5478,10 +5738,8 @@ mod tests {
         let plan = planner
             .scan::<(&Pos,)>()
             .filter(Predicate::intersects::<Pos>(
-                0.0,
-                0.0,
-                25.0,
-                25.0,
+                [0.0, 0.0],
+                [25.0, 25.0],
                 |_, _| true,
             ))
             .build();
@@ -5505,7 +5763,7 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         // Without a spatial index, should fall back to Scan + Filter.
@@ -5543,7 +5801,7 @@ mod tests {
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         // Index exists but doesn't support Within — should fall back.
@@ -5585,7 +5843,7 @@ mod tests {
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         match plan.vec_root() {
@@ -5614,7 +5872,7 @@ mod tests {
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         let explain = plan.explain();
@@ -5627,7 +5885,7 @@ mod tests {
 
     #[test]
     fn spatial_predicate_with_custom_selectivity() {
-        let pred = Predicate::within::<Pos>(0.0, 0.0, 1.0, |_, _| true).with_selectivity(0.05);
+        let pred = Predicate::within::<Pos>([0.0, 0.0], 1.0, |_, _| true).with_selectivity(0.05);
 
         // Selectivity override should work.
         match &pred.kind {
@@ -5641,12 +5899,12 @@ mod tests {
 
     #[test]
     fn spatial_predicate_debug_format() {
-        let pred = Predicate::within::<Pos>(1.0, 2.0, 3.0, |_, _| true);
+        let pred = Predicate::within::<Pos>([1.0, 2.0], 3.0, |_, _| true);
         let dbg = format!("{:?}", pred);
         assert!(dbg.contains("Spatial"));
         assert!(dbg.contains("ST_Within"));
 
-        let pred2 = Predicate::intersects::<Pos>(0.0, 0.0, 10.0, 10.0, |_, _| true);
+        let pred2 = Predicate::intersects::<Pos>([0.0, 0.0], [10.0, 10.0], |_, _| true);
         let dbg2 = format!("{:?}", pred2);
         assert!(dbg2.contains("ST_Intersects"));
     }
@@ -5677,7 +5935,7 @@ mod tests {
         // Spatial predicate with very low estimated cost should win.
         let plan = planner
             .scan::<(&Pos, &Score)>()
-            .filter(Predicate::within::<Pos>(500.0, 500.0, 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true))
             .filter(Predicate::range::<Score, _>(Score(400)..Score(600)))
             .build();
 
@@ -5715,8 +5973,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&Pos,)>()
             .filter(Predicate::within::<Pos>(
-                10.0,
-                10.0,
+                [10.0, 10.0],
                 100.0,
                 |world, entity| {
                     world.get::<Pos>(entity).is_some_and(|p| {
@@ -5734,56 +5991,45 @@ mod tests {
     #[test]
     fn spatial_predicate_display() {
         let sp = SpatialPredicate::Within {
-            x: 1.0,
-            y: 2.0,
+            center: vec![1.0, 2.0],
             radius: 3.0,
         };
-        assert_eq!(format!("{}", sp), "ST_Within((1, 2), 3)");
+        assert_eq!(format!("{}", sp), "ST_Within([1.0, 2.0], 3)");
 
         let sp2 = SpatialPredicate::Intersects {
-            min_x: 0.0,
-            min_y: 0.0,
-            max_x: 10.0,
-            max_y: 10.0,
+            min: vec![0.0, 0.0],
+            max: vec![10.0, 10.0],
         };
-        assert_eq!(format!("{}", sp2), "ST_Intersects((0, 0), (10, 10))");
+        assert_eq!(
+            format!("{}", sp2),
+            "ST_Intersects([0.0, 0.0], [10.0, 10.0])"
+        );
     }
 
     #[test]
     fn spatial_predicate_to_expr_round_trip() {
         let sp = SpatialPredicate::Within {
-            x: 1.0,
-            y: 2.0,
+            center: vec![1.0, 2.0],
             radius: 3.0,
         };
         let expr = crate::index::SpatialExpr::from(&sp);
-        match expr {
-            crate::index::SpatialExpr::Within { x, y, radius } => {
-                assert!((x - 1.0).abs() < f64::EPSILON);
-                assert!((y - 2.0).abs() < f64::EPSILON);
+        match &expr {
+            crate::index::SpatialExpr::Within { center, radius } => {
+                assert_eq!(center, &[1.0, 2.0]);
                 assert!((radius - 3.0).abs() < f64::EPSILON);
             }
             other => panic!("expected Within, got {:?}", other),
         }
 
         let sp2 = SpatialPredicate::Intersects {
-            min_x: 0.0,
-            min_y: 1.0,
-            max_x: 2.0,
-            max_y: 3.0,
+            min: vec![0.0, 1.0],
+            max: vec![2.0, 3.0],
         };
         let expr2 = crate::index::SpatialExpr::from(&sp2);
-        match expr2 {
-            crate::index::SpatialExpr::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-            } => {
-                assert!((min_x - 0.0).abs() < f64::EPSILON);
-                assert!((min_y - 1.0).abs() < f64::EPSILON);
-                assert!((max_x - 2.0).abs() < f64::EPSILON);
-                assert!((max_y - 3.0).abs() < f64::EPSILON);
+        match &expr2 {
+            crate::index::SpatialExpr::Intersects { min, max } => {
+                assert_eq!(min, &[0.0, 1.0]);
+                assert_eq!(max, &[2.0, 3.0]);
             }
             other => panic!("expected Intersects, got {:?}", other),
         }
@@ -5832,7 +6078,7 @@ mod tests {
         // Spatial index reports cpu=500. BTree should win.
         let plan = planner
             .scan::<(&Pos, &Score)>()
-            .filter(Predicate::within::<Pos>(500.0, 500.0, 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true))
             .filter(Predicate::eq::<Score>(Score(42)))
             .build();
 
@@ -5891,7 +6137,7 @@ mod tests {
         // Within should get a SpatialLookup.
         let within_plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(25.0, 25.0, 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([25.0, 25.0], 5.0, |_, _| true))
             .build();
         assert!(
             matches!(within_plan.root(), PlanNode::SpatialLookup { .. }),
@@ -5904,10 +6150,8 @@ mod tests {
         let intersects_plan = planner
             .scan::<(&Pos,)>()
             .filter(Predicate::intersects::<Pos>(
-                0.0,
-                0.0,
-                10.0,
-                10.0,
+                [0.0, 0.0],
+                [10.0, 10.0],
                 |_, _| true,
             ))
             .build();
@@ -5946,10 +6190,12 @@ mod tests {
         // Two spatial predicates on the same component.
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 5.0, |_, _| true))
-            .filter(Predicate::intersects::<Pos>(0.0, 0.0, 0.5, 0.5, |_, _| {
-                true
-            }))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 5.0, |_, _| true))
+            .filter(Predicate::intersects::<Pos>(
+                [0.0, 0.0],
+                [0.5, 0.5],
+                |_, _| true,
+            ))
             .build();
 
         // One should be the driver (SpatialLookup), the other a Filter.
@@ -5975,5 +6221,573 @@ mod tests {
             "expected at least one Filter wrapping the SpatialLookup"
         );
         assert!(plan.warnings().is_empty());
+    }
+
+    /// Spatial index with low CPU but high estimated_rows.
+    /// Used to test that full plan cost (including downstream filters)
+    /// determines the driver, not just the driving access cost alone.
+    struct HighRowsSpatialIndex;
+
+    impl SpatialIndex for HighRowsSpatialIndex {
+        fn rebuild(&mut self, _world: &mut World) {}
+
+        fn supports(&self, expr: &crate::index::SpatialExpr) -> Option<crate::index::SpatialCost> {
+            match expr {
+                crate::index::SpatialExpr::Within { .. } => Some(crate::index::SpatialCost {
+                    // Low CPU but returns most of the dataset — downstream
+                    // filters over 900 rows are expensive.
+                    estimated_rows: 900.0,
+                    cpu: 3.0,
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_low_cpu_high_rows_loses_to_selective_btree() {
+        // Regression: spatial index with cpu=3 but estimated_rows=900
+        // vs BTree with selectivity=0.01 (10 rows from 1000).
+        // Driving access costs alone: spatial=3, btree=5+10=15 → spatial wins.
+        // But full plan cost: spatial driver + btree-as-filter over 900 rows
+        // is more expensive than btree driver + spatial-as-filter over 10 rows.
+        let mut world = World::new();
+        for i in 0..1000 {
+            world.spawn((
+                Pos {
+                    x: i as f32,
+                    y: i as f32,
+                },
+                Score(i),
+            ));
+        }
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(HighRowsSpatialIndex), &world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+
+        let plan = planner
+            .scan::<(&Pos, &Score)>()
+            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true))
+            .filter(Predicate::eq::<Score>(Score(42)))
+            .build();
+
+        // BTree should win as driver because the full plan cost is lower:
+        // btree(10 rows) + spatial-as-filter(10 * 0.5) < spatial(900 rows) + btree-as-filter(900 * 0.5)
+        fn has_index_lookup(node: &PlanNode) -> bool {
+            match node {
+                PlanNode::IndexLookup { .. } => true,
+                PlanNode::Filter { child, .. } => has_index_lookup(child),
+                _ => false,
+            }
+        }
+        assert!(
+            has_index_lookup(plan.root()),
+            "expected IndexLookup as driver when BTree full plan cost is lower, got {:?}",
+            plan.root()
+        );
+    }
+
+    #[test]
+    fn spatial_index_for_each_uses_lookup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+        let _e3 = world.spawn((Pos { x: 100.0, y: 100.0 },));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(
+            Arc::new(grid),
+            &world,
+            move |_expr: &crate::index::SpatialExpr| {
+                call_count_clone.fetch_add(1, Ordering::Relaxed);
+                vec![e1, e2]
+            },
+        );
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([5.0, 5.0], 10.0, |_, _| true))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| {
+            results.push(entity);
+        });
+
+        assert!(
+            call_count.load(Ordering::Relaxed) > 0,
+            "lookup function was never called"
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn spatial_index_join_uses_lookup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 }, Score(10)));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 }, Score(20)));
+        let _e3 = world.spawn((Pos { x: 100.0, y: 100.0 }, Score(30)));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(
+            Arc::new(grid),
+            &world,
+            move |_expr: &crate::index::SpatialExpr| {
+                cc.fetch_add(1, Ordering::Relaxed);
+                vec![e1, e2]
+            },
+        );
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([5.0, 5.0], 10.0, |_, _| true))
+            .join::<(&Score,)>(JoinKind::Inner)
+            .build();
+
+        let results = plan.execute(&mut world);
+        assert!(
+            call_count.load(Ordering::Relaxed) > 0,
+            "lookup not called in join"
+        );
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn spatial_index_execute_returns_correct_entities() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+        let _far = world.spawn((Pos { x: 999.0, y: 999.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.5, 1.5], 5.0, |_, _| true))
+            .build();
+
+        let results = plan.execute(&mut world);
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn spatial_index_stale_entities_filtered() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        // Build the plan while the planner still borrows world, then drop planner.
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.5, 1.5], 5.0, |_, _| true))
+            .build();
+
+        // Now we can mutate world — despawn e2 after the plan is built.
+        world.despawn(e2);
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn spatial_index_for_each_raw_works() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            cc.fetch_add(1, Ordering::Relaxed);
+            vec![e1]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each_raw(&world, |entity| results.push(entity));
+
+        assert!(call_count.load(Ordering::Relaxed) > 0);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn spatial_index_without_lookup_falls_back() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([5.0, 5.0], 100.0, |_, _| true))
+            .build();
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn spatial_index_with_changed_filter() {
+        // Changed<T> is column-granular (per archetype), not per-entity.
+        // If any entity's column is mutated, the whole archetype passes
+        // Changed<T> on the next scan. This test verifies that behavior
+        // in the spatial index-gather path.
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        // Spawn an entity in a SEPARATE archetype (with Score) so we can verify
+        // the column-level filter skips the unmodified archetype on the second scan.
+        let e3 = world.spawn((Pos { x: 3.0, y: 3.0 }, Score(99)));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2, e3]
+        });
+
+        let mut plan = planner
+            .scan::<(Changed<Pos>, &Pos)>()
+            .filter(Predicate::within::<Pos>([1.5, 1.5], 10.0, |_, _| true))
+            .build();
+
+        // First scan — all entities "changed" (never read before by this plan).
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(results.len(), 3, "all entities pass on first scan");
+
+        // Mutate only e1's Pos — this marks the (Pos) archetype column as changed
+        // but NOT the (Pos, Score) archetype.
+        world.get_mut::<Pos>(e1).unwrap().x = 99.0;
+
+        // Second scan — only the archetype containing e1/e2 (which was mutated) passes
+        // Changed<Pos>. e3's (Pos, Score) archetype was not touched, so it is filtered out.
+        results.clear();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(
+            results.len(),
+            2,
+            "only entities in the mutated archetype pass Changed<Pos>"
+        );
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+        assert!(!results.contains(&e3));
+    }
+
+    // ── Additional spatial execution coverage ────────────────────
+
+    #[test]
+    fn spatial_index_empty_lookup_yields_no_results() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 1.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(
+            Arc::new(grid),
+            &world,
+            |_expr| Vec::new(), // empty result set
+        );
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([0.0, 0.0], 1.0, |_, _| true))
+            .build();
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 0, "empty lookup should yield zero results");
+    }
+
+    #[test]
+    fn spatial_index_all_stale_yields_no_results() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        // Despawn ALL entities returned by the lookup after plan is built.
+        world.despawn(e1);
+        world.despawn(e2);
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 0, "all-stale lookup should yield zero results");
+    }
+
+    #[test]
+    fn spatial_index_for_each_raw_filters_stale() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        world.despawn(e2);
+
+        let mut results = Vec::new();
+        plan.for_each_raw(&world, |entity| results.push(entity));
+        assert_eq!(results.len(), 1, "raw path must filter stale entities");
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn spatial_index_filters_entities_missing_required_components() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 }, Score(10))); // has both
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },)); // only Pos
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        // Lookup returns both entities.
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        // Query requires BOTH Pos and Score.
+        let mut plan = planner
+            .scan::<(&Pos, &Score)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(
+            results.len(),
+            1,
+            "entity missing required component should be filtered"
+        );
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn spatial_index_mixed_archetypes_without_changed() {
+        let mut world = World::new();
+        // Two different archetypes, both have Pos.
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 }, Score(10)));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(
+            results.len(),
+            2,
+            "entities from different archetypes should both be yielded"
+        );
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn spatial_index_intersects_through_execution() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 5.0, y: 5.0 },));
+        let _far = world.spawn((Pos { x: 99.0, y: 99.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::intersects::<Pos>(
+                [0.0, 0.0],
+                [10.0, 10.0],
+                |_, _| true,
+            ))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn spatial_index_3d_coordinates_propagate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone, Copy)]
+        #[expect(dead_code)]
+        struct Pos3D {
+            x: f32,
+            y: f32,
+            z: f32,
+        }
+
+        let mut world = World::new();
+        let e1 = world.spawn((Pos3D {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        },));
+
+        // Verify 3D coordinates are passed through to the lookup closure.
+        let received_center = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rc = Arc::clone(&received_center);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        struct Dummy3DIndex;
+        impl SpatialIndex for Dummy3DIndex {
+            fn rebuild(&mut self, _world: &mut World) {}
+            fn supports(
+                &self,
+                _expr: &crate::index::SpatialExpr,
+            ) -> Option<crate::index::SpatialCost> {
+                Some(crate::index::SpatialCost {
+                    estimated_rows: 1.0,
+                    cpu: 1.0,
+                })
+            }
+        }
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos3D>(
+            Arc::new(Dummy3DIndex),
+            &world,
+            move |expr| {
+                cc.fetch_add(1, Ordering::Relaxed);
+                if let crate::index::SpatialExpr::Within { center, .. } = expr {
+                    *rc.lock().unwrap() = center.clone();
+                }
+                vec![e1]
+            },
+        );
+
+        let mut plan = planner
+            .scan::<(&Pos3D,)>()
+            .filter(Predicate::within::<Pos3D>(
+                [10.0, 20.0, 30.0],
+                5.0,
+                |_, _| true,
+            ))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+
+        assert!(call_count.load(Ordering::Relaxed) > 0);
+        assert_eq!(results.len(), 1);
+
+        let center = received_center.lock().unwrap();
+        assert_eq!(
+            center.len(),
+            3,
+            "3D center should propagate all 3 coordinates"
+        );
+        assert!((center[0] - 10.0).abs() < f64::EPSILON);
+        assert!((center[1] - 20.0).abs() < f64::EPSILON);
+        assert!((center[2] - 30.0).abs() < f64::EPSILON);
     }
 }

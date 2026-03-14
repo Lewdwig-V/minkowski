@@ -15,33 +15,31 @@ use crate::world::World;
 /// query planner passes a `SpatialExpr` to an index and asks whether it
 /// can accelerate it and at what estimated cost.
 ///
-/// The variants mirror the spatial predicates in the planner's IR
-/// ([`SpatialPredicate`](crate::planner::SpatialPredicate)), but are
-/// type-erased to work through the `dyn SpatialIndex` interface.
+/// The planner makes **no assumptions** about the geometry, dimensionality,
+/// or coordinate system of the space. The `center` / `min` / `max` fields
+/// are opaque coordinate vectors — their meaning is entirely up to the
+/// [`SpatialIndex`] implementor. A 2D grid, 3D BVH, or spherical-geometry
+/// index all receive the same expression and decide independently whether
+/// they can handle it (returning `None` from `supports` if they cannot).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum SpatialExpr {
-    /// Point-radius proximity test: entities within `radius` of
-    /// `(x, y)`. Corresponds to `ST_Within((x, y), radius)`.
+    /// Proximity test: entities within `radius` of `center`.
+    /// The dimensionality and metric are defined by the index implementation.
     Within {
-        /// X coordinate of the query center.
-        x: f64,
-        /// Y coordinate of the query center.
-        y: f64,
-        /// Search radius.
+        /// Center coordinates (dimensionality defined by the index).
+        center: Vec<f64>,
+        /// Search radius (interpretation defined by the index).
         radius: f64,
     },
-    /// Axis-aligned bounding box intersection test. Corresponds to
-    /// `ST_Intersects(aabb)`.
+    /// Bounding-box intersection test: entities whose spatial extent
+    /// overlaps the box defined by `min` and `max` corners.
+    /// The dimensionality is defined by the index implementation.
     Intersects {
-        /// Minimum X of the query rectangle.
-        min_x: f64,
-        /// Minimum Y of the query rectangle.
-        min_y: f64,
-        /// Maximum X of the query rectangle.
-        max_x: f64,
-        /// Maximum Y of the query rectangle.
-        max_y: f64,
+        /// Minimum corner coordinates.
+        min: Vec<f64>,
+        /// Maximum corner coordinates.
+        max: Vec<f64>,
     },
 }
 
@@ -945,8 +943,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let expr = SpatialExpr::Within {
-            x: 0.0,
-            y: 0.0,
+            center: vec![0.0, 0.0],
             radius: 10.0,
         };
         assert!(idx.supports(&expr).is_none());
@@ -1001,8 +998,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let expr = SpatialExpr::Within {
-            x: 50.0,
-            y: 50.0,
+            center: vec![50.0, 50.0],
             radius: 10.0,
         };
         let cost = idx.supports(&expr).expect("should support Within");
@@ -1024,10 +1020,8 @@ mod tests {
         idx.rebuild(&mut world);
 
         let expr = SpatialExpr::Intersects {
-            min_x: 0.0,
-            min_y: 0.0,
-            max_x: 25.0,
-            max_y: 25.0,
+            min: vec![0.0, 0.0],
+            max: vec![25.0, 25.0],
         };
         let cost = idx.supports(&expr).expect("should support Intersects");
         assert!(cost.estimated_rows > 0.0);
@@ -1042,8 +1036,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let expr = SpatialExpr::Within {
-            x: 0.0,
-            y: 0.0,
+            center: vec![0.0, 0.0],
             radius: 5.0,
         };
         assert!(idx.supports(&expr).is_none());
@@ -1052,18 +1045,15 @@ mod tests {
     #[test]
     fn spatial_expr_debug_display() {
         let w = SpatialExpr::Within {
-            x: 1.0,
-            y: 2.0,
+            center: vec![1.0, 2.0],
             radius: 3.0,
         };
         let dbg = format!("{:?}", w);
         assert!(dbg.contains("Within"));
 
         let i = SpatialExpr::Intersects {
-            min_x: 0.0,
-            min_y: 0.0,
-            max_x: 10.0,
-            max_y: 10.0,
+            min: vec![0.0, 0.0],
+            max: vec![10.0, 10.0],
         };
         let dbg = format!("{:?}", i);
         assert!(dbg.contains("Intersects"));
@@ -1085,8 +1075,7 @@ mod tests {
         // Use as dyn SpatialIndex
         let dyn_idx: &dyn SpatialIndex = &grid;
         let expr = SpatialExpr::Within {
-            x: 10.0,
-            y: 10.0,
+            center: vec![10.0, 10.0],
             radius: 5.0,
         };
         assert!(dyn_idx.supports(&expr).is_some());
