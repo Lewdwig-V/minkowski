@@ -174,6 +174,8 @@ A field can carry both `#[index(btree)]` and `#[index(hash)]` simultaneously. Fi
 
 `QueryPlanner::add_spatial_index_with_lookup::<T>(index, world, lookup)` registers a spatial index with an execution-time lookup closure. The closure bridges between the planner's `SpatialExpr` protocol and the index's concrete query API — the planner makes no assumptions about how the index answers queries (mechanisms not policy). When a spatial predicate is chosen as the driving access, Phase 8 compiles an index-gather closure that calls the lookup instead of scanning archetypes. `add_spatial_index` (without lookup) remains the cost-only registration path — plans fall back to scan + filter at execution time.
 
+BTree and Hash index lookup functions (`eq_lookup_fn`, `range_lookup_fn`) captured at `add_btree_index` / `add_hash_index` registration are invoked at execution time when the index is chosen as the driving access. The predicate's `lookup_value` is pre-bound into the lookup closure at Phase 3 plan-build time (`IndexDriver`), so the execution path never handles `dyn Any`. Same validation pipeline as spatial: `is_alive` → archetype location → required components → `Changed<T>` → filter refinement.
+
 `Indexed<T>` is a compile-time witness that an index exists for component `T`. Cannot be constructed directly — only via `Indexed::btree(&index)` or `Indexed::hash(&index)`. Used by `SubscriptionBuilder` to enforce that every predicate in a subscription query is backed by an index.
 
 `TablePlanner<'w, T>` wraps `QueryPlanner` with compile-time index enforcement via `HasBTreeIndex`/`HasHashIndex` trait bounds. See "Compile-Time Index Enforcement" section.
