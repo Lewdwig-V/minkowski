@@ -1,4 +1,4 @@
-//! Column indexes — B-tree range queries and hash exact lookups.
+//! Column indexes — B-tree range queries, hash exact lookups, and planned queries.
 //!
 //! Run: cargo run -p minkowski-examples --example index --release
 //!
@@ -8,8 +8,11 @@
 //! - Exact lookup
 //! - Incremental update after mutations via per-index ChangeTick
 //! - Stale entry detection after despawn
+//! - Planned queries via QueryPlanner with IndexDriver execution
 
-use minkowski::{BTreeIndex, HashIndex, SpatialIndex, World};
+use std::sync::Arc;
+
+use minkowski::{BTreeIndex, HashIndex, Predicate, QueryPlanner, SpatialIndex, World};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Score(u32);
@@ -166,5 +169,63 @@ fn main() {
     );
     println!();
 
+    // -- Planned queries via QueryPlanner (the recommended path) --
+    //
+    // Sync indexes after the batch mutation above so the planner sees
+    // current state. Without this, the btree/hash still map old keys.
+    btree.update(&mut world);
+    hash.update(&mut world);
+
+    // Wrap indexes in Arc so the planner can hold live references to them.
+    // The planner calls the lookup closure at execution time — it reads the
+    // live index, not a snapshot captured at registration.
+    let btree = Arc::new(btree);
+    let hash = Arc::new(hash);
+
+    // Range query via BTree — build plan, drop planner, then execute.
+    // The planner borrows &world, so it must be released before for_each
+    // takes &mut world.
+    let mut range_plan = {
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index::<Score>(&btree, &world).unwrap();
+        planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(150)..Score(160)))
+            .build()
+    };
+
+    println!(
+        "Planned range [150..160) explain:\n{}",
+        range_plan.explain()
+    );
+    let mut planned_range_count = 0;
+    range_plan
+        .for_each(&mut world, |_| planned_range_count += 1)
+        .unwrap();
+    println!("Planned range [150..160): {planned_range_count} entities (expected 10)");
+    assert_eq!(planned_range_count, 10);
+    println!();
+
+    // Exact lookup via Hash — separate planner so the Hash index is
+    // actually selected (BTree would shadow it if both were registered
+    // for the same component, since add_hash_index uses or_insert).
+    let mut eq_plan = {
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index::<Score>(&hash, &world).unwrap();
+        planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build()
+    };
+
+    println!("Planned eq explain:\n{}", eq_plan.explain());
+    let mut planned_eq_count = 0;
+    eq_plan
+        .for_each(&mut world, |_| planned_eq_count += 1)
+        .unwrap();
+    println!("Planned eq Score(42): {planned_eq_count} entities (expected 1)");
+    assert_eq!(planned_eq_count, 1);
+
+    println!();
     println!("Done.");
 }
