@@ -7,6 +7,7 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+atomic = "0.6"
 fixedbitset = "0.5"
 libc = "0.2"
 memmap2 = "0.9"
