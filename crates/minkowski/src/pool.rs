@@ -282,7 +282,6 @@ impl MmapRegion {
 #[repr(C)]
 struct TaggedPtr(u128);
 
-#[allow(dead_code)] // Methods used when SlabPool migrates to lock-free.
 impl TaggedPtr {
     /// Empty stack head (null pointer, tag 0).
     const fn empty() -> Self {
@@ -326,16 +325,13 @@ impl fmt::Debug for TaggedPtr {
 /// Under `cfg(loom)`, falls back to a Mutex because loom cannot model
 /// 128-bit atomic operations. The Mutex shim verifies logical correctness
 /// (no lost blocks, no duplicates) but not CAS retry paths.
-#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
 #[cfg(not(loom))]
 type AtomicHead = atomic::Atomic<u128>;
 
-#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
 #[cfg(loom)]
 type AtomicHead = Mutex<u128>;
 
 /// Load the current head of a free list.
-#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
 #[inline]
 fn load_head(head: &AtomicHead) -> TaggedPtr {
     #[cfg(not(loom))]
@@ -349,7 +345,6 @@ fn load_head(head: &AtomicHead) -> TaggedPtr {
 }
 
 /// Compare-and-swap the head of a free list. Returns `true` on success.
-#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
 #[inline]
 fn cas_head(head: &AtomicHead, current: TaggedPtr, new: TaggedPtr) -> bool {
     #[cfg(not(loom))]
@@ -370,7 +365,6 @@ fn cas_head(head: &AtomicHead, current: TaggedPtr, new: TaggedPtr) -> bool {
 }
 
 /// Create a new AtomicHead initialized with the given TaggedPtr.
-#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
 fn new_atomic_head(tp: TaggedPtr) -> AtomicHead {
     #[cfg(not(loom))]
     {
@@ -475,55 +469,64 @@ impl SlabPool {
         let base = region.as_mut_ptr();
         let total = region.len();
 
-        // Initialize free lists as empty Vecs.
-        let free_lists: [Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES] =
-            std::array::from_fn(|_| Mutex::new(Vec::new()));
+        // Allocate side table as raw pointer (see struct doc for rationale).
+        let side_table_len = total / SIZE_CLASSES[0];
+        let mut st_vec = vec![SIDE_TABLE_UNALLOCATED; side_table_len];
+        let side_table = st_vec.as_mut_ptr();
+        std::mem::forget(st_vec); // ownership transferred to raw pointer
 
-        // Partition the region into size-class blocks proportionally.
         let proportion_sum: usize = PROPORTIONS.iter().sum();
+
+        // Build intrusive linked lists and heads in a single pass.
         let mut offset: usize = 0;
+        let mut head_values: [TaggedPtr; NUM_SIZE_CLASSES] = [TaggedPtr::empty(); NUM_SIZE_CLASSES];
 
         for class in 0..NUM_SIZE_CLASSES {
             let block_size = SIZE_CLASSES[class];
 
             // Align the absolute address (base + offset) to block_size, not just offset.
-            // The mmap base is page-aligned (4KB) but may not be aligned to larger
-            // block sizes (64KB, 1MB). Without this, blocks in those classes could
-            // be misaligned for components with align > page_size.
             let abs_addr = base as usize + offset;
             let aligned_addr = (abs_addr + block_size - 1) & !(block_size - 1);
             offset = aligned_addr - base as usize;
 
-            // Bytes allocated to this size class (rounded down to whole blocks).
             let class_bytes = total * PROPORTIONS[class] / proportion_sum;
             let block_count = class_bytes / block_size;
 
-            let mut list = free_lists[class].lock();
-            list.reserve(block_count);
-
-            // Push blocks from first to last so that pop yields the lowest
-            // address first (better cache locality).
-            for i in 0..block_count {
+            // Chain blocks as intrusive linked list (reverse iteration
+            // so head points to lowest address for cache locality).
+            let mut first_block: *mut u8 = std::ptr::null_mut();
+            for i in (0..block_count).rev() {
                 let block_offset = offset + i * block_size;
                 if block_offset + block_size > total {
-                    break;
+                    continue;
                 }
-                // SAFETY: `block_offset + block_size <= total` (checked above),
-                // and `base` points to the start of a valid mmap region of
-                // `total` bytes. Each block is at least 64 bytes.
+                // SAFETY: block_offset + block_size <= total, base is valid
+                // for total bytes. Block is >= 64 bytes (MIN_BLOCK_SIZE invariant),
+                // so writing 8 bytes of next-pointer is within bounds.
                 let block_ptr = unsafe { base.add(block_offset) };
-                list.push(block_ptr);
+                unsafe {
+                    (block_ptr as *mut u64).write(first_block as u64);
+                }
+                first_block = block_ptr;
             }
 
+            head_values[class] = TaggedPtr::new(first_block, 0);
             offset += block_count * block_size;
         }
+
+        let heads: [AtomicHead; NUM_SIZE_CLASSES] =
+            std::array::from_fn(|i| new_atomic_head(head_values[i]));
 
         Ok(Self {
             _region: region,
             base,
             total,
-            free_lists,
+            heads,
+            side_table,
+            side_table_len,
             used_bytes: AtomicUsize::new(0),
+            overflow_active: std::array::from_fn(|_| AtomicUsize::new(0)),
+            overflow_total: std::array::from_fn(|_| AtomicUsize::new(0)),
         })
     }
 }
