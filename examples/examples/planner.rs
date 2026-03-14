@@ -1,5 +1,6 @@
 //! Volcano query planner — cost-based plan compilation with index selection,
-//! join optimization, subscription queries, and constraint validation.
+//! join optimization, subscription queries, constraint validation, and spatial
+//! index execution.
 //!
 //! Run: cargo run -p minkowski-examples --example planner --release
 //!
@@ -13,12 +14,13 @@
 //! - Plan execution against a live World (execute returns &[Entity])
 //! - Zero-allocation for_each iteration for scan-only plans
 //! - Transactional for_each_raw with &World (no tick advancement)
+//! - Spatial index execution via add_spatial_index_with_lookup
 
 use std::sync::Arc;
 
 use minkowski::{
-    BTreeIndex, CardinalityConstraint, Changed, HashIndex, Indexed, JoinKind, Predicate,
-    QueryPlanner, SpatialIndex, VectorizeOpts, World,
+    BTreeIndex, CardinalityConstraint, Changed, Entity, HashIndex, Indexed, JoinKind, Predicate,
+    QueryPlanner, SpatialCost, SpatialExpr, SpatialIndex, VectorizeOpts, World,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -405,6 +407,174 @@ fn main() {
         );
         assert_eq!(third_count, 0);
     }
+
+    println!("\n=== 12. Spatial Index Execution ===\n");
+
+    // A simple spatial index that stores (Entity, x, y) and does a linear
+    // distance check. The planner bridges to it via a lookup closure —
+    // the planner has no knowledge of the index's internal structure.
+    struct LinearSpatialIndex {
+        entries: Vec<(Entity, f32, f32)>,
+    }
+
+    impl LinearSpatialIndex {
+        fn new() -> Self {
+            Self {
+                entries: Vec::new(),
+            }
+        }
+
+        /// Return entities within `radius` of `(cx, cy)`.
+        fn query_within(&self, cx: f32, cy: f32, radius: f32) -> Vec<Entity> {
+            self.entries
+                .iter()
+                .filter_map(|&(e, x, y)| {
+                    let dx = x - cx;
+                    let dy = y - cy;
+                    if dx * dx + dy * dy <= radius * radius {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+    }
+
+    impl SpatialIndex for LinearSpatialIndex {
+        fn rebuild(&mut self, world: &mut World) {
+            self.entries = world
+                .query::<(Entity, &Pos)>()
+                .map(|(e, p)| (e, p.x, p.y))
+                .collect();
+        }
+
+        fn supports(&self, expr: &SpatialExpr) -> Option<SpatialCost> {
+            match expr {
+                SpatialExpr::Within { .. } => Some(SpatialCost {
+                    estimated_rows: (self.entries.len() as f64 * 0.05).max(1.0),
+                    cpu: 10.0,
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    // Build and populate the index.
+    let mut spatial_idx = LinearSpatialIndex::new();
+    spatial_idx.rebuild(&mut world);
+
+    // Entities with Pos.x in [0, 999], y = 0.
+    // Center (50, 0) with radius 10 → Score values 40..=60 (21 entities).
+    let cx = 50.0f32;
+    let radius = 10.0f32;
+
+    // Wrap in Arc so the planner and the lookup closure share ownership.
+    let spatial_arc: std::sync::Arc<LinearSpatialIndex> = std::sync::Arc::new(spatial_idx);
+
+    // Fallback scan filter: used when no spatial index is registered or when
+    // the plan falls back to scan + filter. Checks Pos directly.
+    let cx_f64 = cx as f64;
+    let radius_f64 = radius as f64;
+    let scan_filter = move |world: &World, e: Entity| {
+        world.get::<Pos>(e).is_some_and(|p| {
+            let dx = p.x as f64 - cx_f64;
+            let dy = p.y as f64;
+            dx * dx + dy * dy <= radius_f64 * radius_f64
+        })
+    };
+
+    // The lookup closure: maps SpatialExpr → candidate Entity list.
+    // This is the bridge between the planner's expression protocol and the
+    // index's concrete query API.
+    let spatial_arc_lookup = std::sync::Arc::clone(&spatial_arc);
+    let mut planner = QueryPlanner::new(&world);
+    planner.add_spatial_index_with_lookup::<Pos>(
+        std::sync::Arc::clone(&spatial_arc) as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
+        &world,
+        move |expr| match expr {
+            SpatialExpr::Within { center, radius } => {
+                let qx = center.first().copied().unwrap_or(0.0) as f32;
+                let qy = center.get(1).copied().unwrap_or(0.0) as f32;
+                spatial_arc_lookup.query_within(qx, qy, *radius as f32)
+            }
+            _ => Vec::new(),
+        },
+    );
+
+    let plan = planner
+        .scan::<(&Pos, &Score)>()
+        .filter(Predicate::within::<Pos>(
+            vec![cx as f64, 0.0],
+            radius as f64,
+            scan_filter,
+        ))
+        .build();
+
+    // EXPLAIN shows SpatialGather as the driving access.
+    println!("EXPLAIN spatial within plan:");
+    println!("{}", plan.explain());
+
+    // Execute: collect entities near (50, 0) within radius 10.
+    let mut plan = plan;
+    let spatial_results = plan.execute(&mut world);
+    println!(
+        "Spatial within ({cx}, 0) r={radius}: {} entities",
+        spatial_results.len()
+    );
+    // Verify: all results have Pos.x within [cx-radius, cx+radius] and y=0.
+    for &e in spatial_results {
+        let p = world.get::<Pos>(e).unwrap();
+        let dist = ((p.x - cx) * (p.x - cx) + p.y * p.y).sqrt();
+        assert!(
+            dist <= radius + f32::EPSILON,
+            "entity at ({}, {}) is outside radius {radius}",
+            p.x,
+            p.y
+        );
+    }
+    println!("All results verified within radius.\n");
+
+    // for_each variant — zero-allocation iteration.
+    // Build a fresh spatial index (needs &mut world) before creating the planner.
+    let mut spatial_idx2 = LinearSpatialIndex::new();
+    spatial_idx2.rebuild(&mut world);
+    let arc2 = std::sync::Arc::new(spatial_idx2);
+    let arc2c = std::sync::Arc::clone(&arc2);
+
+    let mut planner2 = QueryPlanner::new(&world);
+    planner2.add_spatial_index_with_lookup::<Pos>(
+        arc2 as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
+        &world,
+        move |expr| match expr {
+            SpatialExpr::Within { center, radius } => {
+                let qx = center.first().copied().unwrap_or(0.0) as f32;
+                let qy = center.get(1).copied().unwrap_or(0.0) as f32;
+                arc2c.query_within(qx, qy, *radius as f32)
+            }
+            _ => Vec::new(),
+        },
+    );
+
+    let scan_filter2 = move |world: &World, e: Entity| {
+        world.get::<Pos>(e).is_some_and(|p| {
+            let dx = p.x as f64 - cx as f64;
+            let dy = p.y as f64;
+            dx * dx + dy * dy <= (radius as f64) * (radius as f64)
+        })
+    };
+    let mut plan2 = planner2
+        .scan::<(&Pos, &Score)>()
+        .filter(Predicate::within::<Pos>(
+            vec![cx as f64, 0.0],
+            radius as f64,
+            scan_filter2,
+        ))
+        .build();
+    let mut spatial_count = 0;
+    plan2.for_each(&mut world, |_e| spatial_count += 1);
+    println!("for_each spatial: {spatial_count} entities (matches execute result)");
+    assert_eq!(spatial_count, spatial_results.len());
 
     println!("\nDone.");
 }
