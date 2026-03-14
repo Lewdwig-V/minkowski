@@ -578,5 +578,75 @@ fn main() {
     println!("for_each spatial: {spatial_count} entities (matches execute result)");
     assert_eq!(spatial_count, spatial_results.len());
 
+    println!("\n=== 13. Index-Driven Execution ===\n");
+
+    // BTree and Hash indexes drive execution directly — the predicate's lookup
+    // value is pre-bound at plan-build time (IndexDriver), so the execution
+    // path never handles dyn Any. Same validation as spatial: is_alive →
+    // archetype location → required components → Changed<T> → filter refinement.
+
+    // BTree eq lookup: find entities with Score(42).
+    {
+        let mut btree_exec = BTreeIndex::<Score>::new();
+        btree_exec.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&Arc::new(btree_exec), &world);
+
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq::<Score>(Score(42)))
+            .build();
+
+        println!("EXPLAIN index eq plan:");
+        println!("{}", plan.explain());
+
+        let mut plan = plan;
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        println!("Index eq lookup Score(42): {count} entities");
+        // Score(42) was spawned once in the range 0..500.
+        assert_eq!(count, 1);
+    }
+
+    // Hash eq lookup: find entities with Team(2).
+    {
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index(&team_hash, &world);
+
+        let plan = planner
+            .scan::<(&Team,)>()
+            .filter(Predicate::eq::<Team>(Team(2)))
+            .build();
+
+        println!("\nEXPLAIN hash eq plan:");
+        println!("{}", plan.explain());
+
+        let mut plan = plan;
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        println!("Hash eq lookup Team(2): {count} entities (expected 200)");
+        assert_eq!(count, 200);
+    }
+
+    // BTree range lookup: find entities with Score in [100..200).
+    {
+        let mut btree_range = BTreeIndex::<Score>::new();
+        btree_range.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&Arc::new(btree_range), &world);
+
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
+            .build();
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        println!("BTree range lookup Score(100..200): {count} entities (expected 100)");
+        assert_eq!(count, 100);
+    }
+
     println!("\nDone.");
 }
