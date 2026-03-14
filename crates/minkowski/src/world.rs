@@ -167,6 +167,12 @@ pub struct WorldStats {
     pub pool_capacity: Option<usize>,
     /// Bytes currently allocated from the pool, if tracked.
     pub pool_used: Option<usize>,
+    /// Per-class count of blocks currently serving overflow allocations.
+    /// `None` for system-allocator worlds. Array indices match size classes:
+    /// [64B, 256B, 1KB, 4KB, 64KB, 1MB].
+    pub pool_overflow_active: Option<[u64; 6]>,
+    /// Per-class cumulative count of overflow allocations.
+    pub pool_overflow_total: Option<[u64; 6]>,
 }
 
 /// Debug information about the tick state of a cached query type.
@@ -1766,6 +1772,8 @@ impl World {
             total_despawns: self.entities.total_despawns,
             pool_capacity: self.pool.capacity(),
             pool_used: self.pool.used(),
+            pool_overflow_active: self.pool.overflow_active_counts(),
+            pool_overflow_total: self.pool.overflow_total_counts(),
         }
     }
 

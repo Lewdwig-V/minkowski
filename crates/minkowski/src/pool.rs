@@ -73,6 +73,16 @@ pub unsafe trait PoolAllocator: Send + Sync {
     fn used(&self) -> Option<usize> {
         None
     }
+
+    /// Per-class active overflow count. `None` if not tracked.
+    fn overflow_active_counts(&self) -> Option<[u64; 6]> {
+        None
+    }
+
+    /// Per-class cumulative overflow count. `None` if not tracked.
+    fn overflow_total_counts(&self) -> Option<[u64; 6]> {
+        None
+    }
 }
 
 /// Default allocator -- delegates to `std::alloc`. Unbounded, panics on OOM.
@@ -681,6 +691,18 @@ unsafe impl PoolAllocator for SlabPool {
 
     fn used(&self) -> Option<usize> {
         Some(self.used_bytes.load(Ordering::Relaxed))
+    }
+
+    fn overflow_active_counts(&self) -> Option<[u64; 6]> {
+        Some(std::array::from_fn(|i| {
+            self.overflow_active[i].load(Ordering::Relaxed) as u64
+        }))
+    }
+
+    fn overflow_total_counts(&self) -> Option<[u64; 6]> {
+        Some(std::array::from_fn(|i| {
+            self.overflow_total[i].load(Ordering::Relaxed) as u64
+        }))
     }
 }
 
