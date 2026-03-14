@@ -129,9 +129,9 @@ Each BlobVec column stores a `changed_tick: Tick` — the tick at which it was l
 
 ### Secondary Indexes
 
-`SpatialIndex` is a lifecycle trait for user-owned spatial data structures (grids, quadtrees, BVH, k-d trees). Indexes are fully external to World — they compose from existing query primitives. The trait has two methods: `rebuild` (required, full reconstruction) and `update` (optional, defaults to rebuild — override for incremental updates via `Changed<T>`). Despawned entities are handled via generational validation: stale entries are skipped at query time when `world.is_alive()` returns false, and cleaned up on the next rebuild.
+`SpatialIndex` is a lifecycle trait for user-owned spatial data structures (grids, quadtrees, BVH, k-d trees). Indexes are fully external to World — they compose from existing query primitives. The trait has two methods: `rebuild` (required, full reconstruction from scratch) and `update` (optional, defaults to rebuild — override for incremental updates via `Changed<T>`). `rebuild` is for initial population and periodic compaction. `update` is the per-frame call — cost is proportional to the number of changes, not total entity count. Call `update` once per frame before querying; after that, all lookups (direct `get`/`range`, planner execution, reducer queries) see consistent fresh data. Despawned entities are handled via generational validation: stale entries are skipped at query time when `world.is_alive()` returns false, and cleaned up on the next rebuild.
 
-`BTreeIndex<T>` provides O(log n + k) range queries and exact-match via a `BTreeMap`. `HashIndex<T>` provides O(1) exact-match via `HashMap`. Both support validated queries (`get_valid`, `range_valid`) that filter despawned entities and removed components. Both implement `SpatialIndex` for lifecycle management.
+`BTreeIndex<T>` provides O(log n + k) range queries and exact-match via a `BTreeMap`. `HashIndex<T>` provides O(1) exact-match via `HashMap`. Both support validated queries (`get_valid`, `range_valid`) that filter despawned entities and removed components. Both implement `SpatialIndex` for lifecycle management. Both have incremental `update` implementations that scan only changed entities via `query_changed_since`.
 
 ### Compile-Time Index Enforcement
 

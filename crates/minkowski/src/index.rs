@@ -97,12 +97,25 @@ pub struct SpatialCost {
 /// cheaper path.
 pub trait SpatialIndex {
     /// Reconstruct the index from scratch by scanning all matching entities.
+    ///
+    /// Use this for initial population and periodic compaction (reclaims
+    /// memory from stale entries). For per-frame synchronization, prefer
+    /// [`update`](Self::update) which only processes changed entities.
     fn rebuild(&mut self, world: &mut World);
 
     /// Incrementally update the index. Defaults to full rebuild.
     ///
-    /// Override this for indexes that can efficiently process only the
-    /// entities whose indexed components changed since the last call.
+    /// **This is the per-frame call.** `BTreeIndex` and `HashIndex` use
+    /// per-index tick state to scan only entities whose indexed component
+    /// was mutated since the last call — cost is proportional to the
+    /// number of changes, not the total entity count.
+    ///
+    /// Call once per frame (or per mutation batch) before querying. After
+    /// `update`, all lookups (`get`, `range`, planner execution, reducer
+    /// queries) see consistent, fresh data.
+    ///
+    /// Override this for custom indexes that can efficiently process only
+    /// the entities whose indexed components changed since the last call.
     /// Despawned entities are handled lazily via generational validation
     /// at query time — stale entries are skipped when `world.is_alive()`
     /// returns false.
@@ -130,12 +143,26 @@ pub trait SpatialIndex {
 /// queries via [`range`](Self::range). The index is fully user-owned —
 /// World has no awareness of it.
 ///
-/// # Incremental updates
+/// # Lifecycle
 ///
-/// [`SpatialIndex::update`] uses per-index tick state to scan only entities
-/// whose indexed component was mutated since the last call. Each index
-/// instance tracks its own [`ChangeTick`], so multiple indexes on the same
+/// ```text
+/// index.rebuild(&mut world);   // initial population (full scan)
+///
+/// // game loop / frame loop:
+/// index.update(&mut world);    // incremental — O(changed entities)
+/// // ... query freely: get(), range(), planner, reducers ...
+/// ```
+///
+/// Call [`update`](SpatialIndex::update) once per frame before querying.
+/// It uses per-index tick state to scan only entities whose indexed
+/// component was mutated since the last call. Cost is proportional to
+/// the number of changes, not the total entity count. Each index instance
+/// tracks its own [`ChangeTick`], so multiple indexes on the same
 /// component type can call `update` independently without interfering.
+///
+/// [`rebuild`](SpatialIndex::rebuild) is for initial population and
+/// periodic compaction — it scans all entities and reclaims memory from
+/// stale entries. Do not call it per-frame on large datasets.
 ///
 /// # Stale entries
 ///
@@ -160,7 +187,8 @@ pub struct BTreeIndex<T: Component + Ord + Clone> {
 }
 
 impl<T: Component + Ord + Clone> BTreeIndex<T> {
-    /// Create an empty index. Call [`rebuild`](SpatialIndex::rebuild) to populate.
+    /// Create an empty index. Call [`rebuild`](SpatialIndex::rebuild) for
+    /// initial population, then [`update`](SpatialIndex::update) per frame.
     pub fn new() -> Self {
         Self {
             tree: BTreeMap::new(),
@@ -294,12 +322,18 @@ impl<T: Component + Ord + Clone> SpatialIndex for BTreeIndex<T> {
 /// Supports exact-match lookups via [`get`](Self::get). For ordered queries,
 /// use [`BTreeIndex`] instead.
 ///
-/// # Incremental updates
+/// # Lifecycle
 ///
-/// [`SpatialIndex::update`] uses per-index tick state to scan only entities
-/// whose indexed component was mutated since the last call. Each index
-/// instance tracks its own [`ChangeTick`], so multiple indexes on the same
-/// component type can call `update` independently without interfering.
+/// ```text
+/// index.rebuild(&mut world);   // initial population (full scan)
+///
+/// // game loop / frame loop:
+/// index.update(&mut world);    // incremental — O(changed entities)
+/// // ... query freely: get(), planner, reducers ...
+/// ```
+///
+/// Call [`update`](SpatialIndex::update) once per frame before querying.
+/// See [`BTreeIndex`] for full lifecycle documentation.
 ///
 /// # Stale entries
 ///
@@ -320,7 +354,8 @@ pub struct HashIndex<T: Component + Hash + Eq + Clone> {
 }
 
 impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
-    /// Create an empty index. Call [`rebuild`](SpatialIndex::rebuild) to populate.
+    /// Create an empty index. Call [`rebuild`](SpatialIndex::rebuild) for
+    /// initial population, then [`update`](SpatialIndex::update) per frame.
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
