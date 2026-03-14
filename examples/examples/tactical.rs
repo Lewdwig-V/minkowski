@@ -578,9 +578,9 @@ fn main() {
                 Ok(()) => {
                     println!("    attack: HVT {} second hit succeeded", high_value_target);
                 }
-                Err(conflict) => {
+                Err(e) => {
                     total_conflicts += 1;
-                    println!("    CONFLICT on HVT: {}", conflict.display_with(&world));
+                    println!("    CONFLICT on HVT: {e}");
                 }
             }
         }
@@ -622,9 +622,9 @@ fn main() {
                                 attacker, target_unit, ATTACK_DAMAGE, hp_val
                             );
                         }
-                        Err(conflict) => {
+                        Err(e) => {
                             total_conflicts += 1;
-                            println!("    CONFLICT: {}", conflict.display_with(&world));
+                            println!("    CONFLICT: {e}");
                         }
                     }
                 }

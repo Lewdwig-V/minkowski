@@ -113,5 +113,8 @@ pub use reducer::{
 };
 pub use retention::Expiry;
 pub use tick::ChangeTick;
-pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
+pub use transaction::{
+    Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, TransactError, Tx,
+    WorldMismatch,
+};
 pub use world::{QueryTickInfo, World, WorldBuilder, WorldStats};

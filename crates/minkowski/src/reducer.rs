@@ -13,7 +13,7 @@ use crate::entity::Entity;
 use crate::query::fetch::{Changed, ReadOnlyWorldQuery, ThinSlicePtr, WorldQuery};
 use crate::storage::archetype::Archetype;
 use crate::tick::Tick;
-use crate::transaction::{Conflict, Transact};
+use crate::transaction::{Conflict, Transact, TransactError, WorldMismatch};
 use crate::world::World;
 
 // ── ReducerError ─────────────────────────────────────────────────────
@@ -52,6 +52,9 @@ pub enum ReducerError {
         index: usize,
         max: usize,
     },
+    /// The transaction strategy was used with a different World than it
+    /// was created from.
+    WorldMismatch(WorldMismatch),
 }
 
 impl fmt::Display for ReducerError {
@@ -83,6 +86,7 @@ impl fmt::Display for ReducerError {
                     "invalid {kind} reducer ID (index {index}, registry has {max})"
                 )
             }
+            ReducerError::WorldMismatch(w) => write!(f, "{w}"),
         }
     }
 }
@@ -91,14 +95,18 @@ impl std::error::Error for ReducerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ReducerError::TransactionConflict(c) => Some(c),
+            ReducerError::WorldMismatch(w) => Some(w),
             _ => None,
         }
     }
 }
 
-impl From<Conflict> for ReducerError {
-    fn from(c: Conflict) -> Self {
-        ReducerError::TransactionConflict(c)
+impl From<TransactError> for ReducerError {
+    fn from(e: TransactError) -> Self {
+        match e {
+            TransactError::Conflict(c) => ReducerError::TransactionConflict(c),
+            TransactError::WorldMismatch(w) => ReducerError::WorldMismatch(w),
+        }
     }
 }
 
@@ -4064,12 +4072,20 @@ mod tests {
     }
 
     #[test]
-    fn reducer_error_from_conflict() {
+    fn reducer_error_from_transact_error_conflict() {
         let conflict = Conflict {
             component_ids: fixedbitset::FixedBitSet::new(),
         };
-        let err: ReducerError = conflict.into();
+        let transact_err = TransactError::Conflict(conflict);
+        let err: ReducerError = transact_err.into();
         assert!(matches!(err, ReducerError::TransactionConflict(_)));
+    }
+
+    #[test]
+    fn reducer_error_from_transact_error_world_mismatch() {
+        let transact_err = TransactError::WorldMismatch(WorldMismatch::new());
+        let err: ReducerError = transact_err.into();
+        assert!(matches!(err, ReducerError::WorldMismatch(_)));
     }
 
     // ── Introspection tests ──────────────────────────────────────────

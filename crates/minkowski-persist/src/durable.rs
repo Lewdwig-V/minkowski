@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 
-use minkowski::{Access, Conflict, EnumChangeSet, Transact, Tx, World};
+use minkowski::{Access, EnumChangeSet, Transact, TransactError, Tx, World, WorldMismatch};
 
 use crate::checkpoint::CheckpointHandler;
 use crate::codec::CodecRegistry;
@@ -52,11 +52,15 @@ impl<S: Transact> Durable<S> {
 }
 
 impl<S: Transact> Transact for Durable<S> {
-    fn begin(&self, world: &mut World, access: &Access) -> Tx<'_> {
+    fn begin(&self, world: &mut World, access: &Access) -> Result<Tx<'_>, WorldMismatch> {
         self.inner.begin(world, access)
     }
 
-    fn try_commit(&self, tx: &mut Tx<'_>, world: &mut World) -> Result<EnumChangeSet, Conflict> {
+    fn try_commit(
+        &self,
+        tx: &mut Tx<'_>,
+        world: &mut World,
+    ) -> Result<EnumChangeSet, TransactError> {
         self.inner.try_commit(tx, world)
     }
 
@@ -69,11 +73,11 @@ impl<S: Transact> Transact for Durable<S> {
         world: &mut World,
         access: &Access,
         f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
-    ) -> Result<R, Conflict> {
+    ) -> Result<R, TransactError> {
         let mut f = f;
         let mut last_conflict = None;
         for _attempt in 0..self.max_retries() {
-            let mut tx = self.begin(world, access);
+            let mut tx = self.begin(world, access)?;
             if !tx.is_ready() {
                 drop(tx);
                 continue;
@@ -107,14 +111,17 @@ impl<S: Transact> Transact for Durable<S> {
 
                     return Ok(value);
                 }
-                Err(conflict) => {
+                Err(TransactError::Conflict(conflict)) => {
                     last_conflict = Some(conflict);
                 }
+                Err(e @ TransactError::WorldMismatch(_)) => return Err(e),
             }
         }
-        Err(last_conflict.unwrap_or_else(|| Conflict {
-            component_ids: fixedbitset::FixedBitSet::new(),
-        }))
+        Err(TransactError::Conflict(last_conflict.unwrap_or_else(
+            || minkowski::Conflict {
+                component_ids: fixedbitset::FixedBitSet::new(),
+            },
+        )))
     }
 }
 

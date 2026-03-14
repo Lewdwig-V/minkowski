@@ -223,7 +223,7 @@ fn main() {
     {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score, &Pos)>().build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!(
             "Scan(&Score, &Pos): {} entities (expected {})",
             entities.len(),
@@ -238,7 +238,7 @@ fn main() {
             .scan::<(&Score,)>()
             .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
             .build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!(
             "Score in [100..200): {} entities (expected 100)",
             entities.len()
@@ -258,7 +258,7 @@ fn main() {
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(2)))
             .build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!("Team == 2: {} entities (expected 200)", entities.len());
         for e in entities {
             assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
@@ -272,7 +272,7 @@ fn main() {
             .scan::<(&Score, &Pos)>()
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!("(&Score, &Pos) JOIN (&Team,): {} entities", entities.len());
         // All entities have both Score+Pos and Team, so all 1000 match
         assert_eq!(entities.len(), 1000);
@@ -287,7 +287,7 @@ fn main() {
                 w.get::<Score>(e).is_some_and(|s| s.0 % 2 == 0)
             }))
             .build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!("Even scores: {} entities (expected 500)", entities.len());
         assert_eq!(entities.len(), 500);
     }
@@ -302,7 +302,8 @@ fn main() {
         let mut count = 0;
         plan.for_each(&mut world, |_entity| {
             count += 1;
-        });
+        })
+        .unwrap();
         println!(
             "for_each scan: {count} entities (expected {})",
             world.entity_count()
@@ -320,7 +321,8 @@ fn main() {
         let mut count = 0;
         plan.for_each(&mut world, |_entity| {
             count += 1;
-        });
+        })
+        .unwrap();
         println!("for_each filtered [900..1000): {count} entities (expected 100)");
         assert_eq!(count, 100);
     }
@@ -336,7 +338,8 @@ fn main() {
         let mut count = 0;
         plan.for_each_raw(&world, |_entity| {
             count += 1;
-        });
+        })
+        .unwrap();
         println!("Read-only scan found {count} entities (no &mut World needed)");
         assert_eq!(count, world.entity_count());
     }
@@ -351,7 +354,8 @@ fn main() {
         let mut found = Vec::new();
         plan.for_each_raw(&world, |entity| {
             found.push(entity);
-        });
+        })
+        .unwrap();
         println!(
             "Read-only filtered: {} entity with Score(42) (expected 1)",
             found.len()
@@ -382,7 +386,7 @@ fn main() {
         // First call: both archetypes were written at spawn time, so
         // Changed<Score> matches both. Every entity is visible.
         let mut first_count = 0;
-        plan.for_each(&mut cworld, |_| first_count += 1);
+        plan.for_each(&mut cworld, |_| first_count += 1).unwrap();
         println!("First for_each (all new): {first_count} entities (expected 10, both archetypes)");
         assert_eq!(first_count, 10);
 
@@ -393,7 +397,7 @@ fn main() {
         // Second call: only the Score-only archetype column was touched.
         // Score+Team archetype is stale — skipped entirely.
         let mut second_count = 0;
-        plan.for_each(&mut cworld, |_| second_count += 1);
+        plan.for_each(&mut cworld, |_| second_count += 1).unwrap();
         println!(
             "Second for_each (one archetype mutated): {second_count} entities (expected 5, Score-only archetype)"
         );
@@ -401,7 +405,7 @@ fn main() {
 
         // Third call: nothing changed since the last read tick.
         let mut third_count = 0;
-        plan.for_each(&mut cworld, |_| third_count += 1);
+        plan.for_each(&mut cworld, |_| third_count += 1).unwrap();
         println!(
             "Third for_each (no new changes): {third_count} entities (expected 0, nothing changed)"
         );
@@ -519,7 +523,7 @@ fn main() {
 
     // Execute: collect entities near (50, 0) within radius 10.
     let mut plan = plan;
-    let spatial_results = plan.execute(&mut world);
+    let spatial_results = plan.execute(&mut world).unwrap();
     println!(
         "Spatial within ({cx}, 0) r={radius}: {} entities",
         spatial_results.len()
@@ -574,7 +578,7 @@ fn main() {
         ))
         .build();
     let mut spatial_count = 0;
-    plan2.for_each(&mut world, |_e| spatial_count += 1);
+    plan2.for_each(&mut world, |_e| spatial_count += 1).unwrap();
     println!("for_each spatial: {spatial_count} entities (matches execute result)");
     assert_eq!(spatial_count, spatial_results.len());
 
@@ -603,7 +607,7 @@ fn main() {
 
         let mut plan = plan;
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1);
+        plan.for_each(&mut world, |_| count += 1).unwrap();
         println!("Index eq lookup Score(42): {count} entities");
         // Score(42) was spawned once in the range 0..500.
         assert_eq!(count, 1);
@@ -624,7 +628,7 @@ fn main() {
 
         let mut plan = plan;
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1);
+        plan.for_each(&mut world, |_| count += 1).unwrap();
         println!("Hash eq lookup Team(2): {count} entities (expected 200)");
         assert_eq!(count, 200);
     }
@@ -643,7 +647,7 @@ fn main() {
             .build();
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1);
+        plan.for_each(&mut world, |_| count += 1).unwrap();
         println!("BTree range lookup Score(100..200): {count} entities (expected 100)");
         assert_eq!(count, 100);
     }

@@ -117,6 +117,77 @@ impl std::fmt::Display for Conflict {
 
 impl std::error::Error for Conflict {}
 
+/// Returned when a strategy or plan is used with a different World than
+/// the one it was created from.
+///
+/// Cross-world usage would corrupt entity lifecycle state (orphan queues,
+/// generation counters) or produce silently wrong query results. This is
+/// returned as a `Result` error rather than a panic so callers can handle
+/// it gracefully — use `.unwrap()` if you prefer to panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldMismatch {
+    _private: (),
+}
+
+impl WorldMismatch {
+    pub(crate) fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl std::fmt::Display for WorldMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "strategy or plan used with a different World than it was created from"
+        )
+    }
+}
+
+impl std::error::Error for WorldMismatch {}
+
+/// Error type for transaction operations that can fail with either a
+/// concurrency conflict or a world mismatch.
+///
+/// Returned by [`Transact::transact`] and [`Transact::try_commit`].
+#[derive(Debug)]
+pub enum TransactError {
+    /// The transaction detected a concurrent modification conflict.
+    Conflict(Conflict),
+    /// The strategy was used with a different World than it was created from.
+    WorldMismatch(WorldMismatch),
+}
+
+impl std::fmt::Display for TransactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactError::Conflict(c) => write!(f, "{c}"),
+            TransactError::WorldMismatch(w) => write!(f, "{w}"),
+        }
+    }
+}
+
+impl std::error::Error for TransactError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TransactError::Conflict(c) => Some(c),
+            TransactError::WorldMismatch(w) => Some(w),
+        }
+    }
+}
+
+impl From<Conflict> for TransactError {
+    fn from(c: Conflict) -> Self {
+        TransactError::Conflict(c)
+    }
+}
+
+impl From<WorldMismatch> for TransactError {
+    fn from(w: WorldMismatch) -> Self {
+        TransactError::WorldMismatch(w)
+    }
+}
+
 // ── TxCleanup + Tx ─────────────────────────────────────────────────
 
 /// Strategy-specific teardown logic invoked when a [`Tx`] is dropped
@@ -611,13 +682,16 @@ pub trait Transact {
     /// On success: drops the transaction (committed), applies the forward
     /// changeset to the world, and returns `Ok(value)`.
     /// On conflict: drops the transaction (abort cleanup runs), retries.
-    /// After exhausting retries: returns `Err(Conflict)`.
+    /// After exhausting retries: returns `Err(TransactError::Conflict(_))`.
+    ///
+    /// Returns `Err(TransactError::WorldMismatch(_))` if the strategy was
+    /// created from a different World.
     fn transact<R>(
         &self,
         world: &mut World,
         access: &Access,
         f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
-    ) -> Result<R, Conflict> {
+    ) -> Result<R, TransactError> {
         self.transact_inner(world, access, f)
     }
 
@@ -628,10 +702,10 @@ pub trait Transact {
         world: &mut World,
         access: &Access,
         mut f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
-    ) -> Result<R, Conflict> {
+    ) -> Result<R, TransactError> {
         let mut last_conflict = None;
         for _ in 0..self.max_retries() {
-            let mut tx = self.begin(world, access);
+            let mut tx = self.begin(world, access)?;
             if !tx.is_ready() {
                 drop(tx);
                 continue;
@@ -647,20 +721,26 @@ pub trait Transact {
                         .expect("changeset apply after successful commit");
                     return Ok(value);
                 }
-                Err(conflict) => {
+                Err(TransactError::Conflict(conflict)) => {
                     last_conflict = Some(conflict);
                     drop(tx);
                 }
+                Err(e @ TransactError::WorldMismatch(_)) => return Err(e),
             }
         }
-        Err(last_conflict.unwrap_or_else(|| Conflict {
-            component_ids: FixedBitSet::new(),
-        }))
+        Err(TransactError::Conflict(last_conflict.unwrap_or_else(
+            || Conflict {
+                component_ids: FixedBitSet::new(),
+            },
+        )))
     }
 
     /// Begin a transaction. Snapshots ticks (optimistic) or acquires
     /// locks (pessimistic). Returns a [`Tx`] with strategy-specific cleanup.
-    fn begin(&self, world: &mut World, access: &Access) -> Tx<'_>;
+    ///
+    /// Returns `Err(WorldMismatch)` if the strategy was created from a
+    /// different World.
+    fn begin(&self, world: &mut World, access: &Access) -> Result<Tx<'_>, WorldMismatch>;
 
     /// Validate and extract the changeset. Does NOT apply it — the caller
     /// (typically the default `transact` impl) applies the returned
@@ -668,39 +748,44 @@ pub trait Transact {
     ///
     /// On success: returns the forward changeset (marks the tx for commit
     /// is the caller's responsibility via `tx.mark_committed()`).
-    /// On failure: returns `Err(Conflict)`. The tx will abort on drop.
-    fn try_commit(&self, tx: &mut Tx<'_>, world: &mut World) -> Result<EnumChangeSet, Conflict>;
+    /// On failure: returns `Err(TransactError::Conflict(_))` or
+    /// `Err(TransactError::WorldMismatch(_))`.
+    fn try_commit(
+        &self,
+        tx: &mut Tx<'_>,
+        world: &mut World,
+    ) -> Result<EnumChangeSet, TransactError>;
 
-    /// Maximum number of retry attempts before returning `Err(Conflict)`.
+    /// Maximum number of retry attempts before returning `Err(TransactError::Conflict(_))`.
     fn max_retries(&self) -> usize;
 }
 
 impl Transact for Optimistic {
-    fn begin(&self, world: &mut World, access: &Access) -> Tx<'_> {
-        assert_eq!(
-            self.world_id,
-            world.world_id(),
-            "strategy used with a different World than it was created from"
-        );
+    fn begin(&self, world: &mut World, access: &Access) -> Result<Tx<'_>, WorldMismatch> {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new());
+        }
         let mut accessed = access.reads().clone();
         accessed.union_with(access.writes());
         let read_ticks = world.snapshot_column_ticks(&accessed);
         let archetype_count = world.archetypes.archetypes.len();
-        Tx::new(
+        Ok(Tx::new(
             archetype_count,
             self.orphan_queue.clone(),
             Box::new(OptimisticCleanup {
                 read_ticks: Some(read_ticks),
             }),
-        )
+        ))
     }
 
-    fn try_commit(&self, tx: &mut Tx<'_>, world: &mut World) -> Result<EnumChangeSet, Conflict> {
-        assert_eq!(
-            self.world_id,
-            world.world_id(),
-            "strategy used with a different World than it was created from"
-        );
+    fn try_commit(
+        &self,
+        tx: &mut Tx<'_>,
+        world: &mut World,
+    ) -> Result<EnumChangeSet, TransactError> {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new().into());
+        }
         let read_ticks = tx
             .cleanup
             .take_read_ticks()
@@ -709,7 +794,8 @@ impl Transact for Optimistic {
         if !conflicts.is_empty() {
             return Err(Conflict {
                 component_ids: conflicts,
-            });
+            }
+            .into());
         }
         Ok(tx.take_changeset())
     }
@@ -725,10 +811,10 @@ impl Transact for Pessimistic {
         world: &mut World,
         access: &Access,
         mut f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
-    ) -> Result<R, Conflict> {
+    ) -> Result<R, TransactError> {
         let mut last_conflict = None;
         for attempt in 0..self.max_retries() {
-            let mut tx = Transact::begin(self, world, access);
+            let mut tx = Transact::begin(self, world, access)?;
             if !tx.is_ready() {
                 // Lock acquisition failed — abort and retry with backoff
                 drop(tx);
@@ -746,24 +832,25 @@ impl Transact for Pessimistic {
                         .expect("changeset apply after successful commit");
                     return Ok(value);
                 }
-                Err(conflict) => {
+                Err(TransactError::Conflict(conflict)) => {
                     last_conflict = Some(conflict);
                     drop(tx);
                     backoff(attempt);
                 }
+                Err(e @ TransactError::WorldMismatch(_)) => return Err(e),
             }
         }
-        Err(last_conflict.unwrap_or_else(|| Conflict {
-            component_ids: FixedBitSet::new(),
-        }))
+        Err(TransactError::Conflict(last_conflict.unwrap_or_else(
+            || Conflict {
+                component_ids: FixedBitSet::new(),
+            },
+        )))
     }
 
-    fn begin(&self, world: &mut World, access: &Access) -> Tx<'_> {
-        assert_eq!(
-            self.world_id,
-            world.world_id(),
-            "strategy used with a different World than it was created from"
-        );
+    fn begin(&self, world: &mut World, access: &Access) -> Result<Tx<'_>, WorldMismatch> {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new());
+        }
         let lock_result = self.lock_table.lock().acquire(
             &world.archetypes.archetypes,
             access.reads(),
@@ -771,22 +858,24 @@ impl Transact for Pessimistic {
         );
         let locks = lock_result.ok();
         let archetype_count = world.archetypes.archetypes.len();
-        Tx::new(
+        Ok(Tx::new(
             archetype_count,
             self.orphan_queue.clone(),
             Box::new(PessimisticCleanup {
                 locks,
                 lock_table: &self.lock_table,
             }),
-        )
+        ))
     }
 
-    fn try_commit(&self, tx: &mut Tx<'_>, world: &mut World) -> Result<EnumChangeSet, Conflict> {
-        assert_eq!(
-            self.world_id,
-            world.world_id(),
-            "strategy used with a different World than it was created from"
-        );
+    fn try_commit(
+        &self,
+        tx: &mut Tx<'_>,
+        world: &mut World,
+    ) -> Result<EnumChangeSet, TransactError> {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new().into());
+        }
         let locks = tx.cleanup.take_locks();
         if let Some(locks) = locks {
             let changeset = tx.take_changeset();
@@ -795,7 +884,8 @@ impl Transact for Pessimistic {
         } else {
             Err(Conflict {
                 component_ids: FixedBitSet::new(),
-            })
+            }
+            .into())
         }
     }
 
@@ -902,7 +992,7 @@ mod tests {
 
         let spawned_entity;
         {
-            let mut tx = Transact::begin(&strategy, &mut world, &access);
+            let mut tx = Transact::begin(&strategy, &mut world, &access).unwrap();
             spawned_entity = tx.spawn(&mut world, (Pos(1.0),));
             // drop without commit — entity ID goes to orphan queue via Tx Drop
         }
@@ -925,7 +1015,7 @@ mod tests {
 
         let spawned_entity;
         {
-            let mut tx = Transact::begin(&strategy, &mut world, &access);
+            let mut tx = Transact::begin(&strategy, &mut world, &access).unwrap();
             spawned_entity = tx.spawn(&mut world, (Pos(1.0),));
             // drop without commit — entity ID goes to orphan queue via Tx Drop
         }
@@ -945,7 +1035,7 @@ mod tests {
         let access = Access::of::<(&Pos, &mut Pos)>(&mut world);
         let strategy = Optimistic::new(&world);
 
-        let mut tx = Transact::begin(&strategy, &mut world, &access);
+        let mut tx = Transact::begin(&strategy, &mut world, &access).unwrap();
         let spawned = tx.spawn(&mut world, (Pos(99.0),));
 
         // Mutate a read column to force conflict
@@ -965,34 +1055,34 @@ mod tests {
     // ── Cross-world safety tests ─────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "different World")]
-    fn optimistic_begin_panics_on_wrong_world() {
+    fn optimistic_begin_returns_err_on_wrong_world() {
         let mut world_a = World::new();
         let mut world_b = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world_a);
         let strategy = Optimistic::new(&world_a);
-        let _tx = Transact::begin(&strategy, &mut world_b, &access);
+        let result = Transact::begin(&strategy, &mut world_b, &access);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "different World")]
-    fn pessimistic_begin_panics_on_wrong_world() {
+    fn pessimistic_begin_returns_err_on_wrong_world() {
         let mut world_a = World::new();
         let mut world_b = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world_a);
         let strategy = Pessimistic::new(&world_a);
-        let _tx = Transact::begin(&strategy, &mut world_b, &access);
+        let result = Transact::begin(&strategy, &mut world_b, &access);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "different World")]
-    fn optimistic_commit_panics_on_wrong_world() {
+    fn optimistic_commit_returns_err_on_wrong_world() {
         let mut world_a = World::new();
         let mut world_b = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world_a);
         let strategy = Optimistic::new(&world_a);
-        let mut tx = Transact::begin(&strategy, &mut world_a, &access);
-        let _ = strategy.try_commit(&mut tx, &mut world_b);
+        let mut tx = Transact::begin(&strategy, &mut world_a, &access).unwrap();
+        let result = strategy.try_commit(&mut tx, &mut world_b);
+        assert!(matches!(result, Err(TransactError::WorldMismatch(_))));
     }
 
     // ── Tx (unified) tests ──────────────────────────────────────────
@@ -1183,13 +1273,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "different World")]
-    fn transact_panics_on_wrong_world() {
+    fn transact_returns_err_on_wrong_world() {
         let mut world_a = World::new();
         let mut world_b = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world_a);
         let strategy = Optimistic::new(&world_a);
-        let _ = strategy.transact(&mut world_b, &access, |_tx, _world| {});
+        let result = strategy.transact(&mut world_b, &access, |_tx, _world| {});
+        assert!(matches!(result, Err(TransactError::WorldMismatch(_))));
     }
 
     // ── Conflict display tests ──────────────────────────────────────
@@ -1362,7 +1452,7 @@ mod tests {
         let strategy = Arc::new(Pessimistic::with_retries(&world, 1));
 
         // Hold locks via begin(), then try to transact — should exhaust retries
-        let tx = strategy.begin(&mut world, &access);
+        let tx = strategy.begin(&mut world, &access).unwrap();
         assert!(tx.has_locks());
 
         let result = strategy.transact(&mut world, &access, |_tx, _world| {});
