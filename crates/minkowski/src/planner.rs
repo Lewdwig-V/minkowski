@@ -236,6 +236,275 @@ impl Cost {
     }
 }
 
+// ── Aggregates ───────────────────────────────────────────────────────
+
+/// Aggregate operation to apply to matched entities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggregateOp {
+    /// Count matching entities.
+    Count,
+    /// Sum a numeric component (extracted via closure).
+    Sum,
+    /// Find the minimum value of a numeric component.
+    Min,
+    /// Find the maximum value of a numeric component.
+    Max,
+    /// Compute the arithmetic mean of a numeric component.
+    Avg,
+}
+
+impl fmt::Display for AggregateOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AggregateOp::Count => f.write_str("COUNT"),
+            AggregateOp::Sum => f.write_str("SUM"),
+            AggregateOp::Min => f.write_str("MIN"),
+            AggregateOp::Max => f.write_str("MAX"),
+            AggregateOp::Avg => f.write_str("AVG"),
+        }
+    }
+}
+
+/// Type-erased value extractor: given `&World` and `Entity`, return the
+/// component value as `f64` for aggregate computation. Returns `None` if
+/// the entity does not have the component.
+type ValueExtractor = Arc<dyn Fn(&World, Entity) -> Option<f64> + Send + Sync>;
+
+/// A single aggregate expression: an operation applied to values extracted
+/// from matched entities.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use minkowski::planner::{AggregateExpr, AggregateOp};
+///
+/// // Count all matching entities.
+/// let count = AggregateExpr::count();
+///
+/// // Sum a component value.
+/// let total_score = AggregateExpr::sum::<Score>("Score", |s| s.0 as f64);
+///
+/// // Find the maximum health.
+/// let max_hp = AggregateExpr::max::<Health>("Health", |h| h.0 as f64);
+/// ```
+pub struct AggregateExpr {
+    /// The aggregate operation.
+    pub op: AggregateOp,
+    /// Human-readable label for `explain()` output.
+    label: String,
+    /// Extracts a `f64` value from an entity. `None` for `Count`.
+    extractor: Option<ValueExtractor>,
+}
+
+impl AggregateExpr {
+    /// Count matching entities. No component access needed.
+    pub fn count() -> Self {
+        Self {
+            op: AggregateOp::Count,
+            label: "COUNT(*)".to_string(),
+            extractor: None,
+        }
+    }
+
+    /// Sum a component's value across matching entities.
+    ///
+    /// `name` is a human-readable label for plan output.
+    /// `extract` converts the component reference to `f64`.
+    pub fn sum<T: Component>(
+        name: &str,
+        extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
+    ) -> Self {
+        let label = format!("SUM({name})");
+        Self {
+            op: AggregateOp::Sum,
+            label,
+            extractor: Some(make_extractor::<T>(extract)),
+        }
+    }
+
+    /// Find the minimum component value across matching entities.
+    pub fn min<T: Component>(
+        name: &str,
+        extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
+    ) -> Self {
+        let label = format!("MIN({name})");
+        Self {
+            op: AggregateOp::Min,
+            label,
+            extractor: Some(make_extractor::<T>(extract)),
+        }
+    }
+
+    /// Find the maximum component value across matching entities.
+    pub fn max<T: Component>(
+        name: &str,
+        extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
+    ) -> Self {
+        let label = format!("MAX({name})");
+        Self {
+            op: AggregateOp::Max,
+            label,
+            extractor: Some(make_extractor::<T>(extract)),
+        }
+    }
+
+    /// Compute the arithmetic mean of a component's value.
+    pub fn avg<T: Component>(
+        name: &str,
+        extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
+    ) -> Self {
+        let label = format!("AVG({name})");
+        Self {
+            op: AggregateOp::Avg,
+            label,
+            extractor: Some(make_extractor::<T>(extract)),
+        }
+    }
+}
+
+impl fmt::Debug for AggregateExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AggregateExpr")
+            .field("op", &self.op)
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Build a type-erased value extractor from a typed extraction closure.
+fn make_extractor<T: Component>(
+    extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
+) -> ValueExtractor {
+    Arc::new(move |world: &World, entity: Entity| world.get::<T>(entity).map(&extract))
+}
+
+/// Accumulator state for computing aggregates during plan execution.
+#[derive(Clone, Debug)]
+struct AggregateAccum {
+    op: AggregateOp,
+    label: String,
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+impl AggregateAccum {
+    fn new(op: AggregateOp, label: String) -> Self {
+        Self {
+            op,
+            label,
+            count: 0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
+
+    fn feed(&mut self, value: f64) {
+        self.count += 1;
+        match self.op {
+            AggregateOp::Count => {} // count incremented above
+            AggregateOp::Sum => self.sum += value,
+            AggregateOp::Min => {
+                if value < self.min {
+                    self.min = value;
+                }
+            }
+            AggregateOp::Max => {
+                if value > self.max {
+                    self.max = value;
+                }
+            }
+            AggregateOp::Avg => self.sum += value,
+        }
+    }
+
+    fn feed_count(&mut self) {
+        self.count += 1;
+    }
+
+    fn finish(&self) -> f64 {
+        match self.op {
+            AggregateOp::Count => self.count as f64,
+            AggregateOp::Sum => self.sum,
+            AggregateOp::Min => {
+                if self.count == 0 {
+                    f64::NAN
+                } else {
+                    self.min
+                }
+            }
+            AggregateOp::Max => {
+                if self.count == 0 {
+                    f64::NAN
+                } else {
+                    self.max
+                }
+            }
+            AggregateOp::Avg => {
+                if self.count == 0 {
+                    f64::NAN
+                } else {
+                    self.sum / self.count as f64
+                }
+            }
+        }
+    }
+}
+
+/// The result of executing an aggregate plan.
+///
+/// Contains one `f64` result per aggregate expression, in the same order
+/// they were added via [`ScanBuilder::aggregate`].
+#[derive(Clone, Debug)]
+pub struct AggregateResult {
+    values: Vec<(String, f64)>,
+}
+
+impl AggregateResult {
+    /// Number of aggregate values.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Returns `true` if there are no aggregate values.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Get aggregate value by index (in order of `aggregate()` calls).
+    pub fn get(&self, index: usize) -> Option<f64> {
+        self.values.get(index).map(|(_, v)| *v)
+    }
+
+    /// Get aggregate value by label (e.g. `"SUM(Score)"`).
+    pub fn get_by_label(&self, label: &str) -> Option<f64> {
+        self.values
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, v)| *v)
+    }
+
+    /// Iterate over `(label, value)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, f64)> + '_ {
+        self.values.iter().map(|(l, v)| (l.as_str(), *v))
+    }
+}
+
+impl fmt::Display for AggregateResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{")?;
+        for (i, (label, value)) in self.values.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{label}: {value:.2}")?;
+        }
+        write!(f, "}}")
+    }
+}
+
 // ── Index descriptors (type-erased metadata for planning) ────────────
 
 /// Capability of a registered index.
@@ -660,6 +929,13 @@ pub enum PlanNode {
         join_kind: JoinKind,
         cost: Cost,
     },
+    /// Aggregate: compute aggregate functions over child output.
+    Aggregate {
+        child: Box<PlanNode>,
+        /// Human-readable labels for each aggregate (e.g. `["COUNT(*)", "SUM(Score)"]`).
+        aggregates: Vec<String>,
+        cost: Cost,
+    },
 }
 
 impl PlanNode {
@@ -672,7 +948,8 @@ impl PlanNode {
             | PlanNode::SpatialLookup { cost, .. }
             | PlanNode::Filter { cost, .. }
             | PlanNode::HashJoin { cost, .. }
-            | PlanNode::NestedLoopJoin { cost, .. } => *cost,
+            | PlanNode::NestedLoopJoin { cost, .. }
+            | PlanNode::Aggregate { cost, .. } => *cost,
         }
     }
 
@@ -765,6 +1042,19 @@ impl PlanNode {
                 )?;
                 left.fmt_indent(f, indent + 1)?;
                 right.fmt_indent(f, indent + 1)
+            }
+            PlanNode::Aggregate {
+                child,
+                aggregates,
+                cost,
+            } => {
+                let agg_list = aggregates.join(", ");
+                writeln!(
+                    f,
+                    "Aggregate [{agg_list}] rows={:.0} cpu={:.1}",
+                    cost.rows, cost.cpu
+                )?;
+                child.fmt_indent(f, indent + 1)
             }
         }
     }
@@ -870,6 +1160,8 @@ pub struct QueryPlanResult {
     warnings: Vec<PlanWarning>,
     last_read_tick: Tick,
     world_id: WorldId,
+    /// Aggregate expressions for `execute_aggregates()`. Empty if no aggregates.
+    aggregate_exprs: Vec<AggregateExpr>,
 }
 
 impl QueryPlanResult {
@@ -1054,6 +1346,174 @@ impl QueryPlanResult {
         Ok(())
     }
 
+    /// Returns `true` if this plan has aggregate expressions.
+    pub fn has_aggregates(&self) -> bool {
+        !self.aggregate_exprs.is_empty()
+    }
+
+    /// Execute aggregate functions over matched entities, returning computed values.
+    ///
+    /// This runs the underlying scan/filter/join plan and feeds each matching
+    /// entity through the aggregate accumulators in a single pass.
+    ///
+    /// Returns `Err(WorldMismatch)` if `world` is not the same World this
+    /// plan was built from.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no aggregate expressions were added during plan construction.
+    pub fn execute_aggregates(
+        &mut self,
+        world: &mut World,
+    ) -> Result<AggregateResult, WorldMismatch> {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new(self.world_id, world.world_id()));
+        }
+        assert!(
+            !self.aggregate_exprs.is_empty(),
+            "execute_aggregates() called on a plan with no aggregate expressions"
+        );
+
+        // Initialize accumulators.
+        let mut accums: Vec<AggregateAccum> = self
+            .aggregate_exprs
+            .iter()
+            .map(|expr| AggregateAccum::new(expr.op, expr.label.clone()))
+            .collect();
+
+        // Clone extractors for use in the closure (Arc clone = ref-count bump).
+        let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
+            .aggregate_exprs
+            .iter()
+            .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
+            .collect();
+
+        let tick = self.last_read_tick;
+
+        // Use the compiled scan path (handles all driver types: spatial, index, archetype).
+        if let Some(compiled) = &mut self.compiled_for_each {
+            compiled(&*world, tick, &mut |entity: Entity| {
+                for (i, (op, extractor)) in extractors.iter().enumerate() {
+                    if *op == AggregateOp::Count {
+                        accums[i].feed_count();
+                    } else if let Some(ext) = extractor
+                        && let Some(val) = ext(world, entity)
+                    {
+                        accums[i].feed(val);
+                    }
+                }
+            });
+        } else if let Some(join) = &mut self.join_exec {
+            // For join plans, collect entities first then aggregate.
+            let scratch = self
+                .scratch
+                .as_mut()
+                .expect("aggregate on join plan requires scratch buffer");
+            scratch.clear();
+
+            (join.left_collector)(&*world, tick, scratch);
+            for step in &mut join.steps {
+                let left_len = scratch.len();
+                (step.right_collector)(&*world, tick, scratch);
+                match step.join_kind {
+                    JoinKind::Inner => {
+                        let match_count = scratch.sorted_intersection(left_len).len();
+                        if match_count > 0 {
+                            let total = scratch.entities.len();
+                            scratch.entities.copy_within(total - match_count.., 0);
+                        }
+                        scratch.entities.truncate(match_count);
+                    }
+                    JoinKind::Left => {
+                        scratch.entities.truncate(left_len);
+                    }
+                }
+            }
+            for &entity in scratch.as_slice() {
+                for (i, (op, extractor)) in extractors.iter().enumerate() {
+                    if *op == AggregateOp::Count {
+                        accums[i].feed_count();
+                    } else if let Some(ext) = extractor
+                        && let Some(val) = ext(world, entity)
+                    {
+                        accums[i].feed(val);
+                    }
+                }
+            }
+        } else {
+            panic!(
+                "execute_aggregates() called on a plan with no compiled scan and no join executor"
+            );
+        }
+
+        self.last_read_tick = world.next_tick();
+
+        let values = accums
+            .iter()
+            .map(|a| (a.label.clone(), a.finish()))
+            .collect();
+        Ok(AggregateResult { values })
+    }
+
+    /// Execute aggregate functions with read-only world access.
+    ///
+    /// For use inside transactions where only `&World` is available.
+    /// No tick advancement. Requires the plan's query to be `ReadOnlyWorldQuery`.
+    ///
+    /// Returns `Err(WorldMismatch)` if `world` is not the same World this
+    /// plan was built from.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no aggregate expressions were added during plan construction.
+    pub fn execute_aggregates_raw(
+        &mut self,
+        world: &World,
+    ) -> Result<AggregateResult, WorldMismatch> {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new(self.world_id, world.world_id()));
+        }
+        assert!(
+            !self.aggregate_exprs.is_empty(),
+            "execute_aggregates_raw() called on a plan with no aggregate expressions"
+        );
+
+        let mut accums: Vec<AggregateAccum> = self
+            .aggregate_exprs
+            .iter()
+            .map(|expr| AggregateAccum::new(expr.op, expr.label.clone()))
+            .collect();
+
+        let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
+            .aggregate_exprs
+            .iter()
+            .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
+            .collect();
+
+        let tick = self.last_read_tick;
+
+        let compiled = self.compiled_for_each_raw.as_mut().expect(
+            "execute_aggregates_raw() requires a plan compiled with scan support (no joins).",
+        );
+        compiled(world, tick, &mut |entity: Entity| {
+            for (i, (op, extractor)) in extractors.iter().enumerate() {
+                if *op == AggregateOp::Count {
+                    accums[i].feed_count();
+                } else if let Some(ext) = extractor
+                    && let Some(val) = ext(world, entity)
+                {
+                    accums[i].feed(val);
+                }
+            }
+        });
+
+        let values = accums
+            .iter()
+            .map(|a| (a.label.clone(), a.finish()))
+            .collect();
+        Ok(AggregateResult { values })
+    }
+
     /// Human-readable logical plan (before vectorized lowering).
     pub fn explain_logical(&self) -> String {
         let mut out = String::new();
@@ -1097,6 +1557,7 @@ impl fmt::Debug for QueryPlanResult {
             .field("warnings", &self.warnings)
             .field("last_read_tick", &self.last_read_tick)
             .field("world_id", &self.world_id)
+            .field("aggregate_count", &self.aggregate_exprs.len())
             .finish()
     }
 }
@@ -1500,6 +1961,8 @@ pub struct ScanBuilder<'w> {
     required_for_spatial: Option<FixedBitSet>,
     /// Changed component bitset for spatial index-gather path.
     changed_for_spatial: Option<FixedBitSet>,
+    /// Aggregate expressions to compute over matched entities.
+    aggregates: Vec<AggregateExpr>,
 }
 
 struct JoinSpec {
@@ -1517,6 +1980,25 @@ impl ScanBuilder<'_> {
     /// whether to push it into an index lookup or apply it as a post-filter.
     pub fn filter(mut self, predicate: Predicate) -> Self {
         self.predicates.push(predicate);
+        self
+    }
+
+    /// Add an aggregate expression to compute over matched entities.
+    ///
+    /// Multiple aggregates can be chained. The plan will produce an
+    /// `Aggregate` node that computes all expressions in a single pass.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let plan = planner
+    ///     .scan::<(&Score,)>()
+    ///     .aggregate(AggregateExpr::count())
+    ///     .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+    ///     .build();
+    /// ```
+    pub fn aggregate(mut self, expr: AggregateExpr) -> Self {
+        self.aggregates.push(expr);
         self
     }
 
@@ -1859,7 +2341,7 @@ impl ScanBuilder<'_> {
 
         // Phase 6: Lower logical plan to vectorized plan.
         let opts = VectorizeOpts::default();
-        let vec_root = lower_to_vectorized(&node, &opts);
+        let mut vec_root = lower_to_vectorized(&node, &opts);
 
         // Phase 7: Build join execution state if joins are present.
         // Captures a left collector + one JoinStep per join, supporting
@@ -2219,7 +2701,25 @@ impl ScanBuilder<'_> {
             None
         };
 
-        // Phase 9: Pre-size scratch buffer.
+        // Phase 9: Wrap with aggregate node if aggregates are present.
+        let aggregate_exprs = self.aggregates;
+        if !aggregate_exprs.is_empty() {
+            let agg_labels: Vec<String> = aggregate_exprs.iter().map(|a| a.label.clone()).collect();
+            // Aggregate cost: child cost + constant per-row overhead per aggregate.
+            let child_cost = node.cost();
+            let agg_cost = Cost {
+                rows: 1.0, // aggregates produce a single result row
+                cpu: child_cost.cpu + child_cost.rows * 0.1 * aggregate_exprs.len() as f64,
+            };
+            node = PlanNode::Aggregate {
+                child: Box::new(node),
+                aggregates: agg_labels,
+                cost: agg_cost,
+            };
+            vec_root = lower_to_vectorized(&node, &opts);
+        }
+
+        // Phase 10: Pre-size scratch buffer.
         let scratch = if !self.joins.is_empty() {
             let est = node.cost().rows as usize;
             Some(ScratchBuffer::new(est * 3)) // room for left + right + output
@@ -2238,6 +2738,7 @@ impl ScanBuilder<'_> {
             warnings,
             last_read_tick: Tick::default(),
             world_id: self.world_id,
+            aggregate_exprs,
         }
     }
 }
@@ -2554,6 +3055,7 @@ impl<'w> QueryPlanner<'w> {
             left_changed: Some(left_changed),
             required_for_spatial: Some(required_for_spatial),
             changed_for_spatial: Some(changed_for_spatial),
+            aggregates: Vec::new(),
         }
     }
 
@@ -2624,6 +3126,7 @@ impl<'w> QueryPlanner<'w> {
             left_changed: Some(left_changed),
             required_for_spatial: Some(required_for_spatial),
             changed_for_spatial: Some(changed_for_spatial),
+            aggregates: Vec::new(),
         }
     }
 
@@ -2848,6 +3351,15 @@ pub enum VecExecNode {
         join_kind: JoinKind,
         cost: Cost,
     },
+
+    /// Stream aggregate: compute aggregate functions while streaming child rows.
+    /// Single pass — no intermediate materialization.
+    StreamAggregate {
+        child: Box<VecExecNode>,
+        /// Human-readable labels for each aggregate.
+        aggregates: Vec<String>,
+        cost: Cost,
+    },
 }
 
 impl VecExecNode {
@@ -2860,7 +3372,8 @@ impl VecExecNode {
             | VecExecNode::SpatialGather { cost, .. }
             | VecExecNode::SIMDFilter { cost, .. }
             | VecExecNode::PartitionedHashJoin { cost, .. }
-            | VecExecNode::BatchNestedLoopJoin { cost, .. } => *cost,
+            | VecExecNode::BatchNestedLoopJoin { cost, .. }
+            | VecExecNode::StreamAggregate { cost, .. } => *cost,
         }
     }
 
@@ -2959,6 +3472,19 @@ impl VecExecNode {
                 )?;
                 left.fmt_indent(f, indent + 1)?;
                 right.fmt_indent(f, indent + 1)
+            }
+            VecExecNode::StreamAggregate {
+                child,
+                aggregates,
+                cost,
+            } => {
+                let agg_list = aggregates.join(", ");
+                writeln!(
+                    f,
+                    "StreamAggregate [{agg_list}] rows={:.0} cpu={:.1}",
+                    cost.rows, cost.cpu
+                )?;
+                child.fmt_indent(f, indent + 1)
             }
         }
     }
@@ -3252,6 +3778,29 @@ fn lower_to_vectorized(node: &PlanNode, opts: &VectorizeOpts) -> VecExecNode {
                 left: Box::new(vec_left),
                 right: Box::new(vec_right),
                 join_kind: *join_kind,
+                cost: vec_cost,
+            }
+        }
+
+        PlanNode::Aggregate {
+            child,
+            aggregates,
+            cost,
+        } => {
+            let vec_child = lower_to_vectorized(child, opts);
+
+            // Stream aggregate: single pass over child output. The per-row
+            // cost is negligible (accumulator update), so we model it as
+            // child cost + a small constant per aggregate.
+            let agg_overhead = aggregates.len() as f64 * 0.1;
+            let vec_cost = Cost {
+                rows: cost.rows,
+                cpu: vec_child.cost().cpu + agg_overhead,
+            };
+
+            VecExecNode::StreamAggregate {
+                child: Box::new(vec_child),
+                aggregates: aggregates.clone(),
                 cost: vec_cost,
             }
         }
@@ -7544,5 +8093,311 @@ mod tests {
         let result =
             Predicate::intersects::<Pos>(Vec::<f64>::new(), Vec::<f64>::new(), |_, _| true);
         assert!(result.is_err());
+    }
+
+    // ── Aggregate tests ──────────────────────────────────────────────
+
+    #[test]
+    fn aggregate_count_empty_world() {
+        let mut world = World::new();
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get(0), Some(0.0));
+    }
+
+    #[test]
+    fn aggregate_count() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.get(0), Some(100.0));
+    }
+
+    #[test]
+    fn aggregate_sum() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        // sum(0..10) = 45
+        assert_eq!(result.get(0), Some(45.0));
+    }
+
+    #[test]
+    fn aggregate_min_max() {
+        let mut world = World::new();
+        for i in 5..15 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::min::<Score>("Score", |s| s.0 as f64))
+            .aggregate(AggregateExpr::max::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.get(0), Some(5.0));
+        assert_eq!(result.get(1), Some(14.0));
+    }
+
+    #[test]
+    fn aggregate_avg() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::avg::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        // avg(0..10) = 4.5
+        assert_eq!(result.get(0), Some(4.5));
+    }
+
+    #[test]
+    fn aggregate_multiple_expressions() {
+        let mut world = World::new();
+        for i in 1..=5 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .aggregate(AggregateExpr::min::<Score>("Score", |s| s.0 as f64))
+            .aggregate(AggregateExpr::max::<Score>("Score", |s| s.0 as f64))
+            .aggregate(AggregateExpr::avg::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.get(0), Some(5.0)); // count
+        assert_eq!(result.get(1), Some(15.0)); // sum(1+2+3+4+5)
+        assert_eq!(result.get(2), Some(1.0)); // min
+        assert_eq!(result.get(3), Some(5.0)); // max
+        assert_eq!(result.get(4), Some(3.0)); // avg
+    }
+
+    #[test]
+    fn aggregate_with_filter() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom::<Score>(
+                "score >= 50",
+                0.5,
+                |world: &World, entity: Entity| {
+                    world.get::<Score>(entity).is_some_and(|s| s.0 >= 50)
+                },
+            ))
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.get(0), Some(50.0)); // 50 entities match
+        // sum(50..100) = 50*75-1 = 3725
+        let expected_sum: f64 = (50..100).map(|i| i as f64).sum();
+        assert_eq!(result.get(1), Some(expected_sum));
+    }
+
+    #[test]
+    fn aggregate_get_by_label() {
+        let mut world = World::new();
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.get_by_label("COUNT(*)"), Some(5.0));
+        assert_eq!(result.get_by_label("SUM(Score)"), Some(10.0));
+        assert_eq!(result.get_by_label("NONEXISTENT"), None);
+    }
+
+    #[test]
+    fn aggregate_plan_node_in_explain() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let explain = plan.explain();
+        assert!(explain.contains("StreamAggregate"));
+        assert!(explain.contains("COUNT(*)"));
+        assert!(explain.contains("SUM(Score)"));
+
+        let logical = plan.explain_logical();
+        assert!(logical.contains("Aggregate"));
+        assert!(logical.contains("COUNT(*)"));
+    }
+
+    #[test]
+    fn aggregate_has_aggregates() {
+        let mut world = World::new();
+        world.spawn((Score(1),));
+        let planner = QueryPlanner::new(&world);
+
+        let plan_no_agg = planner.scan::<(&Score,)>().build();
+        assert!(!plan_no_agg.has_aggregates());
+
+        let plan_with_agg = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .build();
+        assert!(plan_with_agg.has_aggregates());
+    }
+
+    #[test]
+    fn aggregate_result_display() {
+        let result = AggregateResult {
+            values: vec![
+                ("COUNT(*)".to_string(), 10.0),
+                ("SUM(Score)".to_string(), 45.0),
+            ],
+        };
+        let display = format!("{result}");
+        assert!(display.contains("COUNT(*)"));
+        assert!(display.contains("SUM(Score)"));
+    }
+
+    #[test]
+    fn aggregate_min_max_on_empty_returns_nan() {
+        let mut world = World::new();
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::min::<Score>("Score", |s| s.0 as f64))
+            .aggregate(AggregateExpr::max::<Score>("Score", |s| s.0 as f64))
+            .aggregate(AggregateExpr::avg::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert!(result.get(0).unwrap().is_nan()); // min on empty
+        assert!(result.get(1).unwrap().is_nan()); // max on empty
+        assert!(result.get(2).unwrap().is_nan()); // avg on empty
+    }
+
+    #[test]
+    fn aggregate_execute_raw() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let result = plan.execute_aggregates_raw(&world).unwrap();
+        assert_eq!(result.get(0), Some(10.0));
+        assert_eq!(result.get(1), Some(45.0));
+    }
+
+    #[test]
+    fn aggregate_with_index_driver() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let idx = Arc::new(idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index::<Score>(&idx, &world).unwrap();
+
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.get(0), Some(40.0)); // 10..50 = 40 entities
+        let expected_sum: f64 = (10..50).map(|i| i as f64).sum();
+        assert_eq!(result.get(1), Some(expected_sum));
+    }
+
+    #[test]
+    fn aggregate_result_iter() {
+        let result = AggregateResult {
+            values: vec![
+                ("COUNT(*)".to_string(), 10.0),
+                ("SUM(Score)".to_string(), 45.0),
+            ],
+        };
+        let items: Vec<_> = result.iter().collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], ("COUNT(*)", 10.0));
+        assert_eq!(items[1], ("SUM(Score)", 45.0));
+    }
+
+    #[test]
+    fn aggregate_op_display() {
+        assert_eq!(format!("{}", AggregateOp::Count), "COUNT");
+        assert_eq!(format!("{}", AggregateOp::Sum), "SUM");
+        assert_eq!(format!("{}", AggregateOp::Min), "MIN");
+        assert_eq!(format!("{}", AggregateOp::Max), "MAX");
+        assert_eq!(format!("{}", AggregateOp::Avg), "AVG");
+    }
+
+    #[test]
+    fn aggregate_plan_cost_single_row() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .build();
+
+        // Aggregate produces 1 result row.
+        assert_eq!(plan.root().cost().rows, 1.0);
     }
 }
