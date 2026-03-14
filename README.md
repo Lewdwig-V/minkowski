@@ -45,7 +45,7 @@ registry.run(&mut world, move_id, ());
 ### Building & testing
 
 ```
-cargo test -p minkowski                # 485 tests
+cargo test -p minkowski                # 644+ tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
@@ -60,6 +60,7 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 - **Split-phase transactions** — `Tx` does not hold `&mut World`. Transactions read concurrently via `&World`, buffer writes privately, and commit sequentially. The borrow checker enforces the phase boundary.
 - **Composable persistence** — `Durable<S>` wraps any transaction strategy to add WAL logging. Zero-copy snapshot loading via mmap + rkyv. The core engine has no serialization dependency.
 - **Mechanisms, not policy** — no built-in scheduler, no application lifecycle. Minkowski provides `Access` bitsets and `is_compatible()` for framework authors to build their own scheduling. Secondary indexes are external consumers of the change detection system.
+- **Results, not panics** — user-triggerable error conditions (dead entities, pool exhaustion, invalid planner inputs, duplicate codec registrations) return `Result` so the caller decides whether to panic, retry, or recover. Internal invariants that users cannot violate through public APIs remain as panics.
 
 ## Deep Dive
 
@@ -72,7 +73,7 @@ Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration
 | Layer | What it catches | When it runs |
 |---|---|---|
 | **Type system + borrow checker** | Aliased `&mut T`, lifetime violations, `Send`/`Sync` misuse. `ReadOnlyWorldQuery` prevents `&mut T` through `&World`. | Every build |
-| **480 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
+| **644 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
 | **[Miri][miri] + [Tree Borrows][tree-borrows]** | Undefined behavior: use-after-free, uninitialized reads, aliasing violations in `unsafe` blocks. Full test suite passes under the strict Tree Borrows model. | Every PR (CI) |
 | **[ThreadSanitizer][tsan]** | Data races: unsynchronized concurrent memory accesses. Full test suite including rayon `par_for_each` passes under TSan instrumentation. | Every PR (CI) |
 | **[Loom][loom]** | Concurrency invariant violations: exhaustive thread interleaving enumeration over OrphanQueue push/drain, column lock acquire/upgrade/deadlock-freedom, and entity ID reservation contention. | Every PR (CI) |
@@ -87,7 +88,7 @@ Entity IDs are [generational][generational-index] — recycled IDs get bumped ge
 ```rust
 let mut world = World::new();
 let e = world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
-world.insert(e, Health(100));   // migrates entity to new archetype
+world.insert(e, Health(100)).unwrap();   // migrates entity to new archetype (Err on dead entity)
 world.remove::<Health>(e);      // migrates it back
 ```
 
@@ -124,8 +125,8 @@ world.query::<(&mut Pos, &Vel)>().for_each_chunk(|(positions, velocities)| {
 use minkowski::{QueryPlanner, Predicate, JoinKind};
 
 let mut planner = QueryPlanner::new(&world);
-planner.add_btree_index::<Score>(&score_index, &world);
-planner.add_hash_index::<Team>(&team_index, &world);
+planner.add_btree_index::<Score>(&score_index, &world).unwrap();
+planner.add_hash_index::<Team>(&team_index, &world).unwrap();
 
 let mut plan = planner
     .scan::<(&Pos, &Score)>()
@@ -271,7 +272,7 @@ RAM is fast, expensive, and limited. Minkowski provides three complementary feat
 
 ### Pre-allocated Memory Pool
 
-`WorldBuilder` creates a World backed by a single [mmap][mmap] region — all memory is allocated upfront at startup, [TigerBeetle][tigerbeetle]-style. After initialization, `try_spawn` and `try_insert` return `Err(PoolExhausted)` instead of crashing the process on exhaustion. No dynamic allocation on the data path.
+`WorldBuilder` creates a World backed by a single [mmap][mmap] region — all memory is allocated upfront at startup, [TigerBeetle][tigerbeetle]-style. After initialization, `try_spawn` and `try_insert` return `Err(InsertError)` instead of crashing the process on exhaustion. No dynamic allocation on the data path.
 
 ```rust
 use minkowski::{World, HugePages, PoolExhausted};
