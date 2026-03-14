@@ -1417,6 +1417,11 @@ impl QueryPlanResult {
         Ok(())
     }
 
+    /// The `WorldId` this plan was built from.
+    pub fn world_id(&self) -> WorldId {
+        self.world_id
+    }
+
     /// Returns `true` if this plan has aggregate expressions.
     pub fn has_aggregates(&self) -> bool {
         !self.aggregate_exprs.is_empty()

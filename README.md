@@ -175,6 +175,23 @@ sub.for_each(&mut world, |entity| {
 
 `HashDebounce<T>` is the default in-memory debounce filter. Implement `SubscriptionDebounce<T>` on your own type for external-backed deduplication.
 
+### Materialized Views
+
+`MaterializedView` wraps a `QueryPlanResult` and caches the matching entity list. On each `refresh()` call it re-executes the plan, but only if the debounce threshold has been met. Two layers of filtering: the plan's `Changed<T>` filter skips unchanged archetypes, and the configurable `DebouncePolicy` limits how often the plan runs at all.
+
+```rust
+use minkowski::{MaterializedView, DebouncePolicy};
+
+let mut view = MaterializedView::new(plan)
+    .with_debounce(DebouncePolicy::EveryNTicks(NonZeroU64::new(10).unwrap()));
+
+// Per-frame: refresh and read
+view.refresh(&mut world).unwrap();
+for &entity in view.entities() {
+    // cached, debounced result — stale by at most N frames
+}
+```
+
 ## Typed Reducers
 
 Reducers are closures registered with the `ReducerRegistry`. The type signature declares exactly what the closure can access, and the registry extracts `Access` metadata at registration time for conflict detection.
@@ -354,16 +371,18 @@ Together, these three features let a Minkowski deployment run indefinitely withi
 
 ## Examples
 
-17 examples cover the full API surface — from basic queries to multi-threaded replication. See [`examples/README.md`](examples/README.md) for the full catalogue.
+20 examples cover the full API surface — from basic queries to multi-threaded replication. See [`examples/README.md`](examples/README.md) for the full catalogue.
 
 ```
-cargo run -p minkowski-examples --example boids --release      # flocking simulation
-cargo run -p minkowski-examples --example persist --release     # WAL + snapshot lifecycle
-cargo run -p minkowski-examples --example replicate --release   # network replication via channels
-cargo run -p minkowski-examples --example reducer --release     # tour of all 7 reducer handles
-cargo run -p minkowski-examples --example pool --release        # pre-allocated memory pool
-cargo run -p minkowski-examples --example blob --release        # blob offloading to external store
-cargo run -p minkowski-examples --example retention --release   # tick-based entity retention
+cargo run -p minkowski-examples --example boids --release              # flocking simulation
+cargo run -p minkowski-examples --example persist --release             # WAL + snapshot lifecycle
+cargo run -p minkowski-examples --example replicate --release           # network replication via channels
+cargo run -p minkowski-examples --example reducer --release             # tour of all 7 reducer handles
+cargo run -p minkowski-examples --example pool --release                # pre-allocated memory pool
+cargo run -p minkowski-examples --example blob --release                # blob offloading to external store
+cargo run -p minkowski-examples --example retention --release           # tick-based entity retention
+cargo run -p minkowski-examples --example planner --release             # query planner with index selection
+cargo run -p minkowski-examples --example materialized_view --release   # cached subscription views
 ```
 
 ## Python / Jupyter Integration
