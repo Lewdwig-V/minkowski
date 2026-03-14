@@ -1857,6 +1857,44 @@ impl ScanBuilder<'_> {
                         }
                     },
                 )
+            } else if let Some(ref driver) = index_driver {
+                // BTree/Hash index-gather path: use the pre-bound lookup function
+                // instead of archetype scanning. Mirrors the Phase 8 index-gather
+                // closure for the left-side of a join.
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let left_required_for_index = left_required.clone();
+                let left_changed_for_index = left_changed.clone();
+                let left_filters_for_index: Vec<FilterFn> =
+                    left_filters.iter().map(Arc::clone).collect();
+                Box::new(
+                    move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
+                        let candidates = lookup_fn();
+                        for &entity in candidates.iter() {
+                            if !world.is_alive(entity) {
+                                continue;
+                            }
+                            let idx = entity.index() as usize;
+                            let Some(loc) = (idx < world.entity_locations.len())
+                                .then(|| world.entity_locations[idx].as_ref())
+                                .flatten()
+                            else {
+                                continue;
+                            };
+                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                            if !left_required_for_index.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !left_changed_for_index.is_clear()
+                                && !passes_change_filter(arch, &left_changed_for_index, tick)
+                            {
+                                continue;
+                            }
+                            if left_filters_for_index.iter().all(|f| f(world, entity)) {
+                                scratch.push(entity);
+                            }
+                        }
+                    },
+                )
             } else {
                 // Archetype-scan path (unchanged).
                 Box::new(
@@ -6917,6 +6955,31 @@ mod tests {
         let mut results = Vec::new();
         plan.for_each(&mut world, |entity| results.push(entity));
 
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn index_join_uses_lookup() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42), Pos { x: 1.0, y: 1.0 }));
+        let e2 = world.spawn((Score(42), Pos { x: 2.0, y: 2.0 }));
+        let _e3 = world.spawn((Score(99), Pos { x: 3.0, y: 3.0 }));
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq::<Score>(Score(42)))
+            .join::<(&Pos,)>(JoinKind::Inner)
+            .build();
+
+        let results = plan.execute(&mut world);
         assert_eq!(results.len(), 2);
         assert!(results.contains(&e1));
         assert!(results.contains(&e2));
