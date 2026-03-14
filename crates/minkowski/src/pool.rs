@@ -271,6 +271,117 @@ impl MmapRegion {
     }
 }
 
+// ── Lock-free intrusive stack ────────────────────────────────────────
+
+/// Tagged pointer for ABA-safe lock-free stack operations.
+///
+/// Packed as a `u128`: low 64 bits = pointer, high 64 bits = monotonic tag.
+/// The tag increments on every push/pop, preventing ABA — even if a pointer
+/// is recycled to the same address, the tag will differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+struct TaggedPtr(u128);
+
+#[allow(dead_code)] // Methods used when SlabPool migrates to lock-free.
+impl TaggedPtr {
+    /// Empty stack head (null pointer, tag 0).
+    const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Create a tagged pointer with the given raw pointer and tag.
+    fn new(ptr: *mut u8, tag: u64) -> Self {
+        Self((ptr as u64 as u128) | ((tag as u128) << 64))
+    }
+
+    /// The raw pointer (null if empty).
+    fn ptr(self) -> *mut u8 {
+        self.0 as u64 as *mut u8
+    }
+
+    /// The monotonic tag.
+    fn tag(self) -> u64 {
+        (self.0 >> 64) as u64
+    }
+
+    /// True if the pointer is null (stack is empty).
+    fn is_empty(self) -> bool {
+        (self.0 as u64) == 0
+    }
+
+    /// Return a new TaggedPtr with the same tag incremented by 1.
+    fn with_next(self, ptr: *mut u8) -> Self {
+        Self::new(ptr, self.tag() + 1)
+    }
+}
+
+impl fmt::Debug for TaggedPtr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TaggedPtr({:p}, tag={})", self.ptr(), self.tag())
+    }
+}
+
+/// Atomic head for a lock-free intrusive stack.
+///
+/// Under `cfg(loom)`, falls back to a Mutex because loom cannot model
+/// 128-bit atomic operations. The Mutex shim verifies logical correctness
+/// (no lost blocks, no duplicates) but not CAS retry paths.
+#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
+#[cfg(not(loom))]
+type AtomicHead = atomic::Atomic<u128>;
+
+#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
+#[cfg(loom)]
+type AtomicHead = Mutex<u128>;
+
+/// Load the current head of a free list.
+#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
+#[inline]
+fn load_head(head: &AtomicHead) -> TaggedPtr {
+    #[cfg(not(loom))]
+    {
+        TaggedPtr(head.load(Ordering::Acquire))
+    }
+    #[cfg(loom)]
+    {
+        TaggedPtr(*head.lock())
+    }
+}
+
+/// Compare-and-swap the head of a free list. Returns `true` on success.
+#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
+#[inline]
+fn cas_head(head: &AtomicHead, current: TaggedPtr, new: TaggedPtr) -> bool {
+    #[cfg(not(loom))]
+    {
+        head.compare_exchange(current.0, new.0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    #[cfg(loom)]
+    {
+        let mut guard = head.lock();
+        if *guard == current.0 {
+            *guard = new.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Create a new AtomicHead initialized with the given TaggedPtr.
+#[allow(dead_code)] // Used when SlabPool migrates to lock-free.
+fn new_atomic_head(tp: TaggedPtr) -> AtomicHead {
+    #[cfg(not(loom))]
+    {
+        atomic::Atomic::new(tp.0)
+    }
+    #[cfg(loom)]
+    {
+        Mutex::new(tp.0)
+    }
+}
+
 // ── SlabPool ────────────────────────────────────────────────────────
 
 const NUM_SIZE_CLASSES: usize = 6;
@@ -504,6 +615,35 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("1024"));
         assert!(msg.contains("64"));
+    }
+
+    // ── TaggedPtr tests ──────────────────────────────────────────────
+
+    #[test]
+    fn tagged_ptr_round_trip() {
+        let ptr = 0xDEAD_BEEF_u64;
+        let tag = 42_u64;
+        let packed = (ptr as u128) | ((tag as u128) << 64);
+        let (got_ptr, got_tag) = (packed as u64, (packed >> 64) as u64);
+        assert_eq!(got_ptr, ptr);
+        assert_eq!(got_tag, tag);
+    }
+
+    #[test]
+    fn tagged_ptr_empty() {
+        let tp = TaggedPtr::empty();
+        assert!(tp.is_empty());
+        assert_eq!(tp.ptr(), std::ptr::null_mut());
+    }
+
+    #[test]
+    fn tagged_ptr_with_real_pointer() {
+        let mut val = 0u64;
+        let ptr = &mut val as *mut u64 as *mut u8;
+        let tp = TaggedPtr::new(ptr, 7);
+        assert!(!tp.is_empty());
+        assert_eq!(tp.ptr(), ptr);
+        assert_eq!(tp.tag(), 7);
     }
 
     // ── SlabPool tests ──────────────────────────────────────────────
