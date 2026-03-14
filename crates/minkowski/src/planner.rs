@@ -285,15 +285,14 @@ struct IndexDescriptor {
     kind: IndexKind,
     /// Type-erased function that returns all entities tracked by this index.
     /// Captured at registration time when the concrete index type is available.
-    /// Reserved for future index-gather execution path.
     all_entities_fn: Option<IndexLookupFn>,
     /// Predicate-specific equality lookup. Takes `&dyn Any` (downcast to `T`),
     /// returns only entities matching the exact value. O(log n) for BTree, O(1) for Hash.
-    /// Reserved for future index-gather execution path.
+    /// Bound into an `IndexDriver` lookup closure at Phase 3 plan-build time.
     eq_lookup_fn: Option<PredicateLookupFn>,
     /// Predicate-specific range lookup. Takes `&dyn Any` (downcast to `(Bound<T>, Bound<T>)`),
     /// returns only entities within the range. O(log n + k) for BTree, not available for Hash.
-    /// Reserved for future index-gather execution path.
+    /// Bound into an `IndexDriver` lookup closure at Phase 3 plan-build time.
     range_lookup_fn: Option<PredicateLookupFn>,
 }
 
@@ -310,8 +309,8 @@ impl fmt::Debug for IndexDescriptor {
 }
 
 // IndexDescriptor methods removed: lookup_fn_for was part of the old
-// ExecNode-based execution engine. Index-driven execution now uses
-// filter fusion into the compiled scan closure.
+// ExecNode-based execution engine. Index-driven execution now uses an
+// IndexDriver pre-bound at Phase 3 and compiled into the for_each closure.
 
 // ── Predicates ───────────────────────────────────────────────────────
 
@@ -335,8 +334,7 @@ pub struct Predicate {
     /// Type-erased predicate value for index lookups. Eq stores `Arc<T>`,
     /// Range stores `Arc<(Bound<T>, Bound<T>)>`. Downcast by the index's
     /// `eq_lookup_fn` / `range_lookup_fn` at plan-build time.
-    /// Reserved for future index-gather execution path.
-    #[expect(dead_code)]
+    /// Bound into the `IndexDriver` lookup closure at Phase 3 plan-build time.
     lookup_value: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
@@ -1420,6 +1418,15 @@ struct SpatialDriver {
     lookup_fn: SpatialLookupFn,
 }
 
+/// Carries a pre-bound index lookup function from Phase 3 (driver selection)
+/// to Phase 7 (join collectors) and Phase 8 (closure compilation).
+///
+/// The lookup function and predicate value are bound together at construction
+/// time, so the execution path never sees `dyn Any`.
+struct IndexDriver {
+    lookup_fn: IndexLookupFn,
+}
+
 /// Builder for a single-table scan with optional predicates and joins.
 pub struct ScanBuilder<'w> {
     planner: &'w QueryPlanner<'w>,
@@ -1630,6 +1637,31 @@ impl ScanBuilder<'_> {
                     expr: sp.into(),
                     lookup_fn: Arc::clone(lookup_fn),
                 })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Compute index driver — pre-binds lookup fn + value for Phase 7/8.
+        // Only used when no spatial driver is selected (spatial takes priority).
+        let index_driver = if spatial_driver.is_none() {
+            if let Some((first_pred, first_idx)) = index_preds.first() {
+                let lookup_fn = match first_pred.kind {
+                    PredicateKind::Eq => first_idx.eq_lookup_fn.as_ref(),
+                    PredicateKind::Range => first_idx.range_lookup_fn.as_ref(),
+                    _ => None,
+                };
+                if let (Some(fn_ref), Some(value)) = (lookup_fn, &first_pred.lookup_value) {
+                    let bound_fn = Arc::clone(fn_ref);
+                    let bound_value = Arc::clone(value);
+                    Some(IndexDriver {
+                        lookup_fn: Arc::new(move || bound_fn(&*bound_value)),
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1899,15 +1931,21 @@ impl ScanBuilder<'_> {
         // Clone filter fns for the raw variant (Arc clone is a ref-count bump).
         let all_filter_fns_raw: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
 
-        // Take the required and changed bitsets; clone for the raw variant.
+        // Take the required and changed bitsets; clone for the raw variant and
+        // for the index-driver path (spatial and index branches each move their
+        // own copy into their closure, so we prepare four copies up front).
         let required_for_index = self.required_for_spatial.take().unwrap_or_default();
+        let required_for_index_idx = required_for_index.clone();
         let required_for_index_raw = required_for_index.clone();
+        let required_for_index_idx_raw = required_for_index.clone();
         let changed_for_index = self.changed_for_spatial.take().unwrap_or_default();
+        let changed_for_index_idx = changed_for_index.clone();
         let changed_for_index_raw = changed_for_index.clone();
+        let changed_for_index_idx_raw = changed_for_index.clone();
 
         let compiled_for_each = if self.joins.is_empty() {
             if let Some(ref driver) = spatial_driver {
-                // Index-gather path: call the lookup function instead of
+                // Spatial index-gather path: call the lookup function instead of
                 // scanning archetypes.
                 let lookup_fn = Arc::clone(&driver.lookup_fn);
                 let expr = driver.expr.clone();
@@ -1928,6 +1966,39 @@ impl ScanBuilder<'_> {
                                 .flatten()
                             else {
                                 continue; // alive but unplaced — no archetype
+                            };
+                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                            if !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
+                                continue;
+                            }
+                            if all_filter_fns.iter().all(|f| f(world, entity)) {
+                                callback(entity);
+                            }
+                        }
+                    },
+                ) as CompiledForEach)
+            } else if let Some(ref driver) = index_driver {
+                // BTree/Hash index-gather path — same validation pipeline as
+                // the spatial path but driven by a pre-bound predicate lookup.
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let required = required_for_index_idx;
+                let changed = changed_for_index_idx;
+                Some(Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        let candidates = lookup_fn();
+                        for &entity in candidates.iter() {
+                            if !world.is_alive(entity) {
+                                continue;
+                            }
+                            let idx = entity.index() as usize;
+                            let Some(loc) = (idx < world.entity_locations.len())
+                                .then(|| world.entity_locations[idx].as_ref())
+                                .flatten()
+                            else {
+                                continue;
                             };
                             let arch = &world.archetypes.archetypes[loc.archetype_id.0];
                             if !required.is_subset(&arch.component_ids) {
@@ -1968,7 +2039,7 @@ impl ScanBuilder<'_> {
 
         let compiled_for_each_raw = if self.joins.is_empty() {
             if let Some(ref driver) = spatial_driver {
-                // Index-gather path for the raw (transactional read) variant.
+                // Spatial index-gather path for the raw (transactional read) variant.
                 let lookup_fn = Arc::clone(&driver.lookup_fn);
                 let expr = driver.expr.clone();
                 let required = required_for_index_raw;
@@ -1988,6 +2059,38 @@ impl ScanBuilder<'_> {
                                 .flatten()
                             else {
                                 continue; // alive but unplaced — no archetype
+                            };
+                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                            if !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
+                                continue;
+                            }
+                            if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
+                                callback(entity);
+                            }
+                        }
+                    },
+                ) as CompiledForEachRaw)
+            } else if let Some(ref driver) = index_driver {
+                // BTree/Hash index-gather path for the raw variant.
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let required = required_for_index_idx_raw;
+                let changed = changed_for_index_idx_raw;
+                Some(Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        let candidates = lookup_fn();
+                        for &entity in candidates.iter() {
+                            if !world.is_alive(entity) {
+                                continue;
+                            }
+                            let idx = entity.index() as usize;
+                            let Some(loc) = (idx < world.entity_locations.len())
+                                .then(|| world.entity_locations[idx].as_ref())
+                                .flatten()
+                            else {
+                                continue;
                             };
                             let arch = &world.archetypes.archetypes[loc.archetype_id.0];
                             if !required.is_subset(&arch.component_ids) {
@@ -6789,5 +6892,33 @@ mod tests {
         assert!((center[0] - 10.0).abs() < f64::EPSILON);
         assert!((center[1] - 20.0).abs() < f64::EPSILON);
         assert!((center[2] - 30.0).abs() < f64::EPSILON);
+    }
+
+    // ── IndexDriver for_each execution ──────────────────────────────
+
+    #[test]
+    fn index_for_each_uses_btree_lookup() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42),));
+        let e2 = world.spawn((Score(42),));
+        let _e3 = world.spawn((Score(99),));
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq::<Score>(Score(42)))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
     }
 }
