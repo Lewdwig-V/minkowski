@@ -472,8 +472,9 @@ fn main() {
     // Wrap in Arc so the planner and the lookup closure share ownership.
     let spatial_arc: std::sync::Arc<LinearSpatialIndex> = std::sync::Arc::new(spatial_idx);
 
-    // Fallback scan filter: used when no spatial index is registered or when
-    // the plan falls back to scan + filter. Checks Pos directly.
+    // Distance filter: always applied as post-scan or post-lookup refinement.
+    // Required both as the scan-path filter (when no spatial index is available)
+    // and as refinement after index-gather (to handle lossy indexes).
     let cx_f64 = cx as f64;
     let radius_f64 = radius as f64;
     let scan_filter = move |world: &World, e: Entity| {
@@ -494,8 +495,9 @@ fn main() {
         &world,
         move |expr| match expr {
             SpatialExpr::Within { center, radius } => {
-                let qx = center.first().copied().unwrap_or(0.0) as f32;
-                let qy = center.get(1).copied().unwrap_or(0.0) as f32;
+                assert!(center.len() >= 2, "expected at least 2D coordinates");
+                let qx = center[0] as f32;
+                let qy = center[1] as f32;
                 spatial_arc_lookup.query_within(qx, qy, *radius as f32)
             }
             _ => Vec::new(),

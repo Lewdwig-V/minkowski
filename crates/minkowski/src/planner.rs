@@ -6537,4 +6537,257 @@ mod tests {
         assert!(results.contains(&e2));
         assert!(!results.contains(&e3));
     }
+
+    // ── Additional spatial execution coverage ────────────────────
+
+    #[test]
+    fn spatial_index_empty_lookup_yields_no_results() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 1.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(
+            Arc::new(grid),
+            &world,
+            |_expr| Vec::new(), // empty result set
+        );
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([0.0, 0.0], 1.0, |_, _| true))
+            .build();
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 0, "empty lookup should yield zero results");
+    }
+
+    #[test]
+    fn spatial_index_all_stale_yields_no_results() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        // Despawn ALL entities returned by the lookup after plan is built.
+        world.despawn(e1);
+        world.despawn(e2);
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 0, "all-stale lookup should yield zero results");
+    }
+
+    #[test]
+    fn spatial_index_for_each_raw_filters_stale() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        world.despawn(e2);
+
+        let mut results = Vec::new();
+        plan.for_each_raw(&world, |entity| results.push(entity));
+        assert_eq!(results.len(), 1, "raw path must filter stale entities");
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn spatial_index_filters_entities_missing_required_components() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 }, Score(10))); // has both
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },)); // only Pos
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        // Lookup returns both entities.
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        // Query requires BOTH Pos and Score.
+        let mut plan = planner
+            .scan::<(&Pos, &Score)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(
+            results.len(),
+            1,
+            "entity missing required component should be filtered"
+        );
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn spatial_index_mixed_archetypes_without_changed() {
+        let mut world = World::new();
+        // Two different archetypes, both have Pos.
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 }, Score(10)));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(
+            results.len(),
+            2,
+            "entities from different archetypes should both be yielded"
+        );
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn spatial_index_intersects_through_execution() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 5.0, y: 5.0 },));
+        let _far = world.spawn((Pos { x: 99.0, y: 99.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::intersects::<Pos>(
+                [0.0, 0.0],
+                [10.0, 10.0],
+                |_, _| true,
+            ))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn spatial_index_3d_coordinates_propagate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone, Copy)]
+        #[expect(dead_code)]
+        struct Pos3D {
+            x: f32,
+            y: f32,
+            z: f32,
+        }
+
+        let mut world = World::new();
+        let e1 = world.spawn((Pos3D {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        },));
+
+        // Verify 3D coordinates are passed through to the lookup closure.
+        let received_center = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rc = Arc::clone(&received_center);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        struct Dummy3DIndex;
+        impl SpatialIndex for Dummy3DIndex {
+            fn rebuild(&mut self, _world: &mut World) {}
+            fn supports(
+                &self,
+                _expr: &crate::index::SpatialExpr,
+            ) -> Option<crate::index::SpatialCost> {
+                Some(crate::index::SpatialCost {
+                    estimated_rows: 1.0,
+                    cpu: 1.0,
+                })
+            }
+        }
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos3D>(
+            Arc::new(Dummy3DIndex),
+            &world,
+            move |expr| {
+                cc.fetch_add(1, Ordering::Relaxed);
+                if let crate::index::SpatialExpr::Within { center, .. } = expr {
+                    *rc.lock().unwrap() = center.clone();
+                }
+                vec![e1]
+            },
+        );
+
+        let mut plan = planner
+            .scan::<(&Pos3D,)>()
+            .filter(Predicate::within::<Pos3D>(
+                [10.0, 20.0, 30.0],
+                5.0,
+                |_, _| true,
+            ))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+
+        assert!(call_count.load(Ordering::Relaxed) > 0);
+        assert_eq!(results.len(), 1);
+
+        let center = received_center.lock().unwrap();
+        assert_eq!(
+            center.len(),
+            3,
+            "3D center should propagate all 3 coordinates"
+        );
+        assert!((center[0] - 10.0).abs() < f64::EPSILON);
+        assert!((center[1] - 20.0).abs() < f64::EPSILON);
+        assert!((center[2] - 30.0).abs() < f64::EPSILON);
+    }
 }
