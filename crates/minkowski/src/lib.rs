@@ -89,6 +89,7 @@ pub(crate) mod sync;
 pub mod table;
 pub mod tick;
 pub mod transaction;
+pub mod view;
 pub mod world;
 
 pub use access::Access;
@@ -120,4 +121,5 @@ pub use transaction::{
     Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, TransactError, Tx,
     WorldMismatch,
 };
+pub use view::{DebouncePolicy, MaterializedView};
 pub use world::{DeadEntity, InsertError, QueryTickInfo, World, WorldBuilder, WorldStats};

@@ -36,6 +36,7 @@ cargo run -p minkowski-examples --example retention --release   # Retention: Exp
 cargo run -p minkowski-examples --example pool --release   # Memory pool: TigerBeetle-style WorldBuilder with 16 MB budget, try_spawn until exhaustion, pool stats (131K entities)
 cargo run -p minkowski-examples --example profile_changeset --release   # Profiling harness: QueryWriter vs QueryMut flamegraph capture (10K entities, 1K iterations)
 cargo run -p minkowski-examples --example planner --release   # Volcano query planner: cost-based plans, index selection, joins, execute/for_each/for_each_raw (1K entities, 2 archetypes)
+cargo run -p minkowski-examples --example materialized_view --release   # Materialized views: cached debounced subscription queries, change detection, invalidation (200 entities, 7 demos)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -182,6 +183,14 @@ BTree and Hash index lookup functions (`eq_lookup_fn`, `range_lookup_fn`) captur
 
 `TablePlanner<'w, T>` wraps `QueryPlanner` with compile-time index enforcement via `HasBTreeIndex`/`HasHashIndex` trait bounds. See "Compile-Time Index Enforcement" section.
 
+### Materialized Views
+
+`MaterializedView` wraps a `QueryPlanResult` (typically from `SubscriptionBuilder`) and caches the matching entity list. On each `refresh(&mut World)` call it re-executes the plan, but only if: (1) the plan's `Changed<T>` filter detects column mutations (archetype-granular), and (2) the configurable `DebouncePolicy` threshold has been met.
+
+Two debounce modes: `DebouncePolicy::Immediate` (default — refresh every call, relying on `Changed<T>` for efficiency) and `DebouncePolicy::EveryNTicks(n)` (refresh at most once per `n` calls). `invalidate()` forces the next call to refresh regardless of policy. `set_policy()` switches policies at runtime.
+
+The view is external to World (same composition pattern as `SpatialIndex`, `BTreeIndex`, `ReducerRegistry`). It owns its `QueryPlanResult` and manages tick advancement. `entities()` returns `&[Entity]` from the cached snapshot. `refresh()` returns `Result<bool, PlanExecError>` — `true` if re-materialized, `false` if debounce-suppressed.
+
 ### System Scheduling Primitives
 
 `Access` extracts component-level read/write metadata from any `WorldQuery` type. `Access::of::<(&mut Pos, &Vel)>(world)` returns a struct with two `FixedBitSet`s: reads (Vel) and writes (Pos), plus a `despawns: bool` flag. `conflicts_with()` detects whether two accesses violate the read-write lock rule — two bitwise ANDs over the component bitsets, plus despawn-vs-any-access blanket conflict. `has_any_access()` returns true if the access touches any component.
@@ -234,7 +243,7 @@ Typed reducers narrow what a closure *can* touch so that conflict freedom is pro
 
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ChangeTick`, `ComponentId`, `SpatialIndex`, `Access`, `BTreeIndex`, `HashIndex`, `HasBTreeIndex`, `HasHashIndex`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `TransactError`, `WorldMismatch`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `QueryWriter`, `WritableRef`, `WriterQuery`, `Spawner`, `WorldStats`, `Expiry`, `WorldBuilder`, `PoolExhausted`, `HugePages`, `DeadEntity`, `InsertError`, `QueryPlanner`, `TablePlanner`, `Indexed`, `PlanNode`, `VecExecNode`, `Predicate`, `Cost`, `IndexKind`, `JoinKind`, `QueryPlanResult`, `PlannerError`, `VectorizeOpts`, `VectorizedPlan`, `SubscriptionBuilder`, `SubscriptionError`, `CardinalityConstraint`, `PlanWarning`, `AggregateExpr`, `AggregateOp`, `AggregateResult`, `PlanExecError`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ChangeTick`, `ComponentId`, `SpatialIndex`, `Access`, `BTreeIndex`, `HashIndex`, `HasBTreeIndex`, `HasHashIndex`, `Transact`, `Tx`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `TransactError`, `WorldMismatch`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `QueryWriter`, `WritableRef`, `WriterQuery`, `Spawner`, `WorldStats`, `Expiry`, `WorldBuilder`, `PoolExhausted`, `HugePages`, `DeadEntity`, `InsertError`, `QueryPlanner`, `TablePlanner`, `Indexed`, `PlanNode`, `VecExecNode`, `Predicate`, `Cost`, `IndexKind`, `JoinKind`, `QueryPlanResult`, `PlannerError`, `VectorizeOpts`, `VectorizedPlan`, `SubscriptionBuilder`, `SubscriptionError`, `CardinalityConstraint`, `PlanWarning`, `AggregateExpr`, `AggregateOp`, `AggregateResult`, `PlanExecError`, `MaterializedView`, `DebouncePolicy`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
