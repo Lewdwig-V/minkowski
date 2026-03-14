@@ -1389,6 +1389,15 @@ fn collect_matching_entities(
 
 // ── Scan builder ─────────────────────────────────────────────────────
 
+/// Carries the spatial lookup function and expression from Phase 1
+/// (predicate classification) to Phase 8 (closure compilation).
+struct SpatialDriver {
+    #[expect(dead_code)]
+    expr: SpatialExpr,
+    #[expect(dead_code)]
+    lookup_fn: SpatialLookupFn,
+}
+
 /// Builder for a single-table scan with optional predicates and joins.
 pub struct ScanBuilder<'w> {
     planner: &'w QueryPlanner<'w>,
@@ -1406,6 +1415,13 @@ pub struct ScanBuilder<'w> {
     left_required: Option<FixedBitSet>,
     /// Changed component bitset for left-side change detection in join plans.
     left_changed: Option<FixedBitSet>,
+    /// Spatial index driver — set when a spatial predicate is chosen as the
+    /// driving access and the index has a registered lookup function.
+    #[expect(dead_code)]
+    spatial_driver: Option<SpatialDriver>,
+    /// Changed component bitset for spatial index-gather path.
+    #[expect(dead_code)]
+    changed_for_spatial: Option<FixedBitSet>,
 }
 
 struct JoinSpec {
@@ -1467,15 +1483,15 @@ impl ScanBuilder<'_> {
 
         // Phase 1: Classify predicates — index-driven vs spatial vs post-filter.
         let mut index_preds: Vec<(Predicate, &IndexDescriptor)> = Vec::new();
-        let mut spatial_preds: Vec<(Predicate, SpatialCost)> = Vec::new();
+        let mut spatial_preds: Vec<(Predicate, SpatialCost, Option<SpatialLookupFn>)> = Vec::new();
         let mut filter_preds = Vec::new();
         let planner = self.planner;
 
         for pred in self.predicates {
             if pred.can_use_spatial() {
                 match planner.find_spatial_index(&pred) {
-                    SpatialLookupResult::Accelerated(_name, cost) => {
-                        spatial_preds.push((pred, cost));
+                    SpatialLookupResult::Accelerated(_name, cost, lookup) => {
+                        spatial_preds.push((pred, cost, lookup));
                     }
                     SpatialLookupResult::Declined(expression) => {
                         warnings.push(PlanWarning::SpatialIndexDeclined {
@@ -1527,7 +1543,7 @@ impl ScanBuilder<'_> {
             "Eq/Range predicate with filter_fn: None — plan would show filter but not apply it"
         );
         debug_assert!(
-            spatial_preds.iter().all(|(p, _)| p.filter_fn.is_some()),
+            spatial_preds.iter().all(|(p, _, _)| p.filter_fn.is_some()),
             "Spatial predicate with filter_fn: None — plan would show filter but not apply it"
         );
         let all_filter_fns: Vec<FilterFn> = index_preds
@@ -1536,7 +1552,7 @@ impl ScanBuilder<'_> {
             .chain(
                 spatial_preds
                     .iter()
-                    .filter_map(|(p, _)| p.filter_fn.as_ref().map(Arc::clone)),
+                    .filter_map(|(p, _, _)| p.filter_fn.as_ref().map(Arc::clone)),
             )
             .chain(
                 filter_preds
@@ -1556,9 +1572,9 @@ impl ScanBuilder<'_> {
         // including downstream filters, not just the driving access alone.
         // A spatial index with high estimated_rows but low CPU can still lose
         // to a selective BTree if the BTree's post-filter cost is lower overall.
-        let spatial_plan_cost = spatial_preds.first().map(|(_, first_sc)| {
+        let spatial_plan_cost = spatial_preds.first().map(|(_, first_sc, _)| {
             let mut cost = Cost::spatial_lookup(first_sc);
-            for (pred, _) in spatial_preds.iter().skip(1) {
+            for (pred, _, _) in spatial_preds.iter().skip(1) {
                 cost = Cost::filter(cost, pred.selectivity);
             }
             for (pred, _) in &index_preds {
@@ -1572,7 +1588,7 @@ impl ScanBuilder<'_> {
             for (pred, _) in index_preds.iter().skip(1) {
                 cost = Cost::filter(cost, pred.selectivity);
             }
-            for (pred, _) in &spatial_preds {
+            for (pred, _, _) in &spatial_preds {
                 cost = Cost::filter(cost, pred.selectivity);
             }
             cost.total()
@@ -1584,9 +1600,27 @@ impl ScanBuilder<'_> {
             _ => false,
         };
 
+        // Task 2g: Compute spatial driver — carries lookup fn + expr to Phase 8.
+        let _spatial_driver = if use_spatial_driver && !spatial_preds.is_empty() {
+            let (first_pred, _, first_lookup) = &spatial_preds[0];
+            if let Some(lookup_fn) = first_lookup {
+                let PredicateKind::Spatial(sp) = &first_pred.kind else {
+                    unreachable!("spatial_preds only contains Spatial predicates");
+                };
+                Some(SpatialDriver {
+                    expr: sp.into(),
+                    lookup_fn: Arc::clone(lookup_fn),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if use_spatial_driver && !spatial_preds.is_empty() {
             // Driving access is a spatial lookup.
-            let (first_pred, first_cost) = &spatial_preds[0];
+            let (first_pred, first_cost, _) = &spatial_preds[0];
             let est = first_cost.estimated_rows.max(1.0) as usize;
             node = PlanNode::SpatialLookup {
                 component_name: first_pred.component_name,
@@ -1596,7 +1630,7 @@ impl ScanBuilder<'_> {
             };
 
             // Additional spatial predicates become filters.
-            for (pred, _) in spatial_preds.iter().skip(1) {
+            for (pred, _, _) in spatial_preds.iter().skip(1) {
                 let parent_cost = node.cost();
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
@@ -1642,7 +1676,7 @@ impl ScanBuilder<'_> {
             }
 
             // Spatial predicates that aren't the driver become filters.
-            for (pred, _) in &spatial_preds {
+            for (pred, _, _) in &spatial_preds {
                 let parent_cost = node.cost();
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
@@ -1867,11 +1901,17 @@ impl ScanBuilder<'_> {
 
 // ── QueryPlanner ─────────────────────────────────────────────────────
 
+/// Type-erased spatial lookup: takes a `SpatialExpr`, returns candidate entities.
+/// Provided by the user at registration time to bridge between the planner's
+/// expression protocol and the index's concrete query API.
+pub type SpatialLookupFn = Arc<dyn Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync>;
+
 /// Descriptor for a registered spatial index.
 struct SpatialIndexDescriptor {
     component_name: &'static str,
     /// The spatial index, behind Arc for shared access at execution time.
     index: Arc<dyn SpatialIndex + Send + Sync>,
+    lookup_fn: Option<SpatialLookupFn>,
 }
 
 impl fmt::Debug for SpatialIndexDescriptor {
@@ -1885,7 +1925,7 @@ impl fmt::Debug for SpatialIndexDescriptor {
 /// Result of checking whether a spatial index can accelerate a predicate.
 enum SpatialLookupResult {
     /// The index can accelerate the expression at the given cost.
-    Accelerated(&'static str, SpatialCost),
+    Accelerated(&'static str, SpatialCost, Option<SpatialLookupFn>),
     /// A spatial index is registered but it declined the expression.
     Declined(String),
     /// No spatial index is registered for this component type.
@@ -2069,6 +2109,34 @@ impl<'w> QueryPlanner<'w> {
             SpatialIndexDescriptor {
                 component_name: std::any::type_name::<T>(),
                 index,
+                lookup_fn: None,
+            },
+        );
+    }
+
+    /// Register a spatial index with both cost discovery and execution-time lookup.
+    ///
+    /// The `lookup` closure bridges between the planner's [`SpatialExpr`]
+    /// protocol and the index's concrete query API. The planner makes no
+    /// assumptions about how the index answers queries — the closure is the
+    /// adapter.
+    pub fn add_spatial_index_with_lookup<T: Component>(
+        &mut self,
+        index: Arc<dyn SpatialIndex + Send + Sync>,
+        world: &World,
+        lookup: impl Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync + 'static,
+    ) {
+        assert!(
+            world.component_id::<T>().is_some(),
+            "QueryPlanner::add_spatial_index_with_lookup: component `{}` not registered",
+            std::any::type_name::<T>()
+        );
+        self.spatial_indexes.insert(
+            TypeId::of::<T>(),
+            SpatialIndexDescriptor {
+                component_name: std::any::type_name::<T>(),
+                index,
+                lookup_fn: Some(Arc::new(lookup)),
             },
         );
     }
@@ -2077,6 +2145,7 @@ impl<'w> QueryPlanner<'w> {
     pub fn scan<Q: crate::query::fetch::WorldQuery + 'static>(&'w self) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
         let changed = Q::changed_ids(self.components);
+        let changed_for_spatial = changed.clone();
         let required_for_each = required.clone();
         let changed_for_each = changed.clone();
         let required_for_each_raw = required.clone();
@@ -2129,6 +2198,8 @@ impl<'w> QueryPlanner<'w> {
             })),
             left_required: Some(left_required),
             left_changed: Some(left_changed),
+            spatial_driver: None,
+            changed_for_spatial: Some(changed_for_spatial),
         }
     }
 
@@ -2142,6 +2213,7 @@ impl<'w> QueryPlanner<'w> {
     ) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
         let changed = Q::changed_ids(self.components);
+        let changed_for_spatial = changed.clone();
         let required_for_each = required.clone();
         let changed_for_each = changed.clone();
         let required_for_each_raw = required.clone();
@@ -2194,6 +2266,8 @@ impl<'w> QueryPlanner<'w> {
             })),
             left_required: Some(left_required),
             left_changed: Some(left_changed),
+            spatial_driver: None,
+            changed_for_spatial: Some(changed_for_spatial),
         }
     }
 
@@ -2232,7 +2306,11 @@ impl<'w> QueryPlanner<'w> {
         };
         let expr: SpatialExpr = sp.into();
         match desc.index.supports(&expr) {
-            Some(cost) => SpatialLookupResult::Accelerated(desc.component_name, cost),
+            Some(cost) => SpatialLookupResult::Accelerated(
+                desc.component_name,
+                cost,
+                desc.lookup_fn.as_ref().map(Arc::clone),
+            ),
             None => SpatialLookupResult::Declined(sp.to_string()),
         }
     }
