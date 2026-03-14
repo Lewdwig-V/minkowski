@@ -3516,13 +3516,6 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     #[expect(dead_code)]
-    struct Vel {
-        dx: f32,
-        dy: f32,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    #[expect(dead_code)]
     struct Health(u32);
 
     // ── Basic planner construction ──────────────────────────────────

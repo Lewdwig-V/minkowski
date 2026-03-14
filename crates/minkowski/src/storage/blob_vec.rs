@@ -20,7 +20,6 @@ pub(crate) struct BlobVec {
 unsafe impl Send for BlobVec {}
 unsafe impl Sync for BlobVec {}
 
-#[expect(dead_code)]
 impl BlobVec {
     /// Minimum allocation alignment for all BlobVec columns.
     /// 64 bytes = cache line on x86-64 and Apple Silicon.
@@ -75,6 +74,7 @@ impl BlobVec {
         self.len
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -168,6 +168,7 @@ impl BlobVec {
     ///
     /// # Safety
     /// `row` must be in bounds. `ptr` must be valid for writes of `item_layout.size()` bytes.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub unsafe fn swap_remove_unchecked(&mut self, row: usize, ptr: *mut u8) {
         debug_assert!(row < self.len);
         let last = self.len - 1;
@@ -317,6 +318,7 @@ impl BlobVec {
     /// # Safety
     /// `ptr` must point to a valid, initialized value matching this BlobVec's layout.
     /// Caller is responsible for not double-dropping the source value.
+    #[expect(dead_code)]
     pub(crate) unsafe fn try_push(&mut self, ptr: *mut u8) -> Result<(), PoolExhausted> {
         if self.len == self.capacity {
             self.try_grow()?;
