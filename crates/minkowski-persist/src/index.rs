@@ -512,7 +512,7 @@ mod tests {
         {
             let mut world = World::new();
             let mut codecs = CodecRegistry::new();
-            codecs.register_as::<Score>("score", &mut world);
+            codecs.register_as::<Score>("score", &mut world).unwrap();
 
             let mut wal = Wal::create(&wal_dir, &codecs, config.clone()).unwrap();
 
@@ -520,7 +520,7 @@ mod tests {
             for i in 0..10 {
                 let e = world.alloc_entity();
                 let mut cs = minkowski::EnumChangeSet::new();
-                cs.spawn_bundle(&mut world, e, (Score(i),));
+                cs.spawn_bundle(&mut world, e, (Score(i),)).unwrap();
                 wal.append(&cs, &codecs).unwrap();
                 cs.apply(&mut world).unwrap();
             }
@@ -540,14 +540,14 @@ mod tests {
             // Phase 2: more WAL mutations AFTER checkpoint+index save
             let e = world.alloc_entity();
             let mut cs = minkowski::EnumChangeSet::new();
-            cs.spawn_bundle(&mut world, e, (Score(99),));
+            cs.spawn_bundle(&mut world, e, (Score(99),)).unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
 
             // Spawn another post-checkpoint entity
             let e2 = world.alloc_entity();
             let mut cs2 = minkowski::EnumChangeSet::new();
-            cs2.spawn_bundle(&mut world, e2, (Score(88),));
+            cs2.spawn_bundle(&mut world, e2, (Score(88),)).unwrap();
             wal.append(&cs2, &codecs).unwrap();
             cs2.apply(&mut world).unwrap();
 
@@ -559,7 +559,9 @@ mod tests {
             let mut codecs = CodecRegistry::new();
             // Must re-register codecs before loading
             let mut tmp_world = World::new();
-            codecs.register_as::<Score>("score", &mut tmp_world);
+            codecs
+                .register_as::<Score>("score", &mut tmp_world)
+                .unwrap();
             drop(tmp_world);
 
             // Load snapshot

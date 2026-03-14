@@ -10,10 +10,10 @@ use minkowski_persist::{CodecRegistry, Snapshot};
 
 fn make_codecs(world: &mut World) -> CodecRegistry {
     let mut codecs = CodecRegistry::new();
-    codecs.register::<A>(world);
-    codecs.register::<B>(world);
-    codecs.register::<C>(world);
-    codecs.register::<D>(world);
+    codecs.register::<A>(world).unwrap();
+    codecs.register::<B>(world).unwrap();
+    codecs.register::<C>(world).unwrap();
+    codecs.register::<D>(world).unwrap();
     codecs
 }
 

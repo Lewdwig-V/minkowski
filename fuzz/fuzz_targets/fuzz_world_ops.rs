@@ -41,10 +41,10 @@ fuzz_target!(|ops: Vec<Op>| {
                     let i = *idx as usize % live.len();
                     let e = live[i];
                     match val {
-                        CompVal::A(v) => world.insert(e, (*v,)),
-                        CompVal::B(v) => world.insert(e, (*v,)),
-                        CompVal::C(v) => world.insert(e, (*v,)),
-                        CompVal::D(v) => world.insert(e, (*v,)),
+                        CompVal::A(v) => { let _ = world.insert(e, (*v,)); }
+                        CompVal::B(v) => { let _ = world.insert(e, (*v,)); }
+                        CompVal::C(v) => { let _ = world.insert(e, (*v,)); }
+                        CompVal::D(v) => { let _ = world.insert(e, (*v,)); }
                     }
                 }
             }

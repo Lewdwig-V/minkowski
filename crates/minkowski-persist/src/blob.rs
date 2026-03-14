@@ -91,7 +91,7 @@ mod tests {
     fn blob_ref_survives_archetype_migration() {
         let mut world = World::new();
         let e = world.spawn((BlobRef::new("s3://a"),));
-        world.insert(e, (42u32,));
+        world.insert(e, (42u32,)).unwrap();
         assert_eq!(world.get::<BlobRef>(e).unwrap().key(), "s3://a");
         assert_eq!(*world.get::<u32>(e).unwrap(), 42);
     }
@@ -150,7 +150,7 @@ mod tests {
     fn blob_ref_codec_registration() {
         let mut world = World::new();
         let mut codecs = crate::CodecRegistry::new();
-        codecs.register::<BlobRef>(&mut world);
+        codecs.register::<BlobRef>(&mut world).unwrap();
 
         let id = world.component_id::<BlobRef>().unwrap();
         assert!(codecs.stable_name(id).is_some());

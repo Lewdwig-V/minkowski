@@ -84,8 +84,8 @@ fn main() {
 
     // Create planner and register indexes
     let mut planner = QueryPlanner::new(&world);
-    planner.add_btree_index(&score_btree, &world);
-    planner.add_hash_index(&team_hash, &world);
+    planner.add_btree_index(&score_btree, &world).unwrap();
+    planner.add_hash_index(&team_hash, &world).unwrap();
 
     // Range query on Score — should use BTree index
     let plan = planner
@@ -132,6 +132,7 @@ fn main() {
         .scan_with_estimate::<(&Score,)>(10)
         .join::<(&Team,)>(JoinKind::Inner)
         .with_right_estimate(5)
+        .unwrap()
         .build();
     println!("Small join (10x5):");
     println!("{}", plan.explain());
@@ -253,7 +254,7 @@ fn main() {
     // Index-driven: Team == 2 via hash index
     {
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&team_hash, &world);
+        planner.add_hash_index(&team_hash, &world).unwrap();
         let mut plan = planner
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(2)))
@@ -494,27 +495,25 @@ fn main() {
     // index's concrete query API.
     let spatial_arc_lookup = std::sync::Arc::clone(&spatial_arc);
     let mut planner = QueryPlanner::new(&world);
-    planner.add_spatial_index_with_lookup::<Pos>(
-        std::sync::Arc::clone(&spatial_arc) as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
-        &world,
-        move |expr| match expr {
-            SpatialExpr::Within { center, radius } => {
-                assert!(center.len() >= 2, "expected at least 2D coordinates");
-                let qx = center[0] as f32;
-                let qy = center[1] as f32;
-                spatial_arc_lookup.query_within(qx, qy, *radius as f32)
-            }
-            _ => Vec::new(),
-        },
-    );
+    planner
+        .add_spatial_index_with_lookup::<Pos>(
+            std::sync::Arc::clone(&spatial_arc) as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
+            &world,
+            move |expr| match expr {
+                SpatialExpr::Within { center, radius } => {
+                    assert!(center.len() >= 2, "expected at least 2D coordinates");
+                    let qx = center[0] as f32;
+                    let qy = center[1] as f32;
+                    spatial_arc_lookup.query_within(qx, qy, *radius as f32)
+                }
+                _ => Vec::new(),
+            },
+        )
+        .unwrap();
 
     let plan = planner
         .scan::<(&Pos, &Score)>()
-        .filter(Predicate::within::<Pos>(
-            vec![cx as f64, 0.0],
-            radius as f64,
-            scan_filter,
-        ))
+        .filter(Predicate::within::<Pos>(vec![cx as f64, 0.0], radius as f64, scan_filter).unwrap())
         .build();
 
     // EXPLAIN shows SpatialGather as the driving access.
@@ -549,18 +548,20 @@ fn main() {
     let arc2c = std::sync::Arc::clone(&arc2);
 
     let mut planner2 = QueryPlanner::new(&world);
-    planner2.add_spatial_index_with_lookup::<Pos>(
-        arc2 as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
-        &world,
-        move |expr| match expr {
-            SpatialExpr::Within { center, radius } => {
-                let qx = center.first().copied().unwrap_or(0.0) as f32;
-                let qy = center.get(1).copied().unwrap_or(0.0) as f32;
-                arc2c.query_within(qx, qy, *radius as f32)
-            }
-            _ => Vec::new(),
-        },
-    );
+    planner2
+        .add_spatial_index_with_lookup::<Pos>(
+            arc2 as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
+            &world,
+            move |expr| match expr {
+                SpatialExpr::Within { center, radius } => {
+                    let qx = center.first().copied().unwrap_or(0.0) as f32;
+                    let qy = center.get(1).copied().unwrap_or(0.0) as f32;
+                    arc2c.query_within(qx, qy, *radius as f32)
+                }
+                _ => Vec::new(),
+            },
+        )
+        .unwrap();
 
     let scan_filter2 = move |world: &World, e: Entity| {
         world.get::<Pos>(e).is_some_and(|p| {
@@ -571,11 +572,9 @@ fn main() {
     };
     let mut plan2 = planner2
         .scan::<(&Pos, &Score)>()
-        .filter(Predicate::within::<Pos>(
-            vec![cx as f64, 0.0],
-            radius as f64,
-            scan_filter2,
-        ))
+        .filter(
+            Predicate::within::<Pos>(vec![cx as f64, 0.0], radius as f64, scan_filter2).unwrap(),
+        )
         .build();
     let mut spatial_count = 0;
     plan2.for_each(&mut world, |_e| spatial_count += 1).unwrap();
@@ -595,7 +594,9 @@ fn main() {
         btree_exec.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree_exec), &world);
+        planner
+            .add_btree_index(&Arc::new(btree_exec), &world)
+            .unwrap();
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -616,7 +617,7 @@ fn main() {
     // Hash eq lookup: find entities with Team(2).
     {
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&team_hash, &world);
+        planner.add_hash_index(&team_hash, &world).unwrap();
 
         let plan = planner
             .scan::<(&Team,)>()
@@ -639,7 +640,9 @@ fn main() {
         btree_range.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree_range), &world);
+        planner
+            .add_btree_index(&Arc::new(btree_range), &world)
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()

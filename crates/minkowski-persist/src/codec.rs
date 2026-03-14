@@ -50,6 +50,21 @@ pub enum CodecError {
     },
     #[error("unknown component name in schema: '{0}'")]
     UnknownComponentName(String),
+    #[error(
+        "component already registered with name {existing_name:?}, cannot re-register as {new_name:?}"
+    )]
+    DuplicateComponentName {
+        existing_name: String,
+        new_name: String,
+    },
+    #[error(
+        "duplicate stable name {name:?}: already registered for ComponentId {existing_id}, cannot register for ComponentId {new_id}"
+    )]
+    DuplicateStableName {
+        name: String,
+        existing_id: ComponentId,
+        new_id: ComponentId,
+    },
 }
 
 struct ComponentCodec {
@@ -85,7 +100,7 @@ impl CodecRegistry {
     /// Register a component type for persistence.
     /// Requires rkyv Archive + Serialize + Deserialize bounds.
     /// Uses `std::any::type_name::<T>()` as the default stable name.
-    pub fn register<T>(&mut self, world: &mut World)
+    pub fn register<T>(&mut self, world: &mut World) -> Result<(), CodecError>
     where
         T: Component
             + Archive
@@ -96,13 +111,13 @@ impl CodecRegistry {
             + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
     {
         let name = std::any::type_name::<T>().to_owned();
-        self.register_with_name::<T>(name, world);
+        self.register_with_name::<T>(name, world)
     }
 
     /// Register a component type for persistence with an explicit stable name.
     /// The name must be unique across all registered components — duplicate
-    /// names mapped to different ComponentIds will panic.
-    pub fn register_as<T>(&mut self, stable_name: &str, world: &mut World)
+    /// names mapped to different ComponentIds return an error.
+    pub fn register_as<T>(&mut self, stable_name: &str, world: &mut World) -> Result<(), CodecError>
     where
         T: Component
             + Archive
@@ -112,10 +127,14 @@ impl CodecRegistry {
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
             + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
     {
-        self.register_with_name::<T>(stable_name.to_owned(), world);
+        self.register_with_name::<T>(stable_name.to_owned(), world)
     }
 
-    fn register_with_name<T>(&mut self, stable_name: String, world: &mut World)
+    fn register_with_name<T>(
+        &mut self,
+        stable_name: String,
+        world: &mut World,
+    ) -> Result<(), CodecError>
     where
         T: Component
             + Archive
@@ -129,25 +148,24 @@ impl CodecRegistry {
 
         // Idempotent: same type re-registered with same name is a no-op.
         if let Some(existing) = self.codecs.get(&comp_id) {
-            assert!(
-                existing.name == stable_name,
-                "component already registered with name {:?}, cannot re-register as {:?}",
-                existing.name,
-                stable_name
-            );
-            return;
+            if existing.name != stable_name {
+                return Err(CodecError::DuplicateComponentName {
+                    existing_name: existing.name.clone(),
+                    new_name: stable_name,
+                });
+            }
+            return Ok(());
         }
 
         // Duplicate name to a different ComponentId is a hard error.
-        if let Some(&existing_id) = self.by_name.get(&stable_name) {
-            assert!(
-                existing_id == comp_id,
-                "duplicate stable name {:?}: already registered for ComponentId {}, \
-                 cannot register for ComponentId {}",
-                stable_name,
+        if let Some(&existing_id) = self.by_name.get(&stable_name)
+            && existing_id != comp_id
+        {
+            return Err(CodecError::DuplicateStableName {
+                name: stable_name,
                 existing_id,
-                comp_id
-            );
+                new_id: comp_id,
+            });
         }
 
         let layout = Layout::new::<T>();
@@ -225,6 +243,7 @@ impl CodecRegistry {
                 raw_copy_size,
             },
         );
+        Ok(())
     }
 
     /// Serialize a component value from a raw pointer to bytes.
@@ -428,7 +447,7 @@ mod tests {
     fn register_and_serialize_round_trip() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         let pos = Pos { x: 1.0, y: 2.0 };
         let mut buf = Vec::new();
@@ -465,8 +484,8 @@ mod tests {
     fn multiple_components() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Vel>(&mut world).unwrap();
 
         assert!(codecs.has_codec(world.component_id::<Pos>().unwrap()));
         assert!(codecs.has_codec(world.component_id::<Vel>().unwrap()));
@@ -477,7 +496,7 @@ mod tests {
     fn layout_and_name() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         let id = world.component_id::<Pos>().unwrap();
         assert_eq!(
@@ -491,7 +510,7 @@ mod tests {
     fn register_as_assigns_stable_name() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
         let id = world.component_id::<Pos>().unwrap();
         assert_eq!(codecs.stable_name(id), Some("pos"));
     }
@@ -500,7 +519,7 @@ mod tests {
     fn register_defaults_to_type_name() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
         let id = world.component_id::<Pos>().unwrap();
         let name = codecs.stable_name(id).unwrap();
         assert!(
@@ -513,37 +532,43 @@ mod tests {
     fn resolve_name_returns_component_id() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
         let id = world.component_id::<Pos>().unwrap();
         assert_eq!(codecs.resolve_name("pos"), Some(id));
         assert_eq!(codecs.resolve_name("nonexistent"), None);
     }
 
     #[test]
-    #[should_panic(expected = "duplicate stable name")]
-    fn duplicate_name_panics() {
+    fn duplicate_name_returns_error() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("collision", &mut world);
-        codecs.register_as::<Vel>("collision", &mut world);
+        codecs.register_as::<Pos>("collision", &mut world).unwrap();
+        let result = codecs.register_as::<Vel>("collision", &mut world);
+        assert!(matches!(
+            result,
+            Err(CodecError::DuplicateStableName { .. })
+        ));
     }
 
     #[test]
     fn register_as_idempotent_same_name() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
-        codecs.register_as::<Pos>("pos", &mut world); // no-op
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap(); // no-op
         assert_eq!(codecs.registered_ids().len(), 1);
     }
 
     #[test]
-    #[should_panic(expected = "already registered with name")]
-    fn register_as_same_type_different_name_panics() {
+    fn register_as_same_type_different_name_returns_error() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
-        codecs.register_as::<Pos>("position", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        let result = codecs.register_as::<Pos>("position", &mut world);
+        assert!(matches!(
+            result,
+            Err(CodecError::DuplicateComponentName { .. })
+        ));
     }
 
     use crate::record::ComponentSchema;
@@ -552,8 +577,8 @@ mod tests {
     fn build_remap_same_order() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
-        codecs.register_as::<Vel>("vel", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Vel>("vel", &mut world).unwrap();
 
         let schema = vec![
             ComponentSchema {
@@ -578,8 +603,8 @@ mod tests {
     fn build_remap_different_order() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Vel>("vel", &mut world); // id=0 locally
-        codecs.register_as::<Pos>("pos", &mut world); // id=1 locally
+        codecs.register_as::<Vel>("vel", &mut world).unwrap(); // id=0 locally
+        codecs.register_as::<Pos>("pos", &mut world).unwrap(); // id=1 locally
 
         // Sender had Pos=0, Vel=1
         let schema = vec![
@@ -605,7 +630,7 @@ mod tests {
     fn build_remap_size_mismatch_is_error() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let schema = vec![ComponentSchema {
             id: 0,
@@ -622,7 +647,7 @@ mod tests {
     fn build_remap_align_mismatch_is_error() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let schema = vec![ComponentSchema {
             id: 0,

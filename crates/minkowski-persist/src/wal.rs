@@ -1023,11 +1023,12 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
         let seq = wal.append(&cs, &codecs).unwrap();
@@ -1045,7 +1046,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Health>(&mut world).unwrap();
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
@@ -1066,7 +1067,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Health>(&mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
 
@@ -1100,7 +1101,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Health>(&mut world).unwrap();
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
@@ -1134,7 +1135,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Health>(&mut world).unwrap();
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
@@ -1163,7 +1164,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Health>(&mut world).unwrap();
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
@@ -1198,7 +1199,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Health>(&mut world).unwrap();
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
@@ -1231,8 +1232,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
-        codecs.register_as::<Health>("health", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Health>("health", &mut world).unwrap();
 
         let _wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
         let wal2 = Wal::open(&wal_dir, &codecs, default_config()).unwrap();
@@ -1246,14 +1247,17 @@ mod tests {
 
         let mut world_a = World::new();
         let mut codecs_a = CodecRegistry::new();
-        codecs_a.register_as::<Pos>("pos", &mut world_a);
-        codecs_a.register_as::<Health>("health", &mut world_a);
+        codecs_a.register_as::<Pos>("pos", &mut world_a).unwrap();
+        codecs_a
+            .register_as::<Health>("health", &mut world_a)
+            .unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs_a, default_config()).unwrap();
 
         let e = world_a.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 }, Health(100)));
+        cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 }, Health(100)))
+            .unwrap();
         wal.append(&cs, &codecs_a).unwrap();
         cs.apply(&mut world_a).unwrap();
 
@@ -1261,8 +1265,10 @@ mod tests {
 
         let mut world_b = World::new();
         let mut codecs_b = CodecRegistry::new();
-        codecs_b.register_as::<Health>("health", &mut world_b);
-        codecs_b.register_as::<Pos>("pos", &mut world_b);
+        codecs_b
+            .register_as::<Health>("health", &mut world_b)
+            .unwrap();
+        codecs_b.register_as::<Pos>("pos", &mut world_b).unwrap();
 
         let mut wal_b = Wal::open(&wal_dir, &codecs_b, default_config()).unwrap();
         wal_b.replay(&mut world_b, &codecs_b).unwrap();
@@ -1331,14 +1337,17 @@ mod tests {
 
         let mut world_a = World::new();
         let mut codecs_a = CodecRegistry::new();
-        codecs_a.register_as::<Pos>("pos", &mut world_a);
-        codecs_a.register_as::<Health>("health", &mut world_a);
+        codecs_a.register_as::<Pos>("pos", &mut world_a).unwrap();
+        codecs_a
+            .register_as::<Health>("health", &mut world_a)
+            .unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs_a, default_config()).unwrap();
 
         let e = world_a.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 },));
+        cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
         wal.append(&cs, &codecs_a).unwrap();
         cs.apply(&mut world_a).unwrap();
 
@@ -1352,8 +1361,10 @@ mod tests {
 
         let mut world_b = World::new();
         let mut codecs_b = CodecRegistry::new();
-        codecs_b.register_as::<Health>("health", &mut world_b);
-        codecs_b.register_as::<Pos>("pos", &mut world_b);
+        codecs_b
+            .register_as::<Health>("health", &mut world_b)
+            .unwrap();
+        codecs_b.register_as::<Pos>("pos", &mut world_b).unwrap();
 
         let mut wal_b = Wal::open(&wal_dir, &codecs_b, default_config()).unwrap();
         wal_b.replay(&mut world_b, &codecs_b).unwrap();
@@ -1372,7 +1383,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
         assert_eq!(wal.next_seq(), 0);
@@ -1399,7 +1410,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
 
@@ -1413,7 +1424,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1441,7 +1453,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
@@ -1455,7 +1467,8 @@ mod tests {
                         x: i as f32,
                         y: 0.0,
                     },),
-                );
+                )
+                .unwrap();
                 wal.append(&cs, &codecs).unwrap();
                 cs.apply(&mut world).unwrap();
             }
@@ -1472,7 +1485,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
 
@@ -1486,7 +1499,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1505,7 +1519,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
 
@@ -1519,7 +1533,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1548,7 +1563,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 64 * 1024 * 1024,
@@ -1566,7 +1581,8 @@ mod tests {
 
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
         wal.append(&cs, &codecs).unwrap();
         cs.apply(&mut world).unwrap();
 
@@ -1582,7 +1598,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
         assert!(!wal.checkpoint_needed());
@@ -1596,7 +1612,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 64 * 1024 * 1024,
@@ -1616,7 +1632,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1631,7 +1648,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 64 * 1024 * 1024,
@@ -1649,7 +1666,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1669,7 +1687,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 64 * 1024 * 1024,
@@ -1680,7 +1698,8 @@ mod tests {
             let mut wal = Wal::create(&wal_dir, &codecs, config.clone()).unwrap();
             let e = world.alloc_entity();
             let mut cs = EnumChangeSet::new();
-            cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+            cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+                .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
 
@@ -1699,7 +1718,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         // Use small segments so rollover happens quickly
         let config = WalConfig {
@@ -1720,7 +1739,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1739,7 +1759,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1768,7 +1789,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
 
@@ -1782,7 +1803,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1797,7 +1819,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1816,7 +1839,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
 
@@ -1830,7 +1853,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -1841,7 +1865,8 @@ mod tests {
         // WAL should still be appendable
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Pos { x: 99.0, y: 99.0 },));
+        cs.spawn_bundle(&mut world, e, (Pos { x: 99.0, y: 99.0 },))
+            .unwrap();
         wal.append(&cs, &codecs).unwrap();
     }
 
@@ -1852,7 +1877,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let last_seq;
         {
@@ -1869,7 +1894,8 @@ mod tests {
                         x: i as f32,
                         y: 0.0,
                     },),
-                );
+                )
+                .unwrap();
                 wal.append(&cs, &codecs).unwrap();
                 cs.apply(&mut world).unwrap();
             }
@@ -1897,8 +1923,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
-        codecs.register_as::<Health>("health", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Health>("health", &mut world).unwrap();
 
         // Create WAL with enough appends to roll over
         {
@@ -1913,7 +1939,8 @@ mod tests {
                         x: i as f32,
                         y: 0.0,
                     },),
-                );
+                )
+                .unwrap();
                 wal.append(&cs, &codecs).unwrap();
                 cs.apply(&mut world).unwrap();
             }
@@ -1933,7 +1960,8 @@ mod tests {
         // by replaying from a fresh process with different registration order.
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Pos { x: 99.0, y: 99.0 },));
+        cs.spawn_bundle(&mut world, e, (Pos { x: 99.0, y: 99.0 },))
+            .unwrap();
         wal2.append(&cs, &codecs).unwrap();
         cs.apply(&mut world).unwrap();
         drop(wal2);
@@ -1941,8 +1969,10 @@ mod tests {
         // Open with reversed registration order to exercise remap
         let mut world_b = World::new();
         let mut codecs_b = CodecRegistry::new();
-        codecs_b.register_as::<Health>("health", &mut world_b);
-        codecs_b.register_as::<Pos>("pos", &mut world_b);
+        codecs_b
+            .register_as::<Health>("health", &mut world_b)
+            .unwrap();
+        codecs_b.register_as::<Pos>("pos", &mut world_b).unwrap();
 
         let mut wal_b = Wal::open(&wal_dir, &codecs_b, small_config()).unwrap();
         wal_b.replay(&mut world_b, &codecs_b).unwrap();
@@ -1965,13 +1995,14 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
 
         // Record spawn + sparse insert in one changeset.
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
         cs.insert_sparse::<Health>(&mut world, e, Health(100));
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
@@ -1985,8 +2016,8 @@ mod tests {
         // Replay into a fresh world.
         let mut world2 = World::new();
         let mut codecs2 = CodecRegistry::new();
-        codecs2.register::<Pos>(&mut world2);
-        codecs2.register::<Health>(&mut world2);
+        codecs2.register::<Pos>(&mut world2).unwrap();
+        codecs2.register::<Health>(&mut world2).unwrap();
 
         let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
         wal2.replay(&mut world2, &codecs2).unwrap();
@@ -2006,8 +2037,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
 
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
         world.insert_sparse::<Health>(e, Health(50));
@@ -2025,8 +2056,8 @@ mod tests {
         // Replay into fresh world that has the entity with sparse component.
         let mut world2 = World::new();
         let mut codecs2 = CodecRegistry::new();
-        codecs2.register::<Pos>(&mut world2);
-        codecs2.register::<Health>(&mut world2);
+        codecs2.register::<Pos>(&mut world2).unwrap();
+        codecs2.register::<Health>(&mut world2).unwrap();
 
         let e2 = world2.spawn((Pos { x: 1.0, y: 2.0 },));
         world2.insert_sparse::<Health>(e2, Health(50));
@@ -2048,8 +2079,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
 
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
         world.insert_sparse::<Health>(e, Health(10));
@@ -2066,8 +2097,8 @@ mod tests {
         // Replay into world with old sparse value.
         let mut world2 = World::new();
         let mut codecs2 = CodecRegistry::new();
-        codecs2.register::<Pos>(&mut world2);
-        codecs2.register::<Health>(&mut world2);
+        codecs2.register::<Pos>(&mut world2).unwrap();
+        codecs2.register::<Health>(&mut world2).unwrap();
 
         let e2 = world2.spawn((Pos { x: 1.0, y: 2.0 },));
         world2.insert_sparse::<Health>(e2, Health(10));
@@ -2092,12 +2123,13 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
 
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
         cs.insert_sparse::<Health>(&mut world, e, Health(42));
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
@@ -2109,8 +2141,8 @@ mod tests {
         // inside changeset apply.
         let mut world2 = World::new();
         let mut codecs2 = CodecRegistry::new();
-        codecs2.register::<Pos>(&mut world2);
-        codecs2.register::<Health>(&mut world2);
+        codecs2.register::<Pos>(&mut world2).unwrap();
+        codecs2.register::<Health>(&mut world2).unwrap();
 
         let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
         wal2.replay(&mut world2, &codecs2).unwrap();
@@ -2139,7 +2171,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Health>(&mut world).unwrap();
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
@@ -2183,7 +2215,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Health>(&mut world).unwrap();
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
@@ -2222,7 +2254,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
 
@@ -2236,7 +2268,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -2294,7 +2327,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
 
@@ -2309,7 +2342,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }

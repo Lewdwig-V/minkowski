@@ -38,7 +38,7 @@ impl CommandBuffer {
 
     pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) {
         self.commands.push(Box::new(move |world| {
-            world.insert(entity, bundle);
+            let _ = world.insert(entity, bundle);
         }));
     }
 

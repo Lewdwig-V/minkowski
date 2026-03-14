@@ -48,8 +48,8 @@ fn source_side(tx: &mpsc::Sender<WireMessage>) {
 
     let mut world = World::new();
     let mut codecs = CodecRegistry::new();
-    codecs.register_as::<Pos>("pos", &mut world);
-    codecs.register_as::<Vel>("vel", &mut world);
+    codecs.register_as::<Pos>("pos", &mut world).unwrap();
+    codecs.register_as::<Vel>("vel", &mut world).unwrap();
 
     // Spawn initial entities
     for i in 0..20 {
@@ -89,7 +89,8 @@ fn source_side(tx: &mpsc::Sender<WireMessage>) {
                 },
                 Vel { dx: -1.0, dy: -0.5 },
             ),
-        );
+        )
+        .unwrap();
         wal.append(&cs, &codecs).unwrap();
         cs.apply(&mut world).expect("replicate apply");
     }
@@ -122,8 +123,8 @@ fn replica_side(rx: &mpsc::Receiver<WireMessage>) -> World {
     // Replica registers codecs independently (could be different order)
     let mut codecs = CodecRegistry::new();
     let mut tmp = World::new();
-    codecs.register_as::<Vel>("vel", &mut tmp);
-    codecs.register_as::<Pos>("pos", &mut tmp);
+    codecs.register_as::<Vel>("vel", &mut tmp).unwrap();
+    codecs.register_as::<Pos>("pos", &mut tmp).unwrap();
     drop(tmp);
 
     // Receive and load snapshot

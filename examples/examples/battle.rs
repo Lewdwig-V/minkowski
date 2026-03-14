@@ -142,7 +142,7 @@ fn apply_effects(world: &mut World) {
         .collect();
 
     for (e, new_hp) in effects {
-        world.insert(e, (Health(new_hp),));
+        world.insert(e, (Health(new_hp),)).unwrap();
     }
 }
 

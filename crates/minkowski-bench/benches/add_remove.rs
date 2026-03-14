@@ -21,14 +21,16 @@ fn add_remove(c: &mut Criterion) {
             || spawn_position_world(10_000),
             |(mut world, entities)| {
                 for &e in &entities {
-                    world.insert(
-                        e,
-                        (Velocity {
-                            dx: 1.0,
-                            dy: 1.0,
-                            dz: 1.0,
-                        },),
-                    );
+                    world
+                        .insert(
+                            e,
+                            (Velocity {
+                                dx: 1.0,
+                                dy: 1.0,
+                                dz: 1.0,
+                            },),
+                        )
+                        .unwrap();
                 }
                 for &e in &entities {
                     world.remove::<Velocity>(e);

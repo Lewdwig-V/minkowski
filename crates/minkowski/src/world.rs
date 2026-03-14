@@ -13,6 +13,61 @@ use fixedbitset::FixedBitSet;
 use std::alloc::Layout;
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::fmt;
+
+/// Error returned when an operation is performed on an entity that is not alive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadEntity {
+    /// The entity that was not alive.
+    pub entity: Entity,
+}
+
+impl fmt::Display for DeadEntity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "entity {:?} is not alive", self.entity)
+    }
+}
+
+impl std::error::Error for DeadEntity {}
+
+/// Error returned by [`World::try_insert`].
+#[derive(Debug, Clone)]
+pub enum InsertError {
+    /// The entity is not alive.
+    DeadEntity(DeadEntity),
+    /// The memory pool is exhausted.
+    PoolExhausted(PoolExhausted),
+}
+
+impl fmt::Display for InsertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InsertError::DeadEntity(e) => write!(f, "{e}"),
+            InsertError::PoolExhausted(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for InsertError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            InsertError::DeadEntity(e) => Some(e),
+            InsertError::PoolExhausted(e) => Some(e),
+        }
+    }
+}
+
+impl From<DeadEntity> for InsertError {
+    fn from(e: DeadEntity) -> Self {
+        InsertError::DeadEntity(e)
+    }
+}
+
+impl From<PoolExhausted> for InsertError {
+    fn from(e: PoolExhausted) -> Self {
+        InsertError::PoolExhausted(e)
+    }
+}
 
 /// Unique identity for a World instance. Strategies capture this at
 /// construction and assert it matches in begin/commit to prevent
@@ -744,22 +799,33 @@ impl World {
             return results;
         };
 
-        // Sparse fast path — duplicate check via sorted indices.
+        // Sparse fast path — deduplicate via sorted indices.
         if self.components.is_sparse(comp_id) {
-            let mut alive_indices: Vec<u32> = entities
+            let mut alive_indices: Vec<(u32, usize)> = entities
                 .iter()
-                .filter(|e| self.entities.is_alive(**e))
-                .map(|e| e.index())
+                .enumerate()
+                .filter(|(_, e)| self.entities.is_alive(**e))
+                .map(|(i, e)| (e.index(), i))
                 .collect();
-            alive_indices.sort_unstable();
-            for w in alive_indices.windows(2) {
-                assert!(w[0] != w[1], "duplicate entity in get_batch_mut");
+            alive_indices.sort_unstable_by_key(|&(idx, _)| idx);
+            // Mark duplicates: only the first occurrence of each index gets a result.
+            let mut seen = fixedbitset::FixedBitSet::with_capacity(0);
+            if !alive_indices.is_empty() {
+                let max_idx = alive_indices.last().unwrap().0 as usize;
+                seen.grow(max_idx + 1);
             }
             for (i, &entity) in entities.iter().enumerate() {
-                if self.entities.is_alive(entity)
-                    && let Some(val) = self.sparse.get_mut::<T>(comp_id, entity)
-                {
-                    // SAFETY: the duplicate check above guarantees each entity
+                let idx = entity.index();
+                if !self.entities.is_alive(entity) {
+                    continue;
+                }
+                if seen.contains(idx as usize) {
+                    // Duplicate — skip to prevent aliased &mut T.
+                    continue;
+                }
+                seen.insert(idx as usize);
+                if let Some(val) = self.sparse.get_mut::<T>(comp_id, entity) {
+                    // SAFETY: the dedup check above guarantees each entity
                     // appears at most once, so no two results alias.
                     results[i] = Some(unsafe { &mut *(val as *mut T) });
                 }
@@ -782,12 +848,19 @@ impl World {
             }
         }
 
-        // Duplicate check: sort each group by row, check adjacent pairs.
+        // Deduplicate: sort each group by row, skip duplicate rows.
         // Same row in same archetype = same entity (each row holds exactly one entity).
+        // Only the first occurrence of each entity gets a mutable reference.
         for rows in by_arch.values_mut() {
             rows.sort_unstable_by_key(|&(_, row)| row);
-            for w in rows.windows(2) {
-                assert!(w[0].1 != w[1].1, "duplicate entity in get_batch_mut");
+            let mut prev_row = usize::MAX;
+            for entry in rows.iter_mut() {
+                if entry.1 == prev_row {
+                    // Mark as duplicate — will be skipped during fetch.
+                    entry.1 = usize::MAX;
+                } else {
+                    prev_row = entry.1;
+                }
             }
         }
 
@@ -797,6 +870,9 @@ impl World {
             let arch = &mut self.archetypes.archetypes[*arch_idx];
             if let Some(col_idx) = arch.column_index(comp_id) {
                 for &(result_idx, row) in rows {
+                    if row == usize::MAX {
+                        continue; // duplicate — skip
+                    }
                     results[result_idx] = unsafe {
                         let ptr = arch.columns[col_idx].get_ptr_mut(row, tick) as *mut T;
                         Some(&mut *ptr)
@@ -1010,9 +1086,11 @@ impl World {
         }
     }
 
-    pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) {
+    pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) -> Result<(), DeadEntity> {
         self.drain_orphans();
-        assert!(self.is_alive(entity), "entity is not alive");
+        if !self.is_alive(entity) {
+            return Err(DeadEntity { entity });
+        }
         let index = entity.index() as usize;
         let location = self.entity_locations[index].unwrap();
         debug_assert!(
@@ -1043,7 +1121,7 @@ impl World {
                     std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
                 });
             }
-            return;
+            return Ok(());
         }
 
         // Compute target archetype: source components ∪ new components
@@ -1077,7 +1155,7 @@ impl World {
                     std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
                 });
             }
-            return;
+            return Ok(());
         }
 
         let (src_arch, target_arch) = get_pair_mut(
@@ -1148,24 +1226,20 @@ impl World {
         // Verify column/entity invariant after migration.
         src_arch.debug_assert_consistent();
         target_arch.debug_assert_consistent();
+        Ok(())
     }
 
-    /// Like [`insert`] but returns `Err(PoolExhausted)` instead of panicking
-    /// when the pool cannot allocate storage for the new archetype's columns.
+    /// Like [`insert`] but returns `Err(InsertError)` instead of panicking
+    /// when the pool cannot allocate storage for the new archetype's columns
+    /// or when the entity is not alive.
     ///
     /// If this method returns `Err`, the world state is unchanged — no partial
     /// migration occurs and the entity remains in its original archetype.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the entity is not alive.
-    pub fn try_insert<B: Bundle>(
-        &mut self,
-        entity: Entity,
-        bundle: B,
-    ) -> Result<(), PoolExhausted> {
+    pub fn try_insert<B: Bundle>(&mut self, entity: Entity, bundle: B) -> Result<(), InsertError> {
         self.drain_orphans();
-        assert!(self.is_alive(entity), "entity is not alive");
+        if !self.is_alive(entity) {
+            return Err(DeadEntity { entity }.into());
+        }
         let index = entity.index() as usize;
         let location = self.entity_locations[index].unwrap();
         debug_assert!(
@@ -1936,7 +2010,7 @@ mod tests {
     fn insert_new_component() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        world.insert(e, (Vel { dx: 3.0, dy: 4.0 },));
+        world.insert(e, (Vel { dx: 3.0, dy: 4.0 },)).unwrap();
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
     }
@@ -1945,7 +2019,7 @@ mod tests {
     fn insert_overwrites_existing() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        world.insert(e, (Pos { x: 10.0, y: 20.0 },));
+        world.insert(e, (Pos { x: 10.0, y: 20.0 },)).unwrap();
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 10.0, y: 20.0 }));
     }
 
@@ -1953,7 +2027,9 @@ mod tests {
     fn insert_multi_component_bundle() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        world.insert(e, (Vel { dx: 3.0, dy: 4.0 }, Health(100u32)));
+        world
+            .insert(e, (Vel { dx: 3.0, dy: 4.0 }, Health(100u32)))
+            .unwrap();
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
         assert_eq!(world.get::<Health>(e), Some(&Health(100u32)));
@@ -1965,7 +2041,9 @@ mod tests {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.0, dy: 0.0 }));
         // Vel already exists, Health is new
-        world.insert(e, (Vel { dx: 9.0, dy: 8.0 }, Health(50u32)));
+        world
+            .insert(e, (Vel { dx: 9.0, dy: 8.0 }, Health(50u32)))
+            .unwrap();
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 9.0, dy: 8.0 }));
         assert_eq!(world.get::<Health>(e), Some(&Health(50u32)));
@@ -1977,7 +2055,7 @@ mod tests {
         // Before the Bundle-based insert, this was a silent footgun.
         let mut world = World::new();
         let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
-        world.insert(e, (Vel { dx: 1.0, dy: 2.0 },));
+        world.insert(e, (Vel { dx: 1.0, dy: 2.0 },)).unwrap();
         // If the tuple were stored as-is, get::<Vel> would return None
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 1.0, dy: 2.0 }));
     }
@@ -2000,7 +2078,7 @@ mod tests {
         let e3 = world.spawn((Pos { x: 3.0, y: 0.0 },));
 
         // Migrate e1 — e3 should swap into e1's old row
-        world.insert(e1, (Vel { dx: 1.0, dy: 0.0 },));
+        world.insert(e1, (Vel { dx: 1.0, dy: 0.0 },)).unwrap();
 
         // All entities still accessible with correct data
         assert_eq!(world.get::<Pos>(e1), Some(&Pos { x: 1.0, y: 0.0 }));
@@ -2068,7 +2146,7 @@ mod tests {
         assert_eq!(world.query::<&Pos>().count(), 1);
         assert_eq!(world.query::<(&Pos, &Vel)>().count(), 0);
 
-        world.insert(e, (Vel { dx: 1.0, dy: 0.0 },));
+        world.insert(e, (Vel { dx: 1.0, dy: 0.0 },)).unwrap();
         assert_eq!(world.query::<&Pos>().count(), 1);
         assert_eq!(world.query::<(&Pos, &Vel)>().count(), 1);
     }
@@ -2721,11 +2799,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate entity")]
-    fn get_batch_mut_duplicate_panics() {
+    fn get_batch_mut_duplicate_returns_none() {
         let mut world = World::new();
         let e = world.spawn((Health(42),));
-        let _results = world.get_batch_mut::<Health>(&[e, e]);
+        let results = world.get_batch_mut::<Health>(&[e, e]);
+        // First occurrence gets Some, duplicate gets None (prevents aliased &mut T).
+        assert!(results[0].is_some());
+        assert!(results[1].is_none());
     }
 
     #[test]
@@ -2762,13 +2842,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate entity")]
-    fn get_batch_mut_sparse_duplicate_panics() {
+    fn get_batch_mut_sparse_duplicate_returns_none() {
         let mut world = World::new();
         world.components.register_sparse::<Health>();
         let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
         world.insert_sparse(e, Health(42));
-        let _results = world.get_batch_mut::<Health>(&[e, e]);
+        let results = world.get_batch_mut::<Health>(&[e, e]);
+        // First occurrence gets Some, duplicate gets None (prevents aliased &mut T).
+        assert!(results[0].is_some());
+        assert!(results[1].is_none());
     }
 
     #[test]

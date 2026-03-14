@@ -369,7 +369,9 @@ impl<'a> Tx<'a> {
     pub fn spawn<B: crate::bundle::Bundle>(&mut self, world: &mut World, bundle: B) -> Entity {
         let entity = world.alloc_entity();
         self.allocated.push(entity);
-        self.changeset.spawn_bundle(world, entity, bundle);
+        self.changeset
+            .spawn_bundle(world, entity, bundle)
+            .expect("spawn_bundle on entity from alloc_entity");
         entity
     }
 
@@ -550,8 +552,8 @@ impl SequentialTx {
         world: &mut World,
         entity: Entity,
         bundle: B,
-    ) {
-        world.insert(entity, bundle);
+    ) -> Result<(), crate::world::DeadEntity> {
+        world.insert(entity, bundle)
     }
 
     pub fn remove<T: Component>(&mut self, world: &mut World, entity: Entity) -> Option<T> {
@@ -1409,7 +1411,7 @@ mod tests {
 
         let strategy = Sequential;
         let mut tx = strategy.begin(&mut world, &access);
-        tx.insert(&mut world, e, (Vel(5.0),));
+        tx.insert(&mut world, e, (Vel(5.0),)).unwrap();
         assert!(world.get::<Vel>(e).is_some());
 
         {

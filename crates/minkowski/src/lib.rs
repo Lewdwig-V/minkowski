@@ -100,9 +100,10 @@ pub use index::{
 };
 pub use minkowski_derive::Table;
 pub use planner::{
-    CardinalityConstraint, Cost, IndexKind, Indexed, JoinKind, PlanNode, PlanWarning, Predicate,
-    QueryPlanResult, QueryPlanner, SpatialLookupFn, SpatialPredicate, SubscriptionBuilder,
-    SubscriptionError, SubscriptionPlan, TablePlanner, VecExecNode, VectorizeOpts, VectorizedPlan,
+    CardinalityConstraint, Cost, IndexKind, Indexed, JoinKind, PlanNode, PlanWarning, PlannerError,
+    Predicate, QueryPlanResult, QueryPlanner, SpatialLookupFn, SpatialPredicate,
+    SubscriptionBuilder, SubscriptionError, SubscriptionPlan, TablePlanner, VecExecNode,
+    VectorizeOpts, VectorizedPlan,
 };
 pub use pool::{HugePages, PoolExhausted};
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
@@ -117,4 +118,4 @@ pub use transaction::{
     Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, TransactError, Tx,
     WorldMismatch,
 };
-pub use world::{QueryTickInfo, World, WorldBuilder, WorldStats};
+pub use world::{DeadEntity, InsertError, QueryTickInfo, World, WorldBuilder, WorldStats};

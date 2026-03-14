@@ -108,7 +108,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 64 * 1024 * 1024,
@@ -126,7 +126,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -181,8 +182,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
-        codecs.register_as::<Score>("score", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Score>("score", &mut world).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 64 * 1024 * 1024,
@@ -201,7 +202,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }

@@ -501,8 +501,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Vel>(&mut world).unwrap();
 
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
         world.spawn((Pos { x: 5.0, y: 6.0 }, Vel { dx: 7.0, dy: 8.0 }));
@@ -532,8 +532,8 @@ mod tests {
     fn bytes_round_trip() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Vel>(&mut world).unwrap();
 
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
         world.spawn((Pos { x: 5.0, y: 6.0 },));
@@ -571,8 +571,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Vel>(&mut world).unwrap();
 
         // Archetype 1: (Pos, Vel)
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.1, dy: 0.2 }));
@@ -596,7 +596,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         // Spawn entity with Vel (which has no codec registered)
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.1, dy: 0.2 }));
@@ -613,8 +613,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Vel>(&mut world).unwrap();
 
         let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
         let _e2 = world.spawn((Pos { x: 3.0, y: 4.0 },));
@@ -642,8 +642,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Vel>(&mut world).unwrap();
 
         let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
         world.insert_sparse::<Vel>(e1, Vel { dx: 5.0, dy: 6.0 });
@@ -672,8 +672,8 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
-        codecs.register::<Vel>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Vel>(&mut world).unwrap();
 
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.1, dy: 0.2 }));
         world.spawn((Pos { x: 3.0, y: 4.0 }, Vel { dx: 0.3, dy: 0.4 }));
@@ -691,7 +691,8 @@ mod tests {
             &mut world,
             e3,
             (Pos { x: 5.0, y: 6.0 }, Vel { dx: 0.5, dy: 0.6 }),
-        );
+        )
+        .unwrap();
         wal.append(&cs, &codecs).unwrap();
         cs.apply(&mut world).unwrap();
 
@@ -717,8 +718,8 @@ mod tests {
         // Recover from snapshot + WAL
         let mut load_codecs = CodecRegistry::new();
         let mut load_world_tmp = World::new();
-        load_codecs.register::<Pos>(&mut load_world_tmp);
-        load_codecs.register::<Vel>(&mut load_world_tmp);
+        load_codecs.register::<Pos>(&mut load_world_tmp).unwrap();
+        load_codecs.register::<Vel>(&mut load_world_tmp).unwrap();
 
         let (mut recovered, snap_seq) = snap.load(&snap_path, &load_codecs).unwrap();
         let last_seq = wal
@@ -736,7 +737,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         world.spawn((Pos { x: 1.0, y: 2.0 },));
 
@@ -761,7 +762,7 @@ mod tests {
         struct Hidden(u32);
         world.register_component::<Hidden>();
 
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
         let pos_id = world.component_id::<Pos>().unwrap();
         assert_eq!(pos_id, 1, "Pos should have id=1 (Hidden took id=0)");
 
@@ -791,7 +792,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
         world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let snap = Snapshot::new();
@@ -856,8 +857,8 @@ mod tests {
         // "Process A": Pos first, then Vel
         let mut world_a = World::new();
         let mut codecs_a = CodecRegistry::new();
-        codecs_a.register_as::<Pos>("pos", &mut world_a);
-        codecs_a.register_as::<Vel>("vel", &mut world_a);
+        codecs_a.register_as::<Pos>("pos", &mut world_a).unwrap();
+        codecs_a.register_as::<Vel>("vel", &mut world_a).unwrap();
 
         world_a.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
 
@@ -867,8 +868,12 @@ mod tests {
         // "Process B": opposite order
         let mut world_b_tmp = World::new();
         let mut codecs_b = CodecRegistry::new();
-        codecs_b.register_as::<Vel>("vel", &mut world_b_tmp);
-        codecs_b.register_as::<Pos>("pos", &mut world_b_tmp);
+        codecs_b
+            .register_as::<Vel>("vel", &mut world_b_tmp)
+            .unwrap();
+        codecs_b
+            .register_as::<Pos>("pos", &mut world_b_tmp)
+            .unwrap();
 
         let (mut world_b, _) = snap.load(&snap_path, &codecs_b).unwrap();
 
@@ -890,8 +895,8 @@ mod tests {
 
         let mut world_a = World::new();
         let mut codecs_a = CodecRegistry::new();
-        codecs_a.register_as::<Pos>("pos", &mut world_a);
-        codecs_a.register_as::<Vel>("vel", &mut world_a);
+        codecs_a.register_as::<Pos>("pos", &mut world_a).unwrap();
+        codecs_a.register_as::<Vel>("vel", &mut world_a).unwrap();
 
         let e = world_a.spawn((Pos { x: 1.0, y: 2.0 },));
         world_a.insert_sparse::<Vel>(e, Vel { dx: 10.0, dy: 20.0 });
@@ -902,8 +907,12 @@ mod tests {
         // Opposite order
         let mut world_b_tmp = World::new();
         let mut codecs_b = CodecRegistry::new();
-        codecs_b.register_as::<Vel>("vel", &mut world_b_tmp);
-        codecs_b.register_as::<Pos>("pos", &mut world_b_tmp);
+        codecs_b
+            .register_as::<Vel>("vel", &mut world_b_tmp)
+            .unwrap();
+        codecs_b
+            .register_as::<Pos>("pos", &mut world_b_tmp)
+            .unwrap();
 
         let (mut world_b, _) = snap.load(&snap_path, &codecs_b).unwrap();
 
@@ -948,7 +957,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
         world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let snap = Snapshot::new();
@@ -972,7 +981,7 @@ mod tests {
     fn snapshot_bytes_crc_mismatch_detected() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
         world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let snap = Snapshot::new();
@@ -995,7 +1004,7 @@ mod tests {
         // Construct a v1-format snapshot (no magic, no CRC — just len+payload)
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
         world.spawn((Pos { x: 42.0, y: 99.0 },));
 
         let snap = Snapshot::new();
@@ -1053,7 +1062,7 @@ mod tests {
         // assert should pass for a well-formed snapshot.
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         // Spawn, despawn, respawn to create non-trivial generations.
         let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
@@ -1080,7 +1089,7 @@ mod tests {
         // Err(SnapshotError::Format), not panic.
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
         world.spawn((Pos { x: 1.0, y: 2.0 },)); // entity(index=0, gen=0)
 
         let snap = Snapshot::new();

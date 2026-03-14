@@ -400,16 +400,18 @@ impl EnumChangeSet {
     /// Record spawning an entity with a bundle of components. Auto-registers
     /// all component types in the bundle.
     ///
-    /// # Panics
-    /// Panics if `entity` is already alive. Use `World::alloc_entity()` to
-    /// obtain an unplaced entity handle.
-    pub fn spawn_bundle<B: Bundle>(&mut self, world: &mut World, entity: Entity, bundle: B) {
-        assert!(
-            !world.is_placed(entity),
-            "spawn_bundle: entity {:?} is already placed in an archetype — \
-             use World::alloc_entity() to obtain an unplaced handle",
-            entity,
-        );
+    /// Returns `Err(ApplyError::AlreadyPlaced)` if the entity is already
+    /// placed in an archetype. Use `World::alloc_entity()` to obtain an
+    /// unplaced entity handle.
+    pub fn spawn_bundle<B: Bundle>(
+        &mut self,
+        world: &mut World,
+        entity: Entity,
+        bundle: B,
+    ) -> Result<(), ApplyError> {
+        if world.is_placed(entity) {
+            return Err(ApplyError::AlreadyPlaced(entity));
+        }
         let _ids = B::component_ids(&mut world.components);
         let mut components = Vec::new();
         unsafe {
@@ -430,6 +432,7 @@ impl EnumChangeSet {
             }
         }
         self.mutations.push(Mutation::Spawn { entity, components });
+        Ok(())
     }
 }
 
@@ -1131,7 +1134,8 @@ mod tests {
             &mut world,
             entity,
             (Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }),
-        );
+        )
+        .unwrap();
 
         cs.apply(&mut world).unwrap();
         assert!(world.is_alive(entity));
@@ -1233,7 +1237,8 @@ mod tests {
             &mut world,
             entity,
             (Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }),
-        );
+        )
+        .unwrap();
 
         cs.apply(&mut world).unwrap();
         assert!(world.is_alive(entity));
@@ -1255,13 +1260,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already placed")]
-    fn spawn_bundle_panics_on_live_entity() {
+    fn spawn_bundle_returns_error_on_live_entity() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Vel { dx: 3.0, dy: 4.0 },));
+        let result = cs.spawn_bundle(&mut world, e, (Vel { dx: 3.0, dy: 4.0 },));
+        assert!(matches!(result, Err(ApplyError::AlreadyPlaced(_))));
     }
 
     #[test]
@@ -1342,7 +1347,8 @@ mod tests {
 
         {
             let mut cs = EnumChangeSet::new();
-            cs.spawn_bundle(&mut world, e, (Tracked::new(42, &drops),));
+            cs.spawn_bundle(&mut world, e, (Tracked::new(42, &drops),))
+                .unwrap();
             // cs dropped here without apply()
         }
 

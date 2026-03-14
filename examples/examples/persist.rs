@@ -53,10 +53,10 @@ fn main() {
     println!("Phase 1: Creating world with 100 entities across 3 archetypes...");
     let mut world = World::new();
     let mut codecs = CodecRegistry::new();
-    codecs.register_as::<Pos>("pos", &mut world);
-    codecs.register_as::<Vel>("vel", &mut world);
-    codecs.register_as::<Health>("health", &mut world);
-    codecs.register_as::<Score>("score", &mut world);
+    codecs.register_as::<Pos>("pos", &mut world).unwrap();
+    codecs.register_as::<Vel>("vel", &mut world).unwrap();
+    codecs.register_as::<Health>("health", &mut world).unwrap();
+    codecs.register_as::<Score>("score", &mut world).unwrap();
 
     // Archetype 1: (Pos, Vel) — moving entities
     for i in 0..50 {
@@ -152,10 +152,18 @@ fn main() {
     println!("Phase 4: Recovering from snapshot + WAL...");
     let mut load_codecs = CodecRegistry::new();
     let mut load_world_tmp = World::new();
-    load_codecs.register_as::<Pos>("pos", &mut load_world_tmp);
-    load_codecs.register_as::<Vel>("vel", &mut load_world_tmp);
-    load_codecs.register_as::<Health>("health", &mut load_world_tmp);
-    load_codecs.register_as::<Score>("score", &mut load_world_tmp);
+    load_codecs
+        .register_as::<Pos>("pos", &mut load_world_tmp)
+        .unwrap();
+    load_codecs
+        .register_as::<Vel>("vel", &mut load_world_tmp)
+        .unwrap();
+    load_codecs
+        .register_as::<Health>("health", &mut load_world_tmp)
+        .unwrap();
+    load_codecs
+        .register_as::<Score>("score", &mut load_world_tmp)
+        .unwrap();
 
     let (mut recovered, snap_seq) = snap.load(&snap_path, &load_codecs).unwrap();
     let mut replay_wal = Wal::open(&wal_dir, &load_codecs, WalConfig::default()).unwrap();

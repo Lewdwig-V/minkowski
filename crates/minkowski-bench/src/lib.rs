@@ -69,10 +69,10 @@ pub fn register_codecs(
     codecs: &mut minkowski_persist::CodecRegistry,
     world: &mut minkowski::World,
 ) {
-    codecs.register::<Transform>(world);
-    codecs.register::<Position>(world);
-    codecs.register::<Rotation>(world);
-    codecs.register::<Velocity>(world);
+    codecs.register::<Transform>(world).unwrap();
+    codecs.register::<Position>(world).unwrap();
+    codecs.register::<Rotation>(world).unwrap();
+    codecs.register::<Velocity>(world).unwrap();
 }
 
 /// Full 4x4 matrix inversion via cofactor expansion (~600 FLOPs per call).

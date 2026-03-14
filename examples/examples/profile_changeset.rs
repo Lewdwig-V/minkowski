@@ -171,7 +171,8 @@ fn run_spawn_changeset() -> World {
                     dz: 0.0,
                 },
             ),
-        );
+        )
+        .unwrap();
     }
     cs.apply(&mut world).unwrap();
     world

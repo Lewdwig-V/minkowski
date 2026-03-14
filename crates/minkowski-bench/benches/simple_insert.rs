@@ -67,7 +67,8 @@ fn simple_insert(c: &mut Criterion) {
                             dz: 1.0,
                         },
                     ),
-                );
+                )
+                .unwrap();
             }
             cs.apply(&mut world).unwrap();
             world

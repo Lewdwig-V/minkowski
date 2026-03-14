@@ -20,8 +20,8 @@ struct Vel {
 fn setup() -> (World, CodecRegistry) {
     let mut world = World::new();
     let mut codecs = CodecRegistry::new();
-    codecs.register::<Pos>(&mut world);
-    codecs.register::<Vel>(&mut world);
+    codecs.register::<Pos>(&mut world).unwrap();
+    codecs.register::<Vel>(&mut world).unwrap();
     for i in 0..1_000 {
         world.spawn((
             Pos {

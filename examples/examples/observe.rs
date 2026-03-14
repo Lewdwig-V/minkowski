@@ -32,8 +32,8 @@ fn main() {
 
     let mut world = World::new();
     let mut codecs = CodecRegistry::new();
-    codecs.register_as::<Pos>("pos", &mut world);
-    codecs.register_as::<Vel>("vel", &mut world);
+    codecs.register_as::<Pos>("pos", &mut world).unwrap();
+    codecs.register_as::<Vel>("vel", &mut world).unwrap();
 
     let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
 
@@ -51,7 +51,8 @@ fn main() {
                 },
                 Vel { dx: 1.0, dy: 0.5 },
             ),
-        );
+        )
+        .unwrap();
         wal.append(&cs, &codecs).unwrap();
         cs.apply(&mut world).expect("observe apply");
     }
@@ -80,7 +81,8 @@ fn main() {
                 x: i as f32,
                 y: 10.0,
             },),
-        );
+        )
+        .unwrap();
         wal.append(&cs, &codecs).unwrap();
         cs.apply(&mut world).expect("observe apply");
     }

@@ -10,10 +10,10 @@ use minkowski_persist::{CodecRegistry, Wal, WalConfig};
 
 fn make_codecs(world: &mut World) -> CodecRegistry {
     let mut codecs = CodecRegistry::new();
-    codecs.register::<A>(world);
-    codecs.register::<B>(world);
-    codecs.register::<C>(world);
-    codecs.register::<D>(world);
+    codecs.register::<A>(world).unwrap();
+    codecs.register::<B>(world).unwrap();
+    codecs.register::<C>(world).unwrap();
+    codecs.register::<D>(world).unwrap();
     codecs
 }
 
@@ -77,14 +77,14 @@ fuzz_target!(|data: &[u8]| {
                 match op {
                     WalOp::SpawnA(a) => {
                         let e = world.alloc_entity();
-                        cs.spawn_bundle(&mut world, e, (*a,));
+                        let _ = cs.spawn_bundle(&mut world, e, (*a,));
                         wal.append(&cs, &codecs).unwrap();
                         cs.apply(&mut world).unwrap();
                         live.push(e);
                     }
                     WalOp::SpawnAB(a, b) => {
                         let e = world.alloc_entity();
-                        cs.spawn_bundle(&mut world, e, (*a, *b));
+                        let _ = cs.spawn_bundle(&mut world, e, (*a, *b));
                         wal.append(&cs, &codecs).unwrap();
                         cs.apply(&mut world).unwrap();
                         live.push(e);

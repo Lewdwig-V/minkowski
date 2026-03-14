@@ -186,10 +186,10 @@ fn main() {
     println!("\n--- Dynamic reducers ---");
 
     // Give hero and enemy Energy + Shield components for dynamic reducer demo
-    world.insert(hero, (Energy(80.0),));
-    world.insert(hero, (Shield(0.0),));
-    world.insert(enemy, (Energy(30.0),));
-    world.insert(enemy, (Shield(0.0),));
+    world.insert(hero, (Energy(80.0),)).unwrap();
+    world.insert(hero, (Shield(0.0),)).unwrap();
+    world.insert(enemy, (Energy(30.0),)).unwrap();
+    world.insert(enemy, (Shield(0.0),)).unwrap();
 
     // Register a dynamic reducer that conditionally applies a shield
     // based on HP and Energy — can't express this with static types

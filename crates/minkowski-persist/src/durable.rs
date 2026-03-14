@@ -152,7 +152,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         let wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let strategy = Optimistic::new(&world);
@@ -178,7 +178,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Health>(&mut world);
+        codecs.register::<Health>(&mut world).unwrap();
 
         let wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let strategy = Pessimistic::new(&world);
@@ -220,7 +220,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 64 * 1024 * 1024,
@@ -259,7 +259,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 64 * 1024 * 1024,
@@ -289,7 +289,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         let wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let strategy = Optimistic::with_retries(&world, 3);

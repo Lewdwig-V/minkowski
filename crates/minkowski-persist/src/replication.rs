@@ -116,7 +116,7 @@ mod tests {
         let wal_dir = dir.join("test.wal");
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
         for i in 0..n {
@@ -129,7 +129,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -270,7 +271,9 @@ mod tests {
 
         let mut replica = World::new();
         let mut replica_codecs = CodecRegistry::new();
-        replica_codecs.register_as::<Pos>("pos", &mut replica);
+        replica_codecs
+            .register_as::<Pos>("pos", &mut replica)
+            .unwrap();
 
         let last_seq = apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
 
@@ -285,14 +288,15 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
-        codecs.register_as::<Health>("health", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Health>("health", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
 
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
         wal.append(&cs, &codecs).unwrap();
         cs.apply(&mut world).unwrap();
 
@@ -309,8 +313,12 @@ mod tests {
 
         let mut replica = World::new();
         let mut replica_codecs = CodecRegistry::new();
-        replica_codecs.register_as::<Pos>("pos", &mut replica);
-        replica_codecs.register_as::<Health>("health", &mut replica);
+        replica_codecs
+            .register_as::<Pos>("pos", &mut replica)
+            .unwrap();
+        replica_codecs
+            .register_as::<Health>("health", &mut replica)
+            .unwrap();
 
         apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
 
@@ -328,13 +336,14 @@ mod tests {
         // Source: Pos=0, Health=1
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
-        codecs.register_as::<Health>("health", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Health>("health", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 }, Health(50)));
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 }, Health(50)))
+            .unwrap();
         wal.append(&cs, &codecs).unwrap();
         drop(wal);
 
@@ -344,8 +353,12 @@ mod tests {
 
         let mut replica = World::new();
         let mut replica_codecs = CodecRegistry::new();
-        replica_codecs.register_as::<Health>("health", &mut replica);
-        replica_codecs.register_as::<Pos>("pos", &mut replica);
+        replica_codecs
+            .register_as::<Health>("health", &mut replica)
+            .unwrap();
+        replica_codecs
+            .register_as::<Pos>("pos", &mut replica)
+            .unwrap();
 
         apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
 
@@ -364,13 +377,14 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
 
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
-        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
         wal.append(&cs, &codecs).unwrap();
         cs.apply(&mut world).unwrap();
 
@@ -387,7 +401,9 @@ mod tests {
 
         let mut replica = World::new();
         let mut replica_codecs = CodecRegistry::new();
-        replica_codecs.register_as::<Pos>("pos", &mut replica);
+        replica_codecs
+            .register_as::<Pos>("pos", &mut replica)
+            .unwrap();
 
         apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
 
@@ -415,7 +431,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
 
@@ -430,7 +446,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -445,7 +462,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -467,7 +485,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         // Small segments to force rollover
         let config = WalConfig {
@@ -486,7 +504,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -508,7 +527,7 @@ mod tests {
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 128,
@@ -526,7 +545,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -586,7 +606,7 @@ mod tests {
         // Source: spawn 5 entities, snapshot, then 3 more via WAL
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
 
         for i in 0..5 {
             world.spawn((Pos {
@@ -612,7 +632,8 @@ mod tests {
                     x: i as f32,
                     y: 0.0,
                 },),
-            );
+            )
+            .unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
@@ -622,7 +643,7 @@ mod tests {
         // Replica: load snapshot + pull WAL
         let mut replica_codecs = CodecRegistry::new();
         let mut tmp = World::new();
-        replica_codecs.register_as::<Pos>("pos", &mut tmp);
+        replica_codecs.register_as::<Pos>("pos", &mut tmp).unwrap();
 
         let (mut replica, snap_seq) = snap.load(&snap_path, &replica_codecs).unwrap();
         assert_eq!(replica.query::<(&Pos,)>().count(), 5);

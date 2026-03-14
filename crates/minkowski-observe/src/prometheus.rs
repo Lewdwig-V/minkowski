@@ -265,7 +265,7 @@ mod tests {
         let wal_path = dir.path().join("test.wal");
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register::<Pos>(&mut world);
+        codecs.register::<Pos>(&mut world).unwrap();
 
         let wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
         let snap = MetricsSnapshot::capture(&world, Some(&wal));

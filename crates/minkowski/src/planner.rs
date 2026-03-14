@@ -102,6 +102,34 @@ use crate::transaction::WorldMismatch;
 use crate::world::{World, WorldId};
 use std::sync::Arc;
 
+// ── Planner errors ───────────────────────────────────────────────────
+
+/// Error returned by planner builder methods when inputs are invalid.
+#[derive(Clone, Debug)]
+pub enum PlannerError {
+    /// Invalid predicate parameters (e.g. negative radius, empty coordinates,
+    /// min > max).
+    InvalidPredicate(String),
+    /// Component type has not been registered in the World.
+    UnregisteredComponent(&'static str),
+    /// Builder method called in wrong order (e.g. `with_right_estimate` before `join`).
+    BuilderOrder(String),
+}
+
+impl fmt::Display for PlannerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlannerError::InvalidPredicate(msg) => write!(f, "{msg}"),
+            PlannerError::UnregisteredComponent(name) => {
+                write!(f, "component `{name}` not registered in this World")
+            }
+            PlannerError::BuilderOrder(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for PlannerError {}
+
 // ── Cost model ───────────────────────────────────────────────────────
 
 /// Cost estimate for a plan node. All values are dimensionless relative units
@@ -459,26 +487,28 @@ impl Predicate {
         center: impl Into<Vec<f64>>,
         radius: f64,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        assert!(
-            radius >= 0.0 && radius.is_finite(),
-            "Predicate::within: radius must be finite and non-negative, got {radius}"
-        );
+    ) -> Result<Self, PlannerError> {
+        if !(radius >= 0.0 && radius.is_finite()) {
+            return Err(PlannerError::InvalidPredicate(format!(
+                "Predicate::within: radius must be finite and non-negative, got {radius}"
+            )));
+        }
         let center = center.into();
-        assert!(
-            !center.is_empty(),
-            "Predicate::within: center must have at least one coordinate"
-        );
+        if center.is_empty() {
+            return Err(PlannerError::InvalidPredicate(
+                "Predicate::within: center must have at least one coordinate".into(),
+            ));
+        }
         // Conservative default — override via .with_selectivity().
         let selectivity = sanitize_selectivity(0.1);
-        Predicate {
+        Ok(Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
             kind: PredicateKind::Spatial(SpatialPredicate::Within { center, radius }),
             selectivity,
             filter_fn: Some(Arc::new(filter)),
             lookup_value: None,
-        }
+        })
     }
 
     /// Spatial bounding-box intersection predicate.
@@ -500,34 +530,37 @@ impl Predicate {
         min: impl Into<Vec<f64>>,
         max: impl Into<Vec<f64>>,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
-    ) -> Self {
+    ) -> Result<Self, PlannerError> {
         let min = min.into();
         let max = max.into();
-        assert!(
-            min.len() == max.len(),
-            "Predicate::intersects: min and max must have the same dimensionality, \
-             got {} vs {}",
-            min.len(),
-            max.len()
-        );
-        assert!(
-            !min.is_empty(),
-            "Predicate::intersects: coordinates must have at least one dimension"
-        );
-        assert!(
-            min.iter().zip(max.iter()).all(|(lo, hi)| lo <= hi),
-            "Predicate::intersects: min must be <= max in all dimensions"
-        );
+        if min.len() != max.len() {
+            return Err(PlannerError::InvalidPredicate(format!(
+                "Predicate::intersects: min and max must have the same dimensionality, \
+                 got {} vs {}",
+                min.len(),
+                max.len()
+            )));
+        }
+        if min.is_empty() {
+            return Err(PlannerError::InvalidPredicate(
+                "Predicate::intersects: coordinates must have at least one dimension".into(),
+            ));
+        }
+        if !min.iter().zip(max.iter()).all(|(lo, hi)| lo <= hi) {
+            return Err(PlannerError::InvalidPredicate(
+                "Predicate::intersects: min must be <= max in all dimensions".into(),
+            ));
+        }
         // Conservative default — override via .with_selectivity().
         let selectivity = sanitize_selectivity(0.1);
-        Predicate {
+        Ok(Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
             kind: PredicateKind::Spatial(SpatialPredicate::Intersects { min, max }),
             selectivity,
             filter_fn: Some(Arc::new(filter)),
             lookup_value: None,
-        }
+        })
     }
 
     /// Override the default selectivity estimate.
@@ -1524,15 +1557,15 @@ impl ScanBuilder<'_> {
 
     /// Set explicit row estimate for the most recently added join's right side.
     ///
-    /// # Panics
-    /// Panics if called before any `join()`.
-    pub fn with_right_estimate(mut self, rows: usize) -> Self {
-        assert!(
-            !self.joins.is_empty(),
-            "with_right_estimate() called before any join() — call join() first"
-        );
+    /// Returns `Err(PlannerError::BuilderOrder)` if called before any `join()`.
+    pub fn with_right_estimate(mut self, rows: usize) -> Result<Self, PlannerError> {
+        if self.joins.is_empty() {
+            return Err(PlannerError::BuilderOrder(
+                "with_right_estimate() called before any join() — call join() first".into(),
+            ));
+        }
         self.joins.last_mut().unwrap().right_estimated_rows = rows;
-        self
+        Ok(self)
     }
 
     /// Compile the scan into an optimized execution plan.
@@ -2310,18 +2343,18 @@ impl<'w> QueryPlanner<'w> {
 
     /// Register a `BTreeIndex` for cost-based index selection.
     ///
-    /// # Panics
-    /// Panics if `T` has not been registered as a component in `world`.
+    /// Returns `Err(PlannerError::UnregisteredComponent)` if `T` has not been
+    /// registered as a component in `world`.
     pub fn add_btree_index<T: Component + Ord + Clone>(
         &mut self,
         index: &Arc<BTreeIndex<T>>,
         world: &World,
-    ) {
-        assert!(
-            world.component_id::<T>().is_some(),
-            "QueryPlanner::add_btree_index: component `{}` not registered in this World",
-            std::any::type_name::<T>()
-        );
+    ) -> Result<(), PlannerError> {
+        if world.component_id::<T>().is_none() {
+            return Err(PlannerError::UnregisteredComponent(
+                std::any::type_name::<T>(),
+            ));
+        }
         let index = index.clone();
 
         // all_entities_fn: iterate live index at execution time (not a snapshot).
@@ -2364,22 +2397,23 @@ impl<'w> QueryPlanner<'w> {
                 range_lookup_fn: Some(range_fn),
             },
         );
+        Ok(())
     }
 
     /// Register a `HashIndex` for cost-based index selection.
     ///
-    /// # Panics
-    /// Panics if `T` has not been registered as a component in `world`.
+    /// Returns `Err(PlannerError::UnregisteredComponent)` if `T` has not been
+    /// registered as a component in `world`.
     pub fn add_hash_index<T: Component + std::hash::Hash + Eq + Clone>(
         &mut self,
         index: &Arc<HashIndex<T>>,
         world: &World,
-    ) {
-        assert!(
-            world.component_id::<T>().is_some(),
-            "QueryPlanner::add_hash_index: component `{}` not registered in this World",
-            std::any::type_name::<T>()
-        );
+    ) -> Result<(), PlannerError> {
+        if world.component_id::<T>().is_none() {
+            return Err(PlannerError::UnregisteredComponent(
+                std::any::type_name::<T>(),
+            ));
+        }
         let index = index.clone();
 
         // all_entities_fn: iterate live index at execution time (not a snapshot).
@@ -2409,6 +2443,7 @@ impl<'w> QueryPlanner<'w> {
                 eq_lookup_fn: Some(eq_fn),
                 range_lookup_fn: None, // Hash doesn't support range queries.
             });
+        Ok(())
     }
 
     /// Register a spatial index for a component type.
@@ -2417,18 +2452,18 @@ impl<'w> QueryPlanner<'w> {
     /// index can accelerate spatial predicates on `T`. Multiple spatial indexes
     /// can be registered for different component types, but only one per type.
     ///
-    /// # Panics
-    /// Panics if `T` has not been registered as a component in `world`.
+    /// Returns `Err(PlannerError::UnregisteredComponent)` if `T` has not been
+    /// registered as a component in `world`.
     pub fn add_spatial_index<T: Component>(
         &mut self,
         index: Arc<dyn SpatialIndex + Send + Sync>,
         world: &World,
-    ) {
-        assert!(
-            world.component_id::<T>().is_some(),
-            "QueryPlanner::add_spatial_index: component `{}` not registered in this World",
-            std::any::type_name::<T>()
-        );
+    ) -> Result<(), PlannerError> {
+        if world.component_id::<T>().is_none() {
+            return Err(PlannerError::UnregisteredComponent(
+                std::any::type_name::<T>(),
+            ));
+        }
         self.spatial_indexes.insert(
             TypeId::of::<T>(),
             SpatialIndexDescriptor {
@@ -2437,6 +2472,7 @@ impl<'w> QueryPlanner<'w> {
                 lookup_fn: None,
             },
         );
+        Ok(())
     }
 
     /// Register a spatial index with both cost discovery and execution-time lookup.
@@ -2446,19 +2482,19 @@ impl<'w> QueryPlanner<'w> {
     /// assumptions about how the index answers queries — the closure is the
     /// adapter.
     ///
-    /// # Panics
-    /// Panics if `T` has not been registered as a component in `world`.
+    /// Returns `Err(PlannerError::UnregisteredComponent)` if `T` has not been
+    /// registered as a component in `world`.
     pub fn add_spatial_index_with_lookup<T: Component>(
         &mut self,
         index: Arc<dyn SpatialIndex + Send + Sync>,
         world: &World,
         lookup: impl Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync + 'static,
-    ) {
-        assert!(
-            world.component_id::<T>().is_some(),
-            "QueryPlanner::add_spatial_index_with_lookup: component `{}` not registered",
-            std::any::type_name::<T>()
-        );
+    ) -> Result<(), PlannerError> {
+        if world.component_id::<T>().is_none() {
+            return Err(PlannerError::UnregisteredComponent(
+                std::any::type_name::<T>(),
+            ));
+        }
         self.spatial_indexes.insert(
             TypeId::of::<T>(),
             SpatialIndexDescriptor {
@@ -2467,6 +2503,7 @@ impl<'w> QueryPlanner<'w> {
                 lookup_fn: Some(Arc::new(lookup)),
             },
         );
+        Ok(())
     }
 
     /// Start building a scan plan for query type `Q`.
@@ -3313,24 +3350,30 @@ impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
     /// optimization.
     ///
     /// **Compile-time enforcement**: requires `T: HasBTreeIndex<C>`.
-    pub fn add_btree_index<C>(&mut self, index: &Arc<crate::index::BTreeIndex<C>>)
+    pub fn add_btree_index<C>(
+        &mut self,
+        index: &Arc<crate::index::BTreeIndex<C>>,
+    ) -> Result<(), PlannerError>
     where
         C: Component + Ord + Clone,
         T: crate::index::HasBTreeIndex<C>,
     {
-        self.planner.add_btree_index::<C>(index, self.world);
+        self.planner.add_btree_index::<C>(index, self.world)
     }
 
     /// Register a hash index with the underlying planner for cost-based
     /// optimization.
     ///
     /// **Compile-time enforcement**: requires `T: HasHashIndex<C>`.
-    pub fn add_hash_index<C>(&mut self, index: &Arc<crate::index::HashIndex<C>>)
+    pub fn add_hash_index<C>(
+        &mut self,
+        index: &Arc<crate::index::HashIndex<C>>,
+    ) -> Result<(), PlannerError>
     where
         C: Component + std::hash::Hash + Eq + Clone,
         T: crate::index::HasHashIndex<C>,
     {
-        self.planner.add_hash_index::<C>(index, self.world);
+        self.planner.add_hash_index::<C>(index, self.world)
     }
 
     /// Register a spatial index with cost discovery and execution-time lookup.
@@ -3342,16 +3385,19 @@ impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
         &mut self,
         index: Arc<dyn SpatialIndex + Send + Sync>,
         lookup: impl Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync + 'static,
-    ) {
+    ) -> Result<(), PlannerError> {
         self.planner
-            .add_spatial_index_with_lookup::<C>(index, self.world, lookup);
+            .add_spatial_index_with_lookup::<C>(index, self.world, lookup)
     }
 
     /// Register a spatial index for cost discovery only (no execution-time lookup).
     ///
     /// Delegates to [`QueryPlanner::add_spatial_index`].
-    pub fn add_spatial_index<C: Component>(&mut self, index: Arc<dyn SpatialIndex + Send + Sync>) {
-        self.planner.add_spatial_index::<C>(index, self.world);
+    pub fn add_spatial_index<C: Component>(
+        &mut self,
+        index: Arc<dyn SpatialIndex + Send + Sync>,
+    ) -> Result<(), PlannerError> {
+        self.planner.add_spatial_index::<C>(index, self.world)
     }
 
     /// Get the `Indexed<C>` witness for a btree-indexed field, suitable for
@@ -3522,7 +3568,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(idx), &world);
+        planner.add_btree_index(&Arc::new(idx), &world).unwrap();
         assert!(planner.indexes.contains_key(&TypeId::of::<Score>()));
         assert_eq!(
             planner.indexes[&TypeId::of::<Score>()].kind,
@@ -3540,7 +3586,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&Arc::new(idx), &world);
+        planner.add_hash_index(&Arc::new(idx), &world).unwrap();
         assert!(planner.indexes.contains_key(&TypeId::of::<Team>()));
         assert_eq!(planner.indexes[&TypeId::of::<Team>()].kind, IndexKind::Hash);
     }
@@ -3557,8 +3603,8 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
-        planner.add_hash_index(&Arc::new(hash), &world); // should not overwrite
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
+        planner.add_hash_index(&Arc::new(hash), &world).unwrap(); // should not overwrite
         assert_eq!(
             planner.indexes[&TypeId::of::<Score>()].kind,
             IndexKind::BTree
@@ -3599,7 +3645,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&Arc::new(idx), &world);
+        planner.add_hash_index(&Arc::new(idx), &world).unwrap();
 
         let plan = planner
             .scan::<(&Team,)>()
@@ -3625,7 +3671,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(idx), &world);
+        planner.add_btree_index(&Arc::new(idx), &world).unwrap();
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -3679,7 +3725,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&Arc::new(idx), &world);
+        planner.add_hash_index(&Arc::new(idx), &world).unwrap();
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -3730,8 +3776,10 @@ mod tests {
         team_idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(score_idx), &world);
-        planner.add_hash_index(&Arc::new(team_idx), &world);
+        planner
+            .add_btree_index(&Arc::new(score_idx), &world)
+            .unwrap();
+        planner.add_hash_index(&Arc::new(team_idx), &world).unwrap();
 
         let plan = planner
             .scan::<(&Score, &Team)>()
@@ -3772,6 +3820,7 @@ mod tests {
             .scan_with_estimate::<(&Score,)>(10)
             .join::<(&Team,)>(JoinKind::Inner)
             .with_right_estimate(5)
+            .unwrap()
             .build();
 
         match plan.root() {
@@ -3809,6 +3858,7 @@ mod tests {
             .scan_with_estimate::<(&Score,)>(100)
             .join::<(&Team,)>(JoinKind::Inner)
             .with_right_estimate(500)
+            .unwrap()
             .build();
 
         match plan.root() {
@@ -3840,6 +3890,7 @@ mod tests {
             .scan_with_estimate::<(&Score,)>(500)
             .join::<(&Team,)>(JoinKind::Left)
             .with_right_estimate(100)
+            .unwrap()
             .build();
 
         match plan.root() {
@@ -3881,6 +3932,7 @@ mod tests {
             .scan_with_estimate::<(&Score,)>(500)
             .join::<(&Team,)>(JoinKind::Inner)
             .with_right_estimate(100)
+            .unwrap()
             .build();
 
         match plan.root() {
@@ -3908,7 +3960,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(idx), &world);
+        planner.add_btree_index(&Arc::new(idx), &world).unwrap();
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -4129,7 +4181,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(idx), &world);
+        planner.add_btree_index(&Arc::new(idx), &world).unwrap();
 
         let full_scan = planner.scan::<(&Score,)>().build();
         let indexed = planner
@@ -4221,7 +4273,9 @@ mod tests {
         score_idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(score_idx), &world);
+        planner
+            .add_btree_index(&Arc::new(score_idx), &world)
+            .unwrap();
 
         let plan = planner
             .scan::<(&Score, &Team)>()
@@ -4338,7 +4392,7 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(idx), &world);
+        planner.add_btree_index(&Arc::new(idx), &world).unwrap();
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -4425,6 +4479,7 @@ mod tests {
             .scan_with_estimate::<(&Score,)>(10)
             .join::<(&Team,)>(JoinKind::Inner)
             .with_right_estimate(5)
+            .unwrap()
             .build();
         let vec_plan = plan.vectorize(VectorizeOpts::default());
 
@@ -4630,7 +4685,7 @@ mod tests {
 
         // Then create planner (borrows &World)
         let mut planner = TablePlanner::<IndexedScores>::new(&world);
-        planner.add_btree_index::<Score>(&Arc::new(btree));
+        planner.add_btree_index::<Score>(&Arc::new(btree)).unwrap();
 
         let plan = planner
             .scan::<(&Score, &Team)>()
@@ -4754,7 +4809,7 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&Arc::new(hash), &world);
+        planner.add_hash_index(&Arc::new(hash), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score, &Team)>()
@@ -4887,7 +4942,7 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&Arc::new(hash), &world);
+        planner.add_hash_index(&Arc::new(hash), &world).unwrap();
 
         // scan::<(&Score, &Team)> requires BOTH components
         let mut plan = planner
@@ -4918,7 +4973,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -4941,7 +4996,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -4967,7 +5022,7 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&Arc::new(hash), &world);
+        planner.add_hash_index(&Arc::new(hash), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score, &Team)>()
@@ -4990,7 +5045,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -5010,7 +5065,7 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&Arc::new(hash), &world);
+        planner.add_hash_index(&Arc::new(hash), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Team,)>()
@@ -5035,7 +5090,7 @@ mod tests {
         let btree = Arc::new(btree);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&btree, &world);
+        planner.add_btree_index(&btree, &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -5071,7 +5126,7 @@ mod tests {
         let hash = Arc::new(hash);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&hash, &world);
+        planner.add_hash_index(&hash, &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Team,)>()
@@ -5099,8 +5154,8 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
-        planner.add_hash_index(&Arc::new(hash), &world);
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
+        planner.add_hash_index(&Arc::new(hash), &world).unwrap();
 
         // Complex plan: index + filter + join
         let mut plan = planner
@@ -5196,6 +5251,7 @@ mod tests {
             .scan_with_estimate::<(&Score,)>(8)
             .join::<(&Team,)>(JoinKind::Left)
             .with_right_estimate(3)
+            .unwrap()
             .build();
         let result = plan.execute(&mut world).unwrap();
         // Left join: all 8 Score entities preserved.
@@ -5882,11 +5938,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(grid), &world)
+            .unwrap();
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true).unwrap())
             .build();
 
         // The root of the logical plan should be a SpatialLookup.
@@ -5920,15 +5978,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(grid), &world)
+            .unwrap();
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::intersects::<Pos>(
-                [0.0, 0.0],
-                [25.0, 25.0],
-                |_, _| true,
-            ))
+            .filter(Predicate::intersects::<Pos>([0.0, 0.0], [25.0, 25.0], |_, _| true).unwrap())
             .build();
 
         match plan.root() {
@@ -5950,7 +6006,7 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true).unwrap())
             .build();
 
         // Without a spatial index, should fall back to Scan + Filter.
@@ -5984,11 +6040,13 @@ mod tests {
 
         // Register a spatial index that doesn't support any queries.
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(UnsupportedGridIndex), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(UnsupportedGridIndex), &world)
+            .unwrap();
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true).unwrap())
             .build();
 
         // Index exists but doesn't support Within — should fall back.
@@ -6026,11 +6084,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(grid), &world)
+            .unwrap();
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true).unwrap())
             .build();
 
         match plan.vec_root() {
@@ -6055,11 +6115,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(grid), &world)
+            .unwrap();
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true).unwrap())
             .build();
 
         let explain = plan.explain();
@@ -6072,7 +6134,9 @@ mod tests {
 
     #[test]
     fn spatial_predicate_with_custom_selectivity() {
-        let pred = Predicate::within::<Pos>([0.0, 0.0], 1.0, |_, _| true).with_selectivity(0.05);
+        let pred = Predicate::within::<Pos>([0.0, 0.0], 1.0, |_, _| true)
+            .unwrap()
+            .with_selectivity(0.05);
 
         // Selectivity override should work.
         match &pred.kind {
@@ -6086,12 +6150,12 @@ mod tests {
 
     #[test]
     fn spatial_predicate_debug_format() {
-        let pred = Predicate::within::<Pos>([1.0, 2.0], 3.0, |_, _| true);
+        let pred = Predicate::within::<Pos>([1.0, 2.0], 3.0, |_, _| true).unwrap();
         let dbg = format!("{:?}", pred);
         assert!(dbg.contains("Spatial"));
         assert!(dbg.contains("ST_Within"));
 
-        let pred2 = Predicate::intersects::<Pos>([0.0, 0.0], [10.0, 10.0], |_, _| true);
+        let pred2 = Predicate::intersects::<Pos>([0.0, 0.0], [10.0, 10.0], |_, _| true).unwrap();
         let dbg2 = format!("{:?}", pred2);
         assert!(dbg2.contains("ST_Intersects"));
     }
@@ -6116,13 +6180,15 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(grid), &world)
+            .unwrap();
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         // Spatial predicate with very low estimated cost should win.
         let plan = planner
             .scan::<(&Pos, &Score)>()
-            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true).unwrap())
             .filter(Predicate::range::<Score, _>(Score(400)..Score(600)))
             .build();
 
@@ -6159,15 +6225,14 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(
-                [10.0, 10.0],
-                100.0,
-                |world, entity| {
+            .filter(
+                Predicate::within::<Pos>([10.0, 10.0], 100.0, |world, entity| {
                     world.get::<Pos>(entity).is_some_and(|p| {
                         ((p.x - 10.0).powi(2) + (p.y - 10.0).powi(2)).sqrt() < 100.0
                     })
-                },
-            ))
+                })
+                .unwrap(),
+            )
             .build();
 
         let mut count = 0;
@@ -6258,14 +6323,16 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(ExpensiveSpatialIndex), &world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(ExpensiveSpatialIndex), &world)
+            .unwrap();
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         // BTree with high selectivity (0.01) → cost ~ 5 + 10 = 15.
         // Spatial index reports cpu=500. BTree should win.
         let plan = planner
             .scan::<(&Pos, &Score)>()
-            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true).unwrap())
             .filter(Predicate::eq::<Score>(Score(42)))
             .build();
 
@@ -6319,12 +6386,14 @@ mod tests {
         idx.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(idx), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(idx), &world)
+            .unwrap();
 
         // Within should get a SpatialLookup.
         let within_plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([25.0, 25.0], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([25.0, 25.0], 5.0, |_, _| true).unwrap())
             .build();
         assert!(
             matches!(within_plan.root(), PlanNode::SpatialLookup { .. }),
@@ -6336,11 +6405,7 @@ mod tests {
         // Intersects should fall back with a SpatialIndexDeclined warning.
         let intersects_plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::intersects::<Pos>(
-                [0.0, 0.0],
-                [10.0, 10.0],
-                |_, _| true,
-            ))
+            .filter(Predicate::intersects::<Pos>([0.0, 0.0], [10.0, 10.0], |_, _| true).unwrap())
             .build();
         match intersects_plan.root() {
             PlanNode::Filter { child, .. } => {
@@ -6372,17 +6437,15 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(grid), &world)
+            .unwrap();
 
         // Two spatial predicates on the same component.
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([50.0, 50.0], 5.0, |_, _| true))
-            .filter(Predicate::intersects::<Pos>(
-                [0.0, 0.0],
-                [0.5, 0.5],
-                |_, _| true,
-            ))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 5.0, |_, _| true).unwrap())
+            .filter(Predicate::intersects::<Pos>([0.0, 0.0], [0.5, 0.5], |_, _| true).unwrap())
             .build();
 
         // One should be the driver (SpatialLookup), the other a Filter.
@@ -6453,12 +6516,14 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(HighRowsSpatialIndex), &world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(HighRowsSpatialIndex), &world)
+            .unwrap();
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         let plan = planner
             .scan::<(&Pos, &Score)>()
-            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true).unwrap())
             .filter(Predicate::eq::<Score>(Score(42)))
             .build();
 
@@ -6494,18 +6559,20 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(
-            Arc::new(grid),
-            &world,
-            move |_expr: &crate::index::SpatialExpr| {
-                call_count_clone.fetch_add(1, Ordering::Relaxed);
-                vec![e1, e2]
-            },
-        );
+        planner
+            .add_spatial_index_with_lookup::<Pos>(
+                Arc::new(grid),
+                &world,
+                move |_expr: &crate::index::SpatialExpr| {
+                    call_count_clone.fetch_add(1, Ordering::Relaxed);
+                    vec![e1, e2]
+                },
+            )
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([5.0, 5.0], 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([5.0, 5.0], 10.0, |_, _| true).unwrap())
             .build();
 
         let mut results = Vec::new();
@@ -6539,18 +6606,20 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(
-            Arc::new(grid),
-            &world,
-            move |_expr: &crate::index::SpatialExpr| {
-                cc.fetch_add(1, Ordering::Relaxed);
-                vec![e1, e2]
-            },
-        );
+        planner
+            .add_spatial_index_with_lookup::<Pos>(
+                Arc::new(grid),
+                &world,
+                move |_expr: &crate::index::SpatialExpr| {
+                    cc.fetch_add(1, Ordering::Relaxed);
+                    vec![e1, e2]
+                },
+            )
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([5.0, 5.0], 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([5.0, 5.0], 10.0, |_, _| true).unwrap())
             .join::<(&Score,)>(JoinKind::Inner)
             .build();
 
@@ -6573,13 +6642,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-            vec![e1, e2]
-        });
+        planner
+            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([1.5, 1.5], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([1.5, 1.5], 5.0, |_, _| true).unwrap())
             .build();
 
         let results = plan.execute(&mut world).unwrap();
@@ -6598,14 +6667,14 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-            vec![e1, e2]
-        });
+        planner
+            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .unwrap();
 
         // Build the plan while the planner still borrows world, then drop planner.
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([1.5, 1.5], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([1.5, 1.5], 5.0, |_, _| true).unwrap())
             .build();
 
         // Now we can mutate world — despawn e2 after the plan is built.
@@ -6633,14 +6702,16 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-            cc.fetch_add(1, Ordering::Relaxed);
-            vec![e1]
-        });
+        planner
+            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+                cc.fetch_add(1, Ordering::Relaxed);
+                vec![e1]
+            })
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true).unwrap())
             .build();
 
         let mut results = Vec::new();
@@ -6666,11 +6737,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+        planner
+            .add_spatial_index::<Pos>(Arc::new(grid), &world)
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([5.0, 5.0], 100.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([5.0, 5.0], 100.0, |_, _| true).unwrap())
             .build();
 
         let mut count = 0;
@@ -6696,13 +6769,15 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-            vec![e1, e2, e3]
-        });
+        planner
+            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+                vec![e1, e2, e3]
+            })
+            .unwrap();
 
         let mut plan = planner
             .scan::<(Changed<Pos>, &Pos)>()
-            .filter(Predicate::within::<Pos>([1.5, 1.5], 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([1.5, 1.5], 10.0, |_, _| true).unwrap())
             .build();
 
         // First scan — all entities "changed" (never read before by this plan).
@@ -6741,15 +6816,17 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(
-            Arc::new(grid),
-            &world,
-            |_expr| Vec::new(), // empty result set
-        );
+        planner
+            .add_spatial_index_with_lookup::<Pos>(
+                Arc::new(grid),
+                &world,
+                |_expr| Vec::new(), // empty result set
+            )
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([0.0, 0.0], 1.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([0.0, 0.0], 1.0, |_, _| true).unwrap())
             .build();
 
         let mut count = 0;
@@ -6767,13 +6844,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-            vec![e1, e2]
-        });
+        planner
+            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true).unwrap())
             .build();
 
         // Despawn ALL entities returned by the lookup after plan is built.
@@ -6795,13 +6872,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-            vec![e1, e2]
-        });
+        planner
+            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true).unwrap())
             .build();
 
         world.despawn(e2);
@@ -6824,14 +6901,14 @@ mod tests {
 
         // Lookup returns both entities.
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-            vec![e1, e2]
-        });
+        planner
+            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .unwrap();
 
         // Query requires BOTH Pos and Score.
         let mut plan = planner
             .scan::<(&Pos, &Score)>()
-            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true).unwrap())
             .build();
 
         let mut results = Vec::new();
@@ -6856,13 +6933,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-            vec![e1, e2]
-        });
+        planner
+            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true).unwrap())
             .build();
 
         let mut results = Vec::new();
@@ -6888,17 +6965,13 @@ mod tests {
         grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-            vec![e1, e2]
-        });
+        planner
+            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::intersects::<Pos>(
-                [0.0, 0.0],
-                [10.0, 10.0],
-                |_, _| true,
-            ))
+            .filter(Predicate::intersects::<Pos>([0.0, 0.0], [10.0, 10.0], |_, _| true).unwrap())
             .build();
 
         let mut results = Vec::new();
@@ -6949,25 +7022,19 @@ mod tests {
         }
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_spatial_index_with_lookup::<Pos3D>(
-            Arc::new(Dummy3DIndex),
-            &world,
-            move |expr| {
+        planner
+            .add_spatial_index_with_lookup::<Pos3D>(Arc::new(Dummy3DIndex), &world, move |expr| {
                 cc.fetch_add(1, Ordering::Relaxed);
                 if let crate::index::SpatialExpr::Within { center, .. } = expr {
                     *rc.lock().unwrap() = center.clone();
                 }
                 vec![e1]
-            },
-        );
+            })
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Pos3D,)>()
-            .filter(Predicate::within::<Pos3D>(
-                [10.0, 20.0, 30.0],
-                5.0,
-                |_, _| true,
-            ))
+            .filter(Predicate::within::<Pos3D>([10.0, 20.0, 30.0], 5.0, |_, _| true).unwrap())
             .build();
 
         let mut results = Vec::new();
@@ -7001,7 +7068,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -7028,7 +7095,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -7053,7 +7120,7 @@ mod tests {
         hash.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&Arc::new(hash), &world);
+        planner.add_hash_index(&Arc::new(hash), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -7081,7 +7148,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -7108,7 +7175,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -7136,7 +7203,7 @@ mod tests {
         btree.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree), &world);
+        planner.add_btree_index(&Arc::new(btree), &world).unwrap();
 
         // Query requires BOTH Score and Pos.
         let mut plan = planner
