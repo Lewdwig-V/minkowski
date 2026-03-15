@@ -104,6 +104,10 @@ changeset::tests::apply_does_not_double_drop
 changeset::tests::drop_runs_destructor_for_unapplied_insert
 changeset::tests::insert_raw_and_apply
 changeset::tests::insert_raw_drop_on_abort
+changeset::tests::fast_lane_single_component
+changeset::tests::fast_lane_drop_on_abort
+changeset::tests::fast_lane_partial_failure_no_double_free
+changeset::tests::fast_lane_overwrite_drops_old_value
 
 # ── Table: derive macro type erasure (3 selected) ───────────────────
 table::tests::derive_table_register
@@ -118,3 +122,6 @@ bundle::tests::pair_component_ids_sorted
 planner::tests::for_each_batched_yields_all_join_results
 planner::tests::for_each_join_chunk_yields_correct_slices
 planner::tests::for_each_join_chunk_multi_archetype
+
+# ── Fast-lane: streaming archetype buffers (1 selected) ────────────
+reducer::tests::query_writer_fast_lane_roundtrip

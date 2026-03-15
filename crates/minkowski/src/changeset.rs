@@ -140,15 +140,46 @@ impl Drop for Arena {
 
 /// Tracks an arena-buffered value that needs its destructor run if the
 /// changeset is dropped without being applied.
-struct DropEntry {
+pub(crate) struct DropEntry {
     /// Byte offset within the arena where the owned value starts.
-    offset: usize,
+    pub(crate) offset: usize,
     /// Type-erased destructor (`drop_in_place::<T>`).
-    drop_fn: unsafe fn(*mut u8),
+    pub(crate) drop_fn: unsafe fn(*mut u8),
     /// Index of the mutation that owns this value. Used to partition
     /// drop entries between processed (ownership transferred to World)
     /// and unprocessed (must be dropped on error) during `apply()`.
-    mutation_idx: usize,
+    /// `usize::MAX` is used for fast-lane entries not yet assigned to a mutation.
+    pub(crate) mutation_idx: usize,
+}
+
+/// A single overwrite entry in a [`ColumnBatch`].
+pub(crate) struct BatchEntry {
+    pub(crate) row: usize,
+    pub(crate) entity: Entity,
+    pub(crate) arena_offset: usize,
+}
+
+/// A single column's worth of buffered overwrites within one archetype.
+/// Column index and drop function are resolved once when the batch is
+/// created, not per entity.
+pub(crate) struct ColumnBatch {
+    pub(crate) comp_id: ComponentId,
+    pub(crate) col_idx: usize,
+    pub(crate) drop_fn: Option<unsafe fn(*mut u8)>,
+    pub(crate) layout: Layout,
+    /// Overwrite entries. Offsets, not pointers — the arena may
+    /// reallocate during recording. Resolved at apply time.
+    pub(crate) entries: Vec<BatchEntry>,
+}
+
+/// All buffered overwrites for a single archetype, grouped by component.
+pub(crate) struct ArchetypeBatch {
+    pub(crate) arch_idx: usize,
+    /// One [`ColumnBatch`] per mutable component, ordered by ascending
+    /// `ComponentId` (matching `FixedBitSet::ones()` iteration order).
+    /// `WritableRef` uses positional indexing (`column_slot`) into this
+    /// vec, so reordering breaks correctness.
+    pub(crate) columns: Vec<ColumnBatch>,
 }
 
 /// A single structural mutation recorded in a ChangeSet.
@@ -212,7 +243,13 @@ pub struct EnumChangeSet {
     /// Drop glue for arena-buffered values whose ownership was transferred
     /// from the caller via typed helpers. Cleared on `apply()` when ownership
     /// moves to the world; remaining entries are cleaned up on drop.
-    drop_entries: Vec<DropEntry>,
+    pub(crate) drop_entries: Vec<DropEntry>,
+    /// Pre-resolved per-archetype batch buffers for the fast lane.
+    /// Drained before the regular mutation vec during apply.
+    ///
+    /// During `QueryWriter::for_each`, the last element is the currently
+    /// open batch — `WritableRef::set` indexes it via `last_mut()`.
+    pub(crate) archetype_batches: Vec<ArchetypeBatch>,
 }
 
 impl EnumChangeSet {
@@ -231,6 +268,7 @@ impl EnumChangeSet {
             mutations: Vec::with_capacity(mutations),
             arena,
             drop_entries: Vec::new(),
+            archetype_batches: Vec::new(),
         }
     }
 
@@ -239,15 +277,29 @@ impl EnumChangeSet {
             mutations: Vec::new(),
             arena: Arena::new(pool),
             drop_entries: Vec::new(),
+            archetype_batches: Vec::new(),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.mutations.len()
+        let fast_lane_count: usize = self
+            .archetype_batches
+            .iter()
+            .flat_map(|b| &b.columns)
+            .map(|c| c.entries.len())
+            .sum();
+        self.mutations.len() + fast_lane_count
     }
 
+    /// Returns `true` when the changeset contains no mutations and no
+    /// fast-lane entries. Empty archetype batches (open but with no
+    /// entries) do not count — consistent with `len()`.
     pub fn is_empty(&self) -> bool {
         self.mutations.is_empty()
+            && self
+                .archetype_batches
+                .iter()
+                .all(|b| b.columns.iter().all(|c| c.entries.is_empty()))
     }
 
     /// Record a spawn: entity + raw component data.
@@ -618,6 +670,51 @@ impl EnumChangeSet {
     }
 }
 
+// ── Fast-lane helpers ─────────────────────────────────────────
+
+impl EnumChangeSet {
+    /// Convert fast-lane archetype batches into regular `Mutation::Insert`
+    /// entries. Used by the WAL path which serializes `iter_mutations()`.
+    ///
+    /// `pub` because `minkowski-persist::Durable` calls this before WAL append.
+    pub fn drain_fast_lane_to_mutations(&mut self) {
+        let sentinel_count = self
+            .drop_entries
+            .iter()
+            .filter(|e| e.mutation_idx == usize::MAX)
+            .count();
+        let mut rebased = 0usize;
+
+        for batch in self.archetype_batches.drain(..) {
+            for col_batch in batch.columns {
+                for batch_entry in col_batch.entries {
+                    let mutation_idx = self.mutations.len();
+                    self.mutations.push(Mutation::Insert {
+                        entity: batch_entry.entity,
+                        component_id: col_batch.comp_id,
+                        offset: batch_entry.arena_offset,
+                        layout: col_batch.layout,
+                    });
+                    for entry in &mut self.drop_entries {
+                        if entry.offset == batch_entry.arena_offset
+                            && entry.mutation_idx == usize::MAX
+                        {
+                            entry.mutation_idx = mutation_idx;
+                            rebased += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        debug_assert_eq!(
+            rebased, sentinel_count,
+            "drain_fast_lane: {sentinel_count} sentinel drop entries but only {rebased} rebased"
+        );
+    }
+}
+
 impl Default for EnumChangeSet {
     fn default() -> Self {
         Self::new()
@@ -660,8 +757,9 @@ impl EnumChangeSet {
                 // Mutations failed_idx.. were not processed — their arena values
                 // must be dropped. Retain only drop entries for unprocessed mutations
                 // so the Drop impl cleans them up.
-                self.drop_entries
-                    .retain(|entry| entry.mutation_idx >= failed_idx);
+                self.drop_entries.retain(|entry| {
+                    entry.mutation_idx >= failed_idx && entry.mutation_idx != usize::MAX
+                });
                 Err(err)
             }
         }
@@ -674,6 +772,42 @@ impl EnumChangeSet {
         world: &mut World,
         tick: crate::tick::Tick,
     ) -> Result<(), (usize, ApplyError)> {
+        // ── Fast lane: drain pre-resolved archetype batches ──
+        for batch in &self.archetype_batches {
+            let arch = &mut world.archetypes.archetypes[batch.arch_idx];
+            for col_batch in &batch.columns {
+                if col_batch.entries.is_empty() {
+                    continue;
+                }
+                let col = &mut arch.columns[col_batch.col_idx];
+                col.mark_changed(tick);
+                let size = col_batch.layout.size();
+                for entry in &col_batch.entries {
+                    debug_assert_eq!(
+                        arch.entities[entry.row], entry.entity,
+                        "fast-lane row {} entity mismatch: expected {:?}, found {:?}",
+                        entry.row, entry.entity, arch.entities[entry.row]
+                    );
+                    // SAFETY: src points into the arena at a valid offset written
+                    // by a prior alloc call. dst points into the BlobVec at a valid
+                    // row. drop_fn is the registered destructor for this component
+                    // type (or None for trivially-droppable types).
+                    //
+                    // `col.mark_changed(tick)` was called above — change detection
+                    // satisfied for the entire batch. `get_ptr` (not `get_ptr_mut`)
+                    // avoids redundant per-row tick marking.
+                    unsafe {
+                        let src = self.arena.get(entry.arena_offset);
+                        let dst = col.get_ptr(entry.row);
+                        if let Some(drop_fn) = col_batch.drop_fn {
+                            drop_fn(dst);
+                        }
+                        std::ptr::copy_nonoverlapping(src, dst, size);
+                    }
+                }
+            }
+        }
+
         // Batch state for consecutive Insert overwrites on the same
         // (archetype, component). Resolved fields amortize per-entity
         // lookups (column_index, drop_fn, layout) across the batch.
@@ -901,6 +1035,36 @@ fn flush_insert_batch(
         }
     }
     *batch = None;
+}
+
+/// Create and push a new `ArchetypeBatch` for the given archetype, with one
+/// empty `ColumnBatch` per mutable component. Column index and drop function
+/// are resolved once here, not per entity.
+pub(crate) fn open_archetype_batch(
+    cs: &mut EnumChangeSet,
+    arch_idx: usize,
+    arch: &crate::storage::archetype::Archetype,
+    components: &ComponentRegistry,
+    mutable_ids: &fixedbitset::FixedBitSet,
+) {
+    let columns: Vec<ColumnBatch> = mutable_ids
+        .ones()
+        .map(|comp_id| {
+            let col_idx = arch
+                .column_index(comp_id)
+                .expect("archetype missing column for mutable component");
+            let info = components.info(comp_id);
+            ColumnBatch {
+                comp_id,
+                col_idx,
+                drop_fn: info.drop_fn,
+                layout: info.layout,
+                entries: Vec::new(),
+            }
+        })
+        .collect();
+    cs.archetype_batches
+        .push(ArchetypeBatch { arch_idx, columns });
 }
 
 /// Raw insert: either overwrites an existing component in-place or performs
@@ -1414,7 +1578,7 @@ mod tests {
     /// Each test creates its own counter, avoiding races with parallel tests.
     #[derive(Debug)]
     struct Tracked {
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         value: u32,
         counter: Arc<AtomicUsize>,
     }
@@ -2013,5 +2177,592 @@ mod tests {
         // The first mutation (on alive entity) should have been flushed
         // and applied before the error.
         assert_eq!(world.get::<Pos>(alive), Some(&Pos { x: 99.0, y: 99.0 }));
+    }
+
+    // ── Fast-lane tests ──────────────────────────────────────────
+
+    /// Helper: look up an entity's (arch_idx, row) from the world.
+    fn entity_location(world: &World, entity: Entity) -> (usize, usize) {
+        let loc = world.entity_locations[entity.index() as usize].unwrap();
+        (loc.archetype_id.0, loc.row)
+    }
+
+    /// Helper: look up the column index for a component within an archetype.
+    fn col_idx_of(world: &World, arch_idx: usize, comp_id: ComponentId) -> usize {
+        world.archetypes.archetypes[arch_idx]
+            .column_index(comp_id)
+            .unwrap()
+    }
+
+    // ── Task 1: is_empty / len with fast-lane entries ──
+
+    #[test]
+    fn fast_lane_is_empty_and_len() {
+        let mut cs = EnumChangeSet::new();
+        assert!(cs.is_empty());
+        assert_eq!(cs.len(), 0);
+
+        // Add an empty archetype batch — is_empty should still be true
+        // (consistent with len() == 0).
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx: 0,
+            columns: Vec::new(),
+        });
+        assert!(cs.is_empty());
+        assert_eq!(cs.len(), 0); // no entries yet
+
+        // Add a column batch with entries.
+        let e = Entity::new(0, 0);
+        cs.archetype_batches[0].columns.push(ColumnBatch {
+            comp_id: 0,
+            col_idx: 0,
+            drop_fn: None,
+            layout: Layout::new::<Pos>(),
+            entries: vec![
+                BatchEntry {
+                    row: 0,
+                    entity: e,
+                    arena_offset: 0,
+                },
+                BatchEntry {
+                    row: 1,
+                    entity: e,
+                    arena_offset: 8,
+                },
+            ],
+        });
+        assert!(!cs.is_empty());
+        assert_eq!(cs.len(), 2);
+
+        // Also add a regular mutation.
+        cs.record_despawn(e);
+        assert_eq!(cs.len(), 3);
+    }
+
+    // ── Task 2: fast-lane single component ──
+
+    #[test]
+    fn fast_lane_single_component() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let e2 = world.spawn((Pos { x: 3.0, y: 4.0 },));
+        let pos_id = world.register_component::<Pos>();
+
+        let (arch_idx1, row1) = entity_location(&world, e1);
+        let (arch_idx2, row2) = entity_location(&world, e2);
+        assert_eq!(arch_idx1, arch_idx2, "same archetype");
+        let col_idx = col_idx_of(&world, arch_idx1, pos_id);
+
+        let mut cs = EnumChangeSet::new();
+
+        // Allocate new values in the arena.
+        let new_pos1 = Pos { x: 10.0, y: 20.0 };
+        let off1 = cs
+            .arena
+            .alloc(&new_pos1 as *const Pos as *const u8, Layout::new::<Pos>());
+        let new_pos2 = Pos { x: 30.0, y: 40.0 };
+        let off2 = cs
+            .arena
+            .alloc(&new_pos2 as *const Pos as *const u8, Layout::new::<Pos>());
+
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx: arch_idx1,
+            columns: vec![ColumnBatch {
+                comp_id: pos_id,
+                col_idx,
+                drop_fn: None,
+                layout: Layout::new::<Pos>(),
+                entries: vec![
+                    BatchEntry {
+                        row: row1,
+                        entity: e1,
+                        arena_offset: off1,
+                    },
+                    BatchEntry {
+                        row: row2,
+                        entity: e2,
+                        arena_offset: off2,
+                    },
+                ],
+            }],
+        });
+
+        cs.apply(&mut world).unwrap();
+        assert_eq!(world.get::<Pos>(e1), Some(&Pos { x: 10.0, y: 20.0 }));
+        assert_eq!(world.get::<Pos>(e2), Some(&Pos { x: 30.0, y: 40.0 }));
+    }
+
+    // ── Task 3: multi-component and multi-archetype ──
+
+    #[test]
+    fn fast_lane_multi_component() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        let e2 = world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        let pos_id = world.register_component::<Pos>();
+        let vel_id = world.register_component::<Vel>();
+
+        let (arch_idx, row1) = entity_location(&world, e1);
+        let (_, row2) = entity_location(&world, e2);
+        let pos_col = col_idx_of(&world, arch_idx, pos_id);
+        let vel_col = col_idx_of(&world, arch_idx, vel_id);
+
+        let mut cs = EnumChangeSet::new();
+
+        let p1 = Pos { x: 1.0, y: 2.0 };
+        let p2 = Pos { x: 3.0, y: 4.0 };
+        let v1 = Vel { dx: 5.0, dy: 6.0 };
+        let v2 = Vel { dx: 7.0, dy: 8.0 };
+
+        let off_p1 = cs
+            .arena
+            .alloc(&p1 as *const Pos as *const u8, Layout::new::<Pos>());
+        let off_p2 = cs
+            .arena
+            .alloc(&p2 as *const Pos as *const u8, Layout::new::<Pos>());
+        let off_v1 = cs
+            .arena
+            .alloc(&v1 as *const Vel as *const u8, Layout::new::<Vel>());
+        let off_v2 = cs
+            .arena
+            .alloc(&v2 as *const Vel as *const u8, Layout::new::<Vel>());
+
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx,
+            columns: vec![
+                ColumnBatch {
+                    comp_id: pos_id,
+                    col_idx: pos_col,
+                    drop_fn: None,
+                    layout: Layout::new::<Pos>(),
+                    entries: vec![
+                        BatchEntry {
+                            row: row1,
+                            entity: e1,
+                            arena_offset: off_p1,
+                        },
+                        BatchEntry {
+                            row: row2,
+                            entity: e2,
+                            arena_offset: off_p2,
+                        },
+                    ],
+                },
+                ColumnBatch {
+                    comp_id: vel_id,
+                    col_idx: vel_col,
+                    drop_fn: None,
+                    layout: Layout::new::<Vel>(),
+                    entries: vec![
+                        BatchEntry {
+                            row: row1,
+                            entity: e1,
+                            arena_offset: off_v1,
+                        },
+                        BatchEntry {
+                            row: row2,
+                            entity: e2,
+                            arena_offset: off_v2,
+                        },
+                    ],
+                },
+            ],
+        });
+
+        cs.apply(&mut world).unwrap();
+        assert_eq!(world.get::<Pos>(e1), Some(&Pos { x: 1.0, y: 2.0 }));
+        assert_eq!(world.get::<Pos>(e2), Some(&Pos { x: 3.0, y: 4.0 }));
+        assert_eq!(world.get::<Vel>(e1), Some(&Vel { dx: 5.0, dy: 6.0 }));
+        assert_eq!(world.get::<Vel>(e2), Some(&Vel { dx: 7.0, dy: 8.0 }));
+    }
+
+    #[test]
+    fn fast_lane_multi_archetype() {
+        let mut world = World::new();
+        // 3 different archetypes
+        let e1 = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let e2 = world.spawn((Vel { dx: 0.0, dy: 0.0 },));
+        let e3 = world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        let pos_id = world.register_component::<Pos>();
+        let vel_id = world.register_component::<Vel>();
+
+        let (arch1, row1) = entity_location(&world, e1);
+        let (arch2, row2) = entity_location(&world, e2);
+        let (arch3, row3) = entity_location(&world, e3);
+
+        let mut cs = EnumChangeSet::new();
+
+        let p1 = Pos { x: 11.0, y: 12.0 };
+        let v2 = Vel { dx: 21.0, dy: 22.0 };
+        let p3 = Pos { x: 31.0, y: 32.0 };
+
+        let off_p1 = cs
+            .arena
+            .alloc(&p1 as *const Pos as *const u8, Layout::new::<Pos>());
+        let off_v2 = cs
+            .arena
+            .alloc(&v2 as *const Vel as *const u8, Layout::new::<Vel>());
+        let off_p3 = cs
+            .arena
+            .alloc(&p3 as *const Pos as *const u8, Layout::new::<Pos>());
+
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx: arch1,
+            columns: vec![ColumnBatch {
+                comp_id: pos_id,
+                col_idx: col_idx_of(&world, arch1, pos_id),
+                drop_fn: None,
+                layout: Layout::new::<Pos>(),
+                entries: vec![BatchEntry {
+                    row: row1,
+                    entity: e1,
+                    arena_offset: off_p1,
+                }],
+            }],
+        });
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx: arch2,
+            columns: vec![ColumnBatch {
+                comp_id: vel_id,
+                col_idx: col_idx_of(&world, arch2, vel_id),
+                drop_fn: None,
+                layout: Layout::new::<Vel>(),
+                entries: vec![BatchEntry {
+                    row: row2,
+                    entity: e2,
+                    arena_offset: off_v2,
+                }],
+            }],
+        });
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx: arch3,
+            columns: vec![ColumnBatch {
+                comp_id: pos_id,
+                col_idx: col_idx_of(&world, arch3, pos_id),
+                drop_fn: None,
+                layout: Layout::new::<Pos>(),
+                entries: vec![BatchEntry {
+                    row: row3,
+                    entity: e3,
+                    arena_offset: off_p3,
+                }],
+            }],
+        });
+
+        cs.apply(&mut world).unwrap();
+        assert_eq!(world.get::<Pos>(e1), Some(&Pos { x: 11.0, y: 12.0 }));
+        assert_eq!(world.get::<Vel>(e2), Some(&Vel { dx: 21.0, dy: 22.0 }));
+        assert_eq!(world.get::<Pos>(e3), Some(&Pos { x: 31.0, y: 32.0 }));
+    }
+
+    // ── Task 4: drop safety ──
+
+    #[test]
+    fn fast_lane_drop_on_abort() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        // We need a world with registered Tracked to get the right drop_fn.
+        let tracked_id = world.register_component::<Tracked>();
+        let drop_fn = world.components.info(tracked_id).drop_fn;
+
+        {
+            let mut cs = EnumChangeSet::new();
+            let value = Tracked::new(42, &drops);
+            let value = std::mem::ManuallyDrop::new(value);
+            let offset = cs.arena.alloc(
+                &*value as *const Tracked as *const u8,
+                Layout::new::<Tracked>(),
+            );
+            // Register drop entry with mutation_idx = usize::MAX (fast-lane sentinel).
+            cs.drop_entries.push(DropEntry {
+                offset,
+                drop_fn: drop_fn.unwrap(),
+                mutation_idx: usize::MAX,
+            });
+            // Drop without apply — destructor should run via Drop impl.
+        }
+
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "fast-lane value must be dropped on changeset abort"
+        );
+    }
+
+    #[test]
+    fn fast_lane_partial_failure_no_double_free() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let dead = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.despawn(dead);
+
+        let tracked_id = world.register_component::<Tracked>();
+        let drop_fn = world.components.info(tracked_id).drop_fn;
+        let pos_id = world.register_component::<Pos>();
+
+        let (arch_idx, row) = entity_location(&world, e);
+        let pos_col = col_idx_of(&world, arch_idx, pos_id);
+
+        let mut cs = EnumChangeSet::new();
+
+        // Fast-lane entry: overwrite Pos on live entity (no drop needed for Pos).
+        let new_pos = Pos { x: 99.0, y: 99.0 };
+        let off_pos = cs
+            .arena
+            .alloc(&new_pos as *const Pos as *const u8, Layout::new::<Pos>());
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx,
+            columns: vec![ColumnBatch {
+                comp_id: pos_id,
+                col_idx: pos_col,
+                drop_fn: None,
+                layout: Layout::new::<Pos>(),
+                entries: vec![BatchEntry {
+                    row,
+                    entity: e,
+                    arena_offset: off_pos,
+                }],
+            }],
+        });
+
+        // Regular mutation that will fail: insert Tracked on dead entity.
+        let value = Tracked::new(1, &drops);
+        let value = std::mem::ManuallyDrop::new(value);
+        let off_tracked = cs.arena.alloc(
+            &*value as *const Tracked as *const u8,
+            Layout::new::<Tracked>(),
+        );
+        cs.mutations.push(Mutation::Insert {
+            entity: dead,
+            component_id: tracked_id,
+            offset: off_tracked,
+            layout: Layout::new::<Tracked>(),
+        });
+        cs.drop_entries.push(DropEntry {
+            offset: off_tracked,
+            drop_fn: drop_fn.unwrap(),
+            mutation_idx: 0,
+        });
+
+        let result = cs.apply(&mut world);
+        assert!(result.is_err());
+
+        // Fast-lane Pos was applied (it runs before the regular mutations).
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 99.0, y: 99.0 }));
+
+        // The dead-entity Tracked should be dropped exactly once (by changeset cleanup).
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "failed mutation's value must be dropped once"
+        );
+    }
+
+    #[test]
+    fn fast_lane_empty_batch() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let pos_id = world.register_component::<Pos>();
+        let (arch_idx, _) = entity_location(&world, e);
+        let col_idx = col_idx_of(&world, arch_idx, pos_id);
+
+        let mut cs = EnumChangeSet::new();
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx,
+            columns: vec![ColumnBatch {
+                comp_id: pos_id,
+                col_idx,
+                drop_fn: None,
+                layout: Layout::new::<Pos>(),
+                entries: Vec::new(), // empty!
+            }],
+        });
+
+        // Get the column's changed tick before apply.
+        let tick_before = world.archetypes.archetypes[arch_idx].columns[col_idx].changed_tick;
+        cs.apply(&mut world).unwrap();
+        let tick_after = world.archetypes.archetypes[arch_idx].columns[col_idx].changed_tick;
+
+        // Empty batch should NOT mark the column changed.
+        assert_eq!(
+            tick_before, tick_after,
+            "empty batch must not mark column changed"
+        );
+    }
+
+    #[test]
+    fn fast_lane_overwrite_drops_old_value() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let tracked_id = world.register_component::<Tracked>();
+        let drop_fn = world.components.info(tracked_id).drop_fn;
+
+        // Spawn entity with an initial Tracked value.
+        let e = world.spawn((Tracked::new(1, &drops),));
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "no drops after spawn");
+
+        let (arch_idx, row) = entity_location(&world, e);
+        let col_idx = col_idx_of(&world, arch_idx, tracked_id);
+
+        // Build a fast-lane batch that overwrites the Tracked value.
+        let mut cs = EnumChangeSet::new();
+        let new_value = Tracked::new(2, &drops);
+        let new_value = std::mem::ManuallyDrop::new(new_value);
+        let offset = cs.arena.alloc(
+            &*new_value as *const Tracked as *const u8,
+            Layout::new::<Tracked>(),
+        );
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx,
+            columns: vec![ColumnBatch {
+                comp_id: tracked_id,
+                col_idx,
+                drop_fn,
+                layout: Layout::new::<Tracked>(),
+                entries: vec![BatchEntry {
+                    row,
+                    entity: e,
+                    arena_offset: offset,
+                }],
+            }],
+        });
+        // Register drop entry for the new value (fast-lane sentinel).
+        cs.drop_entries.push(DropEntry {
+            offset,
+            drop_fn: drop_fn.unwrap(),
+            mutation_idx: usize::MAX,
+        });
+
+        cs.apply(&mut world).unwrap();
+
+        // Old value should have been dropped during the overwrite.
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "old value must be dropped during fast-lane overwrite"
+        );
+
+        // New value is now in the world — verify it's accessible.
+        let tracked = world.get::<Tracked>(e).unwrap();
+        assert!(Arc::ptr_eq(&tracked.counter, &drops));
+
+        // Despawn to drop the new value.
+        world.despawn(e);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "new value must be dropped on despawn"
+        );
+    }
+
+    // ── Task 5: drain_fast_lane_to_mutations ──
+
+    #[test]
+    fn fast_lane_drain_to_mutations() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let tracked_id = world.register_component::<Tracked>();
+        let drop_fn = world.components.info(tracked_id).drop_fn.unwrap();
+        let e = Entity::new(0, 0);
+
+        let mut cs = EnumChangeSet::new();
+
+        // Allocate a Tracked value in the arena.
+        let value = Tracked::new(42, &drops);
+        let value = std::mem::ManuallyDrop::new(value);
+        let offset = cs.arena.alloc(
+            &*value as *const Tracked as *const u8,
+            Layout::new::<Tracked>(),
+        );
+
+        // Register drop entry with fast-lane sentinel.
+        cs.drop_entries.push(DropEntry {
+            offset,
+            drop_fn,
+            mutation_idx: usize::MAX,
+        });
+
+        // Build fast-lane entry.
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx: 0,
+            columns: vec![ColumnBatch {
+                comp_id: tracked_id,
+                col_idx: 0,
+                drop_fn: Some(drop_fn),
+                layout: Layout::new::<Tracked>(),
+                entries: vec![BatchEntry {
+                    row: 0,
+                    entity: e,
+                    arena_offset: offset,
+                }],
+            }],
+        });
+
+        // Drain fast lane to mutations.
+        cs.drain_fast_lane_to_mutations();
+
+        // archetype_batches should be empty now.
+        assert!(cs.archetype_batches.is_empty());
+
+        // Should have one Insert mutation.
+        assert_eq!(cs.mutations.len(), 1);
+        assert!(matches!(
+            cs.mutations[0],
+            Mutation::Insert {
+                component_id,
+                ..
+            } if component_id == tracked_id
+        ));
+
+        // DropEntry should be rebased from usize::MAX to 0.
+        assert_eq!(cs.drop_entries.len(), 1);
+        assert_eq!(cs.drop_entries[0].mutation_idx, 0);
+        assert_eq!(cs.drop_entries[0].offset, offset);
+
+        // Dropping the changeset should drop the Tracked value.
+        drop(cs);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Task 6: open_archetype_batch ──
+
+    #[test]
+    fn open_archetype_batch_resolves_columns() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+        let pos_id = world.register_component::<Pos>();
+        let vel_id = world.register_component::<Vel>();
+
+        let (arch_idx, _) = entity_location(&world, e);
+
+        let mut mutable_ids = fixedbitset::FixedBitSet::with_capacity(vel_id + 1);
+        mutable_ids.insert(pos_id);
+        mutable_ids.insert(vel_id);
+
+        let mut cs = EnumChangeSet::new();
+        super::open_archetype_batch(
+            &mut cs,
+            arch_idx,
+            &world.archetypes.archetypes[arch_idx],
+            &world.components,
+            &mutable_ids,
+        );
+
+        assert_eq!(cs.archetype_batches.len(), 1);
+        let batch = &cs.archetype_batches[0];
+        assert_eq!(batch.arch_idx, arch_idx);
+        assert_eq!(batch.columns.len(), 2);
+
+        // Verify each column batch has the correct comp_id and resolved col_idx.
+        let pos_col = batch.columns.iter().find(|c| c.comp_id == pos_id).unwrap();
+        assert_eq!(pos_col.col_idx, col_idx_of(&world, arch_idx, pos_id));
+        assert_eq!(pos_col.layout, Layout::new::<Pos>());
+        assert!(pos_col.drop_fn.is_none()); // Pos is Copy, no drop
+
+        let vel_col = batch.columns.iter().find(|c| c.comp_id == vel_id).unwrap();
+        assert_eq!(vel_col.col_idx, col_idx_of(&world, arch_idx, vel_id));
+        assert_eq!(vel_col.layout, Layout::new::<Vel>());
+        assert!(vel_col.drop_fn.is_none()); // Vel is Copy, no drop
     }
 }
