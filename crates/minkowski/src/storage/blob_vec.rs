@@ -85,6 +85,53 @@ impl BlobVec {
         self.capacity
     }
 
+    /// Ensures the column has capacity for at least `additional` more elements.
+    /// If the column already has enough spare capacity, this is a no-op.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        let required = self.len + additional;
+        if required <= self.capacity {
+            return;
+        }
+        let size = self.item_layout.size();
+        if size == 0 {
+            return;
+        }
+        // Grow to at least the required capacity, doubling as needed.
+        let mut new_capacity = if self.capacity == 0 { 4 } else { self.capacity };
+        while new_capacity < required {
+            new_capacity = new_capacity
+                .checked_mul(2)
+                .expect("capacity overflow");
+        }
+        let new_layout = Layout::from_size_align(
+            size.checked_mul(new_capacity).expect("capacity overflow"),
+            Self::alloc_align(&self.item_layout),
+        )
+        .expect("invalid layout");
+
+        let new_data = self
+            .pool
+            .allocate(new_layout)
+            .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout));
+        if self.capacity > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.data.as_ptr(),
+                    new_data.as_ptr(),
+                    size * self.len,
+                );
+                let old_layout = Layout::from_size_align(
+                    size * self.capacity,
+                    Self::alloc_align(&self.item_layout),
+                )
+                .unwrap();
+                self.pool.deallocate(self.data, old_layout);
+            }
+        }
+        self.data = new_data;
+        self.capacity = new_capacity;
+    }
+
     /// Pushes a value by copying `item_layout.size()` bytes from `ptr`.
     ///
     /// # Safety
