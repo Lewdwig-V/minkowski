@@ -152,6 +152,13 @@ pub(crate) struct DropEntry {
     pub(crate) mutation_idx: usize,
 }
 
+/// A single overwrite entry in a [`ColumnBatch`].
+pub(crate) struct BatchEntry {
+    pub(crate) row: usize,
+    pub(crate) entity: Entity,
+    pub(crate) arena_offset: usize,
+}
+
 /// A single column's worth of buffered overwrites within one archetype.
 /// Column index and drop function are resolved once when the batch is
 /// created, not per entity.
@@ -160,14 +167,18 @@ pub(crate) struct ColumnBatch {
     pub(crate) col_idx: usize,
     pub(crate) drop_fn: Option<unsafe fn(*mut u8)>,
     pub(crate) layout: Layout,
-    /// (row, entity, arena_offset) triples. Offsets, not pointers — the
-    /// arena may reallocate during recording. Resolved at apply time.
-    pub(crate) entries: Vec<(usize, Entity, usize)>,
+    /// Overwrite entries. Offsets, not pointers — the arena may
+    /// reallocate during recording. Resolved at apply time.
+    pub(crate) entries: Vec<BatchEntry>,
 }
 
 /// All buffered overwrites for a single archetype, grouped by component.
 pub(crate) struct ArchetypeBatch {
     pub(crate) arch_idx: usize,
+    /// One [`ColumnBatch`] per mutable component, ordered by ascending
+    /// `ComponentId` (matching `FixedBitSet::ones()` iteration order).
+    /// `WritableRef` uses positional indexing (`column_slot`) into this
+    /// vec, so reordering breaks correctness.
     pub(crate) columns: Vec<ColumnBatch>,
 }
 
@@ -235,6 +246,9 @@ pub struct EnumChangeSet {
     pub(crate) drop_entries: Vec<DropEntry>,
     /// Pre-resolved per-archetype batch buffers for the fast lane.
     /// Drained before the regular mutation vec during apply.
+    ///
+    /// During `QueryWriter::for_each`, the last element is the currently
+    /// open batch — `WritableRef::set` indexes it via `last_mut()`.
     pub(crate) archetype_batches: Vec<ArchetypeBatch>,
 }
 
@@ -277,6 +291,10 @@ impl EnumChangeSet {
         self.mutations.len() + fast_lane_count
     }
 
+    /// Returns `true` when the changeset has no mutations and no open
+    /// archetype batches. Note: returns `false` when archetype batches are
+    /// open even if they contain zero entries. Use `len() == 0` for
+    /// semantic emptiness (counts actual entries).
     pub fn is_empty(&self) -> bool {
         self.mutations.is_empty() && self.archetype_batches.is_empty()
     }
@@ -657,25 +675,40 @@ impl EnumChangeSet {
     ///
     /// `pub` because `minkowski-persist::Durable` calls this before WAL append.
     pub fn drain_fast_lane_to_mutations(&mut self) {
+        let sentinel_count = self
+            .drop_entries
+            .iter()
+            .filter(|e| e.mutation_idx == usize::MAX)
+            .count();
+        let mut rebased = 0usize;
+
         for batch in self.archetype_batches.drain(..) {
             for col_batch in batch.columns {
-                for (_row, entity, offset) in col_batch.entries {
+                for batch_entry in col_batch.entries {
                     let mutation_idx = self.mutations.len();
                     self.mutations.push(Mutation::Insert {
-                        entity,
+                        entity: batch_entry.entity,
                         component_id: col_batch.comp_id,
-                        offset,
+                        offset: batch_entry.arena_offset,
                         layout: col_batch.layout,
                     });
                     for entry in &mut self.drop_entries {
-                        if entry.offset == offset && entry.mutation_idx == usize::MAX {
+                        if entry.offset == batch_entry.arena_offset
+                            && entry.mutation_idx == usize::MAX
+                        {
                             entry.mutation_idx = mutation_idx;
+                            rebased += 1;
                             break;
                         }
                     }
                 }
             }
         }
+
+        debug_assert_eq!(
+            rebased, sentinel_count,
+            "drain_fast_lane: {sentinel_count} sentinel drop entries but only {rebased} rebased"
+        );
     }
 }
 
@@ -746,7 +779,12 @@ impl EnumChangeSet {
                 let col = &mut arch.columns[col_batch.col_idx];
                 col.mark_changed(tick);
                 let size = col_batch.layout.size();
-                for &(row, _entity, offset) in &col_batch.entries {
+                for entry in &col_batch.entries {
+                    debug_assert_eq!(
+                        arch.entities[entry.row], entry.entity,
+                        "fast-lane row {} entity mismatch: expected {:?}, found {:?}",
+                        entry.row, entry.entity, arch.entities[entry.row]
+                    );
                     // SAFETY: src points into the arena at a valid offset written
                     // by a prior alloc call. dst points into the BlobVec at a valid
                     // row. drop_fn is the registered destructor for this component
@@ -756,8 +794,8 @@ impl EnumChangeSet {
                     // satisfied for the entire batch. `get_ptr` (not `get_ptr_mut`)
                     // avoids redundant per-row tick marking.
                     unsafe {
-                        let src = self.arena.get(offset);
-                        let dst = col.get_ptr(row);
+                        let src = self.arena.get(entry.arena_offset);
+                        let dst = col.get_ptr(entry.row);
                         if let Some(drop_fn) = col_batch.drop_fn {
                             drop_fn(dst);
                         }
@@ -1009,7 +1047,9 @@ pub(crate) fn open_archetype_batch(
     let columns: Vec<ColumnBatch> = mutable_ids
         .ones()
         .map(|comp_id| {
-            let col_idx = arch.column_index(comp_id).unwrap();
+            let col_idx = arch
+                .column_index(comp_id)
+                .expect("archetype missing column for mutable component");
             let info = components.info(comp_id);
             ColumnBatch {
                 comp_id,
@@ -2174,7 +2214,18 @@ mod tests {
             col_idx: 0,
             drop_fn: None,
             layout: Layout::new::<Pos>(),
-            entries: vec![(0, e, 0), (1, e, 8)],
+            entries: vec![
+                BatchEntry {
+                    row: 0,
+                    entity: e,
+                    arena_offset: 0,
+                },
+                BatchEntry {
+                    row: 1,
+                    entity: e,
+                    arena_offset: 8,
+                },
+            ],
         });
         assert!(!cs.is_empty());
         assert_eq!(cs.len(), 2);
@@ -2217,7 +2268,18 @@ mod tests {
                 col_idx,
                 drop_fn: None,
                 layout: Layout::new::<Pos>(),
-                entries: vec![(row1, e1, off1), (row2, e2, off2)],
+                entries: vec![
+                    BatchEntry {
+                        row: row1,
+                        entity: e1,
+                        arena_offset: off1,
+                    },
+                    BatchEntry {
+                        row: row2,
+                        entity: e2,
+                        arena_offset: off2,
+                    },
+                ],
             }],
         });
 
@@ -2269,14 +2331,36 @@ mod tests {
                     col_idx: pos_col,
                     drop_fn: None,
                     layout: Layout::new::<Pos>(),
-                    entries: vec![(row1, e1, off_p1), (row2, e2, off_p2)],
+                    entries: vec![
+                        BatchEntry {
+                            row: row1,
+                            entity: e1,
+                            arena_offset: off_p1,
+                        },
+                        BatchEntry {
+                            row: row2,
+                            entity: e2,
+                            arena_offset: off_p2,
+                        },
+                    ],
                 },
                 ColumnBatch {
                     comp_id: vel_id,
                     col_idx: vel_col,
                     drop_fn: None,
                     layout: Layout::new::<Vel>(),
-                    entries: vec![(row1, e1, off_v1), (row2, e2, off_v2)],
+                    entries: vec![
+                        BatchEntry {
+                            row: row1,
+                            entity: e1,
+                            arena_offset: off_v1,
+                        },
+                        BatchEntry {
+                            row: row2,
+                            entity: e2,
+                            arena_offset: off_v2,
+                        },
+                    ],
                 },
             ],
         });
@@ -2325,7 +2409,11 @@ mod tests {
                 col_idx: col_idx_of(&world, arch1, pos_id),
                 drop_fn: None,
                 layout: Layout::new::<Pos>(),
-                entries: vec![(row1, e1, off_p1)],
+                entries: vec![BatchEntry {
+                    row: row1,
+                    entity: e1,
+                    arena_offset: off_p1,
+                }],
             }],
         });
         cs.archetype_batches.push(ArchetypeBatch {
@@ -2335,7 +2423,11 @@ mod tests {
                 col_idx: col_idx_of(&world, arch2, vel_id),
                 drop_fn: None,
                 layout: Layout::new::<Vel>(),
-                entries: vec![(row2, e2, off_v2)],
+                entries: vec![BatchEntry {
+                    row: row2,
+                    entity: e2,
+                    arena_offset: off_v2,
+                }],
             }],
         });
         cs.archetype_batches.push(ArchetypeBatch {
@@ -2345,7 +2437,11 @@ mod tests {
                 col_idx: col_idx_of(&world, arch3, pos_id),
                 drop_fn: None,
                 layout: Layout::new::<Pos>(),
-                entries: vec![(row3, e3, off_p3)],
+                entries: vec![BatchEntry {
+                    row: row3,
+                    entity: e3,
+                    arena_offset: off_p3,
+                }],
             }],
         });
 
@@ -2418,7 +2514,11 @@ mod tests {
                 col_idx: pos_col,
                 drop_fn: None,
                 layout: Layout::new::<Pos>(),
-                entries: vec![(row, e, off_pos)],
+                entries: vec![BatchEntry {
+                    row,
+                    entity: e,
+                    arena_offset: off_pos,
+                }],
             }],
         });
 
@@ -2487,6 +2587,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fast_lane_overwrite_drops_old_value() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let tracked_id = world.register_component::<Tracked>();
+        let drop_fn = world.components.info(tracked_id).drop_fn;
+
+        // Spawn entity with an initial Tracked value.
+        let e = world.spawn((Tracked::new(1, &drops),));
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "no drops after spawn");
+
+        let (arch_idx, row) = entity_location(&world, e);
+        let col_idx = col_idx_of(&world, arch_idx, tracked_id);
+
+        // Build a fast-lane batch that overwrites the Tracked value.
+        let mut cs = EnumChangeSet::new();
+        let new_value = Tracked::new(2, &drops);
+        let new_value = std::mem::ManuallyDrop::new(new_value);
+        let offset = cs.arena.alloc(
+            &*new_value as *const Tracked as *const u8,
+            Layout::new::<Tracked>(),
+        );
+        cs.archetype_batches.push(ArchetypeBatch {
+            arch_idx,
+            columns: vec![ColumnBatch {
+                comp_id: tracked_id,
+                col_idx,
+                drop_fn,
+                layout: Layout::new::<Tracked>(),
+                entries: vec![BatchEntry {
+                    row,
+                    entity: e,
+                    arena_offset: offset,
+                }],
+            }],
+        });
+        // Register drop entry for the new value (fast-lane sentinel).
+        cs.drop_entries.push(DropEntry {
+            offset,
+            drop_fn: drop_fn.unwrap(),
+            mutation_idx: usize::MAX,
+        });
+
+        cs.apply(&mut world).unwrap();
+
+        // Old value should have been dropped during the overwrite.
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "old value must be dropped during fast-lane overwrite"
+        );
+
+        // New value is now in the world — verify it's accessible.
+        let tracked = world.get::<Tracked>(e).unwrap();
+        assert!(Arc::ptr_eq(&tracked.counter, &drops));
+
+        // Despawn to drop the new value.
+        world.despawn(e);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "new value must be dropped on despawn"
+        );
+    }
+
     // ── Task 5: drain_fast_lane_to_mutations ──
 
     #[test]
@@ -2522,7 +2687,11 @@ mod tests {
                 col_idx: 0,
                 drop_fn: Some(drop_fn),
                 layout: Layout::new::<Tracked>(),
-                entries: vec![(0, e, offset)],
+                entries: vec![BatchEntry {
+                    row: 0,
+                    entity: e,
+                    arena_offset: offset,
+                }],
             }],
         });
 

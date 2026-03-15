@@ -761,7 +761,10 @@ impl<'a, T: Component> WritableRef<'a, T> {
         // and `&mut self` prevents re-entrant access — no overlapping
         // mutable references.
         let cs = unsafe { &mut *self.changeset };
-        let batch = cs.archetype_batches.last_mut().unwrap();
+        let batch = cs
+            .archetype_batches
+            .last_mut()
+            .expect("WritableRef::set called without an open archetype batch");
         let col_batch = &mut batch.columns[self.column_slot];
         debug_assert_eq!(col_batch.comp_id, self.comp_id);
         debug_assert_eq!(col_batch.layout, Layout::new::<T>());
@@ -770,7 +773,11 @@ impl<'a, T: Component> WritableRef<'a, T> {
         let offset = cs
             .arena
             .alloc(&*value as *const T as *const u8, Layout::new::<T>());
-        col_batch.entries.push((self.row, self.entity, offset));
+        col_batch.entries.push(crate::changeset::BatchEntry {
+            row: self.row,
+            entity: self.entity,
+            arena_offset: offset,
+        });
 
         if std::mem::needs_drop::<T>() {
             cs.drop_entries.push(DropEntry {
@@ -972,8 +979,10 @@ macro_rules! impl_writer_query_tuple {
                 $(
                     let sub_mutable = <$name as WorldQuery>::mutable_ids(registry);
                     if sub_mutable.count_ones(..) > 0 {
-                        let first_id = sub_mutable.ones().next().unwrap();
-                        let slot = _mutable.ones().position(|id| id == first_id).unwrap();
+                        let first_id = sub_mutable.ones().next()
+                            .expect("mutable_ids count_ones > 0 but ones() empty");
+                        let slot = _mutable.ones().position(|id| id == first_id)
+                            .expect("sub-element mutable ID not in tuple mutable_ids");
                         <$name as WriterQuery>::set_column_slot($name, slot);
                         _assigned += sub_mutable.count_ones(..);
                     }
@@ -996,7 +1005,10 @@ macro_rules! impl_writer_query_tuple {
             }}
 
             fn set_column_slot(_fetch: &mut Self::WriterFetch<'_>, _slot: usize) {
-                // Tuple assigns slots in init_writer_fetch, not here
+                // Tuple column slots are assigned in init_writer_fetch at construction
+                // time. Nested mutable tuples (e.g., `(&mut A, (&mut B, &mut C))`)
+                // are NOT supported — inner slots would not be globally offset.
+                // Use flat tuple queries instead.
             }
         }
     };
