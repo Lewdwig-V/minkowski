@@ -1844,6 +1844,125 @@ impl QueryPlanResult {
         Ok(())
     }
 
+    /// Execute the plan with archetype-chunked slice extraction.
+    ///
+    /// After join materialisation and archetype sorting, the callback
+    /// receives per-archetype chunks containing:
+    /// - `&[Entity]` — matched entities (sorted by row within this archetype)
+    /// - `&[usize]` — row indices into the column slices
+    /// - `Q::Slice<'_>` — full column slice for the archetype
+    ///
+    /// The callback can iterate `rows` and index into the slice:
+    /// `for (i, &row) in rows.iter().enumerate() { let val = slice[row]; }`
+    ///
+    /// This enables SIMD-friendly access patterns on join results.
+    /// Advances the read tick.
+    pub fn for_each_join_chunk<Q, F>(
+        &mut self,
+        world: &mut World,
+        mut callback: F,
+    ) -> Result<(), PlanExecError>
+    where
+        Q: WorldQuery,
+        F: FnMut(&[Entity], &[usize], Q::Slice<'_>),
+    {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
+        }
+
+        // Phase 1: Populate scratch buffer.
+        if self.join_exec.is_some() {
+            self.run_join(&*world);
+        } else if let Some(compiled) = &mut self.compiled_for_each_raw {
+            let scratch = self
+                .scratch
+                .as_mut()
+                .expect("for_each_join_chunk requires a scratch buffer");
+            scratch.clear();
+            let tick = self.last_read_tick;
+            compiled(&*world, tick, &mut |entity: Entity| {
+                scratch.push(entity);
+            });
+        } else {
+            panic!(
+                "for_each_join_chunk() called on a plan with no join executor and no compiled scan"
+            );
+        }
+
+        // Phase 2: Sort by (archetype_id, row).
+        let scratch = self
+            .scratch
+            .as_mut()
+            .expect("for_each_join_chunk requires a scratch buffer");
+        scratch.sort_by_archetype(&world.entity_locations);
+
+        // Early exit if scratch is empty (before destructuring self).
+        if scratch.as_slice().is_empty() {
+            self.last_read_tick = world.next_tick();
+            return Ok(());
+        }
+
+        // Reborrow disjoint fields to avoid borrow conflict between
+        // scratch.as_slice() (borrows self.scratch) and self.row_indices.
+        let Self {
+            scratch,
+            row_indices,
+            last_read_tick,
+            ..
+        } = self;
+        let scratch = scratch.as_ref().expect("scratch buffer disappeared");
+        let entities = scratch.as_slice();
+
+        let required = Q::required_ids(&world.components);
+        let mut run_start = 0;
+
+        while run_start < entities.len() {
+            let loc = world.entity_locations[entities[run_start].index() as usize]
+                .expect("sorted entity has no location");
+            let arch_id = loc.archetype_id;
+            let archetype = &world.archetypes.archetypes[arch_id.0];
+
+            // Validate Q's required components.
+            if !required.is_subset(&archetype.component_ids) {
+                return Err(PlanExecError::ComponentMismatch {
+                    component: std::any::type_name::<Q>(),
+                    archetype_id: arch_id,
+                });
+            }
+
+            let fetch = Q::init_fetch(archetype, &world.components);
+
+            // Find end of this archetype run.
+            let mut run_end = run_start + 1;
+            while run_end < entities.len() {
+                let next_loc = world.entity_locations[entities[run_end].index() as usize]
+                    .expect("sorted entity has no location");
+                if next_loc.archetype_id != arch_id {
+                    break;
+                }
+                run_end += 1;
+            }
+
+            // Collect row indices for this run.
+            row_indices.clear();
+            for &entity in &entities[run_start..run_end] {
+                let row = world.entity_locations[entity.index() as usize]
+                    .expect("sorted entity has no location")
+                    .row;
+                debug_assert!(row < archetype.len());
+                row_indices.push(row);
+            }
+
+            let slice = unsafe { Q::as_slice(&fetch, archetype.len()) };
+            callback(&entities[run_start..run_end], row_indices, slice);
+
+            run_start = run_end;
+        }
+
+        *last_read_tick = world.next_tick();
+        Ok(())
+    }
+
     /// The `WorldId` this plan was built from.
     pub fn world_id(&self) -> WorldId {
         self.world_id
@@ -9409,5 +9528,50 @@ mod tests {
         results.sort_by_key(|(e, _)| e.to_bits());
         expected.sort_by_key(|(e, _)| e.to_bits());
         assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn for_each_join_chunk_yields_correct_slices() {
+        let mut world = World::new();
+        // Archetype A: Score only (will not match inner join)
+        for i in 0..3 {
+            world.spawn((Score(i),));
+        }
+        // Archetype B: Score + Team (deterministic scores 10..15)
+        for i in 10..15 {
+            world.spawn((Score(i), Team(1)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let mut total_entities = 0;
+        let mut chunk_count = 0;
+        let mut collected_scores = Vec::new();
+        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
+            // rows and entities must have the same length.
+            assert_eq!(entities.len(), rows.len());
+            // Each row index must be valid for the slice.
+            for &row in rows {
+                assert!(
+                    row < scores.len(),
+                    "row {row} out of bounds for slice len {}",
+                    scores.len()
+                );
+                collected_scores.push(scores[row]);
+            }
+            total_entities += entities.len();
+            chunk_count += 1;
+        })
+        .unwrap();
+
+        assert_eq!(total_entities, 5); // Only Score+Team entities
+        assert!(chunk_count >= 1); // At least one archetype chunk
+        // Verify we read the correct score values (10..15).
+        collected_scores.sort_by_key(|s| s.0);
+        assert_eq!(collected_scores, (10..15).map(Score).collect::<Vec<_>>());
     }
 }
