@@ -376,6 +376,41 @@ reducer::tests::query_writer_fast_lane_roundtrip
 (aggressive). The remaining gap to `query_mut` (1.6µs) is structural: arena
 allocation (15%) and `Vec::push` (8%) in the recording phase.
 
+## Regression Risk: Archetype Fragmentation
+
+The one scenario where the fast lane could regress is **highly fragmented
+archetypes** — many archetypes with few entities each (e.g., 5,000 archetypes
+× 2 entities vs 5 archetypes × 2,000 entities).
+
+**Per-archetype overhead:**
+- `open_archetype_batch`: one `ColumnBatch` allocation per archetype per
+  mutable component
+- `init_writer_fetch`: one `column_slot` resolution per archetype
+- Apply: one `mark_changed` call + column pointer resolution per archetype
+
+For 5,000 archetypes × 2 mutable components = 10,000 `ColumnBatch`
+allocations + 10,000 `Vec::new()` calls, most holding only 2 entries each.
+The current path has no per-archetype setup cost — it pays per entity
+uniformly.
+
+**Mitigating factors:**
+- QueryWriter already pays per-archetype costs (`init_writer_fetch`,
+  archetype matching) in the current code. The fast lane adds one
+  `ColumnBatch` struct per component on top of existing overhead.
+- `Vec::new()` does not allocate until first push. A `ColumnBatch` with
+  zero entries (conditional update, archetype doesn't trigger `set()`) is
+  a no-op.
+- For 2-entity archetypes, the entries `Vec` holds 2 elements — a single
+  16-byte heap allocation or inline on some allocators.
+
+**Mitigation if needed:** Skip the fast lane for archetypes below a size
+threshold (e.g., `arch.len() < 4`) and fall back to `insert_raw` for those
+entities. This adds one branch per archetype, not per entity.
+
+**Benchmark coverage:** `reducer/query_writer_fast_lane_multi_arch` (3
+archetypes × 3K entities) tests the multi-archetype path. If fragmentation
+is a concern, add a stress benchmark: 1,000 archetypes × 10 entities each.
+
 ## Files Modified
 
 | File | Changes |
