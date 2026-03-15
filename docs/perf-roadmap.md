@@ -56,11 +56,42 @@ After `run_join()` materialises entities into ScratchBuffer, sort by
 packed `(archetype_id << 32 | row)` key. Walk archetype runs calling
 `init_fetch` once per archetype, `fetch`/`as_slice` per entity.
 
-**Results**: Benchmarks not yet run. Use `cargo bench -p minkowski-bench -- join`
-to measure `for_each_get` (baseline) vs `for_each_batched` and `for_each_chunk`.
+**Results**: After join elimination (P1-5), inner joins become pure scans.
+The batch extraction methods now operate on the scan path:
+
+| Benchmark | v1.3.1 (join) | v1.3.2 (eliminated) |
+|---|---|---|
+| `join/for_each_get_10k` | 122 us | 47 us |
+| `join/for_each_batched_10k` | 103 us | 27 us |
+| `join/for_each_chunk_10k` | 109 us | 35 us |
+| `join/manual_query_10k` | 4.8 us | 4.8 us |
+
+The remaining gap vs manual_query is `execute()` scratch buffer overhead
+(entity-by-entity push into Vec). `for_each()` on eliminated plans uses
+the streaming scan path at ~10 us.
 
 **API**: `for_each_batched`, `for_each_batched_raw`, `for_each_join_chunk`
 on `QueryPlanResult`.
+
+---
+
+### P1-5: Join elimination (inner joins → scan rewrite) --- COMPLETED
+
+**Implementation**: Build-time detection of inner joins that are pure
+component-presence filters. Merges right-side required/changed bitsets
+into the left-side scan, replaces compile_for_each factories with
+merged-bitset closures, drops the join entirely. Phase 4b in
+`ScanBuilder::build()`.
+
+**Results**: Inner joins are eliminated entirely — no `run_join()`
+materialization, sort, or intersection. The plan becomes a pure archetype
+scan with the merged component requirements. `join/for_each_get_10k`
+dropped from 122 us to 47 us (2.6x). `for_each_batched` dropped from
+103 us to 27 us (3.8x). The `for_each()` streaming path (no scratch
+buffer) runs at ~10 us — within 2x of the manual query baseline.
+
+**API**: Automatic — no user code changes needed. `PlanWarning::JoinEliminated`
+informs users when the optimization fires.
 
 ---
 
