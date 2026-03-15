@@ -674,8 +674,75 @@ impl EnumChangeSet {
         world: &mut World,
         tick: crate::tick::Tick,
     ) -> Result<(), (usize, ApplyError)> {
+        // Batch state for consecutive Insert overwrites on the same
+        // (archetype, component). Resolved fields amortize per-entity
+        // lookups (column_index, drop_fn, layout) across the batch.
+        let mut batch: Option<InsertBatch> = None;
+
         for (mutation_idx, mutation) in self.mutations.iter().enumerate() {
             let map_err = |e| (mutation_idx, e);
+
+            // For Insert mutations, try to extend the current batch before
+            // falling through to sequential processing.
+            if let Mutation::Insert {
+                entity,
+                component_id,
+                offset,
+                layout,
+            } = mutation
+            {
+                if !world.is_alive(*entity) {
+                    flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
+                    return Err(map_err(ApplyError::DeadEntity(*entity)));
+                }
+                let index = entity.index() as usize;
+                let location = world.entity_locations[index].unwrap();
+                let arch = &world.archetypes.archetypes[location.archetype_id.0];
+
+                if arch.component_ids.contains(*component_id) {
+                    // Overwrite path — eligible for batching.
+                    let batch_key = (location.archetype_id.0, *component_id);
+
+                    let key_matches = batch
+                        .as_ref()
+                        .is_some_and(|b| b.arch_idx == batch_key.0 && b.comp_id == batch_key.1);
+
+                    if key_matches {
+                        let src = self.arena.get(*offset);
+                        batch.as_mut().unwrap().entries.push((location.row, src));
+                    } else {
+                        // Resolve column/drop before flushing to avoid borrow conflict.
+                        let col_idx = arch.column_index(*component_id).unwrap();
+                        let info = world.components.info(*component_id);
+                        let new_batch = InsertBatch {
+                            arch_idx: location.archetype_id.0,
+                            comp_id: *component_id,
+                            col_idx,
+                            drop_fn: info.drop_fn,
+                            layout: *layout,
+                            entries: Vec::new(),
+                            first_mutation_idx: mutation_idx,
+                        };
+                        // Flush the old batch, start a new one.
+                        flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
+                        batch = Some(new_batch);
+                        let src = self.arena.get(*offset);
+                        batch.as_mut().unwrap().entries.push((location.row, src));
+                    }
+                    continue;
+                }
+                // Component not in archetype — migration path.
+                // Flush batch, fall through to sequential.
+                flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
+                let data_ptr = self.arena.get(*offset);
+                changeset_insert_raw(world, *entity, *component_id, data_ptr, *layout, tick)
+                    .map_err(map_err)?;
+                continue;
+            }
+
+            // Non-Insert mutations: flush any pending batch, then process.
+            flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
+
             match mutation {
                 Mutation::Spawn { entity, components } => {
                     // Ensure the entity allocator's generations vec covers
@@ -728,15 +795,9 @@ impl EnumChangeSet {
                     }
                 }
 
-                Mutation::Insert {
-                    entity,
-                    component_id,
-                    offset,
-                    layout,
-                } => {
-                    let data_ptr = self.arena.get(*offset);
-                    changeset_insert_raw(world, *entity, *component_id, data_ptr, *layout, tick)
-                        .map_err(map_err)?;
+                Mutation::Insert { .. } => {
+                    // Handled above — unreachable because the if-let matched.
+                    unreachable!()
                 }
 
                 Mutation::Remove {
@@ -785,8 +846,53 @@ impl EnumChangeSet {
             }
         }
 
+        // Flush any remaining batch.
+        flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
+
         Ok(())
     }
+}
+
+/// Batch state for consecutive Insert overwrites targeting the same
+/// `(archetype, component)` pair. Resolves column index, drop function,
+/// and layout once per batch instead of per entity.
+struct InsertBatch {
+    arch_idx: usize,
+    comp_id: ComponentId,
+    col_idx: usize,
+    drop_fn: Option<unsafe fn(*mut u8)>,
+    layout: Layout,
+    entries: Vec<(usize, *const u8)>,
+    /// Index of the first mutation in this batch (for error attribution).
+    #[expect(dead_code)]
+    first_mutation_idx: usize,
+}
+
+/// Flush a pending insert batch by writing all accumulated entries into
+/// the target column. Marks the column changed once per batch.
+fn flush_insert_batch(
+    archetypes: &mut [crate::storage::archetype::Archetype],
+    batch: &mut Option<InsertBatch>,
+    tick: Tick,
+) {
+    let Some(b) = batch.as_mut() else { return };
+    if b.entries.is_empty() {
+        *batch = None;
+        return;
+    }
+    let col = &mut archetypes[b.arch_idx].columns[b.col_idx];
+    col.mark_changed(tick);
+    let size = b.layout.size();
+    for &(row, src) in &b.entries {
+        unsafe {
+            let dst = col.get_ptr(row);
+            if let Some(drop_fn) = b.drop_fn {
+                drop_fn(dst);
+            }
+            std::ptr::copy_nonoverlapping(src, dst, size);
+        }
+    }
+    *batch = None;
 }
 
 /// Raw insert: either overwrites an existing component in-place or performs
@@ -1761,5 +1867,143 @@ mod tests {
             2,
             "both values must be dropped total"
         );
+    }
+
+    // ── Batch apply tests ────────────────────────────────────────
+
+    #[test]
+    fn batch_apply_overwrites_same_archetype() {
+        // 10K overwrites on the same (archetype, component) should be batched
+        // and all values must be correct after apply.
+        let mut world = World::new();
+        let entities: Vec<Entity> = (0..10_000)
+            .map(|i| {
+                world.spawn((Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },))
+            })
+            .collect();
+
+        let mut cs = EnumChangeSet::new();
+        for (i, &e) in entities.iter().enumerate() {
+            cs.insert::<Pos>(
+                &mut world,
+                e,
+                Pos {
+                    x: (i as f32) * 10.0,
+                    y: (i as f32) * 20.0,
+                },
+            );
+        }
+        cs.apply(&mut world).unwrap();
+
+        for (i, &e) in entities.iter().enumerate() {
+            let pos = world.get::<Pos>(e).unwrap();
+            assert_eq!(
+                *pos,
+                Pos {
+                    x: (i as f32) * 10.0,
+                    y: (i as f32) * 20.0,
+                },
+                "entity {i} has wrong position"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_apply_mixed_insert_despawn() {
+        // Interleaving Insert and Despawn must preserve ordering:
+        // Insert(A), Insert(B), Despawn(A) -> A has updated Pos when despawned.
+        let mut world = World::new();
+        let a = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let b = world.spawn((Pos { x: 0.0, y: 0.0 },));
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert::<Pos>(&mut world, a, Pos { x: 1.0, y: 1.0 });
+        cs.insert::<Pos>(&mut world, b, Pos { x: 2.0, y: 2.0 });
+        cs.record_despawn(a);
+
+        cs.apply(&mut world).unwrap();
+
+        assert!(!world.is_alive(a), "a should be despawned");
+        assert_eq!(
+            world.get::<Pos>(b),
+            Some(&Pos { x: 2.0, y: 2.0 }),
+            "b should have updated pos"
+        );
+    }
+
+    #[test]
+    fn batch_apply_cross_archetype_flushes() {
+        // Entities in different archetypes break the batch — verify both
+        // sets get correct values.
+        let mut world = World::new();
+        // Archetype 1: (Pos,)
+        let a1 = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let a2 = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        // Archetype 2: (Pos, Vel)
+        let b1 = world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        let b2 = world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
+
+        let mut cs = EnumChangeSet::new();
+        // Batch 1: a1, a2 (same archetype)
+        cs.insert::<Pos>(&mut world, a1, Pos { x: 1.0, y: 1.0 });
+        cs.insert::<Pos>(&mut world, a2, Pos { x: 2.0, y: 2.0 });
+        // Batch 2: b1, b2 (different archetype — flushes batch 1)
+        cs.insert::<Pos>(&mut world, b1, Pos { x: 3.0, y: 3.0 });
+        cs.insert::<Pos>(&mut world, b2, Pos { x: 4.0, y: 4.0 });
+
+        cs.apply(&mut world).unwrap();
+
+        assert_eq!(world.get::<Pos>(a1), Some(&Pos { x: 1.0, y: 1.0 }));
+        assert_eq!(world.get::<Pos>(a2), Some(&Pos { x: 2.0, y: 2.0 }));
+        assert_eq!(world.get::<Pos>(b1), Some(&Pos { x: 3.0, y: 3.0 }));
+        assert_eq!(world.get::<Pos>(b2), Some(&Pos { x: 4.0, y: 4.0 }));
+    }
+
+    #[test]
+    fn batch_apply_migration_falls_through() {
+        // Insert of a component NOT in the entity's archetype should trigger
+        // migration via the sequential path, not the batch path.
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        let mut cs = EnumChangeSet::new();
+        // These inserts add Vel to entities that only have Pos — migration.
+        cs.insert::<Vel>(&mut world, e1, Vel { dx: 10.0, dy: 10.0 });
+        cs.insert::<Vel>(&mut world, e2, Vel { dx: 20.0, dy: 20.0 });
+
+        cs.apply(&mut world).unwrap();
+
+        assert_eq!(world.get::<Vel>(e1), Some(&Vel { dx: 10.0, dy: 10.0 }));
+        assert_eq!(world.get::<Vel>(e2), Some(&Vel { dx: 20.0, dy: 20.0 }));
+        // Original components still intact.
+        assert_eq!(world.get::<Pos>(e1), Some(&Pos { x: 1.0, y: 1.0 }));
+        assert_eq!(world.get::<Pos>(e2), Some(&Pos { x: 2.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn batch_apply_dead_entity_returns_error() {
+        // A dead entity mid-batch should flush the batch and return an error.
+        let mut world = World::new();
+        let alive = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let dead = world.spawn((Pos { x: 2.0, y: 2.0 },));
+        world.despawn(dead);
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert::<Pos>(&mut world, alive, Pos { x: 99.0, y: 99.0 });
+        cs.insert::<Pos>(&mut world, dead, Pos { x: 0.0, y: 0.0 });
+
+        let result = cs.apply(&mut world);
+        assert!(
+            matches!(result, Err(ApplyError::DeadEntity(_))),
+            "should return DeadEntity error"
+        );
+
+        // The first mutation (on alive entity) should have been flushed
+        // and applied before the error.
+        assert_eq!(world.get::<Pos>(alive), Some(&Pos { x: 99.0, y: 99.0 }));
     }
 }
