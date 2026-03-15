@@ -19,6 +19,7 @@ refs
 .bashrc
 .bash_profile
 .worktrees/
+.claude/worktrees/
 __pycache__/
 *.pyc
 *.pyo

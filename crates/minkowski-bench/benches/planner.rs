@@ -442,11 +442,81 @@ fn join_selectivity_benches(c: &mut Criterion) {
     group.finish();
 }
 
+/// Left join benchmarks — the materialized path (not eliminated).
+/// 10K entities with Score, 80% also have Team.
+/// Left join preserves all 10K entities (8K matched + 2K unmatched).
+fn join_left_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("join_left");
+
+    group.bench_function("execute_10k", |b| {
+        let (mut world, _) = join_world(10_000, 0.8);
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Left)
+            .build();
+        drop(planner);
+
+        b.iter(|| plan.execute(&mut world).unwrap().len());
+    });
+
+    group.bench_function("for_each_10k", |b| {
+        let (mut world, _) = join_world(10_000, 0.8);
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Left)
+            .build();
+        drop(planner);
+
+        b.iter(|| {
+            let mut count = 0u32;
+            plan.for_each(&mut world, |_| count += 1).unwrap();
+            count
+        });
+    });
+
+    group.bench_function("for_each_batched_10k", |b| {
+        let (mut world, _) = join_world(10_000, 0.8);
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Left)
+            .build();
+        drop(planner);
+
+        b.iter(|| {
+            let mut sum = 0u64;
+            plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+                sum += score.0 as u64;
+            })
+            .unwrap();
+            sum
+        });
+    });
+
+    // Manual baseline: process all Score entities, optionally read Team.
+    group.bench_function("manual_10k", |b| {
+        let (mut world, _) = join_world(10_000, 0.8);
+
+        b.iter(|| {
+            let mut sum = 0u64;
+            for score in world.query::<&Score>() {
+                sum += score.0 as u64;
+            }
+            sum
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     planner,
     join_benches,
     join_fat_benches,
-    join_selectivity_benches
+    join_selectivity_benches,
+    join_left_benches
 );
 criterion_main!(benches);
