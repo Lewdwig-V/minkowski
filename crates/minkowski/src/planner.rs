@@ -88,7 +88,7 @@ use crate::tick::Tick;
 // Use std Arc directly — the planner has no concurrent code, so it does not
 // need loom's Arc (which lacks unsized coercion for Arc<dyn Fn> type erasure).
 use crate::transaction::WorldMismatch;
-use crate::world::{World, WorldId};
+use crate::world::{EntityLocation, World, WorldId};
 use std::sync::Arc;
 
 // ── Planner errors ───────────────────────────────────────────────────
@@ -4258,6 +4258,23 @@ impl ScratchBuffer {
 
         let final_len = self.entities.len();
         &self.entities[final_len - match_count..final_len]
+    }
+
+    /// Sort entities by (ArchetypeId, Row) to restore cache locality after
+    /// join materialisation. Entities from the same archetype become
+    /// contiguous, and within each archetype group, rows are in physical
+    /// memory order (ascending).
+    ///
+    /// # Panics
+    /// Panics if any entity in the buffer has no location (dead entity).
+    /// This should never happen: join collectors only iterate live archetypes.
+    #[expect(dead_code, reason = "used by for_each_batched in the next commit")]
+    fn sort_by_archetype(&mut self, entity_locations: &[Option<EntityLocation>]) {
+        self.entities.sort_unstable_by_key(|e| {
+            let loc = entity_locations[e.index() as usize]
+                .expect("join produced dead entity in scratch buffer");
+            ((loc.archetype_id.0 as u64) << 32) | (loc.row as u64)
+        });
     }
 }
 
@@ -9179,5 +9196,42 @@ mod tests {
         assert_eq!(result.get(0), Some(8.0)); // count: 5 + 3
         // sum of Health: only from archetype 2 = 0 + 10 + 20 = 30
         assert_eq!(result.get(1), Some(30.0));
+    }
+
+    // ── Batch join execution ──────────────────────────────────────────
+
+    #[test]
+    fn scratch_sort_by_archetype_groups_entities() {
+        let mut world = World::new();
+        // Archetype A: Score only
+        let a1 = world.spawn((Score(1),));
+        let a2 = world.spawn((Score(2),));
+        // Archetype B: Score + Team
+        let b1 = world.spawn((Score(3), Team(1)));
+        let b2 = world.spawn((Score(4), Team(2)));
+
+        // Deliberately interleave: [b1, a1, b2, a2]
+        let mut scratch = ScratchBuffer::new(4);
+        scratch.push(b1);
+        scratch.push(a1);
+        scratch.push(b2);
+        scratch.push(a2);
+
+        scratch.sort_by_archetype(&world.entity_locations);
+
+        // After sort: entities from same archetype should be contiguous.
+        let sorted = scratch.as_slice();
+        // First two share one archetype, last two share another.
+        let loc0 = world.entity_locations[sorted[0].index() as usize].unwrap();
+        let loc1 = world.entity_locations[sorted[1].index() as usize].unwrap();
+        let loc2 = world.entity_locations[sorted[2].index() as usize].unwrap();
+        let loc3 = world.entity_locations[sorted[3].index() as usize].unwrap();
+        assert_eq!(loc0.archetype_id, loc1.archetype_id);
+        assert_eq!(loc2.archetype_id, loc3.archetype_id);
+        assert_ne!(loc0.archetype_id, loc2.archetype_id);
+
+        // Within each archetype group, rows should be sorted ascending.
+        assert!(loc0.row < loc1.row);
+        assert!(loc2.row < loc3.row);
     }
 }
