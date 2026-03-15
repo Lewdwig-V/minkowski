@@ -14,8 +14,10 @@ fn schedule(c: &mut Criterion) {
             &mut world,
             "sys_pos",
             |mut q: QueryMut<'_, (&mut Position,)>, (): ()| {
-                q.for_each(|(pos,)| {
-                    pos.x += 1.0;
+                q.for_each(|(positions,)| {
+                    for p in positions.iter_mut() {
+                        p.x += 1.0;
+                    }
                 });
             },
         )
@@ -26,8 +28,10 @@ fn schedule(c: &mut Criterion) {
             &mut world,
             "sys_vel",
             |mut q: QueryMut<'_, (&mut Velocity,)>, (): ()| {
-                q.for_each(|(vel,)| {
-                    vel.dx += 0.1;
+                q.for_each(|(velocities,)| {
+                    for v in velocities.iter_mut() {
+                        v.dx += 0.1;
+                    }
                 });
             },
         )
@@ -38,8 +42,10 @@ fn schedule(c: &mut Criterion) {
             &mut world,
             "sys_rot",
             |mut q: QueryMut<'_, (&mut Rotation,)>, (): ()| {
-                q.for_each(|(rot,)| {
-                    rot.x += 0.01;
+                q.for_each(|(rotations,)| {
+                    for r in rotations.iter_mut() {
+                        r.x += 0.01;
+                    }
                 });
             },
         )
@@ -50,8 +56,10 @@ fn schedule(c: &mut Criterion) {
             &mut world,
             "sys_transform",
             |mut q: QueryMut<'_, (&mut Transform,)>, (): ()| {
-                q.for_each(|(t,)| {
-                    t.matrix[0][0] += 0.001;
+                q.for_each(|(transforms,)| {
+                    for t in transforms.iter_mut() {
+                        t.matrix[0][0] += 0.001;
+                    }
                 });
             },
         )
@@ -62,7 +70,7 @@ fn schedule(c: &mut Criterion) {
             &mut world,
             "sys_read_pos",
             |mut q: QueryRef<'_, (&Position,)>, (): ()| {
-                q.for_each(|(_pos,)| {
+                q.for_each(|(_positions,)| {
                     // pure read — measures iteration overhead without mutation cost
                 });
             },

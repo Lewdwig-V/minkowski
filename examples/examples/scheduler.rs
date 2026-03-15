@@ -88,9 +88,11 @@ fn main() {
             &mut world,
             "movement",
             |mut query: QueryMut<'_, (&mut Pos, &Vel)>, ()| {
-                query.for_each(|(pos, vel)| {
-                    pos.x += vel.dx;
-                    pos.y += vel.dy;
+                query.for_each(|(positions, velocities)| {
+                    for i in 0..positions.len() {
+                        positions[i].x += velocities[i].dx;
+                        positions[i].y += velocities[i].dy;
+                    }
                 });
             },
         )
@@ -101,8 +103,10 @@ fn main() {
             &mut world,
             "gravity",
             |mut query: QueryMut<'_, (&mut Vel,)>, ()| {
-                query.for_each(|(vel,)| {
-                    vel.dy -= 9.8;
+                query.for_each(|(velocities,)| {
+                    for v in velocities.iter_mut() {
+                        v.dy -= 9.8;
+                    }
                 });
             },
         )
@@ -113,8 +117,10 @@ fn main() {
             &mut world,
             "health_regen",
             |mut query: QueryMut<'_, (&mut Health,)>, ()| {
-                query.for_each(|(hp,)| {
-                    hp.0 = hp.0.saturating_add(1);
+                query.for_each(|(healths,)| {
+                    for hp in healths.iter_mut() {
+                        hp.0 = hp.0.saturating_add(1);
+                    }
                 });
             },
         )
@@ -125,8 +131,10 @@ fn main() {
             &mut world,
             "apply_damage",
             |mut query: QueryMut<'_, (&mut Health,)>, ()| {
-                query.for_each(|(hp,)| {
-                    hp.0 = hp.0.saturating_sub(5);
+                query.for_each(|(healths,)| {
+                    for hp in healths.iter_mut() {
+                        hp.0 = hp.0.saturating_sub(5);
+                    }
                 });
             },
         )
@@ -149,8 +157,10 @@ fn main() {
             "log_health",
             |mut query: QueryRef<'_, (&Health,)>, ()| {
                 let mut total: u32 = 0;
-                query.for_each(|(h,)| {
-                    total += h.0;
+                query.for_each(|(healths,)| {
+                    for h in healths {
+                        total += h.0;
+                    }
                 });
                 println!("    log_health: total HP = {total}");
             },

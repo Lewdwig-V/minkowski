@@ -106,7 +106,7 @@ pub use planner::{
     AggregateExpr, AggregateOp, AggregateResult, CardinalityConstraint, Cost, IndexKind, Indexed,
     JoinKind, PlanExecError, PlanNode, PlanWarning, PlannerError, Predicate, QueryPlanResult,
     QueryPlanner, SpatialLookupFn, SpatialPredicate, SubscriptionBuilder, SubscriptionError,
-    TablePlanner, VecExecNode, VectorizeOpts, VectorizedPlan,
+    TablePlanner,
 };
 pub use pool::{HugePages, PoolExhausted};
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};

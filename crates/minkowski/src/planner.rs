@@ -1,36 +1,25 @@
-//! Volcano-model query planner for composing index-driven lookups, joins,
-//! and full scans into optimized execution plans.
+//! Query planner for composing index-driven lookups, joins, and full scans
+//! into optimized execution plans.
 //!
 //! The planner is designed for an in-memory ECS where data already lives in L1/L2
 //! cache. Planning overhead is kept to O(indexes + predicates). Plans are
-//! executable against live world data: scan-only plans without a spatial driver use zero-alloc `for_each`
-//! with fused filter closures; join plans use a scratch-buffer intersection model.
+//! executable against live world data: scan-only plans without a spatial driver
+//! use zero-alloc `for_each` with fused filter closures; join plans use a
+//! scratch-buffer intersection model.
 //!
-//! # Volcano Model
+//! All plans execute via chunked, slice-based iteration over 64-byte-aligned
+//! columns. LLVM auto-vectorizes loops over these contiguous slices — there
+//! is no separate "scalar" execution path. Cost estimates reflect batch
+//! amortization, branchless filter eligibility, and cache-partitioned joins.
 //!
-//! Each node in the plan tree is a **pull-based iterator**: the root calls
-//! `next()` on its child, which calls `next()` on *its* child, and so on.
-//! This is the classic Volcano/iterator model adapted for in-memory ECS:
+//! # Plan Nodes
 //!
-//! - **Scan**: full archetype iteration via `world.query()`
-//! - **IndexLookup**: point or range lookup on a `BTreeIndex` / `HashIndex`
-//! - **SpatialLookup**: spatial index query (within, intersects)
-//! - **Filter**: predicate pushdown (applied per-entity after fetch)
-//! - **HashJoin**: join two entity streams on a shared component value
-//! - **NestedLoopJoin**: fallback join for small cardinalities
-//!
-//! # Vectorized Execution
-//!
-//! Plans are compiled to vectorized execution by default. Instead of the
-//! classic row-at-a-time Volcano pull model, vectorized plans process data
-//! in **morsel-sized batches** (one archetype chunk at a time), mapping
-//! directly to `QueryIter::for_each_chunk` which yields typed `&[T]` /
-//! `&mut [T]` slices that LLVM can auto-vectorize.
-//!
-//! The [`VectorizedPlan`] captures the execution strategy for each node:
-//! - **ChunkedScan**: yields one batch per archetype (cache-line aligned)
-//! - **SIMDFilter**: filter applied to contiguous slices (branchless when possible)
-//! - **PartitionedHashJoin**: build side partitioned for L2 cache residency
+//! - **Scan** (ChunkedScan): one batch per archetype, cache-line aligned
+//! - **IndexLookup** (IndexGather): batch entity fetch via BTree/Hash index
+//! - **SpatialLookup** (SpatialGather): spatial index query (within, intersects)
+//! - **Filter**: predicate applied to contiguous slices (branchless when possible)
+//! - **HashJoin** (PartitionedHashJoin): build side partitioned for L2 residency
+//! - **NestedLoopJoin** (BatchNestedLoopJoin): fallback for small cardinalities
 //!
 //! ```rust,ignore
 //! let plan = planner
@@ -38,8 +27,7 @@
 //!     .filter(Predicate::range::<Score>(Score(10)..Score(50)))
 //!     .build();
 //!
-//! let vectorized = plan.vectorize(VectorizeOpts::default());
-//! println!("{}", vectorized.explain());
+//! println!("{}", plan.explain());
 //! ```
 //!
 //! # Usage
@@ -245,9 +233,14 @@ impl Cost {
     }
 
     fn filter(input: Cost, selectivity: f64) -> Self {
+        Self::filter_with_branchless(input, selectivity, false)
+    }
+
+    fn filter_with_branchless(input: Cost, selectivity: f64, branchless: bool) -> Self {
+        let speedup = if branchless { 0.5 } else { 0.85 };
         Cost {
             rows: (input.rows * selectivity).max(0.0),
-            cpu: input.cpu + input.rows * Self::FILTER_PER_ROW,
+            cpu: input.cpu + input.rows * Self::FILTER_PER_ROW * speedup,
         }
     }
 
@@ -1090,16 +1083,27 @@ pub enum JoinKind {
 }
 
 /// A node in the query execution plan tree.
+///
+/// All plans execute via chunked, slice-based iteration over 64-byte-aligned
+/// columns. LLVM auto-vectorizes loops over these contiguous slices — there
+/// is no separate "scalar" execution path. Cost estimates reflect the
+/// vectorized execution model (batch amortization, branchless filters,
+/// cache-partitioned joins).
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PlanNode {
-    /// Full archetype scan via `world.query()`.
+    /// Chunked archetype scan: yields one batch per archetype.
+    /// Each batch is a contiguous column slice (64-byte aligned).
     Scan {
         query_name: &'static str,
         estimated_rows: usize,
+        /// Average rows per chunk (= archetype size). Tuned for L1 residency.
+        avg_chunk_size: usize,
         cost: Cost,
     },
-    /// Index-driven lookup (point or range).
+    /// Index-driven gather: lookup entities via index, then batch-fetch
+    /// components. Entities are sorted by archetype to maximize sequential
+    /// access.
     IndexLookup {
         index_kind: IndexKind,
         component_name: &'static str,
@@ -1107,38 +1111,44 @@ pub enum PlanNode {
         estimated_rows: usize,
         cost: Cost,
     },
-    /// Spatial index lookup (within, intersects).
+    /// Spatial index gather: lookup entities via a spatial index.
     SpatialLookup {
         component_name: &'static str,
         predicate: String,
         estimated_rows: usize,
         cost: Cost,
     },
-    /// Post-fetch filter applied to child output.
+    /// Filter applied to contiguous slices from the child node.
+    /// Branchless filters (Eq/Range on numeric types) are ~2x faster
+    /// than branched filters (Custom predicates) on aligned data.
     Filter {
         child: Box<PlanNode>,
         predicate: String,
         selectivity: f64,
-        /// Whether this filter can be lowered to branchless SIMD comparison.
-        /// True for Eq/Range predicates on numeric types, false for Custom.
-        branchless_eligible: bool,
+        /// Whether this filter can be applied branchlessly on aligned data.
+        branchless: bool,
         cost: Cost,
     },
-    /// Hash join: build table on left, probe with right.
+    /// Partitioned hash join: build side is partitioned into L2-cache-sized
+    /// segments. Probe side streams through chunks, probing the partition
+    /// that fits in cache.
     HashJoin {
         left: Box<PlanNode>,
         right: Box<PlanNode>,
         join_kind: JoinKind,
+        /// Number of partitions (tuned for L2 cache residency).
+        partitions: usize,
         cost: Cost,
     },
-    /// Nested-loop join for small cardinalities.
+    /// Batch nested-loop join on small materialized sides.
     NestedLoopJoin {
         left: Box<PlanNode>,
         right: Box<PlanNode>,
         join_kind: JoinKind,
         cost: Cost,
     },
-    /// Aggregate: compute aggregate functions over child output.
+    /// Stream aggregate: compute aggregate functions in a single pass
+    /// over child output.
     Aggregate {
         child: Box<PlanNode>,
         /// Human-readable labels for each aggregate (e.g. `["COUNT(*)", "SUM(Score)"]`).
@@ -1177,11 +1187,13 @@ impl PlanNode {
             PlanNode::Scan {
                 query_name,
                 estimated_rows,
+                avg_chunk_size,
                 cost,
             } => {
                 writeln!(
                     f,
-                    "Scan [{query_name}] rows={estimated_rows} cpu={:.1}",
+                    "ChunkedScan [{query_name}] rows={estimated_rows} \
+                     chunk_size={avg_chunk_size} cpu={:.1}",
                     cost.cpu
                 )
             }
@@ -1194,7 +1206,8 @@ impl PlanNode {
             } => {
                 writeln!(
                     f,
-                    "IndexLookup [{index_kind:?} on {component_name}] {predicate} rows={estimated_rows} cpu={:.1}",
+                    "IndexGather [{index_kind:?} on {component_name}] \
+                     {predicate} rows={estimated_rows} cpu={:.1}",
                     cost.cpu
                 )
             }
@@ -1206,7 +1219,8 @@ impl PlanNode {
             } => {
                 writeln!(
                     f,
-                    "SpatialLookup [Spatial on {component_name}] {predicate} rows={estimated_rows} cpu={:.1}",
+                    "SpatialGather [Spatial on {component_name}] \
+                     {predicate} rows={estimated_rows} cpu={:.1}",
                     cost.cpu
                 )
             }
@@ -1214,12 +1228,18 @@ impl PlanNode {
                 child,
                 predicate,
                 selectivity,
+                branchless,
                 cost,
-                ..
             } => {
+                let mode = if *branchless {
+                    "branchless"
+                } else {
+                    "branched"
+                };
                 writeln!(
                     f,
-                    "Filter [{predicate}] sel={selectivity:.2} rows={:.0} cpu={:.1}",
+                    "Filter [{predicate}] sel={selectivity:.2} \
+                     mode={mode} rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
                 child.fmt_indent(f, indent + 1)
@@ -1228,11 +1248,13 @@ impl PlanNode {
                 left,
                 right,
                 join_kind,
+                partitions,
                 cost,
             } => {
                 writeln!(
                     f,
-                    "HashJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
+                    "PartitionedHashJoin [{join_kind:?}] partitions={partitions} \
+                     rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
                 left.fmt_indent(f, indent + 1)?;
@@ -1246,7 +1268,7 @@ impl PlanNode {
             } => {
                 writeln!(
                     f,
-                    "NestedLoopJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
+                    "BatchNestedLoopJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
                 left.fmt_indent(f, indent + 1)?;
@@ -1260,7 +1282,7 @@ impl PlanNode {
                 let agg_list = aggregates.join(", ");
                 writeln!(
                     f,
-                    "Aggregate [{agg_list}] rows={:.0} cpu={:.1}",
+                    "StreamAggregate [{agg_list}] rows={:.0} cpu={:.1}",
                     cost.rows, cost.cpu
                 )?;
                 child.fmt_indent(f, indent + 1)
@@ -1369,7 +1391,6 @@ impl fmt::Display for PlanWarning {
 /// A compiled query execution plan.
 pub struct QueryPlanResult {
     root: PlanNode,
-    vec_root: VecExecNode,
     join_exec: Option<JoinExec>,
     compiled_for_each: Option<CompiledForEach>,
     compiled_for_each_raw: Option<CompiledForEachRaw>,
@@ -1387,24 +1408,14 @@ pub struct QueryPlanResult {
 }
 
 impl QueryPlanResult {
-    /// The logical plan root. Use this for introspection (matching on
+    /// The plan root. Use this for introspection (matching on
     /// `PlanNode` variants to inspect index selection, join strategy, etc.).
     pub fn root(&self) -> &PlanNode {
         &self.root
     }
 
-    /// The vectorized execution root — the plan that will actually run.
-    pub fn vec_root(&self) -> &VecExecNode {
-        &self.vec_root
-    }
-
-    /// Total estimated cost of the vectorized execution plan.
+    /// Total estimated cost of the execution plan.
     pub fn cost(&self) -> Cost {
-        self.vec_root.cost()
-    }
-
-    /// Cost of the logical plan before vectorized lowering.
-    pub fn logical_cost(&self) -> Cost {
         self.root.cost()
     }
 
@@ -1413,11 +1424,11 @@ impl QueryPlanResult {
         &self.warnings
     }
 
-    /// Human-readable execution plan showing the vectorized plan tree.
+    /// Human-readable execution plan.
     pub fn explain(&self) -> String {
         let mut out = String::new();
-        out.push_str("=== Vectorized Execution Plan ===\n");
-        let _ = write!(out, "{}", self.vec_root);
+        out.push_str("=== Execution Plan ===\n");
+        let _ = write!(out, "{}", self.root);
         if !self.warnings.is_empty() {
             out.push_str("\nWarnings:\n");
             for w in &self.warnings {
@@ -1433,8 +1444,8 @@ impl QueryPlanResult {
         let _ = writeln!(
             out,
             "Estimated: {:.0} rows, {:.1} cpu",
-            self.vec_root.cost().rows,
-            self.vec_root.cost().cpu
+            self.root.cost().rows,
+            self.root.cost().cpu
         );
         out
     }
@@ -1796,26 +1807,6 @@ impl QueryPlanResult {
             .collect();
         Ok(AggregateResult { values })
     }
-
-    /// Human-readable logical plan (before vectorized lowering).
-    pub fn explain_logical(&self) -> String {
-        let mut out = String::new();
-        out.push_str("=== Logical Plan ===\n");
-        let _ = write!(out, "{}", self.root);
-        if !self.warnings.is_empty() {
-            out.push_str("\nWarnings:\n");
-            for w in &self.warnings {
-                let _ = writeln!(out, "  - {w}");
-            }
-        }
-        let _ = write!(
-            out,
-            "\nEstimated: {:.0} rows, {:.1} cpu\n",
-            self.root.cost().rows,
-            self.root.cost().cpu
-        );
-        out
-    }
 }
 
 impl fmt::Display for QueryPlanResult {
@@ -1828,7 +1819,6 @@ impl fmt::Debug for QueryPlanResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryPlanResult")
             .field("root", &self.root)
-            .field("vec_root", &self.vec_root)
             .field("has_join_exec", &self.join_exec.is_some())
             .field("has_compiled_for_each", &self.compiled_for_each.is_some())
             .field(
@@ -2650,11 +2640,16 @@ impl ScanBuilder<'_> {
             // Driving access is a spatial lookup.
             let (first_pred, first_cost, _) = &spatial_preds[0];
             let est = first_cost.estimated_rows.max(1.0) as usize;
+            let base_cost = Cost::spatial_lookup(first_cost);
+            let sort_overhead = (est as f64).log2().max(1.0);
             node = PlanNode::SpatialLookup {
                 component_name: first_pred.component_name,
                 predicate: format!("{:?}", first_pred),
                 estimated_rows: est,
-                cost: Cost::spatial_lookup(first_cost),
+                cost: Cost {
+                    rows: base_cost.rows,
+                    cpu: base_cost.cpu * 0.9 + sort_overhead,
+                },
             };
 
             // Additional spatial predicates become filters.
@@ -2663,42 +2658,49 @@ impl ScanBuilder<'_> {
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
                     selectivity: pred.selectivity,
-                    branchless_eligible: false, // spatial predicates are not branchless
-                    cost: Cost::filter(parent_cost, pred.selectivity),
+                    branchless: false, // spatial predicates are not branchless
+                    cost: Cost::filter_with_branchless(parent_cost, pred.selectivity, false),
                     child: Box::new(node),
                 };
             }
 
             // All index predicates become filters too.
             for (pred, _idx) in &index_preds {
+                let bl = pred.is_branchless_eligible();
                 let parent_cost = node.cost();
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
                     selectivity: pred.selectivity,
-                    branchless_eligible: pred.is_branchless_eligible(),
-                    cost: Cost::filter(parent_cost, pred.selectivity),
+                    branchless: bl,
+                    cost: Cost::filter_with_branchless(parent_cost, pred.selectivity, bl),
                     child: Box::new(node),
                 };
             }
         } else if let Some((first_pred, first_idx)) = index_preds.first() {
             // Driving access is an index lookup.
             let est = (self.estimated_rows as f64 * first_pred.selectivity).max(1.0) as usize;
+            let base_cost = Cost::index_lookup(first_pred.selectivity, self.estimated_rows);
+            let sort_overhead = (est as f64).log2().max(1.0);
             node = PlanNode::IndexLookup {
                 index_kind: first_idx.kind,
                 component_name: first_pred.component_name,
                 predicate: format!("{:?}", first_pred),
                 estimated_rows: est,
-                cost: Cost::index_lookup(first_pred.selectivity, self.estimated_rows),
+                cost: Cost {
+                    rows: base_cost.rows,
+                    cpu: base_cost.cpu + sort_overhead,
+                },
             };
 
             // Additional index predicates become filters.
             for (pred, _idx) in index_preds.iter().skip(1) {
+                let bl = pred.is_branchless_eligible();
                 let parent_cost = node.cost();
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
                     selectivity: pred.selectivity,
-                    branchless_eligible: pred.is_branchless_eligible(),
-                    cost: Cost::filter(parent_cost, pred.selectivity),
+                    branchless: bl,
+                    cost: Cost::filter_with_branchless(parent_cost, pred.selectivity, bl),
                     child: Box::new(node),
                 };
             }
@@ -2709,39 +2711,53 @@ impl ScanBuilder<'_> {
                 node = PlanNode::Filter {
                     predicate: format!("{:?}", pred),
                     selectivity: pred.selectivity,
-                    branchless_eligible: false,
-                    cost: Cost::filter(parent_cost, pred.selectivity),
+                    branchless: false,
+                    cost: Cost::filter_with_branchless(parent_cost, pred.selectivity, false),
                     child: Box::new(node),
                 };
             }
         } else {
             // No usable index — full scan.
+            let opts = VectorizeOpts::default();
+            let base_cost = Cost::scan(self.estimated_rows);
             node = PlanNode::Scan {
                 query_name: self.query_name,
                 estimated_rows: self.estimated_rows,
-                cost: Cost::scan(self.estimated_rows),
+                avg_chunk_size: self.estimated_rows.min(opts.target_chunk_rows).max(1),
+                cost: Cost {
+                    rows: base_cost.rows,
+                    cpu: base_cost.cpu * 0.9,
+                },
             };
         }
 
         // Phase 4: Apply remaining filter predicates.
         for pred in filter_preds {
+            let bl = pred.is_branchless_eligible();
             let parent_cost = node.cost();
             node = PlanNode::Filter {
                 predicate: format!("{:?}", pred),
                 selectivity: pred.selectivity,
-                branchless_eligible: pred.is_branchless_eligible(),
-                cost: Cost::filter(parent_cost, pred.selectivity),
+                branchless: bl,
+                cost: Cost::filter_with_branchless(parent_cost, pred.selectivity, bl),
                 child: Box::new(node),
             };
         }
 
+        let opts = VectorizeOpts::default();
+
         // Phase 5: Join ordering — smallest intermediate result drives the
         // left side; each join's output becomes the next left input.
         for join in &self.joins {
+            let base_cost = Cost::scan(join.right_estimated_rows);
             let right_node = PlanNode::Scan {
                 query_name: join.right_query_name,
                 estimated_rows: join.right_estimated_rows,
-                cost: Cost::scan(join.right_estimated_rows),
+                avg_chunk_size: join.right_estimated_rows.min(opts.target_chunk_rows).max(1),
+                cost: Cost {
+                    rows: base_cost.rows,
+                    cpu: base_cost.cpu * 0.9,
+                },
             };
 
             let left_cost = node.cost();
@@ -2757,13 +2773,26 @@ impl ScanBuilder<'_> {
                     } else {
                         (node, right_node)
                     };
-                let cost = Cost::hash_join(build.cost(), probe.cost());
+                let base_cost = Cost::hash_join(build.cost(), probe.cost());
+
+                // Partition count: build side should fit in L2 cache.
+                let build_bytes = build.cost().rows as usize * opts.avg_component_bytes;
+                let l2 = opts.l2_cache_bytes.max(1);
+                let partitions = build_bytes.div_ceil(l2).max(1);
+                let partition_factor = if partitions > 1 { 0.7 } else { 0.9 };
+
+                let vec_cost = Cost {
+                    rows: base_cost.rows,
+                    cpu: (build.cost().cpu + probe.cost().cpu)
+                        + (base_cost.cpu - build.cost().cpu - probe.cost().cpu) * partition_factor,
+                };
 
                 node = PlanNode::HashJoin {
                     left: Box::new(build),
                     right: Box::new(probe),
                     join_kind: join.join_kind,
-                    cost,
+                    partitions,
+                    cost: vec_cost,
                 };
             } else {
                 if left_cost.rows > right_cost.rows {
@@ -2772,19 +2801,18 @@ impl ScanBuilder<'_> {
                         right_name: join.right_query_name,
                     });
                 }
-                let cost = Cost::nested_loop_join(left_cost, right_cost);
+                let base_cost = Cost::nested_loop_join(left_cost, right_cost);
                 node = PlanNode::NestedLoopJoin {
                     left: Box::new(node),
                     right: Box::new(right_node),
                     join_kind: join.join_kind,
-                    cost,
+                    cost: Cost {
+                        rows: base_cost.rows,
+                        cpu: base_cost.cpu * 0.95,
+                    },
                 };
             }
         }
-
-        // Phase 6: Lower logical plan to vectorized plan.
-        let opts = VectorizeOpts::default();
-        let mut vec_root = lower_to_vectorized(&node, &opts);
 
         // Phase 7: Build join execution state if joins are present.
         // Captures a left collector + one JoinStep per join, supporting
@@ -3305,7 +3333,6 @@ impl ScanBuilder<'_> {
                 aggregates: agg_labels,
                 cost: agg_cost,
             };
-            vec_root = lower_to_vectorized(&node, &opts);
         }
 
         // Phase 10: Pre-size scratch buffer from pre-aggregate cardinality.
@@ -3318,7 +3345,6 @@ impl ScanBuilder<'_> {
 
         QueryPlanResult {
             root: node,
-            vec_root,
             join_exec,
             compiled_for_each,
             compiled_for_each_raw,
@@ -3865,242 +3891,20 @@ impl CardinalityConstraint {
     }
 }
 
-// ── Vectorized execution ─────────────────────────────────────────────
-
-/// Execution strategy for a vectorized plan node.
-///
-/// Instead of the classic Volcano row-at-a-time pull model, vectorized
-/// nodes process **morsel-sized batches** — one archetype chunk at a time.
-/// This maps directly to `QueryIter::for_each_chunk` which yields typed
-/// `&[T]` / `&mut [T]` slices. LLVM can auto-vectorize loops over these
-/// contiguous, 64-byte-aligned columns.
-///
-/// The vectorized plan is the **default execution representation**.
-/// `build()` automatically lowers the logical [`PlanNode`] tree to
-/// vectorized form. Users inspect it via `explain()` and can access
-/// the logical plan via `root()` or `explain_logical()`.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum VecExecNode {
-    /// Chunked scan: yields one batch per archetype.
-    /// Each batch is a contiguous column slice (64-byte aligned).
-    ChunkedScan {
-        query_name: &'static str,
-        estimated_rows: usize,
-        /// Average rows per chunk (= archetype size). Tuned for L1 residency.
-        avg_chunk_size: usize,
-        cost: Cost,
-    },
-
-    /// Index-driven gather: lookup entities via index, then batch-fetch
-    /// components via `get_batch`. Entities are sorted by archetype to
-    /// maximize sequential access.
-    IndexGather {
-        index_kind: IndexKind,
-        component_name: &'static str,
-        predicate: String,
-        estimated_rows: usize,
-        cost: Cost,
-    },
-
-    /// Spatial index gather: lookup entities via a spatial index.
-    SpatialGather {
-        component_name: &'static str,
-        predicate: String,
-        estimated_rows: usize,
-        cost: Cost,
-    },
-
-    /// SIMD-friendly filter: applied to contiguous slices.
-    /// The filter function operates on `&[T]` and produces a selection
-    /// vector (bitmask) — no branching per row.
-    SIMDFilter {
-        child: Box<VecExecNode>,
-        predicate: String,
-        selectivity: f64,
-        /// Whether this filter can be applied branchlessly on aligned data.
-        branchless: bool,
-        cost: Cost,
-    },
-
-    /// Partitioned hash join: build side is partitioned into L2-cache-sized
-    /// segments. Probe side streams through chunks, probing the partition
-    /// that fits in cache.
-    PartitionedHashJoin {
-        build: Box<VecExecNode>,
-        probe: Box<VecExecNode>,
-        join_kind: JoinKind,
-        /// Number of partitions (tuned for L2 cache residency).
-        partitions: usize,
-        cost: Cost,
-    },
-
-    /// Nested-loop join on small batches. Both sides materialized.
-    BatchNestedLoopJoin {
-        left: Box<VecExecNode>,
-        right: Box<VecExecNode>,
-        join_kind: JoinKind,
-        cost: Cost,
-    },
-
-    /// Stream aggregate: compute aggregate functions while streaming child rows.
-    /// Single pass — no intermediate materialization.
-    StreamAggregate {
-        child: Box<VecExecNode>,
-        /// Human-readable labels for each aggregate.
-        aggregates: Vec<String>,
-        cost: Cost,
-    },
-}
-
-impl VecExecNode {
-    /// Cost of this vectorized node.
-    #[inline]
-    pub fn cost(&self) -> Cost {
-        match self {
-            VecExecNode::ChunkedScan { cost, .. }
-            | VecExecNode::IndexGather { cost, .. }
-            | VecExecNode::SpatialGather { cost, .. }
-            | VecExecNode::SIMDFilter { cost, .. }
-            | VecExecNode::PartitionedHashJoin { cost, .. }
-            | VecExecNode::BatchNestedLoopJoin { cost, .. }
-            | VecExecNode::StreamAggregate { cost, .. } => *cost,
-        }
-    }
-
-    fn fmt_indent(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
-        // Write indentation without heap allocation: two spaces per level.
-        for _ in 0..indent {
-            f.write_str("  ")?;
-        }
-        match self {
-            VecExecNode::ChunkedScan {
-                query_name,
-                estimated_rows,
-                avg_chunk_size,
-                cost,
-            } => {
-                writeln!(
-                    f,
-                    "ChunkedScan [{query_name}] rows={estimated_rows} \
-                     chunk_size={avg_chunk_size} cpu={:.1}",
-                    cost.cpu
-                )
-            }
-            VecExecNode::IndexGather {
-                index_kind,
-                component_name,
-                predicate,
-                estimated_rows,
-                cost,
-            } => {
-                writeln!(
-                    f,
-                    "IndexGather [{index_kind:?} on {component_name}] \
-                     {predicate} rows={estimated_rows} cpu={:.1}",
-                    cost.cpu
-                )
-            }
-            VecExecNode::SpatialGather {
-                component_name,
-                predicate,
-                estimated_rows,
-                cost,
-            } => {
-                writeln!(
-                    f,
-                    "SpatialGather [Spatial on {component_name}] \
-                     {predicate} rows={estimated_rows} cpu={:.1}",
-                    cost.cpu
-                )
-            }
-            VecExecNode::SIMDFilter {
-                child,
-                predicate,
-                selectivity,
-                branchless,
-                cost,
-            } => {
-                let mode = if *branchless {
-                    "branchless"
-                } else {
-                    "branched"
-                };
-                writeln!(
-                    f,
-                    "SIMDFilter [{predicate}] sel={selectivity:.2} \
-                     mode={mode} rows={:.0} cpu={:.1}",
-                    cost.rows, cost.cpu
-                )?;
-                child.fmt_indent(f, indent + 1)
-            }
-            VecExecNode::PartitionedHashJoin {
-                build,
-                probe,
-                join_kind,
-                partitions,
-                cost,
-            } => {
-                writeln!(
-                    f,
-                    "PartitionedHashJoin [{join_kind:?}] partitions={partitions} \
-                     rows={:.0} cpu={:.1}",
-                    cost.rows, cost.cpu
-                )?;
-                build.fmt_indent(f, indent + 1)?;
-                probe.fmt_indent(f, indent + 1)
-            }
-            VecExecNode::BatchNestedLoopJoin {
-                left,
-                right,
-                join_kind,
-                cost,
-            } => {
-                writeln!(
-                    f,
-                    "BatchNestedLoopJoin [{join_kind:?}] rows={:.0} cpu={:.1}",
-                    cost.rows, cost.cpu
-                )?;
-                left.fmt_indent(f, indent + 1)?;
-                right.fmt_indent(f, indent + 1)
-            }
-            VecExecNode::StreamAggregate {
-                child,
-                aggregates,
-                cost,
-            } => {
-                let agg_list = aggregates.join(", ");
-                writeln!(
-                    f,
-                    "StreamAggregate [{agg_list}] rows={:.0} cpu={:.1}",
-                    cost.rows, cost.cpu
-                )?;
-                child.fmt_indent(f, indent + 1)
-            }
-        }
-    }
-}
-
-impl fmt::Display for VecExecNode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.fmt_indent(f, 0)
-    }
-}
-
-/// Options for vectorized plan compilation.
+/// Options for plan cost estimation (internal).
 #[derive(Clone, Copy, Debug)]
-pub struct VectorizeOpts {
+pub(crate) struct VectorizeOpts {
     /// L2 cache size in bytes. Used to partition hash join build tables
     /// so each partition fits in cache. Default: 256 KiB.
-    pub l2_cache_bytes: usize,
+    pub(crate) l2_cache_bytes: usize,
 
     /// Average component size in bytes. Used to estimate how many rows
     /// fit in a cache line / partition. Default: 16 bytes.
-    pub avg_component_bytes: usize,
+    pub(crate) avg_component_bytes: usize,
 
     /// Target archetype chunk size. Scans that produce chunks larger than
     /// this will note it in the plan for monitoring. Default: 4096 rows.
-    pub target_chunk_rows: usize,
+    pub(crate) target_chunk_rows: usize,
 }
 
 impl Default for VectorizeOpts {
@@ -4113,75 +3917,7 @@ impl Default for VectorizeOpts {
     }
 }
 
-/// A compiled vectorized execution plan.
-///
-/// Produced by [`QueryPlanResult::vectorize`]. Nodes process data in
-/// archetype-sized batches, enabling SIMD auto-vectorization on the
-/// contiguous, 64-byte-aligned column slices that `for_each_chunk` yields.
-pub struct VectorizedPlan {
-    root: VecExecNode,
-    opts: VectorizeOpts,
-}
-
-impl VectorizedPlan {
-    /// The root node of the vectorized plan tree.
-    pub fn root(&self) -> &VecExecNode {
-        &self.root
-    }
-
-    /// Total estimated cost.
-    pub fn cost(&self) -> Cost {
-        self.root.cost()
-    }
-
-    /// Human-readable vectorized plan.
-    pub fn explain(&self) -> String {
-        let mut out = String::new();
-        out.push_str("=== Vectorized Execution Plan ===\n");
-        let _ = write!(out, "{}", self.root);
-        let _ = write!(
-            out,
-            "\nL2 cache budget: {} KiB, target chunk: {} rows\n",
-            self.opts.l2_cache_bytes / 1024,
-            self.opts.target_chunk_rows,
-        );
-        let _ = writeln!(
-            out,
-            "Estimated: {:.0} rows, {:.1} cpu",
-            self.root.cost().rows,
-            self.root.cost().cpu
-        );
-        out
-    }
-}
-
-impl fmt::Display for VectorizedPlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.explain())
-    }
-}
-
-impl fmt::Debug for VectorizedPlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VectorizedPlan")
-            .field("root", &self.root)
-            .field("opts", &self.opts)
-            .finish()
-    }
-}
-
 impl QueryPlanResult {
-    /// Re-lower the logical plan with custom vectorization options.
-    ///
-    /// By default, `build()` compiles to vectorized execution with
-    /// `VectorizeOpts::default()`. Use this method to re-lower with
-    /// different cache/chunk parameters (e.g., for a different cache
-    /// hierarchy).
-    pub fn vectorize(&self, opts: VectorizeOpts) -> VectorizedPlan {
-        let root = lower_to_vectorized(&self.root, &opts);
-        VectorizedPlan { root, opts }
-    }
-
     /// Validate this plan against cardinality constraints.
     ///
     /// Returns a list of constraint violations (empty = plan is valid).
@@ -4207,193 +3943,6 @@ impl QueryPlanResult {
             self
         } else {
             other
-        }
-    }
-}
-
-/// Recursively lower a logical plan node to a vectorized execution node.
-fn lower_to_vectorized(node: &PlanNode, opts: &VectorizeOpts) -> VecExecNode {
-    match node {
-        PlanNode::Scan {
-            query_name,
-            estimated_rows,
-            cost,
-        } => {
-            // Average chunk size = total rows / estimated archetypes.
-            // Conservative: assume at least 1 archetype, cap at target.
-            let avg_chunk = (*estimated_rows).min(opts.target_chunk_rows).max(1);
-
-            // Vectorized scan is slightly cheaper than scalar: batch amortizes
-            // iterator overhead. Apply a 0.9x factor.
-            let vec_cost = Cost {
-                rows: cost.rows,
-                cpu: cost.cpu * 0.9,
-            };
-
-            VecExecNode::ChunkedScan {
-                query_name,
-                estimated_rows: *estimated_rows,
-                avg_chunk_size: avg_chunk,
-                cost: vec_cost,
-            }
-        }
-
-        PlanNode::IndexLookup {
-            index_kind,
-            component_name,
-            predicate,
-            estimated_rows,
-            cost,
-        } => {
-            // Index gather: entities are batch-fetched and sorted by archetype
-            // for sequential column access. Slight overhead for the sort, but
-            // much better cache behavior than random access.
-            let sort_overhead = (*estimated_rows as f64).log2().max(1.0);
-            let vec_cost = Cost {
-                rows: cost.rows,
-                cpu: cost.cpu + sort_overhead,
-            };
-
-            VecExecNode::IndexGather {
-                index_kind: *index_kind,
-                component_name,
-                predicate: predicate.clone(),
-                estimated_rows: *estimated_rows,
-                cost: vec_cost,
-            }
-        }
-
-        PlanNode::SpatialLookup {
-            component_name,
-            predicate,
-            estimated_rows,
-            cost,
-        } => {
-            // Spatial gather: similar to index gather but via spatial index.
-            // Spatial lookups already produce entity lists, so the overhead
-            // is just the archetype-sort for sequential access.
-            let sort_overhead = (*estimated_rows as f64).log2().max(1.0);
-            let vec_cost = Cost {
-                rows: cost.rows,
-                cpu: cost.cpu * 0.9 + sort_overhead, // spatial indexes have good cache behavior
-            };
-
-            VecExecNode::SpatialGather {
-                component_name,
-                predicate: predicate.clone(),
-                estimated_rows: *estimated_rows,
-                cost: vec_cost,
-            }
-        }
-
-        PlanNode::Filter {
-            child,
-            predicate,
-            selectivity,
-            branchless_eligible,
-            cost,
-        } => {
-            let vec_child = lower_to_vectorized(child, opts);
-
-            let branchless = *branchless_eligible;
-
-            // Branchless filters are ~2x cheaper on contiguous data.
-            let speedup = if branchless { 0.5 } else { 0.85 };
-            let vec_cost = Cost {
-                rows: cost.rows,
-                cpu: vec_child.cost().cpu
-                    + cost.rows / cost.rows.max(1.0)
-                        * Cost::FILTER_PER_ROW
-                        * speedup
-                        * vec_child.cost().rows,
-            };
-
-            VecExecNode::SIMDFilter {
-                child: Box::new(vec_child),
-                predicate: predicate.clone(),
-                selectivity: *selectivity,
-                branchless,
-                cost: vec_cost,
-            }
-        }
-
-        PlanNode::HashJoin {
-            left,
-            right,
-            join_kind,
-            cost,
-        } => {
-            let vec_left = lower_to_vectorized(left, opts);
-            let vec_right = lower_to_vectorized(right, opts);
-
-            // Partition count: build side should fit in L2 cache.
-            // partitions = ceil(build_rows * avg_component_bytes / l2_cache_bytes)
-            let build_bytes = left.cost().rows as usize * opts.avg_component_bytes;
-            let l2 = opts.l2_cache_bytes.max(1); // guard against zero
-            let partitions = build_bytes.div_ceil(l2).max(1);
-
-            // Partitioned join reduces cache misses. Model as ~0.7x of naive hash join.
-            let partition_factor = if partitions > 1 { 0.7 } else { 0.9 };
-            let vec_cost = Cost {
-                rows: cost.rows,
-                cpu: (vec_left.cost().cpu + vec_right.cost().cpu)
-                    + (cost.cpu - left.cost().cpu - right.cost().cpu) * partition_factor,
-            };
-
-            VecExecNode::PartitionedHashJoin {
-                build: Box::new(vec_left),
-                probe: Box::new(vec_right),
-                join_kind: *join_kind,
-                partitions,
-                cost: vec_cost,
-            }
-        }
-
-        PlanNode::NestedLoopJoin {
-            left,
-            right,
-            join_kind,
-            cost,
-        } => {
-            let vec_left = lower_to_vectorized(left, opts);
-            let vec_right = lower_to_vectorized(right, opts);
-
-            // Batch NLJ: materialize both sides, iterate in blocks.
-            // Slight improvement from batch processing.
-            let vec_cost = Cost {
-                rows: cost.rows,
-                cpu: cost.cpu * 0.95,
-            };
-
-            VecExecNode::BatchNestedLoopJoin {
-                left: Box::new(vec_left),
-                right: Box::new(vec_right),
-                join_kind: *join_kind,
-                cost: vec_cost,
-            }
-        }
-
-        PlanNode::Aggregate {
-            child,
-            aggregates,
-            cost,
-        } => {
-            let vec_child = lower_to_vectorized(child, opts);
-
-            // Stream aggregate: single pass over child output. The per-row
-            // cost is negligible (accumulator update), so we model it as
-            // child cost + a small constant per aggregate.
-            let agg_overhead = aggregates.len() as f64 * 0.1;
-            let vec_cost = Cost {
-                rows: cost.rows,
-                cpu: vec_child.cost().cpu + agg_overhead,
-            };
-
-            VecExecNode::StreamAggregate {
-                child: Box::new(vec_child),
-                aggregates: aggregates.clone(),
-                cost: vec_cost,
-            }
         }
     }
 }
@@ -5088,18 +4637,12 @@ mod tests {
             .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
             .build();
 
-        // Default explain shows vectorized plan
         let explain = plan.explain();
-        assert!(explain.contains("Vectorized Execution Plan"));
+        assert!(explain.contains("Execution Plan"));
         assert!(explain.contains("IndexGather"));
         assert!(explain.contains("BTree"));
         assert!(explain.contains("Score"));
         assert!(explain.contains("L2 cache budget"));
-
-        // Logical explain shows the original plan tree
-        let logical = plan.explain_logical();
-        assert!(logical.contains("Logical Plan"));
-        assert!(logical.contains("IndexLookup"));
     }
 
     // ── Subscription plans ──────────────────────────────────────────
@@ -5712,10 +5255,10 @@ mod tests {
         assert_eq!(w1.kind, w2.kind);
     }
 
-    // ── Vectorized execution (default) ────────────────────────────────
+    // ── Plan node introspection ─────────────────────────────────────
 
     #[test]
-    fn build_produces_vectorized_by_default() {
+    fn build_produces_chunked_scan() {
         let mut world = World::new();
         for i in 0..1000 {
             world.spawn((Score(i),));
@@ -5723,30 +5266,8 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let plan = planner.scan::<(&Score,)>().build();
 
-        // vec_root() is available without calling .vectorize()
-        match plan.vec_root() {
-            VecExecNode::ChunkedScan { estimated_rows, .. } => {
-                assert_eq!(*estimated_rows, 1000);
-            }
-            other => panic!("expected ChunkedScan, got {:?}", other),
-        }
-
-        // cost() returns vectorized cost (cheaper than logical)
-        assert!(plan.cost().cpu < plan.logical_cost().cpu);
-    }
-
-    #[test]
-    fn vectorize_scan_produces_chunked_scan() {
-        let mut world = World::new();
-        for i in 0..1000 {
-            world.spawn((Score(i),));
-        }
-        let planner = QueryPlanner::new(&world);
-        let plan = planner.scan::<(&Score,)>().build();
-        let vec_plan = plan.vectorize(VectorizeOpts::default());
-
-        match vec_plan.root() {
-            VecExecNode::ChunkedScan {
+        match plan.root() {
+            PlanNode::Scan {
                 estimated_rows,
                 avg_chunk_size,
                 ..
@@ -5754,12 +5275,12 @@ mod tests {
                 assert_eq!(*estimated_rows, 1000);
                 assert!(*avg_chunk_size <= VectorizeOpts::default().target_chunk_rows);
             }
-            other => panic!("expected ChunkedScan, got {:?}", other),
+            other => panic!("expected Scan, got {:?}", other),
         }
     }
 
     #[test]
-    fn vectorize_index_lookup_produces_index_gather() {
+    fn index_lookup_produces_index_gather() {
         let mut world = World::new();
         for i in 0..1000 {
             world.spawn((Score(i),));
@@ -5774,18 +5295,17 @@ mod tests {
             .scan::<(&Score,)>()
             .filter(Predicate::eq(Score(42)))
             .build();
-        let vec_plan = plan.vectorize(VectorizeOpts::default());
 
-        match vec_plan.root() {
-            VecExecNode::IndexGather { index_kind, .. } => {
+        match plan.root() {
+            PlanNode::IndexLookup { index_kind, .. } => {
                 assert_eq!(*index_kind, IndexKind::BTree);
             }
-            other => panic!("expected IndexGather, got {:?}", other),
+            other => panic!("expected IndexLookup, got {:?}", other),
         }
     }
 
     #[test]
-    fn vectorize_filter_detects_branchless() {
+    fn filter_detects_branchless() {
         let mut world = World::new();
         for i in 0..1000 {
             world.spawn((Score(i),));
@@ -5797,13 +5317,12 @@ mod tests {
             .scan::<(&Score,)>()
             .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
             .build();
-        let vec_plan = plan.vectorize(VectorizeOpts::default());
 
-        match vec_plan.root() {
-            VecExecNode::SIMDFilter { branchless, .. } => {
+        match plan.root() {
+            PlanNode::Filter { branchless, .. } => {
                 assert!(*branchless, "Range predicate should be branchless");
             }
-            other => panic!("expected SIMDFilter, got {:?}", other),
+            other => panic!("expected Filter, got {:?}", other),
         }
 
         // Custom predicate → branched
@@ -5813,18 +5332,17 @@ mod tests {
                 true
             }))
             .build();
-        let vec_plan = plan.vectorize(VectorizeOpts::default());
 
-        match vec_plan.root() {
-            VecExecNode::SIMDFilter { branchless, .. } => {
+        match plan.root() {
+            PlanNode::Filter { branchless, .. } => {
                 assert!(!*branchless, "Custom predicate should be branched");
             }
-            other => panic!("expected SIMDFilter, got {:?}", other),
+            other => panic!("expected Filter, got {:?}", other),
         }
     }
 
     #[test]
-    fn vectorize_hash_join_partitioned() {
+    fn hash_join_partitioned() {
         let mut world = World::new();
         for i in 0..1000 {
             world.spawn((Score(i),));
@@ -5834,18 +5352,17 @@ mod tests {
             .scan::<(&Score,)>()
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let vec_plan = plan.vectorize(VectorizeOpts::default());
 
-        match vec_plan.root() {
-            VecExecNode::PartitionedHashJoin { partitions, .. } => {
+        match plan.root() {
+            PlanNode::HashJoin { partitions, .. } => {
                 assert!(*partitions >= 1);
             }
-            other => panic!("expected PartitionedHashJoin, got {:?}", other),
+            other => panic!("expected HashJoin, got {:?}", other),
         }
     }
 
     #[test]
-    fn vectorize_nested_loop_becomes_batch() {
+    fn nested_loop_for_small_cardinality() {
         let mut world = World::new();
         for i in 0..10 {
             world.spawn((Score(i),));
@@ -5857,34 +5374,15 @@ mod tests {
             .with_right_estimate(5)
             .unwrap()
             .build();
-        let vec_plan = plan.vectorize(VectorizeOpts::default());
 
-        match vec_plan.root() {
-            VecExecNode::BatchNestedLoopJoin { .. } => {} // expected
-            other => panic!("expected BatchNestedLoopJoin, got {:?}", other),
+        match plan.root() {
+            PlanNode::NestedLoopJoin { .. } => {} // expected
+            other => panic!("expected NestedLoopJoin, got {:?}", other),
         }
     }
 
     #[test]
-    fn vectorized_cost_cheaper_than_logical() {
-        let mut world = World::new();
-        for i in 0..10_000 {
-            world.spawn((Score(i),));
-        }
-        let planner = QueryPlanner::new(&world);
-        let plan = planner.scan::<(&Score,)>().build();
-
-        // cost() returns vectorized (default), logical_cost() returns pre-lowering
-        assert!(
-            plan.cost().cpu < plan.logical_cost().cpu,
-            "vectorized ({:.1}) should be cheaper than logical ({:.1})",
-            plan.cost().cpu,
-            plan.logical_cost().cpu
-        );
-    }
-
-    #[test]
-    fn vectorize_explain_contains_details() {
+    fn explain_contains_details() {
         let mut world = World::new();
         for i in 0..100 {
             world.spawn((Score(i),));
@@ -5897,62 +5395,11 @@ mod tests {
             }))
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let vec_plan = plan.vectorize(VectorizeOpts::default());
-        let explain = vec_plan.explain();
+        let explain = plan.explain();
 
-        assert!(explain.contains("Vectorized Execution Plan"));
+        assert!(explain.contains("Execution Plan"));
         assert!(explain.contains("L2 cache budget"));
         assert!(explain.contains("target chunk"));
-    }
-
-    #[test]
-    fn vectorize_opts_custom() {
-        let mut world = World::new();
-        for i in 0..1000 {
-            world.spawn((Score(i),));
-        }
-        let planner = QueryPlanner::new(&world);
-        let plan = planner.scan::<(&Score,)>().build();
-
-        let opts = VectorizeOpts {
-            l2_cache_bytes: 128 * 1024,
-            avg_component_bytes: 32,
-            target_chunk_rows: 1024,
-        };
-        let vec_plan = plan.vectorize(opts);
-
-        match vec_plan.root() {
-            VecExecNode::ChunkedScan { avg_chunk_size, .. } => {
-                assert!(*avg_chunk_size <= 1024);
-            }
-            other => panic!("expected ChunkedScan, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn vectorize_hash_join_zero_l2_cache_does_not_panic() {
-        let mut world = World::new();
-        for i in 0..1000 {
-            world.spawn((Score(i),));
-        }
-        let planner = QueryPlanner::new(&world);
-        let plan = planner
-            .scan::<(&Score,)>()
-            .join::<(&Team,)>(JoinKind::Inner)
-            .build();
-
-        let opts = VectorizeOpts {
-            l2_cache_bytes: 0,
-            ..VectorizeOpts::default()
-        };
-        let vec_plan = plan.vectorize(opts);
-
-        match vec_plan.root() {
-            VecExecNode::PartitionedHashJoin { partitions, .. } => {
-                assert!(*partitions >= 1);
-            }
-            other => panic!("expected PartitionedHashJoin, got {:?}", other),
-        }
     }
 
     // ── TablePlanner tests ───────────────────────────────────────────
@@ -6038,10 +5485,10 @@ mod tests {
         let planner = TablePlanner::<IndexedScores>::new(&world);
         let plan = planner.scan::<(&Score, &Team)>().build();
 
-        // Should produce a valid plan with vectorized execution
+        // Should produce a valid plan
         assert!(plan.cost().cpu > 0.0);
         let explain = plan.explain();
-        assert!(explain.contains("Vectorized"));
+        assert!(explain.contains("Execution Plan"));
     }
 
     #[test]
@@ -6517,9 +5964,9 @@ mod tests {
     }
 
     #[test]
-    fn vectorized_execution_produces_correct_results() {
-        // End-to-end: vectorized plan must produce the same results as
-        // a naive query would.
+    fn execution_produces_correct_results() {
+        // End-to-end: plan must produce the same results as a naive
+        // query would.
         let mut world = World::new();
         for i in 0..500 {
             world.spawn((Score(i), Team(i % 5)));
@@ -7447,7 +6894,7 @@ mod tests {
     }
 
     #[test]
-    fn spatial_lookup_vectorizes_to_spatial_gather() {
+    fn spatial_lookup_uses_spatial_gather() {
         let mut world = World::new();
         for i in 0..100 {
             world.spawn((Pos {
@@ -7469,11 +6916,11 @@ mod tests {
             .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true).unwrap())
             .build();
 
-        match plan.vec_root() {
-            VecExecNode::SpatialGather { component_name, .. } => {
+        match plan.root() {
+            PlanNode::SpatialLookup { component_name, .. } => {
                 assert!(component_name.contains("Pos"));
             }
-            other => panic!("expected SpatialGather, got {:?}", other),
+            other => panic!("expected SpatialLookup, got {:?}", other),
         }
     }
 
@@ -7503,9 +6950,6 @@ mod tests {
         let explain = plan.explain();
         assert!(explain.contains("SpatialGather"));
         assert!(explain.contains("Pos"));
-
-        let logical = plan.explain_logical();
-        assert!(logical.contains("SpatialLookup"));
     }
 
     #[test]
@@ -8885,10 +8329,6 @@ mod tests {
         assert!(explain.contains("StreamAggregate"));
         assert!(explain.contains("COUNT(*)"));
         assert!(explain.contains("SUM(Score)"));
-
-        let logical = plan.explain_logical();
-        assert!(logical.contains("Aggregate"));
-        assert!(logical.contains("COUNT(*)"));
     }
 
     #[test]

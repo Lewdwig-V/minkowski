@@ -65,8 +65,10 @@ fn main() {
             &mut world,
             "gravity",
             |mut query: QueryMut<'_, (&mut Velocity,)>, dt: f32| {
-                query.for_each(|(vel,)| {
-                    vel.0 -= 9.81 * dt;
+                query.for_each(|(velocities,)| {
+                    for v in velocities.iter_mut() {
+                        v.0 -= 9.81 * dt;
+                    }
                 });
             },
         )
@@ -271,9 +273,11 @@ fn main() {
         .can_despawn()
         .build(|ctx: &mut DynamicCtx, _args: &()| {
             let mut to_despawn = Vec::new();
-            ctx.for_each::<(Entity, &Health)>(|(entity, health)| {
-                if health.0 == 0 {
-                    to_despawn.push(entity);
+            ctx.for_each::<(Entity, &Health)>(|(entities, healths)| {
+                for (entity, health) in entities.iter().copied().zip(healths.iter()) {
+                    if health.0 == 0 {
+                        to_despawn.push(entity);
+                    }
                 }
             });
             for entity in to_despawn {

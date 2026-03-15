@@ -125,9 +125,11 @@ fn register_reducers(
             world,
             "move_entities",
             |mut query: QueryMut<'_, (&mut Pos, &Vel)>, dt: f32| {
-                query.for_each(|(pos, vel)| {
-                    pos.x += vel.dx * dt;
-                    pos.y += vel.dy * dt;
+                query.for_each(|(positions, velocities)| {
+                    for i in 0..positions.len() {
+                        positions[i].x += velocities[i].dx * dt;
+                        positions[i].y += velocities[i].dy * dt;
+                    }
                 });
             },
         )
@@ -138,8 +140,10 @@ fn register_reducers(
             world,
             "decay_health",
             |mut query: QueryMut<'_, (&mut Health,)>, amount: u32| {
-                query.for_each(|(health,)| {
-                    health.0 = health.0.saturating_sub(amount);
+                query.for_each(|(healths,)| {
+                    for h in healths.iter_mut() {
+                        h.0 = h.0.saturating_sub(amount);
+                    }
                 });
             },
         )

@@ -138,9 +138,11 @@ fn register_write_neighbors(registry: &mut ReducerRegistry, world: &mut World) -
             "write_neighbor_counts",
             |mut query: QueryMut<'_, (&mut NeighborCount,)>, counts: Vec<u8>| {
                 let mut i = 0;
-                query.for_each(|(nc,)| {
-                    nc.0 = counts[i];
-                    i += 1;
+                query.for_each(|(ncs,)| {
+                    for nc in ncs.iter_mut() {
+                        nc.0 = counts[i];
+                        i += 1;
+                    }
                 });
             },
         )

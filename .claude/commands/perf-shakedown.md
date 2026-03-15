@@ -35,7 +35,7 @@ Determine which files to analyze:
 - `changeset.rs` — `EnumChangeSet::apply`, `changeset_insert_raw` (overwrite path), `changeset_remove_raw` (migration path), `record_insert` (arena alloc + Vec push), `Arena::alloc` (alignment + capacity check + copy)
 
 **Reducer (per-entity iteration through handles)** — `crates/minkowski/src/`
-- `reducer.rs` — `QueryWriter::for_each` (manual archetype scan), `WritableRef::modify` (clone + insert_raw), `WritableRef::set` (insert_raw), `QueryMut::for_each`/`for_each_chunk`, `QueryRef::for_each`/`for_each_chunk`, `DynamicCtx::for_each`, `DynamicCtx::write` (HashMap lookup + insert_raw), `EntityMut::get`/`set`/`remove`, `Spawner::spawn`
+- `reducer.rs` — `QueryWriter::for_each` (manual archetype scan), `WritableRef::modify` (clone + insert_raw), `WritableRef::set` (insert_raw), `QueryMut::for_each` (slice-based), `QueryRef::for_each` (slice-based), `DynamicCtx::for_each` (slice-based), `DynamicCtx::write` (HashMap lookup + insert_raw), `EntityMut::get`/`set`/`remove`, `Spawner::spawn`
 
 **Persistence (I/O hot paths)** — `crates/minkowski-persist/src/`
 - `wal.rs` — `append`, `replay_from`, `scan_last_seq`
@@ -65,11 +65,9 @@ Reference numbers from `cargo bench -p minkowski-bench` on the dev machine. Use 
 | `simple_iter/for_each_chunk` | 1.5 µs | 0.15 ns | SIMD-friendly baseline |
 | `simple_iter/for_each` | 14.5 µs | 1.45 ns | ~10x slower — per-element callback overhead |
 | `simple_iter/par_for_each` | 289 µs | — | Rayon overhead dominates at 10K entities |
-| `reducer/query_mut_10k` | 8.6 µs | 0.86 ns | Direct mutation baseline |
-| `reducer/query_mut_chunk_10k` | 1.5 µs | 0.15 ns | Chunk iteration ≈ raw iteration |
-| `reducer/query_writer_10k` | 93 µs | 9.3 ns | **~11x query_mut** — buffered write overhead |
-| `reducer/dynamic_for_each_10k` | 132 µs | 13.2 ns | **~15x query_mut** — identity-hashed lookup + buffered writes |
-| `reducer/dynamic_for_each_chunk_10k` | 125 µs | 12.5 ns | Chunk helps less for dynamic (write-back dominates) |
+| `reducer/query_mut_10k` | 1.5 µs | 0.15 ns | Slice-based iteration |
+| `reducer/query_writer_10k` | 93 µs | 9.3 ns | **~62x query_mut** — buffered write overhead |
+| `reducer/dynamic_for_each_10k` | 132 µs | 13.2 ns | **~88x query_mut** — identity-hashed lookup + buffered writes |
 | `changeset/record_10k_inserts` | 70 µs | 7.0 ns | Arena alloc + Vec push (recording only) |
 | `changeset/apply_10k_overwrites` | 123 µs | 12.3 ns | Entity lookup + memcpy + tick mark (apply only) |
 | `changeset/record_apply_10k` | 148 µs | 14.8 ns | Full round-trip (record + apply) |
@@ -127,9 +125,10 @@ Agents should verify these invariants are maintained when modifying the listed f
    `DynamicCtx::write` and `DynamicResolved::lookup` must remain `#[inline]`.
    Benchmark: `reducer/dynamic_for_each_10k`.
 
-5. **Query planner `#[inline]` on cost accessors** (`planner.rs`):
-   `Cost::rows`, `Cost::cpu`, `Cost::total`, `PlanNode::cost`, `VecExecNode::cost`
-   must remain `#[inline]`. These are called during plan build and cost comparison.
+5. **Query planner `#[inline]` on accessors** (`planner.rs`):
+   `Cost::rows`, `Cost::cpu`, `Cost::total`, `PlanNode::cost`, `PlanNode::estimated_rows`,
+   `ProbeSet::contains` must remain `#[inline]`. These are called during plan build and
+   cost comparison.
    Benchmark: none yet — exercise via `cargo run -p minkowski-examples --example planner --release`.
 
 6. **Query planner `PredicateKind` is fieldless for `Eq`/`Range`** (`planner.rs`):
@@ -165,17 +164,13 @@ These have been analyzed and are documented here to prevent re-discovery:
    reducers — can't inline writes during iteration because the type is resolved at
    runtime) plus the `assert!` write-permission check per `ctx.write()` call.
 
-3. **`par_for_each` / parallel overhead** — rayon's thread pool spawn + work stealing amortizes poorly below ~50K entities. At 10K entities, sequential `for_each_chunk` is 430x faster. This is a rayon characteristic, not a Minkowski bug. Users should use `par_for_each` only for large entity counts or expensive per-entity work (like `heavy_compute`).
+3. **`par_for_each` / parallel overhead** — rayon's thread pool spawn + work stealing amortizes poorly below ~50K entities. At 10K entities, sequential `for_each` (slice-based) is 430x faster. This is a rayon characteristic, not a Minkowski bug. Users should use `par_for_each` only for large entity counts or expensive per-entity work (like `heavy_compute`).
 
-4. **`for_each` vs `for_each_chunk` 9x gap** — per-element callback prevents SIMD auto-vectorization. `for_each_chunk` yields contiguous `&[T]` slices. This is the single biggest "free win" for users switching iteration style. Not an engine optimization — it's API choice.
+4. **Changeset spawn ~1.5x direct** — arena allocation + mutation log overhead on top of the same archetype push work. Inherent to the data-driven mutation model.
 
-5. **Changeset spawn ~1.5x direct** — arena allocation + mutation log overhead on top of the same archetype push work. Inherent to the data-driven mutation model.
+5. **Query planner `CompiledForEach` is `Box<dyn FnMut>`** — per-entity callback through `&mut dyn FnMut(Entity)` prevents SIMD vectorization. Inherent to type-erased plan composition — the plan is compiled once and re-executed with different callbacks. Custom predicates (`Predicate::custom`) also use `Arc<dyn Fn>` for per-entity filtering. Annotated with `// PERF:` at the type alias.
 
-6. **Query planner `CompiledForEach` is `Box<dyn FnMut>`** — per-entity callback through `&mut dyn FnMut(Entity)` prevents SIMD vectorization. Inherent to type-erased plan composition — the plan is compiled once and re-executed with different callbacks. Custom predicates (`Predicate::custom`) also use `Arc<dyn Fn>` for per-entity filtering. Annotated with `// PERF:` at the type alias.
-
-7. **Aggregate extractors do per-entity `world.get::<T>(entity)`** — `make_extractor` creates a closure that calls `world.get()` per entity per aggregate, which is an entity_locations lookup + archetype column access each time. The scan that drives the aggregate already has column pointers, but plumbing them through the type-erased extractor interface would couple aggregates to archetype internals. Non-trivial to fix without breaking the clean `AggregateExpr` API.
-
-8. **`MaterializedView::refresh` copies the entity list** — `extend_from_slice` from the plan's scratch buffer into the view's owned `Vec<Entity>` on every re-materialization. Borrowing the scratch directly would tie `entities()` lifetime to `&mut self` from refresh, breaking the common pattern of `view.refresh(); for e in view.entities() { world.get(e) }`. The copy is O(N) where N is result size, typically small for subscription queries.
+6. **`MaterializedView::refresh` copies the entity list** — `extend_from_slice` from the plan's scratch buffer into the view's owned `Vec<Entity>` on every re-materialization. Borrowing the scratch directly would tie `entities()` lifetime to `&mut self` from refresh, breaking the common pattern of `view.refresh(); for e in view.entities() { world.get(e) }`. The copy is O(N) where N is result size, typically small for subscription queries.
 
 ## Phase 2 — Analysis
 
@@ -210,8 +205,7 @@ Use the Agent tool with this prompt:
 > You are analyzing Minkowski ECS iteration paths for auto-vectorization fitness. Read these files: [SCOPED FILE LIST].
 >
 > Check:
-> 1. **`for_each` vs `for_each_chunk`**: Any `for_each` call on numeric/math data (positions, velocities, forces) where `for_each_chunk` would yield typed slices that LLVM can auto-vectorize. `for_each_chunk` yields `&[T]`/`&mut [T]` slices per archetype — far more vectorizable than per-element callbacks.
-> 2. **Vectorization blockers in chunk bodies**: Inside `for_each_chunk` closures, look for: function calls that won't inline (non-generic, cross-crate, or `dyn`), per-element branching (`if`/`match`), scalar math on types that could be SIMD-width (`f32` operations that could be `[f32; 4]`), and index-based array access instead of slice iteration.
+> 1. **Vectorization blockers in for_each bodies**: Inside `for_each` closures (which yield typed slices per archetype), look for: function calls that won't inline (non-generic, cross-crate, or `dyn`), per-element branching (`if`/`match`), scalar math on types that could be SIMD-width (`f32` operations that could be `[f32; 4]`), and index-based array access instead of slice iteration. Note: `QueryIter::for_each_chunk` on `world.query()` is the underlying slice method; reducer handles (`QueryMut`, `QueryRef`, `DynamicCtx`) expose `for_each` which is slice-based.
 > 3. **Component alignment**: Check component types used in hot numeric loops for `#[repr(align(16))]` or naturally 16-byte-aligned types. BlobVec provides 64-byte column alignment, but component layout determines SIMD packing.
 > 4. **Build config**: Verify `.cargo/config.toml` has `target-cpu=native` for platform-specific SIMD instructions.
 > 5. **QueryWriter iteration**: `QueryWriter::for_each` does manual archetype scanning. Check if its inner loop has vectorization blockers — the `WritableRef` indirection may prevent LLVM from seeing contiguous memory.
@@ -241,7 +235,7 @@ Use the Agent tool with this prompt:
 >
 > Check:
 > 1. **False sharing**: Are any `AtomicU64`/`AtomicU32` fields on the same cache line (64 bytes) as frequently-written non-atomic data? Check `Tick`, `EntityAllocator`, `OrphanQueue` atomics.
-> 2. **Allocation in hot loops**: `Vec::new()`, `Box::new()`, `HashMap::new()`, or `.collect()` inside per-entity iteration. Each allocation hits the global allocator. Look inside `for_each`, `for_each_chunk`, and `par_for_each` closures.
+> 2. **Allocation in hot loops**: `Vec::new()`, `Box::new()`, `HashMap::new()`, or `.collect()` inside per-entity iteration. Each allocation hits the global allocator. Look inside `for_each`, `for_each_chunk` (on `QueryIter`), and `par_for_each` closures.
 > 3. **Redundant lookups**: Repeated `HashMap::get` for the same key, repeated `entity_locations[idx]` lookups that could be hoisted, or repeated `ComponentId` resolution that could be cached.
 > 4. **Branch patterns**: `Option::unwrap()` or `match` in inner loops where the variant is always the same — branch predictor will handle it, but `unwrap_unchecked` (with safety comment) or restructuring may help.
 > 5. **HashMap vs Vec**: `HashMap` used on a hot path where a dense `Vec` indexed by `ComponentId` (which is `usize`) or `ArchetypeId` would give O(1) indexed access without hashing.
@@ -315,7 +309,7 @@ After presenting the report and discussing findings with the user, add `// PERF:
 Format: `// PERF: <concise rationale for why this is intentional or unavoidable>`
 
 Place the comment immediately above or on the line containing the pattern. Examples:
-- `// PERF: No for_each_chunk — WritableRef indirection is inherent to buffered writes.`
+- `// PERF: Per-item iteration only — WritableRef indirection is inherent to buffered writes.`
 - `// PERF: Per-row Vec::new() unavoidable — ColumnData::values owns Vec<Vec<u8>>.`
 - `// PERF: Full WAL scan on open required for crash recovery — no index or footer.`
 

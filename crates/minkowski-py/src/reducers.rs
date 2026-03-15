@@ -113,8 +113,15 @@ pub fn register_all(
              params: BoidsForceParams| {
                 // Pass 1: snapshot all boid data.
                 let mut snapshot: Vec<(f32, f32, f32, f32)> = Vec::new();
-                query.for_each(|(_acc, pos, vel, _entity)| {
-                    snapshot.push((pos.x, pos.y, vel.x, vel.y));
+                query.for_each(|(_accs, positions, velocities, _entities)| {
+                    for i in 0..positions.len() {
+                        snapshot.push((
+                            positions[i].x,
+                            positions[i].y,
+                            velocities[i].x,
+                            velocities[i].y,
+                        ));
+                    }
                 });
 
                 // Build simple spatial grid for neighbor lookups.
@@ -214,11 +221,13 @@ pub fn register_all(
                 // Pass 2: write forces into accelerations.
                 // Iteration order is stable between passes, so use index counter.
                 let mut i = 0;
-                query.for_each(|(acc, _pos, _vel, _entity)| {
-                    let (fx, fy) = forces[i];
-                    acc.x = fx;
-                    acc.y = fy;
-                    i += 1;
+                query.for_each(|(accs, _positions, _velocities, _entities)| {
+                    for acc in accs.iter_mut() {
+                        let (fx, fy) = forces[i];
+                        acc.x = fx;
+                        acc.y = fy;
+                        i += 1;
+                    }
                 });
             },
         )
@@ -235,7 +244,7 @@ pub fn register_all(
                 let max_speed = params.max_speed;
                 let ws = params.world_size;
                 let dt = params.dt;
-                query.for_each_chunk(|(poss, vels, accs)| {
+                query.for_each(|(poss, vels, accs)| {
                     for i in 0..vels.len() {
                         vels[i].x += accs[i].x * dt;
                         vels[i].y += accs[i].y * dt;
@@ -267,8 +276,10 @@ pub fn register_all(
              params: GravityParams| {
                 // Snapshot all bodies.
                 let mut bodies: Vec<(f32, f32, f32)> = Vec::new(); // x, y, mass
-                query.for_each(|(_vel, pos, mass, _entity)| {
-                    bodies.push((pos.x, pos.y, mass.0));
+                query.for_each(|(_vels, positions, masses, _entities)| {
+                    for i in 0..positions.len() {
+                        bodies.push((positions[i].x, positions[i].y, masses[i].0));
+                    }
                 });
 
                 let n = bodies.len();
@@ -300,13 +311,15 @@ pub fn register_all(
                 let dt = params.dt;
                 let ws = params.world_size;
                 let mut i = 0;
-                query.for_each(|(vel, pos, _mass, _entity)| {
-                    let (ax, ay) = accels[i];
-                    vel.x += ax * dt;
-                    vel.y += ay * dt;
-                    pos.x = wrap(pos.x + vel.x * dt, ws);
-                    pos.y = wrap(pos.y + vel.y * dt, ws);
-                    i += 1;
+                query.for_each(|(vels, positions, _masses, _entities)| {
+                    for j in 0..vels.len() {
+                        let (ax, ay) = accels[i];
+                        vels[j].x += ax * dt;
+                        vels[j].y += ay * dt;
+                        positions[j].x = wrap(positions[j].x + vels[j].x * dt, ws);
+                        positions[j].y = wrap(positions[j].y + vels[j].y * dt, ws);
+                        i += 1;
+                    }
                 });
             },
         )
@@ -326,8 +339,10 @@ pub fn register_all(
 
                 // Snapshot current cell states in entity order.
                 let mut cells: Vec<bool> = Vec::new();
-                query.for_each(|(cs, _entity)| {
-                    cells.push(cs.0);
+                query.for_each(|(cell_states, _entities)| {
+                    for cs in cell_states.iter() {
+                        cells.push(cs.0);
+                    }
                 });
 
                 let n = cells.len();
@@ -374,9 +389,11 @@ pub fn register_all(
 
                 // Write back. Iteration order is stable between passes.
                 let mut i = 0;
-                query.for_each(|(cs, _entity)| {
-                    cs.0 = new_states[i];
-                    i += 1;
+                query.for_each(|(cell_states, _entities)| {
+                    for cs in cell_states.iter_mut() {
+                        cs.0 = new_states[i];
+                        i += 1;
+                    }
                 });
             },
         )
@@ -392,7 +409,7 @@ pub fn register_all(
             |mut query: QueryMut<'_, (&mut Position, &Heading)>, params: MovementParams| {
                 let ws = params.world_size;
                 let dt = params.dt;
-                query.for_each_chunk(|(poss, headings)| {
+                query.for_each(|(poss, headings)| {
                     for i in 0..poss.len() {
                         let h = headings[i].0;
                         poss[i].x = wrap(poss[i].x + h.cos() * dt, ws);
@@ -422,11 +439,13 @@ pub fn register_all(
                 let ws = params.world_size;
                 let dt = params.dt;
                 let speed = params.speed;
-                query.for_each(|(pos, heading, energy)| {
-                    let e_factor = (energy.0 / FULL_ENERGY).clamp(MIN_SPEED_FACTOR, 1.0);
-                    let h = heading.0;
-                    pos.x = wrap(pos.x + h.cos() * speed * e_factor * dt, ws);
-                    pos.y = wrap(pos.y + h.sin() * speed * e_factor * dt, ws);
+                query.for_each(|(positions, headings, energies)| {
+                    for i in 0..positions.len() {
+                        let e_factor = (energies[i].0 / FULL_ENERGY).clamp(MIN_SPEED_FACTOR, 1.0);
+                        let h = headings[i].0;
+                        positions[i].x = wrap(positions[i].x + h.cos() * speed * e_factor * dt, ws);
+                        positions[i].y = wrap(positions[i].y + h.sin() * speed * e_factor * dt, ws);
+                    }
                 });
             },
         )
@@ -441,10 +460,12 @@ pub fn register_all(
             "worm_metabolism",
             |mut query: QueryMut<'_, (&mut Energy, &mut WormSize)>,
              params: WormMetabolismParams| {
-                query.for_each(|(energy, size)| {
-                    energy.0 = (energy.0 - params.drain_rate * params.dt).max(0.0);
-                    if energy.0 < SHRINK_THRESHOLD {
-                        size.0 = (size.0 - SHRINK_RATE * params.dt).max(MIN_SIZE);
+                query.for_each(|(energies, sizes)| {
+                    for i in 0..energies.len() {
+                        energies[i].0 = (energies[i].0 - params.drain_rate * params.dt).max(0.0);
+                        if energies[i].0 < SHRINK_THRESHOLD {
+                            sizes[i].0 = (sizes[i].0 - SHRINK_RATE * params.dt).max(MIN_SIZE);
+                        }
                     }
                 });
             },

@@ -276,7 +276,7 @@ fn main() {
             &mut world,
             "worm_move",
             move |mut query: QueryMut<'_, (&mut Position, &Heading, &Worm)>, dt: f32| {
-                query.for_each_chunk(|(poss, headings, _worms)| {
+                query.for_each(|(poss, headings, _worms)| {
                     for i in 0..poss.len() {
                         let h = headings[i].0;
                         poss[i].0.x = wrap(poss[i].0.x + h.cos() * worm_speed * dt, ws);
@@ -297,11 +297,13 @@ fn main() {
             &mut world,
             "metabolism",
             move |mut query: QueryMut<'_, (&mut Energy, &mut WormSize, &Worm)>, dt: f32| {
-                query.for_each(|(energy, size, _)| {
-                    energy.0 -= energy_drain * dt;
-                    // Size scales linearly with energy, clamped
-                    let target = min_size + (energy.0 / fission_thr) * (max_size - min_size);
-                    size.0 = target.clamp(min_size, max_size);
+                query.for_each(|(energies, sizes, _worms)| {
+                    for i in 0..energies.len() {
+                        energies[i].0 -= energy_drain * dt;
+                        let target =
+                            min_size + (energies[i].0 / fission_thr) * (max_size - min_size);
+                        sizes[i].0 = target.clamp(min_size, max_size);
+                    }
                 });
             },
         )
@@ -315,9 +317,11 @@ fn main() {
             |mut query: QueryRef<'_, (&Energy, &Worm)>, ()| {
                 let mut total_energy = 0.0f32;
                 let mut count = 0usize;
-                query.for_each(|(energy, _)| {
-                    total_energy += energy.0;
-                    count += 1;
+                query.for_each(|(energies, _worms)| {
+                    for e in energies {
+                        total_energy += e.0;
+                        count += 1;
+                    }
                 });
                 if count > 0 {
                     let avg = total_energy / count as f32;

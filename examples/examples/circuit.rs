@@ -249,8 +249,10 @@ fn main() {
             &mut world,
             "reset_currents",
             |mut query: QueryMut<'_, (&mut CurrentSum,)>, ()| {
-                query.for_each(|(cs,)| {
-                    cs.0 = 0.0;
+                query.for_each(|(currents,)| {
+                    for cs in currents.iter_mut() {
+                        cs.0 = 0.0;
+                    }
                 });
             },
         )

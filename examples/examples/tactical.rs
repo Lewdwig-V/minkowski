@@ -427,15 +427,15 @@ fn main() {
             &mut world,
             "movement",
             |mut query: minkowski::QueryMut<'_, (&mut Position, &mut Heading, &Speed)>, ()| {
-                query.for_each(|(pos, heading, speed)| {
-                    // Random drift
-                    let drift = (fastrand::f32() - 0.5) * 0.3;
-                    heading.0 += drift;
-                    pos.0 += heading.0.cos() * speed.0 * 0.1;
-                    pos.1 += heading.0.sin() * speed.0 * 0.1;
-                    // Wrap around map
-                    pos.0 = pos.0.rem_euclid(MAP_SIZE);
-                    pos.1 = pos.1.rem_euclid(MAP_SIZE);
+                query.for_each(|(positions, headings, speeds)| {
+                    for i in 0..positions.len() {
+                        let drift = (fastrand::f32() - 0.5) * 0.3;
+                        headings[i].0 += drift;
+                        positions[i].0 += headings[i].0.cos() * speeds[i].0 * 0.1;
+                        positions[i].1 += headings[i].0.sin() * speeds[i].0 * 0.1;
+                        positions[i].0 = positions[i].0.rem_euclid(MAP_SIZE);
+                        positions[i].1 = positions[i].1.rem_euclid(MAP_SIZE);
+                    }
                 });
             },
         )
@@ -464,13 +464,15 @@ fn main() {
                 let mut red_count = 0u32;
                 let mut blue_hp = 0u32;
                 let mut red_hp = 0u32;
-                query.for_each(|(f, h)| {
-                    if f.0 == BLUE {
-                        blue_count += 1;
-                        blue_hp += h.0;
-                    } else {
-                        red_count += 1;
-                        red_hp += h.0;
+                query.for_each(|(factions, healths)| {
+                    for (f, h) in factions.iter().zip(healths.iter()) {
+                        if f.0 == BLUE {
+                            blue_count += 1;
+                            blue_hp += h.0;
+                        } else {
+                            red_count += 1;
+                            red_hp += h.0;
+                        }
                     }
                 });
                 println!(

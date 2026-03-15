@@ -283,7 +283,7 @@ fn main() {
             &mut world,
             "zero_accel",
             |mut query: QueryMut<'_, (&mut Acceleration,)>, ()| {
-                query.for_each_chunk(|(accs,)| {
+                query.for_each(|(accs,)| {
                     for acc in accs.iter_mut() {
                         acc.0 = Vec2::ZERO;
                     }
@@ -302,7 +302,7 @@ fn main() {
             move |mut query: QueryMut<'_, (&mut Position, &mut Velocity, &Acceleration)>,
                   dt: f32| {
                 // Velocity integration + clamping
-                query.for_each_chunk(|(poss, vels, accs)| {
+                query.for_each(|(poss, vels, accs)| {
                     for i in 0..vels.len() {
                         vels[i].0.x += accs[i].0.x * dt;
                         vels[i].0.y += accs[i].0.y * dt;

@@ -402,52 +402,6 @@ impl<'a> DynamicCtx<'a> {
         self.changeset.record_despawn(entity);
     }
 
-    /// Iterate entities matching query `Q` using the typed query codepath.
-    /// `Q` must be a `ReadOnlyWorldQuery` — writes go through `ctx.write()`.
-    ///
-    /// Iteration visits archetypes in creation order and rows within each
-    /// archetype in insertion order. This is deterministic given identical
-    /// world state but is not a stability guarantee.
-    ///
-    /// # Panics
-    /// Panics if `Q` accesses any component not declared via `can_read`
-    /// or `can_write` on the builder.
-    pub fn for_each<Q: ReadOnlyWorldQuery + 'static>(&self, mut f: impl FnMut(Q::Item<'_>)) {
-        self.queried.store(true, Ordering::Relaxed);
-        // Runtime validation: Q's accessed components must be a subset
-        // of the builder-declared components.
-        let accessed = Q::accessed_ids(&self.world.components);
-        for comp_id in accessed.ones() {
-            assert!(
-                self.resolved.contains_comp_id(comp_id),
-                "query accesses component ID {} which was not declared \
-                 in dynamic reducer (use can_read/can_write)",
-                comp_id,
-            );
-        }
-
-        let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
-        let required = Q::required_ids(&self.world.components);
-
-        for arch in &self.world.archetypes.archetypes {
-            if arch.is_empty() || !required.is_subset(&arch.component_ids) {
-                continue;
-            }
-            if !Q::matches_filters(arch, &self.world.components, last_tick) {
-                continue;
-            }
-            let fetch = Q::init_fetch(arch, &self.world.components);
-            for row in 0..arch.len() {
-                // Safety: row is in bounds (0..arch.len()), fetch was
-                // initialized from the same archetype.
-                let item = unsafe { Q::fetch(&fetch, row) };
-                f(item);
-            }
-        }
-        // last_read_tick is updated by dynamic_call() AFTER the changeset
-        // is applied, ensuring it's newer than any column tick set during commit.
-    }
-
     /// Debug-only validation: check that a component type is declared on
     /// this context without performing any read or write. Returns `true`
     /// if the type was declared via `can_read` or `can_write`.
@@ -479,13 +433,18 @@ impl<'a> DynamicCtx<'a> {
         self.resolved.access().despawns()
     }
 
-    /// Chunk iteration: yields typed slices per archetype for SIMD-friendly
-    /// access. Same validation and semantics as [`for_each`](Self::for_each).
+    /// Iterate entities matching query `Q` using the typed query codepath.
+    /// `Q` must be a `ReadOnlyWorldQuery` — writes go through `ctx.write()`.
+    ///
+    /// Yields typed slices per archetype for SIMD-friendly access.
+    /// Iteration visits archetypes in creation order and rows within each
+    /// archetype in insertion order. This is deterministic given identical
+    /// world state but is not a stability guarantee.
     ///
     /// # Panics
     /// Panics if `Q` accesses any component not declared via `can_read`
     /// or `can_write` on the builder.
-    pub fn for_each_chunk<Q: ReadOnlyWorldQuery + 'static>(&self, mut f: impl FnMut(Q::Slice<'_>)) {
+    pub fn for_each<Q: ReadOnlyWorldQuery + 'static>(&self, mut f: impl FnMut(Q::Slice<'_>)) {
         self.queried.store(true, Ordering::Relaxed);
         let accessed = Q::accessed_ids(&self.world.components);
         for comp_id in accessed.ones() {
@@ -1055,8 +1014,8 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
     /// Advances the change detection tick: entities matched here will NOT
     /// be matched again on the next call unless their columns are modified.
     ///
-    // PERF: No for_each_chunk variant — WritableRef indirection is inherent
-    // to buffered writes. A chunk API would imply contiguous-slice performance
+    // PERF: Per-item iteration only — WritableRef indirection is inherent
+    // to buffered writes. A slice API would imply contiguous-slice performance
     // characteristics that the changeset buffering cannot deliver.
     pub fn for_each(&mut self, mut f: impl FnMut(Q::WriterItem<'_>)) {
         self.queried.store(true, Ordering::Relaxed);
@@ -1140,8 +1099,8 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
 ///
 /// Uses the full [`World::query`] path with tick management and filter
 /// support (including `Changed<T>`). The [`ReadOnlyWorldQuery`] bound
-/// guarantees no `&mut T` access through the query. Provides [`for_each`](QueryRef::for_each),
-/// [`for_each_chunk`](QueryRef::for_each_chunk), and [`count`](QueryRef::count).
+/// guarantees no `&mut T` access through the query. Provides
+/// [`for_each`](QueryRef::for_each) and [`count`](QueryRef::count).
 /// For read-write iteration, see [`QueryMut`].
 ///
 /// Registered via [`ReducerRegistry::register_query_ref`], dispatched
@@ -1159,21 +1118,12 @@ impl<'a, Q: ReadOnlyWorldQuery + 'static> QueryRef<'a, Q> {
         }
     }
 
-    /// Iterate all matching entities in read-only mode.
+    /// Iterate matching entities in contiguous typed slices per archetype.
     ///
     /// Iteration visits archetypes in creation order and rows within each
     /// archetype in insertion order. This is deterministic given identical
     /// world state but is not a stability guarantee.
-    pub fn for_each(&mut self, f: impl FnMut(Q::Item<'_>)) {
-        self.world.query::<Q>().for_each(f);
-    }
-
-    /// Iterate matching entities in contiguous typed slices per archetype.
-    ///
-    /// Same iteration order guarantees as [`for_each`](Self::for_each).
-    /// Yields typed slices that LLVM can auto-vectorize — prefer this over
-    /// `for_each` for numeric/math workloads.
-    pub fn for_each_chunk(&mut self, f: impl FnMut(Q::Slice<'_>)) {
+    pub fn for_each(&mut self, f: impl FnMut(Q::Slice<'_>)) {
         self.world.query::<Q>().for_each_chunk(f);
     }
 
@@ -1185,8 +1135,8 @@ impl<'a, Q: ReadOnlyWorldQuery + 'static> QueryRef<'a, Q> {
 /// Read-write query iteration handle for scheduled reducers.
 ///
 /// Same as [`QueryRef`] but allows `&mut T` in the query type, enabling
-/// direct in-place mutation during iteration. Provides [`for_each`](QueryMut::for_each),
-/// [`for_each_chunk`](QueryMut::for_each_chunk), and [`count`](QueryMut::count).
+/// direct in-place mutation during iteration. Provides
+/// [`for_each`](QueryMut::for_each) and [`count`](QueryMut::count).
 ///
 /// Registered via [`ReducerRegistry::register_query`], dispatched
 /// via [`ReducerRegistry::run`].
@@ -1203,19 +1153,12 @@ impl<'a, Q: WorldQuery + 'static> QueryMut<'a, Q> {
         }
     }
 
-    /// Iterate all matching entities with read-write access.
+    /// Iterate matching entities in contiguous typed slices per archetype.
     ///
     /// Iteration visits archetypes in creation order and rows within each
     /// archetype in insertion order. This is deterministic given identical
     /// world state but is not a stability guarantee.
-    pub fn for_each(&mut self, f: impl FnMut(Q::Item<'_>)) {
-        self.world.query::<Q>().for_each(f);
-    }
-
-    /// Iterate matching entities in contiguous typed slices per archetype.
-    ///
-    /// Same iteration order guarantees as [`for_each`](Self::for_each).
-    pub fn for_each_chunk(&mut self, f: impl FnMut(Q::Slice<'_>)) {
+    pub fn for_each(&mut self, f: impl FnMut(Q::Slice<'_>)) {
         self.world.query::<Q>().for_each_chunk(f);
     }
 
@@ -2806,8 +2749,8 @@ mod tests {
             .dynamic("count_pos", &mut world)
             .can_read::<Pos>()
             .build(move |ctx: &mut DynamicCtx, _args: &()| {
-                ctx.for_each::<(&Pos,)>(|(_pos,)| {
-                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ctx.for_each::<(&Pos,)>(|(positions,)| {
+                    counter.fetch_add(positions.len(), std::sync::atomic::Ordering::Relaxed);
                 });
             })
             .unwrap();
@@ -2847,8 +2790,10 @@ mod tests {
             .can_write::<Vel>()
             .build(|ctx: &mut DynamicCtx, _args: &()| {
                 let mut updates: Vec<(Entity, f32)> = Vec::new();
-                ctx.for_each::<(Entity, &Vel)>(|(entity, vel)| {
-                    updates.push((entity, vel.0 * 2.0));
+                ctx.for_each::<(Entity, &Vel)>(|(entities, velocities)| {
+                    for (entity, vel) in entities.iter().copied().zip(velocities.iter()) {
+                        updates.push((entity, vel.0 * 2.0));
+                    }
                 });
                 for (entity, new_vel) in updates {
                     ctx.write(entity, Vel(new_vel));
@@ -2876,9 +2821,11 @@ mod tests {
             .can_write::<Pos>()
             .build(move |ctx: &mut DynamicCtx, _args: &()| {
                 let mut updates = Vec::new();
-                ctx.for_each::<(Entity, Changed<Pos>, &Pos)>(|(entity, (), pos)| {
-                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    updates.push((entity, Pos(pos.0 + 1.0)));
+                ctx.for_each::<(Entity, Changed<Pos>, &Pos)>(|(entities, (), positions)| {
+                    for (entity, pos) in entities.iter().copied().zip(positions.iter()) {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        updates.push((entity, Pos(pos.0 + 1.0)));
+                    }
                 });
                 for (entity, val) in updates {
                     ctx.write(entity, val);
@@ -2912,10 +2859,8 @@ mod tests {
         assert_eq!(world.get::<Pos>(e).unwrap().0, 100.0);
     }
 
-    // ── DynamicCtx::for_each_chunk tests ────────────────────────
-
     #[test]
-    fn dynamic_ctx_for_each_chunk_iterates() {
+    fn dynamic_ctx_for_each_slice_iterates() {
         let mut world = World::new();
         world.spawn((Pos(1.0),));
         world.spawn((Pos(2.0),));
@@ -2928,7 +2873,7 @@ mod tests {
             .dynamic("count_pos_chunks", &mut world)
             .can_read::<Pos>()
             .build(move |ctx: &mut DynamicCtx, _args: &()| {
-                ctx.for_each_chunk::<(&Pos,)>(|(positions,)| {
+                ctx.for_each::<(&Pos,)>(|(positions,)| {
                     counter.fetch_add(positions.len(), std::sync::atomic::Ordering::Relaxed);
                 });
             })
@@ -2941,7 +2886,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "not declared")]
-    fn dynamic_ctx_for_each_chunk_undeclared_panics() {
+    fn dynamic_ctx_for_each_undeclared_multi_component_panics() {
         let mut world = World::new();
         world.spawn((Pos(1.0), Vel(2.0)));
         let strategy = Optimistic::new(&world);
@@ -2950,7 +2895,7 @@ mod tests {
             .dynamic("bad_chunk_query", &mut world)
             .can_read::<Pos>()
             .build(|ctx: &mut DynamicCtx, _args: &()| {
-                ctx.for_each_chunk::<(&Pos, &Vel)>(|(_p, _v)| {});
+                ctx.for_each::<(&Pos, &Vel)>(|(_p, _v)| {});
             })
             .unwrap();
         let _ = registry.dynamic_call(&strategy, &mut world, id, &());
@@ -3155,7 +3100,11 @@ mod tests {
         world.spawn((Pos(2.0),));
         let mut qr: QueryRef<'_, (&Pos,)> = QueryRef::new(&mut world);
         let mut sum = 0.0;
-        qr.for_each(|(pos,)| sum += pos.0);
+        qr.for_each(|(positions,)| {
+            for p in positions {
+                sum += p.0;
+            }
+        });
         assert_eq!(sum, 3.0);
     }
 
@@ -3177,7 +3126,11 @@ mod tests {
         let e = world.spawn((Pos(1.0),));
         {
             let mut qm: QueryMut<'_, (&mut Pos,)> = QueryMut::new(&mut world);
-            qm.for_each(|(pos,)| pos.0 += 10.0);
+            qm.for_each(|(positions,)| {
+                for p in positions {
+                    p.0 += 10.0;
+                }
+            });
         }
         assert_eq!(world.get::<Pos>(e).unwrap().0, 11.0);
     }
@@ -3224,7 +3177,11 @@ mod tests {
         let mut registry = ReducerRegistry::new();
         let gravity_id = registry
             .register_query::<(&mut Vel,), f32, _>(&mut world, "gravity", |mut query, dt: f32| {
-                query.for_each(|(vel,)| vel.0 -= 9.81 * dt);
+                query.for_each(|(velocities,)| {
+                    for v in velocities {
+                        v.0 -= 9.81 * dt;
+                    }
+                });
             })
             .unwrap();
 
@@ -4022,7 +3979,7 @@ mod tests {
     }
 
     #[test]
-    fn query_mut_for_each_chunk() {
+    fn query_mut_for_each_slice() {
         let mut world = World::new();
         for i in 0..5 {
             world.spawn((Pos(i as f32),));
@@ -4034,7 +3991,7 @@ mod tests {
                 "chunk_iter",
                 |mut query: QueryMut<'_, (&Pos,)>, ()| {
                     let mut count = 0;
-                    query.for_each_chunk(|chunk| {
+                    query.for_each(|chunk| {
                         count += chunk.0.len();
                     });
                     assert_eq!(count, 5);

@@ -476,7 +476,7 @@ fn main() {
             "integrate",
             |mut query: QueryMut<'_, (&mut Position, &Velocity)>, dt: f32| {
                 let ws = WORLD_SIZE;
-                query.for_each_chunk(|(poss, vels)| {
+                query.for_each(|(poss, vels)| {
                     for i in 0..poss.len() {
                         let mut x = poss[i].0.x + vels[i].0.x * dt;
                         let mut y = poss[i].0.y + vels[i].0.y * dt;
