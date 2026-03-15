@@ -85,9 +85,12 @@ impl<S: Transact> Transact for Durable<S> {
             let value = f(&mut tx, world);
             let commit_result = self.try_commit(&mut tx, world);
             match commit_result {
-                Ok(forward) => {
+                Ok(mut forward) => {
                     tx.mark_committed();
                     drop(tx);
+                    // Drain fast-lane archetype batches into regular mutations
+                    // so the WAL serializer can iterate them.
+                    forward.drain_fast_lane_to_mutations();
                     // WAL write BEFORE apply — durable commit point
                     self.wal
                         .lock()

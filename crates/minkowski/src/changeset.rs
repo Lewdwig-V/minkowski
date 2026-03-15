@@ -654,8 +654,7 @@ impl EnumChangeSet {
 impl EnumChangeSet {
     /// Convert fast-lane archetype batches into regular `Mutation::Insert`
     /// entries. Used by the WAL path which serializes `iter_mutations()`.
-    #[allow(dead_code)]
-    pub(crate) fn drain_fast_lane_to_mutations(&mut self) {
+    pub fn drain_fast_lane_to_mutations(&mut self) {
         for batch in self.archetype_batches.drain(..) {
             for col_batch in batch.columns {
                 for (_row, entity, offset) in col_batch.entries {
