@@ -9574,4 +9574,167 @@ mod tests {
         collected_scores.sort_by_key(|s| s.0);
         assert_eq!(collected_scores, (10..15).map(Score).collect::<Vec<_>>());
     }
+
+    #[test]
+    fn for_each_batched_raw_no_tick_advance() {
+        let mut world = World::new();
+        world.spawn((Score(1), Team(1)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        // Call raw twice — both should succeed (no tick advancement).
+        let mut count1 = 0u32;
+        plan.for_each_batched_raw::<(&Score,), _>(&world, |_, _| count1 += 1)
+            .unwrap();
+        assert_eq!(count1, 1);
+
+        let mut count2 = 0u32;
+        plan.for_each_batched_raw::<(&Score,), _>(&world, |_, _| count2 += 1)
+            .unwrap();
+        assert_eq!(count2, 1);
+    }
+
+    #[test]
+    fn for_each_join_chunk_works_for_scan_plans() {
+        let mut world = World::new();
+        world.spawn((Score(1),));
+        world.spawn((Score(2),));
+        world.spawn((Score(3),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        let mut total = 0;
+        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
+            assert_eq!(entities.len(), rows.len());
+            total += entities.len();
+            // For scan plans, rows should be 0..len (all entities in the archetype).
+            for (i, &row) in rows.iter().enumerate() {
+                assert_eq!(row, i, "scan plan rows should be sequential");
+            }
+            assert_eq!(scores.len(), entities.len());
+        })
+        .unwrap();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn for_each_batched_left_join() {
+        let mut world = World::new();
+        // 5 Score-only, 5 Score+Team
+        let mut all_score = Vec::new();
+        for i in 0..5 {
+            all_score.push(world.spawn((Score(i),)));
+        }
+        for i in 5..10 {
+            all_score.push(world.spawn((Score(i), Team(1))));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Left)
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each_batched::<(&Score,), _>(&mut world, |entity, _| {
+            results.push(entity);
+        })
+        .unwrap();
+
+        // Left join: all 10 Score entities should appear.
+        assert_eq!(results.len(), 10);
+        all_score.sort_by_key(|e| e.to_bits());
+        results.sort_by_key(|e| e.to_bits());
+        assert_eq!(results, all_score);
+    }
+
+    #[test]
+    fn for_each_join_chunk_multi_archetype() {
+        let mut world = World::new();
+        // 3 different archetypes, all with Score
+        world.spawn((Score(1),));
+        world.spawn((Score(2), Team(1)));
+        world.spawn((Score(3), Team(1), Health(50)));
+
+        let planner = QueryPlanner::new(&world);
+        // Scan Score, join Team — only archetypes with Team match the join.
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        // Collect chunk info: (entity_count, first_entity) per chunk.
+        let mut chunk_entities: Vec<Vec<Entity>> = Vec::new();
+        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, _, _| {
+            assert!(!entities.is_empty());
+            chunk_entities.push(entities.to_vec());
+        })
+        .unwrap();
+
+        // Two archetypes have Team: (Score, Team) and (Score, Team, Health).
+        assert_eq!(chunk_entities.len(), 2);
+        // Total: 2 entities (one per Team-bearing archetype).
+        let total: usize = chunk_entities.iter().map(|c| c.len()).sum();
+        assert_eq!(total, 2);
+        // Each chunk should have different entities.
+        assert_ne!(chunk_entities[0], chunk_entities[1]);
+    }
+
+    #[test]
+    fn for_each_batched_empty_join() {
+        let mut world = World::new();
+        // Score-only entities, no Team — inner join produces empty result.
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let mut called = false;
+        plan.for_each_batched::<(&Score,), _>(&mut world, |_, _| {
+            called = true;
+        })
+        .unwrap();
+        assert!(!called);
+    }
+
+    #[test]
+    fn for_each_batched_world_mismatch() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        world_a.spawn((Score(1),));
+        world_b.spawn((Score(2),));
+
+        let planner = QueryPlanner::new(&world_a);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        let result = plan.for_each_batched::<(&Score,), _>(&mut world_b, |_, _| {});
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn for_each_batched_component_mismatch() {
+        let mut world = World::new();
+        // Entities have Score only — no Health component.
+        world.spawn((Score(1),));
+        world.spawn((Score(2),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        // Request (&Health,) via Q, but no archetype has Health.
+        let result = plan.for_each_batched::<(&Health,), _>(&mut world, |_, _| {});
+        assert!(
+            matches!(result, Err(PlanExecError::ComponentMismatch { .. })),
+            "expected ComponentMismatch, got {result:?}"
+        );
+    }
 }
