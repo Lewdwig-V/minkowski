@@ -36,6 +36,38 @@ fn simple_insert(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("spawn_batch", |b| {
+        b.iter(|| {
+            let mut world = minkowski::World::new();
+            let bundles = (0..10_000).map(|i| {
+                let f = i as f32;
+                (
+                    Transform {
+                        matrix: [
+                            [f, 0.0, 0.0, 0.0],
+                            [0.0, f, 0.0, 0.0],
+                            [0.0, 0.0, f, 0.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ],
+                    },
+                    Position { x: f, y: f, z: f },
+                    Rotation {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    Velocity {
+                        dx: 1.0,
+                        dy: 1.0,
+                        dz: 1.0,
+                    },
+                )
+            });
+            world.spawn_batch(bundles);
+            world
+        });
+    });
+
     group.bench_function("changeset", |b| {
         b.iter(|| {
             let mut world = minkowski::World::new();

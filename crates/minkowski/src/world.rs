@@ -488,6 +488,72 @@ impl World {
         Ok(entity)
     }
 
+    /// Spawns a batch of entities from an iterator of identical bundles.
+    ///
+    /// This is faster than calling [`spawn`] in a loop because the archetype
+    /// is resolved once for the entire batch and column capacity is reserved
+    /// up front.
+    ///
+    /// Returns a `Vec` of the newly created entities.
+    pub fn spawn_batch<B: Bundle>(&mut self, bundles: impl IntoIterator<Item = B>) -> Vec<Entity> {
+        self.drain_orphans();
+        let iter = bundles.into_iter();
+        let (lower, _) = iter.size_hint();
+
+        // Resolve archetype once for the whole batch.
+        let component_ids = B::component_ids(&mut self.components);
+        let arch_id = self
+            .archetypes
+            .get_or_create(&component_ids, &self.components, &self.pool);
+
+        // Pre-reserve capacity in every column + entities vec.
+        if lower > 0 {
+            let archetype = &mut self.archetypes.archetypes[arch_id.0];
+            for col in &mut archetype.columns {
+                col.reserve(lower);
+            }
+            archetype.entities.reserve(lower);
+        }
+
+        let mut spawned = Vec::with_capacity(lower);
+
+        for bundle in iter {
+            let entity = self.entities.alloc();
+            let index = entity.index() as usize;
+
+            if index >= self.entity_locations.len() {
+                self.entity_locations.resize(index + 1, None);
+            }
+
+            let tick = self.next_tick();
+            let archetype = &mut self.archetypes.archetypes[arch_id.0];
+            unsafe {
+                bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
+                    let col = archetype.column_index(comp_id).unwrap();
+                    archetype.columns[col].push(ptr as *mut u8);
+                });
+            }
+            for col in &mut archetype.columns {
+                col.mark_changed(tick);
+            }
+            let row = archetype.entities.len();
+            archetype.entities.push(entity);
+
+            self.entity_locations[index] = Some(EntityLocation {
+                archetype_id: arch_id,
+                row,
+            });
+            spawned.push(entity);
+        }
+
+        if !spawned.is_empty() {
+            let archetype = &self.archetypes.archetypes[arch_id.0];
+            archetype.debug_assert_consistent();
+        }
+
+        spawned
+    }
+
     pub fn despawn(&mut self, entity: Entity) -> bool {
         self.drain_orphans();
         if !self.entities.is_alive(entity) {
@@ -3631,6 +3697,128 @@ mod tests {
         world.despawn(e);
         let result = world.try_insert(e, (Vel { dx: 1.0, dy: 1.0 },));
         assert!(matches!(result, Err(InsertError::DeadEntity(_))));
+    }
+
+    #[test]
+    fn spawn_batch_basic() {
+        let mut world = World::new();
+        let bundles = vec![
+            (Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }),
+            (Pos { x: 5.0, y: 6.0 }, Vel { dx: 7.0, dy: 8.0 }),
+            (Pos { x: 9.0, y: 10.0 }, Vel { dx: 11.0, dy: 12.0 }),
+        ];
+        let entities = world.spawn_batch(bundles);
+        assert_eq!(entities.len(), 3);
+        assert_eq!(world.get::<Pos>(entities[0]), Some(&Pos { x: 1.0, y: 2.0 }));
+        assert_eq!(
+            world.get::<Vel>(entities[0]),
+            Some(&Vel { dx: 3.0, dy: 4.0 })
+        );
+        assert_eq!(world.get::<Pos>(entities[1]), Some(&Pos { x: 5.0, y: 6.0 }));
+        assert_eq!(
+            world.get::<Pos>(entities[2]),
+            Some(&Pos { x: 9.0, y: 10.0 })
+        );
+    }
+
+    #[test]
+    fn spawn_batch_empty() {
+        let mut world = World::new();
+        let entities = world.spawn_batch::<(Pos,)>(std::iter::empty());
+        assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn spawn_batch_single() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(Pos { x: 1.0, y: 2.0 },)]);
+        assert_eq!(entities.len(), 1);
+        assert_eq!(world.get::<Pos>(entities[0]), Some(&Pos { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn spawn_batch_entities_alive() {
+        let mut world = World::new();
+        let entities = world.spawn_batch((0..100).map(|i| {
+            (Pos {
+                x: i as f32,
+                y: 0.0,
+            },)
+        }));
+        assert_eq!(entities.len(), 100);
+        for (i, &e) in entities.iter().enumerate() {
+            assert!(world.is_alive(e));
+            assert!(world.is_placed(e));
+            assert_eq!(
+                world.get::<Pos>(e),
+                Some(&Pos {
+                    x: i as f32,
+                    y: 0.0
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_batch_query_visible() {
+        let mut world = World::new();
+        world.spawn_batch((0..5).map(|i| {
+            (
+                Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+                Vel { dx: 1.0, dy: 1.0 },
+            )
+        }));
+        let mut count = 0;
+        world.query::<(&Pos, &Vel)>().for_each(|(p, v)| {
+            assert!(p.x >= 0.0 && p.x < 5.0);
+            assert_eq!(v.dx, 1.0);
+            count += 1;
+        });
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn spawn_batch_mixed_with_spawn() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
+        let batch = world.spawn_batch((1..4).map(|i| {
+            (
+                Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+                Vel { dx: 0.0, dy: 0.0 },
+            )
+        }));
+        let e5 = world.spawn((Pos { x: 4.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
+
+        assert!(world.is_alive(e1));
+        for &e in &batch {
+            assert!(world.is_alive(e));
+        }
+        assert!(world.is_alive(e5));
+
+        let mut count = 0;
+        world.query::<&Pos>().for_each(|_| count += 1);
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn spawn_batch_unique_entities() {
+        let mut world = World::new();
+        let entities = world.spawn_batch((0..100).map(|i| {
+            (Pos {
+                x: i as f32,
+                y: 0.0,
+            },)
+        }));
+        let mut seen = std::collections::HashSet::new();
+        for &e in &entities {
+            assert!(seen.insert(e.index()), "duplicate entity index");
+        }
     }
 }
 
