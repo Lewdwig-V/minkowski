@@ -61,14 +61,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: nightly
-      - name: Miri tests (skip par_for_each)
-        run: cargo +nightly miri test -p minkowski --lib -- --skip par_for_each
+      - name: Miri subset (~85 tests targeting unsafe code)
+        run: ci/run-miri-subset.sh
         env:
           MIRIFLAGS: "-Zmiri-tree-borrows"
-      - name: Miri par_for_each (ignore leaks)
-        run: cargo +nightly miri test -p minkowski --lib par_for_each
-        env:
-          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-ignore-leaks"
 
   tsan:
     name: ThreadSanitizer
