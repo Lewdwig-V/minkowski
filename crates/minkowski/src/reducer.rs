@@ -1,3 +1,4 @@
+use std::alloc::Layout;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -7,7 +8,7 @@ use crate::sync::{Arc, AtomicBool, AtomicU64, Ordering};
 
 use crate::access::Access;
 use crate::bundle::Bundle;
-use crate::changeset::EnumChangeSet;
+use crate::changeset::{DropEntry, EnumChangeSet};
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
 use crate::query::fetch::{Changed, ReadOnlyWorldQuery, ThinSlicePtr, WorldQuery};
@@ -720,6 +721,8 @@ pub struct WritableRef<'a, T: Component> {
     current: &'a T,
     comp_id: ComponentId,
     changeset: *mut EnumChangeSet,
+    row: usize,
+    column_slot: usize,
     _marker: PhantomData<&'a EnumChangeSet>,
 }
 
@@ -729,12 +732,16 @@ impl<'a, T: Component> WritableRef<'a, T> {
         current: &'a T,
         comp_id: ComponentId,
         changeset: *mut EnumChangeSet,
+        row: usize,
+        column_slot: usize,
     ) -> Self {
         Self {
             entity,
             current,
             comp_id,
             changeset,
+            row,
+            column_slot,
             _marker: PhantomData,
         }
     }
@@ -744,7 +751,8 @@ impl<'a, T: Component> WritableRef<'a, T> {
         self.current
     }
 
-    /// Buffer a write. The value is stored in the changeset and applied on commit.
+    /// Buffer a write. The value is stored in the changeset's fast-lane
+    /// archetype batch and applied on commit.
     #[inline]
     pub fn set(&mut self, value: T) {
         // Safety: the raw pointer is valid for the lifetime of the transaction.
@@ -752,7 +760,25 @@ impl<'a, T: Component> WritableRef<'a, T> {
         // temporary `&mut EnumChangeSet` does not outlive this method call,
         // and `&mut self` prevents re-entrant access — no overlapping
         // mutable references.
-        unsafe { &mut *self.changeset }.insert_raw(self.entity, self.comp_id, value);
+        let cs = unsafe { &mut *self.changeset };
+        let batch = cs.archetype_batches.last_mut().unwrap();
+        let col_batch = &mut batch.columns[self.column_slot];
+        debug_assert_eq!(col_batch.comp_id, self.comp_id);
+        debug_assert_eq!(col_batch.layout, Layout::new::<T>());
+
+        let value = std::mem::ManuallyDrop::new(value);
+        let offset = cs
+            .arena
+            .alloc(&*value as *const T as *const u8, Layout::new::<T>());
+        col_batch.entries.push((self.row, self.entity, offset));
+
+        if std::mem::needs_drop::<T>() {
+            cs.drop_entries.push(DropEntry {
+                offset,
+                drop_fn: crate::component::drop_ptr::<T>,
+                mutation_idx: usize::MAX,
+            });
+        }
     }
 
     /// Clone the current value, apply `f`, and buffer the result.
@@ -785,6 +811,10 @@ pub unsafe trait WriterQuery: WorldQuery {
         archetype: &'w Archetype,
         registry: &ComponentRegistry,
     ) -> Self::WriterFetch<'w>;
+
+    /// Set the column slot index for fast-lane archetype batches.
+    /// Only meaningful for `&mut T` — other impls use the default no-op.
+    fn set_column_slot(_fetch: &mut Self::WriterFetch<'_>, _slot: usize) {}
 
     /// # Safety
     /// `row` must be less than `archetype.len()`. `changeset` must be valid.
@@ -824,7 +854,7 @@ unsafe impl<T: Component> WriterQuery for &T {
 // writes are buffered into the changeset.
 unsafe impl<T: Component> WriterQuery for &mut T {
     type WriterItem<'a> = WritableRef<'a, T>;
-    type WriterFetch<'a> = (ThinSlicePtr<T>, ComponentId);
+    type WriterFetch<'a> = (ThinSlicePtr<T>, ComponentId, usize);
 
     fn init_writer_fetch<'w>(
         archetype: &'w Archetype,
@@ -832,7 +862,11 @@ unsafe impl<T: Component> WriterQuery for &mut T {
     ) -> Self::WriterFetch<'w> {
         let id = registry.id::<T>().expect("component not registered");
         let ptr = <&T as WorldQuery>::init_fetch(archetype, registry);
-        (ptr, id)
+        (ptr, id, 0) // column_slot set by tuple or defaults to 0 for single
+    }
+
+    fn set_column_slot(fetch: &mut Self::WriterFetch<'_>, slot: usize) {
+        fetch.2 = slot;
     }
 
     unsafe fn fetch_writer<'w>(
@@ -842,9 +876,9 @@ unsafe impl<T: Component> WriterQuery for &mut T {
         changeset: *mut EnumChangeSet,
     ) -> Self::WriterItem<'w> {
         unsafe {
-            let (ptr, comp_id) = fetch;
+            let (ptr, comp_id, column_slot) = fetch;
             let current: &T = &*ptr.ptr.add(row);
-            WritableRef::new(entity, current, *comp_id, changeset)
+            WritableRef::new(entity, current, *comp_id, changeset, row, *column_slot)
         }
     }
 }
@@ -928,7 +962,23 @@ macro_rules! impl_writer_query_tuple {
                 archetype: &'w Archetype,
                 registry: &ComponentRegistry,
             ) -> Self::WriterFetch<'w> {
-                ($($name::init_writer_fetch(archetype, registry),)*)
+                let mut fetch = ($($name::init_writer_fetch(archetype, registry),)*);
+                // Assign column_slot based on position in combined mutable_ids
+                let _mutable = <Self as WorldQuery>::mutable_ids(registry);
+                let mut _slot = 0usize;
+                let ($($name,)*) = &mut fetch;
+                $(
+                    let sub_mutable = <$name as WorldQuery>::mutable_ids(registry);
+                    if sub_mutable.count_ones(..) > 0 {
+                        <$name as WriterQuery>::set_column_slot($name, _slot);
+                        _slot += sub_mutable.count_ones(..);
+                    }
+                )*
+                debug_assert_eq!(
+                    _slot, _mutable.count_ones(..),
+                    "column_slot assignment out of sync with mutable_ids"
+                );
+                fetch
             }
 
             unsafe fn fetch_writer<'w>(
@@ -940,6 +990,10 @@ macro_rules! impl_writer_query_tuple {
                 let ($($name,)*) = fetch;
                 ($(<$name as WriterQuery>::fetch_writer($name, row, entity, changeset),)*)
             }}
+
+            fn set_column_slot(_fetch: &mut Self::WriterFetch<'_>, _slot: usize) {
+                // Tuple assigns slots in init_writer_fetch, not here
+            }
         }
     };
 }
@@ -1022,9 +1076,10 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
         let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
 
         let required = Q::required_ids(&self.world.components);
+        let mutable = Q::mutable_ids(&self.world.components);
         let cs_ptr = self.changeset;
 
-        // Pre-allocate changeset capacity based on matching entity count,
+        // Pre-allocate arena capacity based on matching entity count,
         // capped to avoid worst-case overallocation when only a fraction of
         // matched entities are actually written (conditional-update reducers).
         {
@@ -1040,20 +1095,30 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
             }
             if entity_count > 0 {
                 let cs = unsafe { &mut *cs_ptr };
-                let mutable_count = Q::mutable_ids(&self.world.components).count_ones(..);
+                let mutable_count = mutable.count_ones(..);
                 let mutations_needed = (entity_count * mutable_count).min(MAX_PREALLOC_MUTATIONS);
-                cs.mutations.reserve(mutations_needed);
                 cs.arena.reserve(mutations_needed * 64);
             }
         }
 
-        for arch in &self.world.archetypes.archetypes {
+        for (arch_idx, arch) in self.world.archetypes.archetypes.iter().enumerate() {
             if arch.is_empty() || !required.is_subset(&arch.component_ids) {
                 continue;
             }
             if !Q::matches_filters(arch, &self.world.components, last_tick) {
                 continue;
             }
+
+            // Open a fast-lane batch for this archetype
+            let cs = unsafe { &mut *cs_ptr };
+            crate::changeset::open_archetype_batch(
+                cs,
+                arch_idx,
+                arch,
+                &self.world.components,
+                &mutable,
+            );
+
             let fetch = Q::init_writer_fetch(arch, &self.world.components);
             for row in 0..arch.len() {
                 let entity = arch.entities[row];
@@ -3552,8 +3617,25 @@ mod tests {
         let current = world.get::<Pos>(e).unwrap();
 
         let mut cs = EnumChangeSet::new();
-        let wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet);
+        let wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet, 0, 0);
         assert_eq!(wr.get().0, 42.0);
+    }
+
+    /// Helper: open an archetype batch for the given entity's archetype
+    /// with a single mutable component so that `WritableRef::set` can
+    /// route through the fast lane.
+    fn open_batch_for_entity(
+        cs: &mut EnumChangeSet,
+        world: &World,
+        entity: Entity,
+        comp_id: ComponentId,
+    ) {
+        let loc = world.entity_locations[entity.index() as usize].unwrap();
+        let arch_idx = loc.archetype_id.0;
+        let arch = &world.archetypes.archetypes[arch_idx];
+        let mut mutable = fixedbitset::FixedBitSet::with_capacity(comp_id + 1);
+        mutable.insert(comp_id);
+        crate::changeset::open_archetype_batch(cs, arch_idx, arch, &world.components, &mutable);
     }
 
     #[test]
@@ -3564,8 +3646,9 @@ mod tests {
         let current = world.get::<Pos>(e).unwrap();
 
         let mut cs = EnumChangeSet::new();
+        open_batch_for_entity(&mut cs, &world, e, pos_id);
         {
-            let mut wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet);
+            let mut wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet, 0, 0);
             wr.set(Pos(99.0));
         }
         // World unchanged before apply
@@ -3584,8 +3667,9 @@ mod tests {
         let current = world.get::<Pos>(e).unwrap();
 
         let mut cs = EnumChangeSet::new();
+        open_batch_for_entity(&mut cs, &world, e, pos_id);
         {
-            let mut wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet);
+            let mut wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet, 0, 0);
             wr.modify(|p| p.0 += 10.0);
         }
         cs.apply(&mut world).unwrap();
@@ -3618,6 +3702,8 @@ mod tests {
 
         let fetch = <&mut Pos as WriterQuery>::init_writer_fetch(archetype, &world.components);
         let mut cs = EnumChangeSet::new();
+        let pos_id = world.components.id::<Pos>().unwrap();
+        open_batch_for_entity(&mut cs, &world, e, pos_id);
         let mut item = unsafe {
             <&mut Pos as WriterQuery>::fetch_writer(
                 &fetch,
@@ -3645,6 +3731,8 @@ mod tests {
         let fetch =
             <(&Vel, &mut Pos) as WriterQuery>::init_writer_fetch(archetype, &world.components);
         let mut cs = EnumChangeSet::new();
+        let pos_id = world.components.id::<Pos>().unwrap();
+        open_batch_for_entity(&mut cs, &world, e, pos_id);
         let (vel_ref, mut pos_wr) = unsafe {
             <(&Vel, &mut Pos) as WriterQuery>::fetch_writer(
                 &fetch,
