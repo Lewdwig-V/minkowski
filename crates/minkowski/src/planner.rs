@@ -1957,18 +1957,25 @@ impl QueryPlanResult {
             }
         }
 
-        // Fast path: scan-only plan with no custom predicates.
+        // Fast path: scan-only plan with no custom predicates or index drivers.
         // Walk archetypes directly — no ScratchBuffer, no sort.
-        if let Some(ref required) = self.scan_required {
-            let changed = &self.scan_changed;
-            let tick = self.last_read_tick;
+        // Destructure self to borrow scan_required + row_indices disjointly.
+        if self.scan_required.is_some() {
+            let Self {
+                scan_required,
+                scan_changed,
+                last_read_tick,
+                row_indices,
+                ..
+            } = self;
+            let required = scan_required.as_ref().unwrap();
+            let tick = *last_read_tick;
             let q_required = Q::required_ids(&world.components);
-            let mut row_buf = Vec::new();
             for arch in &world.archetypes.archetypes {
                 if arch.is_empty() || !required.is_subset(&arch.component_ids) {
                     continue;
                 }
-                if !passes_change_filter(arch, changed, tick) {
+                if !passes_change_filter(arch, scan_changed, tick) {
                     continue;
                 }
                 if !q_required.is_subset(&arch.component_ids) {
@@ -1979,11 +1986,11 @@ impl QueryPlanResult {
                 }
                 let fetch = Q::init_fetch(arch, &world.components);
                 let slice = unsafe { Q::as_slice(&fetch, arch.len()) };
-                row_buf.clear();
-                row_buf.extend(0..arch.len());
-                callback(&arch.entities, &row_buf, slice);
+                row_indices.clear();
+                row_indices.extend(0..arch.len());
+                callback(&arch.entities, row_indices, slice);
             }
-            self.last_read_tick = world.next_tick();
+            *last_read_tick = world.next_tick();
             return Ok(());
         }
 
@@ -3901,7 +3908,14 @@ impl ScanBuilder<'_> {
             compiled_agg_scan,
             compiled_agg_scan_raw,
             row_indices: Vec::new(),
-            scan_required: if !has_custom_filters && self.joins.is_empty() {
+            // Direct archetype iteration: only for pure scans with no
+            // predicates, indexes, or spatial drivers. Plans with index/spatial
+            // drivers use compiled closures that execute the index lookup.
+            scan_required: if !has_custom_filters
+                && self.joins.is_empty()
+                && index_driver.is_none()
+                && spatial_driver.is_none()
+            {
                 self.left_required.clone()
             } else {
                 None
@@ -10489,5 +10503,42 @@ mod tests {
 
         results.sort_unstable();
         assert_eq!(results, vec![10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn direct_iter_disabled_with_index_driver() {
+        use crate::BTreeIndex;
+
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let idx = Arc::new(idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index::<Score>(&idx, &world).unwrap();
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(10)..Score(20)))
+            .build();
+
+        // Index driver present — scan_required should be None.
+        assert!(
+            plan.scan_required.is_none(),
+            "direct path should be disabled when index driver is present"
+        );
+
+        // Verify the plan still produces correct results (index-driven path).
+        let mut plan = plan;
+        let mut results = Vec::new();
+        plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+            results.push(score.0);
+        })
+        .unwrap();
+        results.sort_unstable();
+        assert_eq!(results, (10..20).collect::<Vec<_>>());
     }
 }
