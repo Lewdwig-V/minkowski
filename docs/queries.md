@@ -98,6 +98,16 @@ for &entity in view.entities() {
 }
 ```
 
+## Relationship to morsel-driven execution and reducers
+
+The compiled query pipeline and a [typed reducer](../README.md#typed-reducers) are structurally similar — both are closed-over access declarations that the runtime can reason about externally. The divergence is in what that reasoning is *for*.
+
+In the [morsel-driven model][morsel-driven], the unit of scheduling is a data fragment bound to a fixed pipeline. The query execution plan (QEP) is the consistency boundary — pipeline breakers enforce materialization points, and the dispatcher assigns morsels to worker threads. No transaction mechanism is needed because the plan topology *is* the isolation guarantee. Intra-query parallelism is structurally safe by construction.
+
+Reducers solve a different problem: scheduling *multiple independent computations* that may conflict. The `Access` bitset is the consistency boundary — the registry and scheduler use it to prove disjointness or route through a transaction strategy (`Sequential`, `Optimistic`, `Pessimistic`). The type signature does the job that pipeline topology does in the morsel model.
+
+Minkowski's query planner borrows the morsel execution model (push-based compiled closures, batch granularity over 64-byte-aligned column slices) but lives in a world where the *inter-query* problem — "can these two things run concurrently?" — is solved by a completely different mechanism. The planner handles intra-query execution; reducers and transactions handle inter-query isolation. They compose but don't overlap.
+
 <!-- Link definitions -->
 [rayon]: https://github.com/rayon-rs/rayon
 [simd]: https://en.wikipedia.org/wiki/Single_instruction,_multiple_data
