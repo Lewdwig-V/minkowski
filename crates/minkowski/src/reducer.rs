@@ -963,19 +963,23 @@ macro_rules! impl_writer_query_tuple {
                 registry: &ComponentRegistry,
             ) -> Self::WriterFetch<'w> {
                 let mut fetch = ($($name::init_writer_fetch(archetype, registry),)*);
-                // Assign column_slot based on position in combined mutable_ids
+                // Assign column_slot by finding each element's position in
+                // ascending ComponentId order (matching open_archetype_batch's
+                // ColumnBatch creation order via mutable_ids.ones()).
                 let _mutable = <Self as WorldQuery>::mutable_ids(registry);
-                let mut _slot = 0usize;
+                let mut _assigned = 0usize;
                 let ($($name,)*) = &mut fetch;
                 $(
                     let sub_mutable = <$name as WorldQuery>::mutable_ids(registry);
                     if sub_mutable.count_ones(..) > 0 {
-                        <$name as WriterQuery>::set_column_slot($name, _slot);
-                        _slot += sub_mutable.count_ones(..);
+                        let first_id = sub_mutable.ones().next().unwrap();
+                        let slot = _mutable.ones().position(|id| id == first_id).unwrap();
+                        <$name as WriterQuery>::set_column_slot($name, slot);
+                        _assigned += sub_mutable.count_ones(..);
                     }
                 )*
                 debug_assert_eq!(
-                    _slot, _mutable.count_ones(..),
+                    _assigned, _mutable.count_ones(..),
                     "column_slot assignment out of sync with mutable_ids"
                 );
                 fetch
@@ -4688,6 +4692,36 @@ mod tests {
 
         registry.call(&strategy, &mut world, id, ()).unwrap();
         // If we get here without a debug_assert panic, slots are correct.
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 10.0);
+        assert_eq!(world.get::<Vel>(e).unwrap().0, 30.0);
+    }
+
+    #[test]
+    fn query_writer_reverse_component_order() {
+        // Exercises the slot assignment when tuple order is reversed relative
+        // to ascending ComponentId order. Without the position-based lookup
+        // fix, Vel's set() would write to Pos's column (and vice versa),
+        // tripping the debug_assert_eq on comp_id inside WritableRef::set().
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(3.0)));
+
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        // Note: (&mut Vel, &mut Pos) — reverse of registration order
+        let id = registry
+            .register_query_writer::<(&mut Vel, &mut Pos), (), _>(
+                &mut world,
+                "reverse_slot_test",
+                |mut qw: QueryWriter<'_, (&mut Vel, &mut Pos)>, ()| {
+                    qw.for_each(|(mut vel, mut pos)| {
+                        vel.set(Vel(30.0));
+                        pos.set(Pos(10.0));
+                    });
+                },
+            )
+            .unwrap();
+
+        registry.call(&strategy, &mut world, id, ()).unwrap();
         assert_eq!(world.get::<Pos>(e).unwrap().0, 10.0);
         assert_eq!(world.get::<Vel>(e).unwrap().0, 30.0);
     }

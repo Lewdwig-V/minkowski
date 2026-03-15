@@ -654,6 +654,8 @@ impl EnumChangeSet {
 impl EnumChangeSet {
     /// Convert fast-lane archetype batches into regular `Mutation::Insert`
     /// entries. Used by the WAL path which serializes `iter_mutations()`.
+    ///
+    /// `pub` because `minkowski-persist::Durable` calls this before WAL append.
     pub fn drain_fast_lane_to_mutations(&mut self) {
         for batch in self.archetype_batches.drain(..) {
             for col_batch in batch.columns {
@@ -749,6 +751,10 @@ impl EnumChangeSet {
                     // by a prior alloc call. dst points into the BlobVec at a valid
                     // row. drop_fn is the registered destructor for this component
                     // type (or None for trivially-droppable types).
+                    //
+                    // `col.mark_changed(tick)` was called above — change detection
+                    // satisfied for the entire batch. `get_ptr` (not `get_ptr_mut`)
+                    // avoids redundant per-row tick marking.
                     unsafe {
                         let src = self.arena.get(offset);
                         let dst = col.get_ptr(row);
@@ -1529,7 +1535,7 @@ mod tests {
     /// Each test creates its own counter, avoiding races with parallel tests.
     #[derive(Debug)]
     struct Tracked {
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         value: u32,
         counter: Arc<AtomicUsize>,
     }
