@@ -7,10 +7,15 @@
 //!
 //! Part 2: Reducer API — same logic registered as query reducers, dispatched
 //!         via `registry.run()`. Strategy-agnostic, with free conflict detection.
+//!
+//! Part 3: Join plans inside transactions — demonstrates that query planner
+//!         joins work through `for_each_raw`/`execute_raw` with `&World`.
+//!         The plan's internal scratch buffer is invisible to the conflict
+//!         model — it's computation, not state.
 
 use minkowski::{
-    Access, Entity, Optimistic, QueryMut, QueryReducerId, ReducerRegistry, Sequential, Transact,
-    World,
+    Access, Entity, JoinKind, Optimistic, QueryMut, QueryPlanResult, QueryPlanner, QueryReducerId,
+    ReducerRegistry, Sequential, Transact, World,
 };
 
 // ── Components ──────────────────────────────────────────────────────
@@ -205,6 +210,103 @@ fn show_conflict_detection(
     );
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Part 3: Join plans inside transactions
+// ════════════════════════════════════════════════════════════════════
+
+/// Build a join plan that finds entities with both Pos and Health.
+fn build_join_plan(world: &World) -> QueryPlanResult {
+    let planner = QueryPlanner::new(world);
+    planner
+        .scan::<(&Pos,)>()
+        .join::<(&Health,)>(JoinKind::Inner)
+        .build()
+}
+
+fn run_transactional_join(world: &mut World) {
+    let strategy = Optimistic::new(world);
+    let access = Access::of::<(&Pos, &Health, &mut Health)>(world);
+
+    // Build the join plan outside the transaction — plans are reusable.
+    let mut plan = build_join_plan(world);
+
+    // Use execute_raw inside a transaction to get joined entity list.
+    strategy
+        .transact(world, &access, |tx, world| {
+            let joined = plan
+                .execute_raw(world)
+                .expect("same world, plan supports joins");
+
+            println!(
+                "    execute_raw: {count} entities in join result",
+                count = joined.len()
+            );
+
+            // Apply decay to every entity in the join result.
+            for &entity in joined {
+                let hp = tx
+                    .query::<(Entity, &Health)>(world)
+                    .find(|(e, _)| *e == entity)
+                    .map_or(0, |(_, h)| h.0);
+                tx.write::<Health>(world, entity, Health(hp.saturating_sub(5)));
+            }
+        })
+        .expect("clean commit");
+
+    // Use for_each_raw inside a transaction — collect join results, then mutate.
+    // for_each_raw borrows &World, so we collect entities first, then process.
+    strategy
+        .transact(world, &access, |tx, world| {
+            let mut joined = Vec::new();
+            plan.for_each_raw(world, |entity| {
+                joined.push(entity);
+            })
+            .expect("for_each_raw supports joins");
+
+            println!(
+                "    for_each_raw: collected {count} joined entities",
+                count = joined.len()
+            );
+
+            for entity in joined {
+                let hp = tx
+                    .query::<(Entity, &Health)>(world)
+                    .find(|(e, _)| *e == entity)
+                    .map_or(0, |(_, h)| h.0);
+                tx.write::<Health>(world, entity, Health(hp.saturating_sub(5)));
+            }
+        })
+        .expect("clean commit");
+
+    let avg = avg_health(world);
+    println!("    after 2 transactional join-driven decays: avg health = {avg:.0}");
+}
+
+fn run_left_join_demo(world: &mut World) {
+    // Spawn some entities without Health to demonstrate left join semantics.
+    for i in 0..20 {
+        world.spawn((Pos {
+            x: 200.0 + i as f32,
+            y: 0.0,
+        },));
+    }
+
+    let planner = QueryPlanner::new(world);
+    let mut inner_plan = planner
+        .scan::<(&Pos,)>()
+        .join::<(&Health,)>(JoinKind::Inner)
+        .build();
+    let mut left_plan = planner
+        .scan::<(&Pos,)>()
+        .join::<(&Health,)>(JoinKind::Left)
+        .build();
+
+    let inner = inner_plan.execute_raw(world).unwrap().len();
+    let left = left_plan.execute_raw(world).unwrap().len();
+    println!("    inner join: {inner} entities (Pos ∩ Health)");
+    println!("    left join:  {left} entities (all Pos, including those without Health)");
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 fn main() {
@@ -252,6 +354,20 @@ fn main() {
     println!("5. Same reducers, fresh world (strategy-agnostic reproducibility)");
     let (mut world2, _) = spawn_world();
     run_reducer_demo(&registry, &mut world2, move_id, decay_id);
+    println!();
+
+    // ── Part 3: Join plans inside transactions ──────────────────────
+
+    println!("=== Part 3: Join plans inside transactions ===");
+    println!();
+
+    println!("6. execute_raw + for_each_raw with join plans inside Optimistic Tx");
+    let (mut world3, _) = spawn_world();
+    run_transactional_join(&mut world3);
+    println!();
+
+    println!("7. Inner vs Left join comparison (execute_raw)");
+    run_left_join_demo(&mut world3);
     println!();
 
     println!("Done.");
