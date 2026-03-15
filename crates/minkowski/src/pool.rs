@@ -9,6 +9,7 @@ use std::alloc::Layout;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicU64 as StdAtomicU64;
+use std::sync::atomic::AtomicU64;
 
 #[cfg(loom)]
 use crate::sync::Mutex;
@@ -70,7 +71,9 @@ pub unsafe trait PoolAllocator: Send + Sync {
         None
     }
 
-    /// Bytes currently allocated. `None` if not tracked.
+    /// Bytes currently allocated, including blocks held in thread-local
+    /// caches. Call [`flush_caches`](Self::flush_caches) first for a more
+    /// accurate count. `None` if not tracked.
     fn used(&self) -> Option<usize> {
         None
     }
@@ -84,6 +87,21 @@ pub unsafe trait PoolAllocator: Send + Sync {
     fn overflow_total_counts(&self) -> Option<[u64; 6]> {
         None
     }
+
+    /// Flush thread-local allocation caches.
+    ///
+    /// **Calling thread**: flushed eagerly (blocks returned immediately).
+    /// **Other threads**: flushed lazily via epoch bump — each thread flushes
+    /// its TCache on its next `allocate` or `deallocate` call. Idle threads
+    /// (e.g., Rayon workers that never allocate again) retain their cached
+    /// blocks until thread exit.
+    ///
+    /// The `used()` value reflects the calling thread's flush immediately,
+    /// but may still include blocks cached by other threads until they check
+    /// in.
+    ///
+    /// No-op for allocators without caching (e.g., `SystemAllocator`).
+    fn flush_caches(&self) {}
 }
 
 /// Default allocator -- delegates to `std::alloc`. Unbounded, panics on OOM.
@@ -419,17 +437,8 @@ fn size_class_for(layout: Layout) -> Option<usize> {
     SIZE_CLASSES.iter().position(|&s| s >= size)
 }
 
-/// TigerBeetle-style slab allocator backed by a single mmap'd region.
-///
-/// Memory is partitioned into fixed-size blocks across six size classes.
-/// Allocation and deallocation use a lock-free intrusive stack per class
-/// via `AtomicHead` (128-bit tagged pointer CAS).
-///
-// PERF: Lock-free intrusive stack via AtomicHead (Atomic<u128> tagged pointer).
-// ABA prevention via 64-bit monotonic tag. Side table routes deallocation to
-// the correct class regardless of the caller's Layout. Single-step overflow
-// from exhausted class to the next larger class.
-pub(crate) struct SlabPool {
+/// Inner state of the slab pool, shared via `Arc` across threads and TCache.
+struct SlabPoolInner {
     /// Keeps the mmap alive. Never re-borrowed after construction —
     /// use `base` and `total` instead to avoid Tree Borrows invalidation.
     _region: MmapRegion,
@@ -448,9 +457,10 @@ pub(crate) struct SlabPool {
     used_bytes: AtomicUsize,
     overflow_active: [AtomicUsize; NUM_SIZE_CLASSES],
     overflow_total: [AtomicUsize; NUM_SIZE_CLASSES],
+    epoch: AtomicU64,
 }
 
-impl Drop for SlabPool {
+impl Drop for SlabPoolInner {
     fn drop(&mut self) {
         if self.side_table_len > 0 {
             // SAFETY: side_table was allocated via Box::into_raw in new().
@@ -464,16 +474,15 @@ impl Drop for SlabPool {
 }
 
 // SAFETY: Pointers into the mmap region are only accessed through atomic CAS
-// operations (or Mutex under loom). The mmap region is owned by SlabPool and
+// operations (or Mutex under loom). The mmap region is owned by SlabPoolInner and
 // outlives all allocations. The side table raw pointer is written only by
 // the thread that owns the block (after successful CAS) and read before
 // the CAS that returns it — single-owner access, no concurrent mutation.
-unsafe impl Send for SlabPool {}
-unsafe impl Sync for SlabPool {}
+unsafe impl Send for SlabPoolInner {}
+unsafe impl Sync for SlabPoolInner {}
 
-impl SlabPool {
-    /// Create a new slab pool backed by an mmap region of `budget` bytes.
-    pub(crate) fn new(budget: usize, hugepages: HugePages) -> Result<Self, PoolExhausted> {
+impl SlabPoolInner {
+    fn new(budget: usize, hugepages: HugePages) -> Result<Self, PoolExhausted> {
         let mut region = MmapRegion::new(budget, hugepages)?;
 
         // Cache base pointer and length now. After this point we never
@@ -545,6 +554,7 @@ impl SlabPool {
             used_bytes: AtomicUsize::new(0),
             overflow_active: std::array::from_fn(|_| AtomicUsize::new(0)),
             overflow_total: std::array::from_fn(|_| AtomicUsize::new(0)),
+            epoch: AtomicU64::new(0),
         })
     }
 
@@ -559,6 +569,11 @@ impl SlabPool {
     #[cfg(test)]
     fn overflow_total(&self, class: usize) -> u64 {
         self.overflow_total[class].load(Ordering::Relaxed) as u64
+    }
+
+    fn bump_epoch(&self) {
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Derive a valid pointer into the mmap region from a raw address.
@@ -581,15 +596,11 @@ impl SlabPool {
         // mmap region (checked by debug_assert above).
         unsafe { self.base.add(offset) }
     }
-}
 
-// SAFETY: SlabPool returns properly aligned, non-overlapping memory regions.
-// Each block is a fixed-size slab from the mmap region. Blocks within each
-// size class are aligned to their class size. Size classes are chosen such
-// that `layout.size() <= block_size` and `layout.align() <= block_size`.
-// Lock-free CAS on AtomicHead serializes access to each free list.
-unsafe impl PoolAllocator for SlabPool {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
+    /// Allocate one block from the global lock-free stack.
+    /// Does CAS + side table write + used_bytes increment.
+    /// SAFETY-CRITICAL: Does NOT touch TCACHE thread-local.
+    fn global_allocate(&self, layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
         if layout.size() == 0 {
             return Ok(NonNull::new(layout.align() as *mut u8).expect("alignment is non-zero"));
         }
@@ -660,15 +671,11 @@ unsafe impl PoolAllocator for SlabPool {
         Err(PoolExhausted { requested: layout })
     }
 
-    /// Return a block to the pool.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must have been returned by a prior call to `allocate` on this
-    /// pool. The caller must not use `ptr` after this call. The `layout`
-    /// parameter is accepted for API compatibility but is not used for
-    /// class routing — the side table is authoritative.
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+    /// Return one block to the global lock-free stack.
+    /// Reads side table for class routing, does CAS + side table clear.
+    /// SAFETY-CRITICAL: Does NOT touch TCACHE thread-local.
+    #[cfg_attr(not(loom), allow(dead_code))]
+    unsafe fn global_deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         if layout.size() == 0 {
             return;
         }
@@ -744,24 +751,405 @@ unsafe impl PoolAllocator for SlabPool {
         }
     }
 
+    /// Return one block to a specific class's global free list.
+    /// Used by TCache flush/spill. Class is caller-provided.
+    /// SAFETY-CRITICAL: Does NOT touch TCACHE thread-local.
+    unsafe fn global_deallocate_to_class(&self, class: usize, ptr: *mut u8) {
+        debug_assert!(class < NUM_SIZE_CLASSES, "class {class} out of bounds");
+        debug_assert!(
+            ptr as usize >= self.base as usize && (ptr as usize) < self.base as usize + self.total,
+            "global_deallocate_to_class: pointer {ptr:p} outside pool region"
+        );
+
+        let block = self.block_ptr(ptr as u64);
+
+        // Clear side table entry before pushing.
+        let index = (ptr as usize - self.base as usize) / SIZE_CLASSES[0];
+        let entry = unsafe { self.side_table.add(index).read() };
+        let was_overflow = (entry & SIDE_TABLE_OVERFLOW_BIT) != 0;
+
+        // Verify caller-provided class matches side table (defense-in-depth).
+        debug_assert_eq!(
+            class,
+            (entry & SIDE_TABLE_CLASS_MASK) as usize,
+            "global_deallocate_to_class: bin class {class} != side table class {}",
+            entry & SIDE_TABLE_CLASS_MASK
+        );
+
+        unsafe { self.side_table.add(index).write(SIDE_TABLE_UNALLOCATED) };
+
+        // Push to global free list.
+        loop {
+            let head = load_head(&self.heads[class]);
+            unsafe {
+                (*(block as *const StdAtomicU64))
+                    .store(head.ptr() as u64, std::sync::atomic::Ordering::Release);
+            }
+            let new_head = head.with_next(block);
+            if cas_head(&self.heads[class], head, new_head) {
+                self.used_bytes
+                    .fetch_sub(SIZE_CLASSES[class], Ordering::Relaxed);
+                if was_overflow {
+                    let prev = self.overflow_active[class].fetch_sub(1, Ordering::Relaxed);
+                    debug_assert!(prev > 0, "overflow_active underflow for class {class}");
+                }
+                return;
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+
+// ── Thread-Local Cache (TLC) ─────────────────────────────────────
+
+const TCACHE_REFILL: usize = 16;
+const TCACHE_CAPACITY: usize = 32;
+const TCACHE_SPILL: usize = 16;
+
+/// Per-class block cache. count placed after stack for cache-line
+/// adjacency with stack[31] in steady state.
+#[repr(C)]
+struct TCacheBin {
+    stack: [*mut u8; TCACHE_CAPACITY],
+    count: usize,
+}
+
+impl TCacheBin {
+    const fn empty() -> Self {
+        Self {
+            stack: [std::ptr::null_mut(); TCACHE_CAPACITY],
+            count: 0,
+        }
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<*mut u8> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(self.stack[self.count])
+    }
+
+    #[inline]
+    fn push(&mut self, ptr: *mut u8) {
+        // assert! not debug_assert!: OOB write at stack[32] overwrites `count`
+        // (adjacent in repr(C) layout), corrupting the allocator silently.
+        assert!(self.count < TCACHE_CAPACITY, "TCacheBin overflow");
+        self.stack[self.count] = ptr;
+        self.count += 1;
+    }
+
+    fn is_full(&self) -> bool {
+        self.count >= TCACHE_CAPACITY
+    }
+}
+
+struct TCache {
+    bins: [TCacheBin; NUM_SIZE_CLASSES],
+    local_epoch: u64,
+    pool: Arc<SlabPoolInner>,
+}
+
+impl TCache {
+    fn new(pool: Arc<SlabPoolInner>) -> Self {
+        Self {
+            bins: [const { TCacheBin::empty() }; NUM_SIZE_CLASSES],
+            local_epoch: pool.epoch.load(std::sync::atomic::Ordering::Acquire),
+            pool,
+        }
+    }
+
+    /// Refill a bin by grabbing up to TCACHE_REFILL blocks from the global pool.
+    /// Returns the first block to the caller, caches the rest.
+    fn refill(&mut self, _class: usize, layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
+        let mut first: Option<NonNull<u8>> = None;
+
+        for _ in 0..TCACHE_REFILL {
+            match self.pool.global_allocate(layout) {
+                Ok(ptr) => {
+                    if first.is_none() {
+                        first = Some(ptr);
+                    } else {
+                        // Read the side table to find the actual class
+                        // (may differ from `class` due to overflow).
+                        let index =
+                            (ptr.as_ptr() as usize - self.pool.base as usize) / SIZE_CLASSES[0];
+                        let entry = unsafe { self.pool.side_table.add(index).read() };
+                        let actual_class = (entry & SIDE_TABLE_CLASS_MASK) as usize;
+                        // Spill if the target bin is full before pushing.
+                        if self.bins[actual_class].is_full() {
+                            self.spill(actual_class);
+                        }
+                        self.bins[actual_class].push(ptr.as_ptr());
+                    }
+                }
+                Err(_) => break, // Pool exhausted — stop refilling.
+            }
+        }
+
+        first.ok_or(PoolExhausted { requested: layout })
+    }
+
+    /// Flush all bins back to the global pool (epoch mismatch).
+    fn flush_all(&mut self) {
+        for class in 0..NUM_SIZE_CLASSES {
+            let bin = &mut self.bins[class];
+            for i in 0..bin.count {
+                unsafe {
+                    self.pool.global_deallocate_to_class(class, bin.stack[i]);
+                }
+            }
+            bin.count = 0;
+        }
+    }
+
+    /// Spill TCACHE_SPILL blocks from the bottom of a bin back to global.
+    fn spill(&mut self, class: usize) {
+        let bin = &mut self.bins[class];
+        let spill_count = TCACHE_SPILL.min(bin.count);
+        for i in 0..spill_count {
+            unsafe {
+                self.pool.global_deallocate_to_class(class, bin.stack[i]);
+            }
+        }
+        // Compact: shift remaining blocks down.
+        let remaining = bin.count - spill_count;
+        for i in 0..remaining {
+            bin.stack[i] = bin.stack[spill_count + i];
+        }
+        bin.count = remaining;
+    }
+}
+
+impl Drop for TCache {
+    fn drop(&mut self) {
+        for class in 0..NUM_SIZE_CLASSES {
+            let bin = &mut self.bins[class];
+            for i in 0..bin.count {
+                // SAFETY: blocks are valid pointers from global_allocate.
+                // global_deallocate_to_class does NOT touch TCACHE (no reentrancy).
+                unsafe {
+                    self.pool.global_deallocate_to_class(class, bin.stack[i]);
+                }
+            }
+            bin.count = 0;
+        }
+    }
+}
+
+#[cfg(not(loom))]
+thread_local! {
+    static TCACHE: std::cell::UnsafeCell<Option<TCache>> =
+        const { std::cell::UnsafeCell::new(None) };
+}
+
+// ── SlabPool (public wrapper) ────────────────────────────────────
+
+/// TigerBeetle-style slab allocator backed by a single mmap'd region.
+///
+/// Memory is partitioned into fixed-size blocks across six size classes.
+/// Allocation and deallocation use a lock-free intrusive stack per class
+/// via `AtomicHead` (128-bit tagged pointer CAS). A thread-local cache
+/// (TCache) amortizes global CAS operations across batches of 16 allocations.
+///
+// PERF: Lock-free intrusive stack via AtomicHead (Atomic<u128> tagged pointer).
+// ABA prevention via 64-bit monotonic tag. Side table routes deallocation to
+// the correct class regardless of the caller's Layout. Single-step overflow
+// from exhausted class to the next larger class. TCache L1 provides ~3
+// instruction fast path for 15/16 allocations.
+pub(crate) struct SlabPool {
+    inner: Arc<SlabPoolInner>,
+}
+
+impl SlabPool {
+    /// Create a new slab pool backed by an mmap region of `budget` bytes.
+    pub(crate) fn new(budget: usize, hugepages: HugePages) -> Result<Self, PoolExhausted> {
+        Ok(Self {
+            inner: Arc::new(SlabPoolInner::new(budget, hugepages)?),
+        })
+    }
+
+    /// Number of blocks in `class` currently serving overflow requests
+    /// from smaller classes.
+    #[cfg(test)]
+    fn overflow_active(&self, class: usize) -> u64 {
+        self.inner.overflow_active(class)
+    }
+
+    /// Cumulative count of overflow allocations served by `class`.
+    #[cfg(test)]
+    fn overflow_total(&self, class: usize) -> u64 {
+        self.inner.overflow_total(class)
+    }
+
+    /// Flush the current thread's TCache back to the global pool.
+    /// Test-only: needed for exact used_bytes accounting in tests.
+    /// Under loom, TCache is bypassed — this is a no-op.
+    #[cfg(test)]
+    #[allow(clippy::unused_self)]
+    fn flush_current_thread_cache(&self) {
+        #[cfg(not(loom))]
+        TCACHE.with(|cell| {
+            // SAFETY: same no-reentrancy argument as allocate/deallocate.
+            let cache = unsafe { &mut *cell.get() };
+            if let Some(c) = cache.as_mut() {
+                c.flush_all();
+            }
+        });
+    }
+}
+
+// SAFETY: SlabPool returns properly aligned, non-overlapping memory regions.
+// Each block is a fixed-size slab from the mmap region. Blocks within each
+// size class are aligned to their class size. Size classes are chosen such
+// that `layout.size() <= block_size` and `layout.align() <= block_size`.
+// Lock-free CAS on AtomicHead serializes access to each free list.
+unsafe impl PoolAllocator for SlabPool {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
+        if layout.size() == 0 {
+            return Ok(NonNull::new(layout.align() as *mut u8).expect("alignment is non-zero"));
+        }
+
+        let class = size_class_for(layout).ok_or(PoolExhausted { requested: layout })?;
+
+        #[cfg(not(loom))]
+        {
+            TCACHE.with(|cell| {
+                // SAFETY: No reentrancy — allocate() is not called from within
+                // this closure. BlobVec::grow is the sole caller and does not
+                // nest allocations.
+                let slot = unsafe { &mut *cell.get() };
+
+                // If the TCache belongs to a different pool, flush and replace.
+                if let Some(existing) = slot.as_ref()
+                    && !Arc::ptr_eq(&existing.pool, &self.inner)
+                {
+                    // Drop the old TCache (flushes blocks to old pool).
+                    *slot = None;
+                }
+
+                let cache = slot.get_or_insert_with(|| TCache::new(Arc::clone(&self.inner)));
+
+                // Epoch check — lazy flush if stale.
+                let global_epoch = self.inner.epoch.load(std::sync::atomic::Ordering::Acquire);
+                if cache.local_epoch != global_epoch {
+                    cache.flush_all();
+                    cache.local_epoch = global_epoch;
+                }
+
+                // L1 hit: pop from local bin.
+                if let Some(ptr) = cache.bins[class].pop() {
+                    return Ok(NonNull::new(ptr).unwrap());
+                }
+
+                // L1 miss: refill from global pool.
+                cache.refill(class, layout)
+            })
+        }
+
+        #[cfg(loom)]
+        {
+            self.inner.global_allocate(layout)
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() == 0 {
+            return;
+        }
+
+        #[cfg(not(loom))]
+        {
+            // Read actual class from side table BEFORE touching TCache.
+            // This ensures bins are "pure" — no bin drift.
+            let addr = ptr.as_ptr() as usize;
+            let base = self.inner.base as usize;
+
+            assert!(
+                addr >= base && addr < base + self.inner.total,
+                "SlabPool::deallocate: pointer {:p} is outside pool region",
+                ptr.as_ptr()
+            );
+
+            let index = (addr - base) / SIZE_CLASSES[0];
+            let entry = unsafe { self.inner.side_table.add(index).read() };
+            let actual_class = (entry & SIDE_TABLE_CLASS_MASK) as usize;
+
+            assert!(
+                actual_class < NUM_SIZE_CLASSES,
+                "SlabPool::deallocate: side table entry {entry:#x} has invalid class \
+                 {actual_class} — possible double-free or foreign pointer"
+            );
+
+            TCACHE.with(|cell| {
+                let slot = unsafe { &mut *cell.get() };
+
+                // If the TCache belongs to a different pool, flush and replace.
+                if let Some(existing) = slot.as_ref()
+                    && !Arc::ptr_eq(&existing.pool, &self.inner)
+                {
+                    *slot = None;
+                }
+
+                let cache = slot.get_or_insert_with(|| TCache::new(Arc::clone(&self.inner)));
+
+                // Epoch check — lazy flush if stale (must check on BOTH
+                // allocate and deallocate per spec).
+                let global_epoch = self.inner.epoch.load(std::sync::atomic::Ordering::Acquire);
+                if cache.local_epoch != global_epoch {
+                    cache.flush_all();
+                    cache.local_epoch = global_epoch;
+                }
+
+                // Spill BEFORE pushing if full to avoid overflow.
+                if cache.bins[actual_class].is_full() {
+                    cache.spill(actual_class);
+                }
+
+                cache.bins[actual_class].push(ptr.as_ptr());
+            });
+        }
+
+        #[cfg(loom)]
+        {
+            self.inner.global_deallocate(ptr, layout);
+        }
+    }
+
     fn capacity(&self) -> Option<usize> {
-        Some(self.total)
+        Some(self.inner.total)
     }
 
     fn used(&self) -> Option<usize> {
-        Some(self.used_bytes.load(Ordering::Relaxed))
+        Some(self.inner.used_bytes.load(Ordering::Relaxed))
     }
 
     fn overflow_active_counts(&self) -> Option<[u64; 6]> {
         Some(std::array::from_fn(|i| {
-            self.overflow_active[i].load(Ordering::Relaxed) as u64
+            self.inner.overflow_active[i].load(Ordering::Relaxed) as u64
         }))
     }
 
     fn overflow_total_counts(&self) -> Option<[u64; 6]> {
         Some(std::array::from_fn(|i| {
-            self.overflow_total[i].load(Ordering::Relaxed) as u64
+            self.inner.overflow_total[i].load(Ordering::Relaxed) as u64
         }))
+    }
+
+    fn flush_caches(&self) {
+        // Eagerly flush the calling thread's TCache.
+        #[cfg(not(loom))]
+        TCACHE.with(|cell| {
+            let slot = unsafe { &mut *cell.get() };
+            if let Some(cache) = slot.as_mut()
+                && Arc::ptr_eq(&cache.pool, &self.inner)
+            {
+                cache.flush_all();
+            }
+        });
+        // Lazily flush other threads via epoch bump.
+        self.inner.bump_epoch();
     }
 }
 
@@ -946,6 +1334,8 @@ mod tests {
             let ptr = NonNull::new(*addr as *mut u8).unwrap();
             unsafe { pool.deallocate(ptr, layout) };
         }
+        // Flush main thread's TCache so blocks return to global pool.
+        pool.flush_current_thread_cache();
         assert_eq!(pool.used(), Some(0));
     }
 
@@ -954,19 +1344,25 @@ mod tests {
         let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
         let layout = Layout::from_size_align(64, 64).unwrap();
 
-        std::thread::scope(|s| {
-            for _ in 0..4 {
+        // Use std::thread::spawn (not scope) so threads fully exit and
+        // their thread-local TCache destructors run before we check.
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
                 let pool = Arc::clone(&pool);
-                s.spawn(move || {
+                std::thread::spawn(move || {
                     for _ in 0..1000 {
                         let ptr = pool.allocate(layout).unwrap();
                         // SAFETY: ptr was just allocated.
                         unsafe { pool.deallocate(ptr, layout) };
                     }
-                });
-            }
-        });
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
 
+        // After threads exit, their TCache destructors flush all blocks.
         assert_eq!(pool.used(), Some(0));
     }
 
@@ -1009,6 +1405,8 @@ mod tests {
             pool.deallocate(p1, layout);
             pool.deallocate(p2, layout);
         }
+        // Flush TCache so blocks return to global pool for accounting.
+        pool.flush_current_thread_cache();
         assert_eq!(pool.used(), Some(0));
     }
 
@@ -1057,6 +1455,7 @@ mod tests {
         for ptr in ptrs {
             unsafe { pool.deallocate(ptr, layout_small) };
         }
+        pool.flush_current_thread_cache();
         assert_eq!(pool.used(), Some(0));
     }
 
@@ -1090,6 +1489,7 @@ mod tests {
         for ptr in ptrs {
             unsafe { pool.deallocate(ptr, layout_for_dealloc) };
         }
+        pool.flush_current_thread_cache();
         assert_eq!(pool.used(), Some(0));
     }
 
@@ -1107,10 +1507,17 @@ mod tests {
             ptrs.push(pool.allocate(layout_small).unwrap());
         }
 
+        // Flush TCache so we can observe exact used_bytes from global state.
+        pool.flush_current_thread_cache();
+
         // The last allocation overflowed. Deallocate it — used_bytes should
         // decrease by the OVERFLOW class size (256), not the requested class (64).
+        // Use global_deallocate directly to bypass TCache for exact accounting.
         let used_before = pool.used().unwrap();
-        unsafe { pool.deallocate(ptrs.pop().unwrap(), layout_small) };
+        unsafe {
+            pool.inner
+                .global_deallocate(ptrs.pop().unwrap(), layout_small);
+        }
         let used_after = pool.used().unwrap();
         let freed = used_before - used_after;
         // Overflow block came from class 1 (256B).
@@ -1152,11 +1559,13 @@ mod tests {
         for ptr in ptrs1 {
             unsafe { pool.deallocate(ptr, layout_medium) };
         }
+        pool.flush_current_thread_cache();
         assert_eq!(pool.used(), Some(0));
     }
 
     #[test]
     fn slab_pool_overflow_telemetry() {
+        // Test overflow telemetry via global paths (bypassing TCache).
         let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
@@ -1166,7 +1575,7 @@ mod tests {
 
         let mut ptrs = Vec::new();
         for _ in 0..class0_blocks {
-            ptrs.push(pool.allocate(layout_small).unwrap());
+            ptrs.push(pool.inner.global_allocate(layout_small).unwrap());
         }
 
         // No overflow yet.
@@ -1174,17 +1583,17 @@ mod tests {
         assert_eq!(pool.overflow_total(1), 0);
 
         // Next allocation overflows to class 1.
-        let overflow_ptr = pool.allocate(layout_small).unwrap();
+        let overflow_ptr = pool.inner.global_allocate(layout_small).unwrap();
         assert_eq!(pool.overflow_active(1), 1);
         assert_eq!(pool.overflow_total(1), 1);
 
         // Deallocate the overflow block — active drops, total stays.
-        unsafe { pool.deallocate(overflow_ptr, layout_small) };
+        unsafe { pool.inner.global_deallocate(overflow_ptr, layout_small) };
         assert_eq!(pool.overflow_active(1), 0);
         assert_eq!(pool.overflow_total(1), 1);
 
         for ptr in ptrs {
-            unsafe { pool.deallocate(ptr, layout_small) };
+            unsafe { pool.inner.global_deallocate(ptr, layout_small) };
         }
     }
 
@@ -1218,28 +1627,31 @@ mod tests {
         let layout_small = Layout::from_size_align(64, 64).unwrap();
         let layout_large = Layout::from_size_align(4000, 8).unwrap();
 
-        std::thread::scope(|s| {
-            // 4 threads on class 0.
-            for _ in 0..4 {
-                let pool = Arc::clone(&pool);
-                s.spawn(move || {
-                    for _ in 0..200 {
-                        let ptr = pool.allocate(layout_small).unwrap();
-                        unsafe { pool.deallocate(ptr, layout_small) };
-                    }
-                });
-            }
-            // 4 threads on class 3.
-            for _ in 0..4 {
-                let pool = Arc::clone(&pool);
-                s.spawn(move || {
-                    for _ in 0..50 {
-                        let ptr = pool.allocate(layout_large).unwrap();
-                        unsafe { pool.deallocate(ptr, layout_large) };
-                    }
-                });
-            }
-        });
+        // Use std::thread::spawn so thread-local destructors run on join.
+        let mut handles = Vec::new();
+        // 4 threads on class 0.
+        for _ in 0..4 {
+            let pool = Arc::clone(&pool);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let ptr = pool.allocate(layout_small).unwrap();
+                    unsafe { pool.deallocate(ptr, layout_small) };
+                }
+            }));
+        }
+        // 4 threads on class 3.
+        for _ in 0..4 {
+            let pool = Arc::clone(&pool);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    let ptr = pool.allocate(layout_large).unwrap();
+                    unsafe { pool.deallocate(ptr, layout_large) };
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
 
         assert_eq!(pool.used(), Some(0));
     }
@@ -1255,11 +1667,13 @@ mod tests {
         let layout_small = Layout::from_size_align(32, 8).unwrap();
         let ptr = pool.allocate(layout_small).unwrap();
         unsafe { pool.deallocate(ptr, layout_small) };
+        pool.flush_current_thread_cache();
         assert_eq!(pool.used(), Some(0));
     }
 
     #[test]
     fn slab_pool_multi_class_used_bytes_tracking() {
+        // Test exact used_bytes tracking via global paths (bypassing TCache).
         let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off).unwrap();
         assert_eq!(pool.used(), Some(0));
 
@@ -1267,26 +1681,410 @@ mod tests {
         let l2 = Layout::from_size_align(900, 8).unwrap(); // class 2 (1KB)
         let l4 = Layout::from_size_align(60_000, 8).unwrap(); // class 4 (64KB)
 
-        let p0 = pool.allocate(l0).unwrap();
+        let p0 = pool.inner.global_allocate(l0).unwrap();
         assert_eq!(pool.used(), Some(SIZE_CLASSES[0]));
 
-        let p2 = pool.allocate(l2).unwrap();
+        let p2 = pool.inner.global_allocate(l2).unwrap();
         assert_eq!(pool.used(), Some(SIZE_CLASSES[0] + SIZE_CLASSES[2]));
 
-        let p4 = pool.allocate(l4).unwrap();
+        let p4 = pool.inner.global_allocate(l4).unwrap();
         assert_eq!(
             pool.used(),
             Some(SIZE_CLASSES[0] + SIZE_CLASSES[2] + SIZE_CLASSES[4])
         );
 
-        unsafe { pool.deallocate(p4, l4) };
+        unsafe { pool.inner.global_deallocate(p4, l4) };
         assert_eq!(pool.used(), Some(SIZE_CLASSES[0] + SIZE_CLASSES[2]));
 
-        unsafe { pool.deallocate(p2, l2) };
+        unsafe { pool.inner.global_deallocate(p2, l2) };
         assert_eq!(pool.used(), Some(SIZE_CLASSES[0]));
 
-        unsafe { pool.deallocate(p0, l0) };
+        unsafe { pool.inner.global_deallocate(p0, l0) };
         assert_eq!(pool.used(), Some(0));
+    }
+
+    // ── TCacheBin unit tests ────────────────────────────────────────
+
+    #[test]
+    fn tcache_bin_push_pop() {
+        let mut bin = TCacheBin::empty();
+        assert!(bin.pop().is_none());
+
+        let ptrs: Vec<*mut u8> = (1..=5).map(|i| i as *mut u8).collect();
+        for &p in &ptrs {
+            bin.push(p);
+        }
+        assert_eq!(bin.count, 5);
+
+        // LIFO order
+        for &p in ptrs.iter().rev() {
+            assert_eq!(bin.pop(), Some(p));
+        }
+        assert!(bin.pop().is_none());
+    }
+
+    #[test]
+    fn tcache_bin_is_full() {
+        let mut bin = TCacheBin::empty();
+        for i in 0..TCACHE_CAPACITY {
+            bin.push(i as *mut u8);
+        }
+        assert!(bin.is_full());
+    }
+
+    // ── TCache behavior tests ───────────────────────────────────────
+
+    #[test]
+    fn tcache_refill_and_hit() {
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        // First allocation triggers refill (16 blocks from global).
+        let p1 = pool.allocate(layout).unwrap();
+        // After refill: 16 blocks charged to used_bytes (1 returned, 15 cached).
+        assert_eq!(pool.used(), Some(TCACHE_REFILL * SIZE_CLASSES[0]));
+
+        // Next 15 allocations are TCache hits (no additional global allocs).
+        let mut ptrs = vec![p1];
+        for _ in 0..15 {
+            ptrs.push(pool.allocate(layout).unwrap());
+        }
+        assert_eq!(ptrs.len(), 16);
+        // Still 16 blocks charged — all came from the same refill batch.
+        assert_eq!(pool.used(), Some(TCACHE_REFILL * SIZE_CLASSES[0]));
+
+        // Deallocate all — goes to TCache, not global.
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout) };
+        }
+        // used_bytes still 16*64 — blocks are in TCache, not returned globally.
+        assert_eq!(pool.used(), Some(TCACHE_REFILL * SIZE_CLASSES[0]));
+
+        // Flush returns all to global.
+        pool.flush_caches();
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn tcache_spill_on_full() {
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        // Allocate enough blocks to fill the TCache bin on dealloc.
+        let mut ptrs = Vec::new();
+        for _ in 0..=TCACHE_CAPACITY {
+            ptrs.push(pool.allocate(layout).unwrap());
+        }
+        let used_after_alloc = pool.used().unwrap();
+
+        // Deallocate all — after 32 deallocs, a spill fires (16 blocks
+        // returned to global). The 33rd dealloc also goes to TCache.
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout) };
+        }
+
+        // Spill returned TCACHE_SPILL blocks to global — used_bytes decreased.
+        let used_after_dealloc = pool.used().unwrap();
+        assert!(
+            used_after_dealloc < used_after_alloc,
+            "spill should have returned blocks to global: before={used_after_alloc}, after={used_after_dealloc}"
+        );
+
+        // Flush TCache to get accurate count, then verify all returned.
+        pool.flush_caches();
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn tcache_epoch_flush() {
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        // Allocate 5 blocks (refill grabs 16 from global, returns 1, caches 15).
+        // After 5 allocs: 5 in user hands, 11 in TCache, 16 charged to used_bytes.
+        let mut ptrs = Vec::new();
+        for _ in 0..5 {
+            ptrs.push(pool.allocate(layout).unwrap());
+        }
+        let used_before_flush = pool.used().unwrap();
+
+        // flush_caches eagerly flushes calling thread's TCache (11 blocks back
+        // to global), then bumps epoch.
+        pool.flush_caches();
+        let used_after_flush = pool.used().unwrap();
+        assert!(
+            used_after_flush < used_before_flush,
+            "flush should return TCache blocks: before={used_before_flush}, after={used_after_flush}"
+        );
+        // Only the 5 user-held blocks should remain.
+        assert_eq!(used_after_flush, 5 * SIZE_CLASSES[0]);
+
+        // Next allocate triggers refill (TCache was flushed).
+        let p = pool.allocate(layout).unwrap();
+        ptrs.push(p);
+
+        // Clean up.
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout) };
+        }
+        pool.flush_caches();
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn tcache_cross_thread_dealloc() {
+        let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        // Thread A allocates.
+        let ptrs: Vec<usize> = (0..16)
+            .map(|_| pool.allocate(layout).unwrap().as_ptr() as usize)
+            .collect();
+
+        // Thread B deallocates.
+        let pool2 = Arc::clone(&pool);
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                for addr in ptrs {
+                    let ptr = NonNull::new(addr as *mut u8).unwrap();
+                    unsafe { pool2.deallocate(ptr, layout) };
+                }
+            });
+        });
+
+        // Blocks are in thread B's TCache (thread exited -> TCache dropped -> flushed).
+        // All blocks should be back in the global pool.
+        // Allocate again to verify they're available.
+        let p = pool.allocate(layout).unwrap();
+        unsafe { pool.deallocate(p, layout) };
+    }
+
+    #[test]
+    fn tcache_thread_exit_flushes() {
+        let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        let used_before = pool.used().unwrap();
+
+        // Spawn a thread, allocate and deallocate, then let it die.
+        let pool2 = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let p = pool2.allocate(layout).unwrap();
+            // Deallocate so the block returns to TCache.
+            unsafe { pool2.deallocate(p, layout) };
+            // Thread exits here — TCache::drop flushes all cached blocks
+            // (from refill + the deallocated block) back to global pool.
+        })
+        .join()
+        .unwrap();
+
+        // After thread exit, all blocks returned to global pool.
+        assert_eq!(pool.used().unwrap(), used_before);
+    }
+
+    #[test]
+    fn tcache_overflow_refill_correct_bin() {
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+
+        // Exhaust class 0 globally so refill overflows to class 1.
+        // First, burn through class 0.
+        let proportion_sum: usize = PROPORTIONS.iter().sum();
+        let class0_blocks = 1024 * 1024 * PROPORTIONS[0] / proportion_sum / SIZE_CLASSES[0];
+
+        let mut burn = Vec::new();
+        for _ in 0..class0_blocks {
+            burn.push(pool.allocate(layout_small).unwrap());
+        }
+
+        // Next allocation overflows — refill gets class-1 blocks.
+        // These should go in bins[1], not bins[0].
+        let overflow_ptr = pool.allocate(layout_small).unwrap();
+
+        // Deallocate overflow — should go to correct bin and eventually global.
+        unsafe { pool.deallocate(overflow_ptr, layout_small) };
+
+        // Clean up.
+        for ptr in burn {
+            unsafe { pool.deallocate(ptr, layout_small) };
+        }
+    }
+
+    // ── Concurrent TCache tests ─────────────────────────────────────
+
+    #[test]
+    fn tcache_concurrent_no_duplicates() {
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        let all_ptrs: Vec<Vec<usize>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let pool = Arc::clone(&pool);
+                    s.spawn(move || {
+                        let mut ptrs = Vec::new();
+                        for _ in 0..500 {
+                            if let Ok(ptr) = pool.allocate(layout) {
+                                ptrs.push(ptr.as_ptr() as usize);
+                            }
+                        }
+                        // Deallocate half to test mixed alloc/dealloc.
+                        let half = ptrs.len() / 2;
+                        for &addr in &ptrs[..half] {
+                            let ptr = NonNull::new(addr as *mut u8).unwrap();
+                            unsafe { pool.deallocate(ptr, layout) };
+                        }
+                        ptrs[half..].to_vec()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Verify no duplicates in remaining allocated pointers.
+        let mut all: Vec<usize> = all_ptrs.into_iter().flatten().collect();
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), total, "duplicate pointers across threads");
+
+        // Deallocate remaining.
+        for addr in all {
+            let ptr = NonNull::new(addr as *mut u8).unwrap();
+            unsafe { pool.deallocate(ptr, layout) };
+        }
+    }
+
+    #[test]
+    fn tcache_flush_caches_via_world() {
+        let mut world = crate::World::builder()
+            .memory_budget(4 * 1024 * 1024)
+            .build()
+            .unwrap();
+
+        // Spawn some entities to trigger pool allocations.
+        for _ in 0..100 {
+            world.spawn((0u32,));
+        }
+
+        let used_before = world.stats().pool_used.unwrap();
+        assert!(used_before > 0);
+
+        // flush_pool_caches should eagerly flush the calling thread's TCache.
+        world.flush_pool_caches();
+
+        // used_bytes should have decreased (TCache blocks returned to global).
+        let used_after = world.stats().pool_used.unwrap();
+        assert!(
+            used_after <= used_before,
+            "flush should not increase used: before={used_before}, after={used_after}"
+        );
+    }
+
+    #[test]
+    fn tcache_rapid_fill_spill_cycles() {
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        // Repeated fill-spill cycles to stress the shift-down compaction.
+        for _ in 0..10 {
+            let mut ptrs = Vec::new();
+            for _ in 0..=TCACHE_CAPACITY {
+                ptrs.push(pool.allocate(layout).unwrap());
+            }
+            // Deallocate all — triggers spill when bin fills.
+            for ptr in ptrs {
+                unsafe { pool.deallocate(ptr, layout) };
+            }
+        }
+
+        // All blocks should be recoverable after flush.
+        pool.flush_caches();
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn tcache_epoch_flush_dealloc_cached_blocks() {
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        // Allocate blocks then deallocate (blocks enter TCache via dealloc path).
+        let mut ptrs = Vec::new();
+        for _ in 0..10 {
+            ptrs.push(pool.allocate(layout).unwrap());
+        }
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout) };
+        }
+
+        let used_before = pool.used().unwrap();
+
+        // Bump epoch — next op should flush dealloc-cached blocks too.
+        pool.flush_caches();
+
+        let used_after = pool.used().unwrap();
+        assert_eq!(
+            used_after, 0,
+            "epoch flush should return all blocks: used={used_after}"
+        );
+        assert!(used_after <= used_before);
+    }
+
+    #[test]
+    fn tcache_thread_exit_with_overflow_blocks() {
+        let pool = Arc::new(SlabPool::new(1024 * 1024, HugePages::Off).unwrap());
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+
+        // Exhaust class 0 so refill overflows to class 1.
+        let proportion_sum: usize = PROPORTIONS.iter().sum();
+        let class0_blocks = 1024 * 1024 * PROPORTIONS[0] / proportion_sum / SIZE_CLASSES[0];
+
+        let mut burn = Vec::new();
+        for _ in 0..class0_blocks {
+            burn.push(pool.allocate(layout_small).unwrap());
+        }
+
+        // Spawn a thread that gets overflow blocks in its TCache.
+        let pool2 = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let p = pool2.allocate(layout_small).unwrap();
+            unsafe { pool2.deallocate(p, layout_small) };
+            // Thread exits — TCache::drop returns overflow blocks to correct class.
+        })
+        .join()
+        .unwrap();
+
+        // Clean up burn blocks.
+        for ptr in burn {
+            unsafe { pool.deallocate(ptr, layout_small) };
+        }
+        pool.flush_caches();
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn tcache_epoch_flush_under_contention() {
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        std::thread::scope(|s| {
+            // 4 threads doing alloc/dealloc.
+            for _ in 0..4 {
+                let pool = Arc::clone(&pool);
+                s.spawn(move || {
+                    for _ in 0..200 {
+                        let ptr = pool.allocate(layout).unwrap();
+                        unsafe { pool.deallocate(ptr, layout) };
+                    }
+                });
+            }
+
+            // Main thread bumps epoch periodically.
+            for _ in 0..5 {
+                pool.flush_caches();
+                std::thread::yield_now();
+            }
+        });
     }
 }
 

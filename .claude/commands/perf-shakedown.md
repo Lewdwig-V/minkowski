@@ -74,7 +74,9 @@ Reference numbers from `cargo bench -p minkowski-bench` on the dev machine. Use 
 | `changeset/new_drop_empty` | 10 ns | — | Per-transaction allocation cost |
 | `simple_insert/batch` | 1.74 ms | 174 ns | Direct spawn |
 | `simple_insert/changeset` | 2.58 ms | 258 ns | Changeset spawn ~1.5x direct |
+| `simple_insert/pool` | 8.83 ms | 883 ns | Slab pool spawn (dominated by entity/archetype overhead) |
 | `add_remove/add_remove` | 1.30 ms | 130 ns | Archetype migration cost |
+| `add_remove/pool` | 1.35 ms | 135 ns | Slab pool add/remove with TCache (6x improvement over pre-TCache) |
 | `heavy_compute/sequential` | 9.3 µs | 9.3 ns | 4x4 matrix inversion |
 | `heavy_compute/parallel` | 402 µs | — | Rayon overhead dominates at 1K entities |
 | `schedule/5_systems_10k` | 30.5 µs | — | Access conflict detection + dispatch |

@@ -5,4 +5,4 @@ rustflags = ["-C", "target-cpu=native"]
 rustflags = ["-C", "target-cpu=native"]
 
 [alias]
-cov = "llvm-cov --workspace --exclude minkowski-py"
+cov = "llvm-cov --workspace --exclude minkowski-py --exclude minkowski-bench"
