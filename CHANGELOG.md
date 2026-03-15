@@ -4,7 +4,7 @@
 
 ### Query Planner (`minkowski`)
 
-- **Volcano-model query planner** — `QueryPlanner` compiles queries into cost-optimized execution plans with automatic index selection. Logical plan nodes (`Scan`, `IndexLookup`, `Filter`, `HashJoin`, `NestedLoopJoin`, `Aggregate`) are lowered to vectorized execution nodes (`ChunkedScan`, `IndexGather`, `SIMDFilter`, `PartitionedHashJoin`, `StreamAggregate`) via `lower_to_vectorized()`. Cost model tracks `rows` (estimated cardinality) and `cpu` (dimensionless relative units).
+- **Morsel-driven query planner** — `QueryPlanner` compiles queries into cost-optimized execution plans with automatic index selection. Logical plan nodes (`Scan`, `IndexLookup`, `Filter`, `HashJoin`, `NestedLoopJoin`, `Aggregate`) are lowered to vectorized execution nodes (`ChunkedScan`, `IndexGather`, `SIMDFilter`, `PartitionedHashJoin`, `StreamAggregate`) via `lower_to_vectorized()`. Cost model tracks `rows` (estimated cardinality) and `cpu` (dimensionless relative units).
 - **Allocation-free query execution** — `for_each(&mut World, callback)` iterates scan-only plans with zero intermediate allocation. `for_each_raw(&World, callback)` provides a transactional read-only path with no tick advancement. `execute(&mut World)` collects entities into a plan-owned scratch buffer (supports joins).
 - **BTree and Hash index-driven access** — `add_btree_index` / `add_hash_index` register live `Arc<BTreeIndex<T>>` / `Arc<HashIndex<T>>` with the planner. Type-erased lookup closures are pre-bound at plan-build time and invoked at execution time. `IndexGather` nodes bypass full archetype scans — O(log n + k) for BTree range, O(1) for Hash eq.
 - **Spatial predicates** — `Predicate::within_radius`, `Predicate::within_aabb`, `Predicate::intersects` with dimension-agnostic coordinate vectors. `SpatialIndex::supports()` for capability discovery. `add_spatial_index_with_lookup` registers execution-time spatial query closures.
@@ -35,7 +35,7 @@
 
 ### Examples
 
-- **`planner`** — Volcano query planner demo: cost-based plans, index selection, joins, `for_each`/`for_each_raw`, subscription queries, aggregates, `explain()` output.
+- **`planner`** — Morsel-driven query planner demo: cost-based plans, index selection, joins, `for_each`/`for_each_raw`, subscription queries, aggregates, `explain()` output.
 - **`materialized_view`** — Materialized views: cached debounced subscription queries, change detection, invalidation, multi-index subscriptions, dynamic policy switching.
 - **`index`** — Updated with planned query section demonstrating `QueryPlanner` + `IndexDriver` execution for BTree range and Hash eq queries.
 - **`profile_changeset`** — Profiling harness comparing `QueryWriter` vs `QueryMut` throughput (10K entities, 1K iterations).

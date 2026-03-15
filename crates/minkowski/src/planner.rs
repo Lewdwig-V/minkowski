@@ -3393,7 +3393,7 @@ enum SpatialLookupResult {
     NoIndex,
 }
 
-/// Volcano-model query planner that composes index lookups, filters, and joins
+/// Morsel-driven query planner that composes index lookups, filters, and joins
 /// into cost-optimized execution plans.
 ///
 /// The planner operates on metadata only — it never touches actual component

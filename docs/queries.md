@@ -25,7 +25,7 @@ world.query::<(&mut Pos, &Vel)>().for_each_chunk(|(positions, velocities)| {
 
 ## Query Planner
 
-`QueryPlanner` compiles queries into cost-optimized execution plans using a [Volcano][volcano]-model optimizer with automatic index selection, then executes them against the live world. Plans are vectorized by default — each node processes data in morsel-sized batches mapped to `for_each_chunk`, enabling SIMD auto-vectorization. Three execution modes: `execute(&mut World) -> &[Entity]` (collects into plan-owned scratch buffer, supports joins), `for_each(&mut World, callback)` (zero-allocation scan iteration), and `for_each_raw(&World, callback)` (transactional read-only path).
+`QueryPlanner` compiles queries into cost-optimized execution plans using a [morsel-driven][morsel-driven] push-based optimizer with automatic index selection, then executes them against the live world. Plans compile to reusable closures that process data in morsel-sized batches over 64-byte-aligned column slices, enabling SIMD auto-vectorization. Three execution modes: `execute(&mut World) -> &[Entity]` (collects into plan-owned scratch buffer, supports joins), `for_each(&mut World, callback)` (zero-allocation scan iteration), and `for_each_raw(&World, callback)` (transactional read-only path).
 
 ```rust
 use minkowski::{QueryPlanner, Predicate, JoinKind};
@@ -101,4 +101,4 @@ for &entity in view.entities() {
 <!-- Link definitions -->
 [rayon]: https://github.com/rayon-rs/rayon
 [simd]: https://en.wikipedia.org/wiki/Single_instruction,_multiple_data
-[volcano]: https://en.wikipedia.org/wiki/Volcano_(query_processing)
+[morsel-driven]: https://db.in.tum.de/~leis/papers/morsels.pdf

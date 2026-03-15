@@ -35,7 +35,7 @@ cargo run -p minkowski-examples --example blob --release   # Blob offloading: Bl
 cargo run -p minkowski-examples --example retention --release   # Retention: Expiry countdown + RetentionReducer, dispatch-count TTL, progressive despawn (5 entities, 8 frames)
 cargo run -p minkowski-examples --example pool --release   # Memory pool: TigerBeetle-style WorldBuilder with 16 MB budget, try_spawn until exhaustion, pool stats (131K entities)
 cargo run -p minkowski-examples --example profile_changeset --release   # Profiling harness: QueryWriter vs QueryMut flamegraph capture (10K entities, 1K iterations)
-cargo run -p minkowski-examples --example planner --release   # Volcano query planner: cost-based plans, index selection, joins, execute/for_each/for_each_raw (1K entities, 2 archetypes)
+cargo run -p minkowski-examples --example planner --release   # Morsel-driven query planner: cost-based plans, index selection, joins, execute/for_each/for_each_raw (1K entities, 2 archetypes)
 cargo run -p minkowski-examples --example materialized_view --release   # Materialized views: cached debounced subscription queries, change detection, invalidation (200 entities, 7 demos)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
