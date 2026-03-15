@@ -103,10 +103,10 @@ pub use index::{
 };
 pub use minkowski_derive::Table;
 pub use planner::{
-    AggregateExpr, AggregateOp, AggregateResult, CardinalityConstraint, Cost, IndexKind, Indexed,
-    JoinKind, PlanExecError, PlanNode, PlanWarning, PlannerError, Predicate, QueryPlanResult,
-    QueryPlanner, SpatialLookupFn, SpatialPredicate, SubscriptionBuilder, SubscriptionError,
-    TablePlanner,
+    AggregateExpr, AggregateOp, AggregateResult, AsEntityRef, CardinalityConstraint, Cost,
+    IndexKind, Indexed, JoinKind, PlanExecError, PlanNode, PlanWarning, PlannerError, Predicate,
+    QueryPlanResult, QueryPlanner, SpatialLookupFn, SpatialPredicate, SubscriptionBuilder,
+    SubscriptionError, TablePlanner,
 };
 pub use pool::{HugePages, PoolExhausted};
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
