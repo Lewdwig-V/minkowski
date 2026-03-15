@@ -985,9 +985,11 @@ impl SlabPool {
 
     /// Flush the current thread's TCache back to the global pool.
     /// Test-only: needed for exact used_bytes accounting in tests.
+    /// Under loom, TCache is bypassed — this is a no-op.
     #[cfg(test)]
     #[allow(clippy::unused_self)]
     fn flush_current_thread_cache(&self) {
+        #[cfg(not(loom))]
         TCACHE.with(|cell| {
             // SAFETY: same no-reentrancy argument as allocate/deallocate.
             let cache = unsafe { &mut *cell.get() };
