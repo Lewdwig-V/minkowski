@@ -47,39 +47,56 @@ Determine which files to analyze:
 - `entity.rs` — `EntityAllocator::reserve` (atomic), `alloc`, `materialize_reserved`
 
 **Query planner & executor (plan execution)** — `crates/minkowski/src/`
-- `planner.rs` — `ExecNode::execute` (scan, filter, join dispatch), `scan_matching_entities` (archetype scan + entity collection), `ProbeSet::contains` (hash join probe), `lower_to_executable` (closure tree → exec tree lowering)
+- `planner.rs` — `CompiledForEach` / `CompiledForEachRaw` closures (per-entity callback dispatch), `passes_change_filter` (archetype-level `Changed<T>` tick comparison), `ScratchBuffer::sorted_intersection` (join entity merge), `EntityCollector` closures (join left/right collection), `IndexDriver` lookup closures (pre-bound `eq_lookup_fn` / `range_lookup_fn` for `IndexGather`), `make_extractor` (per-entity `world.get` in aggregates), `AggregateAccum::feed` / `feed_count` (accumulator hot loop), `lower_to_vectorized` (plan build, not execution — but called on every `ScanBuilder::build()`)
+
+**Materialized views (per-refresh)** — `crates/minkowski/src/`
+- `view.rs` — `MaterializedView::refresh` (world_id check + debounce gate + `plan.execute` + `extend_from_slice` cache copy)
 
 **Transaction (commit path)** — `crates/minkowski/src/`
 - `transaction.rs` — `try_commit`, `begin`, tick validation, changeset apply
 - `lock_table.rs` — `acquire`, `release`
 
-### Benchmark Baselines (as of v1.1.0)
+### Benchmark Baselines (as of v1.2.0)
 
-Reference numbers from `cargo bench -p minkowski-bench` on the dev machine. Use these to contextualize findings — a "PERF-CRITICAL" on a path that takes 1.6µs total is less urgent than one on a 250µs path.
+Reference numbers from `cargo bench -p minkowski-bench` on the dev machine. Use these to contextualize findings — a "PERF-CRITICAL" on a path that takes 1.5µs total is less urgent than one on a 250µs path.
 
 | Benchmark | Time | Per-entity | Notes |
 |---|---|---|---|
-| `simple_iter/for_each_chunk` | 1.6 µs | 0.16 ns | SIMD-friendly baseline |
-| `simple_iter/for_each` | 14.8 µs | 1.48 ns | 9x slower — per-element callback overhead |
-| `reducer/query_mut_10k` | 11 µs | 1.1 ns | Direct mutation baseline |
-| `reducer/query_mut_chunk_10k` | 1.7 µs | 0.17 ns | Chunk iteration ≈ raw iteration |
-| `reducer/query_writer_10k` | 96 µs | 9.6 ns | **~9x query_mut** — buffered write overhead |
-| `reducer/dynamic_for_each_10k` | 176 µs | 17.6 ns | **~16x query_mut** — identity-hashed lookup + buffered writes |
-| `reducer/dynamic_for_each_chunk_10k` | 176 µs | 17.6 ns | Chunk helps less for dynamic (write-back dominates) |
-| `changeset/record_10k_inserts` | 193 µs | 19.3 ns | Arena alloc + Vec push (recording only) |
-| `changeset/apply_10k_overwrites` | 77 µs | 7.7 ns | Entity lookup + memcpy + tick mark (apply only) |
-| `changeset/record_apply_10k` | 307 µs | 30.7 ns | Full round-trip (record + apply) |
-| `changeset/new_drop_empty` | 11 ns | — | Per-transaction allocation cost |
-| `simple_insert/batch` | 2.9 ms | 290 ns | Direct spawn |
-| `simple_insert/changeset` | 4.4 ms | 440 ns | Changeset spawn ~1.5x direct |
-| `add_remove/add_remove` | 1.6 ms | 162 ns | Archetype migration cost |
+| `simple_iter/for_each_chunk` | 1.5 µs | 0.15 ns | SIMD-friendly baseline |
+| `simple_iter/for_each` | 14.5 µs | 1.45 ns | ~10x slower — per-element callback overhead |
+| `simple_iter/par_for_each` | 289 µs | — | Rayon overhead dominates at 10K entities |
+| `reducer/query_mut_10k` | 8.6 µs | 0.86 ns | Direct mutation baseline |
+| `reducer/query_mut_chunk_10k` | 1.5 µs | 0.15 ns | Chunk iteration ≈ raw iteration |
+| `reducer/query_writer_10k` | 93 µs | 9.3 ns | **~11x query_mut** — buffered write overhead |
+| `reducer/dynamic_for_each_10k` | 132 µs | 13.2 ns | **~15x query_mut** — identity-hashed lookup + buffered writes |
+| `reducer/dynamic_for_each_chunk_10k` | 125 µs | 12.5 ns | Chunk helps less for dynamic (write-back dominates) |
+| `changeset/record_10k_inserts` | 70 µs | 7.0 ns | Arena alloc + Vec push (recording only) |
+| `changeset/apply_10k_overwrites` | 123 µs | 12.3 ns | Entity lookup + memcpy + tick mark (apply only) |
+| `changeset/record_apply_10k` | 148 µs | 14.8 ns | Full round-trip (record + apply) |
+| `changeset/new_drop_empty` | 10 ns | — | Per-transaction allocation cost |
+| `simple_insert/batch` | 1.74 ms | 174 ns | Direct spawn |
+| `simple_insert/changeset` | 2.58 ms | 258 ns | Changeset spawn ~1.5x direct |
+| `add_remove/add_remove` | 1.30 ms | 130 ns | Archetype migration cost |
 | `heavy_compute/sequential` | 9.3 µs | 9.3 ns | 4x4 matrix inversion |
-| `heavy_compute/parallel` | 1.1 ms | — | Rayon overhead dominates at 1K entities |
-| `simple_iter/par_for_each` | 691 µs | — | Rayon overhead dominates at 10K entities |
-| `serialize/snapshot_save` | 502 µs | 502 ns | 1K entities |
-| `serialize/snapshot_load` | 325 µs | 325 ns | 1K entities |
-| `serialize/wal_append` | 1.25 µs | — | Single mutation |
-| `serialize/wal_replay` | 1.76 ms | 1.76 µs | 1K mutations |
+| `heavy_compute/parallel` | 402 µs | — | Rayon overhead dominates at 1K entities |
+| `schedule/5_systems_10k` | 30.5 µs | — | Access conflict detection + dispatch |
+| `serialize/snapshot_save` | 495 µs | 495 ns | 1K entities |
+| `serialize/snapshot_load` | 311 µs | 311 ns | 1K entities |
+| `serialize/wal_append` | 1.22 µs | — | Single mutation |
+| `serialize/wal_replay` | 1.72 ms | 1.72 µs | 1K mutations |
+
+| `planner/scan_for_each_10k` | 9.5 µs | 0.95 ns | Planner scan — ~2.5x `query_for_each` (type-erased dispatch overhead) |
+| `planner/query_for_each_10k` | 3.9 µs | 0.39 ns | Direct `world.query()` baseline for comparison |
+| `planner/btree_range_10pct` | 11.4 µs | 11.4 ns/match | BTree `IndexGather` — 1K entities out of 10K |
+| `planner/hash_eq_1` | 39 ns | — | Hash `IndexGather` — single entity lookup |
+| `planner/custom_filter_50pct` | 63.4 µs | 12.7 ns | `Predicate::custom` — per-entity `Arc<dyn Fn>` + `world.get()` |
+| `planner/changed_skip_10k` | 6.8 ns | — | `Changed<T>` skip — all archetypes filtered (tick comparison only) |
+| `planner/aggregate_count_sum_10k` | 76.1 µs | 7.6 ns | COUNT + SUM via type-erased extractors |
+| `planner/manual_count_sum_10k` | 5.8 µs | 0.58 ns | Same COUNT + SUM via direct query — **~13x faster** |
+| `planner/execute_collect_10k` | 14.7 µs | 1.47 ns | `execute()` — entity push into scratch buffer |
+
+**Missing benchmark coverage** (no bench exists for these hot paths):
+- `MaterializedView::refresh` (debounce gate + plan execute + cache copy)
 
 ### Regression Guards
 
@@ -110,25 +127,26 @@ Agents should verify these invariants are maintained when modifying the listed f
    `DynamicCtx::write` and `DynamicResolved::lookup` must remain `#[inline]`.
    Benchmark: `reducer/dynamic_for_each_10k`.
 
-5. **Query planner ownership lowering** (`planner.rs`):
-   `lower_to_executable` must take `ClosureNode` by value (not `&ClosureNode`) to avoid
-   `Arc::clone` on every scan_fn/filter_fn/lookup_fn during the lowering pass.
-   `find_best_index` must return `&IndexDescriptor` (not `IndexDescriptor` by clone).
-   Index snapshot closures must return `Arc<[Entity]>` (not `Vec<Entity>` clone).
+5. **Query planner `#[inline]` on cost accessors** (`planner.rs`):
+   `Cost::rows`, `Cost::cpu`, `Cost::total`, `PlanNode::cost`, `VecExecNode::cost`
+   must remain `#[inline]`. These are called during plan build and cost comparison.
    Benchmark: none yet — exercise via `cargo run -p minkowski-examples --example planner --release`.
 
-6. **Query planner `#[inline]` on accessors** (`planner.rs`):
-   `Cost::rows`, `Cost::cpu`, `Cost::total`, `PlanNode::cost`, `PlanNode::estimated_rows`,
-   `VecExecNode::cost`, `ProbeSet::contains` must remain `#[inline]`.
-
-7. **Query planner `PredicateKind` is fieldless for `Eq`/`Range`** (`planner.rs`):
+6. **Query planner `PredicateKind` is fieldless for `Eq`/`Range`** (`planner.rs`):
    `PredicateKind::Eq` and `PredicateKind::Range` must remain unit variants (no `String`
    payload). The Debug impl uses `component_name` from the parent `Predicate` struct.
    Adding payload strings back would re-introduce 2 heap allocations per predicate.
 
-8. **Query planner IndexGather sort uses pre-computed keys** (`planner.rs`):
-   The `IndexGather` execution path must pre-compute archetype IDs into a `Vec<(usize, Entity)>`
-   before sorting, giving O(N) entity_locations lookups instead of O(N log N).
+7. **Query planner `IndexDriver` uses pre-bound lookup closures** (`planner.rs`):
+   `eq_lookup_fn` / `range_lookup_fn` / `all_entities_fn` are captured at plan-build
+   time (Phase 3 `IndexDriver` construction), not resolved at execution time. This
+   avoids per-execution `dyn Any` downcasting. The lookup value is pre-bound into the
+   closure via `Predicate`'s `lookup_value` field.
+
+8. **`ScratchBuffer::sorted_intersection` avoids reallocation** (`planner.rs`):
+   Join entity merge uses in-place sort + dedup on the existing `Vec<Entity>`, avoiding
+   temporary `HashSet` allocation. The sorted intersection result is appended to the
+   same buffer via `copy_within` + `truncate`.
 
 ### Known Bottlenecks (profiled, residual after optimization)
 
@@ -153,11 +171,11 @@ These have been analyzed and are documented here to prevent re-discovery:
 
 5. **Changeset spawn ~1.5x direct** — arena allocation + mutation log overhead on top of the same archetype push work. Inherent to the data-driven mutation model.
 
-6. **Query planner FilterFn is `Arc<dyn Fn>`** — per-entity vtable call in `BatchFilter::execute` prevents SIMD vectorization of filter loops. Inherent to type-erased plan composition — monomorphic filters would require codegen per plan. Annotated with `// PERF:` at the type alias and execution site.
+6. **Query planner `CompiledForEach` is `Box<dyn FnMut>`** — per-entity callback through `&mut dyn FnMut(Entity)` prevents SIMD vectorization. Inherent to type-erased plan composition — the plan is compiled once and re-executed with different callbacks. Custom predicates (`Predicate::custom`) also use `Arc<dyn Fn>` for per-entity filtering. Annotated with `// PERF:` at the type alias.
 
-7. **Query planner `ExecNode::execute` returns `Vec<Entity>` per node** — recursive calls create temporary Vecs at each tree level (3+ allocations for join+filter). An iterator model would avoid this but requires GATs or self-referential types. Annotated with `// PERF:`.
+7. **Aggregate extractors do per-entity `world.get::<T>(entity)`** — `make_extractor` creates a closure that calls `world.get()` per entity per aggregate, which is an entity_locations lookup + archetype column access each time. The scan that drives the aggregate already has column pointers, but plumbing them through the type-erased extractor interface would couple aggregates to archetype internals. Non-trivial to fix without breaking the clean `AggregateExpr` API.
 
-8. **Query planner `PartitionedHashJoin` allocates HashSets per execution** — creates P `HashSet`s every `execute()` call. Caching across calls would require mutable `ExecNode`, breaking the `&self` execute signature. Annotated with `// PERF:`.
+8. **`MaterializedView::refresh` copies the entity list** — `extend_from_slice` from the plan's scratch buffer into the view's owned `Vec<Entity>` on every re-materialization. Borrowing the scratch directly would tie `entities()` lifetime to `&mut self` from refresh, breaking the common pattern of `view.refresh(); for e in view.entities() { world.get(e) }`. The copy is O(N) where N is result size, typically small for subscription queries.
 
 ## Phase 2 — Analysis
 
@@ -254,8 +272,9 @@ After all 4 agents complete, aggregate their reports into the output format belo
    - `transaction` — 3 transaction strategies (100 entities)
    - `scheduler` — conflict detection + batch scheduling (6 systems)
    - `reducer` — all reducer handle types + structural mutations
-   - `index` — B-tree + hash index lookups (200 entities)
-   - `planner` — query planner: scan, filter, join execution (1K entities)
+   - `index` — B-tree + hash index lookups + planned queries (200 entities)
+   - `planner` — query planner: scan, filter, join, subscription, aggregate execution (1K entities)
+   - `materialized_view` — MaterializedView: debounced subscription refresh (200 entities)
 
 ## Output Format
 

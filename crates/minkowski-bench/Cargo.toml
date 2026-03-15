@@ -51,3 +51,7 @@ harness = false
 [[bench]]
 name = "changeset_micro"
 harness = false
+
+[[bench]]
+name = "planner"
+harness = false

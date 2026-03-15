@@ -34,6 +34,13 @@ pub struct Velocity {
     pub dz: f32,
 }
 
+/// Scalar score -- 4 bytes. Supports Ord + Hash for index benchmarks.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize,
+)]
+#[repr(C)]
+pub struct Score(pub u32);
+
 /// Spawn a world with `n` entities, each with (Transform, Position, Rotation, Velocity).
 pub fn spawn_world(n: usize) -> minkowski::World {
     let mut world = minkowski::World::new();
