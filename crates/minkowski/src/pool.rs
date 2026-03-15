@@ -550,14 +550,14 @@ impl SlabPool {
 
     /// Number of blocks in `class` currently serving overflow requests
     /// from smaller classes.
-    #[expect(dead_code)]
-    pub(crate) fn overflow_active(&self, class: usize) -> u64 {
+    #[cfg(test)]
+    fn overflow_active(&self, class: usize) -> u64 {
         self.overflow_active[class].load(Ordering::Relaxed) as u64
     }
 
     /// Cumulative count of overflow allocations served by `class`.
-    #[expect(dead_code)]
-    pub(crate) fn overflow_total(&self, class: usize) -> u64 {
+    #[cfg(test)]
+    fn overflow_total(&self, class: usize) -> u64 {
         self.overflow_total[class].load(Ordering::Relaxed) as u64
     }
 
