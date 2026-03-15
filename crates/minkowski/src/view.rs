@@ -155,8 +155,7 @@ impl MaterializedView {
     /// same one the plan was built from. This check runs on every call,
     /// including debounce-suppressed ones.
     ///
-    /// Returns [`PlanExecError::JoinNotSupported`] if the wrapped plan
-    /// contains joins. Use `plan.execute()` directly for join plans.
+    /// Supports both scan-only and join plans.
     pub fn refresh(&mut self, world: &mut World) -> Result<bool, PlanExecError> {
         // World identity check runs unconditionally — even suppressed calls
         // must not silently serve stale data from a different world.

@@ -119,14 +119,18 @@ impl fmt::Display for PlannerError {
 
 impl std::error::Error for PlannerError {}
 
-/// Error returned by plan execution methods (`execute`, `for_each`,
-/// `for_each_raw`, `execute_aggregates`, `execute_aggregates_raw`).
+/// Error returned by plan execution methods (`execute`, `execute_raw`,
+/// `for_each`, `for_each_raw`, `execute_aggregates`, `execute_aggregates_raw`).
 #[derive(Clone, Debug)]
 pub enum PlanExecError {
     /// Plan was built from a different World.
     WorldMismatch(WorldMismatch),
     /// `for_each` / `for_each_raw` called on a plan that contains joins.
     /// Use `execute()` instead, which collects entities into a scratch buffer.
+    ///
+    /// **Deprecated**: join plans are now supported by all execution methods.
+    /// This variant is retained for backward compatibility but is no longer
+    /// returned by any method in this crate.
     JoinNotSupported,
 }
 
@@ -1450,6 +1454,53 @@ impl QueryPlanResult {
         out
     }
 
+    /// Run join collectors into the scratch buffer.
+    ///
+    /// The scratch buffer is cleared before use. Join steps are applied
+    /// sequentially: left collector populates the initial set, then each
+    /// step collects right-side entities and intersects (inner join) or
+    /// preserves left (left join). The result is left in the scratch buffer.
+    ///
+    /// This is pure computation over `&World` — the scratch is plan-local
+    /// and invisible to the conflict model. Both the mutable (`execute`)
+    /// and read-only (`execute_raw`, `for_each_raw`) paths use this.
+    fn run_join(&mut self, world: &World) {
+        let tick = self.last_read_tick;
+        let join = self
+            .join_exec
+            .as_mut()
+            .expect("run_join called without join_exec");
+        let scratch = self
+            .scratch
+            .as_mut()
+            .expect("run_join requires a scratch buffer");
+        scratch.clear();
+
+        // Collect initial left-side entities.
+        (join.left_collector)(world, tick, scratch);
+
+        // Apply each join step. After each step the result becomes the
+        // left side for the next step, enabling A JOIN B JOIN C chains.
+        for step in &mut join.steps {
+            let left_len = scratch.len();
+            (step.right_collector)(world, tick, scratch);
+            match step.join_kind {
+                JoinKind::Inner => {
+                    let match_count = scratch.sorted_intersection(left_len).len();
+                    if match_count > 0 {
+                        let total = scratch.entities.len();
+                        scratch.entities.copy_within(total - match_count.., 0);
+                    }
+                    scratch.entities.truncate(match_count);
+                }
+                JoinKind::Left => {
+                    // Keep only left entities (discard right).
+                    scratch.entities.truncate(left_len);
+                }
+            }
+        }
+    }
+
     /// Execute the plan against a live world, returning matching entities.
     ///
     /// For join plans, entities are collected from both sides into an internal
@@ -1473,41 +1524,18 @@ impl QueryPlanResult {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
-        let scratch = self
-            .scratch
-            .as_mut()
-            .expect("execute() requires a plan with a scratch buffer");
-        scratch.clear();
-        let tick = self.last_read_tick;
 
-        if let Some(join) = &mut self.join_exec {
-            // Collect initial left-side entities.
-            (join.left_collector)(&*world, tick, scratch);
-
-            // Apply each join step. After each step the result becomes the
-            // left side for the next step, enabling A JOIN B JOIN C chains.
-            for step in &mut join.steps {
-                let left_len = scratch.len();
-                (step.right_collector)(&*world, tick, scratch);
-                match step.join_kind {
-                    JoinKind::Inner => {
-                        let match_count = scratch.sorted_intersection(left_len).len();
-                        if match_count > 0 {
-                            let total = scratch.entities.len();
-                            scratch.entities.copy_within(total - match_count.., 0);
-                        }
-                        scratch.entities.truncate(match_count);
-                    }
-                    JoinKind::Left => {
-                        // Keep only left entities (discard right).
-                        scratch.entities.truncate(left_len);
-                    }
-                }
-            }
+        if self.join_exec.is_some() {
+            self.run_join(&*world);
             self.last_read_tick = world.next_tick();
-            Ok(scratch.as_slice())
+            Ok(self.scratch.as_ref().unwrap().as_slice())
         } else if let Some(compiled) = &mut self.compiled_for_each {
-            // Scan-only plan: use the compiled scan closure to collect entities.
+            let scratch = self
+                .scratch
+                .as_mut()
+                .expect("execute() requires a plan with a scratch buffer");
+            scratch.clear();
+            let tick = self.last_read_tick;
             compiled(&*world, tick, &mut |entity: Entity| {
                 scratch.push(entity);
             });
@@ -1521,19 +1549,66 @@ impl QueryPlanResult {
         }
     }
 
-    /// Execute the compiled scan, calling `callback` for each matching entity.
+    /// Execute the plan with read-only world access, returning matching entities.
+    ///
+    /// Like [`execute`](Self::execute) but takes `&World` instead of `&mut World`.
+    /// No tick advancement, no query cache mutation. Safe for use inside
+    /// transactions where only `&World` is available.
+    ///
+    /// Supports both scan-only and join plans. Join execution uses the plan's
+    /// internal scratch buffer — this is pure computation, invisible to the
+    /// conflict model. The scratch is plan-local and ephemeral: it exists for
+    /// the duration of the join and is never observable by other reducers.
+    ///
+    /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
+    /// same World this plan was built from.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the plan has no scratch buffer (should not happen for plans
+    /// built via [`ScanBuilder::build`]).
+    pub fn execute_raw(&mut self, world: &World) -> Result<&[Entity], PlanExecError> {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
+        }
+
+        if self.join_exec.is_some() {
+            self.run_join(world);
+            Ok(self.scratch.as_ref().unwrap().as_slice())
+        } else if let Some(compiled) = &mut self.compiled_for_each_raw {
+            let scratch = self
+                .scratch
+                .as_mut()
+                .expect("execute_raw() requires a plan with a scratch buffer");
+            scratch.clear();
+            let tick = self.last_read_tick;
+            compiled(world, tick, &mut |entity: Entity| {
+                scratch.push(entity);
+            });
+            Ok(scratch.as_slice())
+        } else {
+            panic!(
+                "execute_raw() called on a plan with no join executor and no compiled scan — \
+                 this indicates a bug in plan compilation"
+            );
+        }
+    }
+
+    /// Execute the plan, calling `callback` for each matching entity.
     ///
     /// For scan-only plans (no joins) without a spatial index driver, this
     /// compiles to archetype iteration with no intermediate allocation.
     /// When a spatial driver is present, the lookup function allocates
     /// a candidate list per call.
     ///
+    /// For join plans, entities are materialised into the plan's internal
+    /// scratch buffer first (sorted intersection for inner joins, left-side
+    /// preservation for left joins), then the callback is called for each
+    /// result entity. The materialisation is invisible to the conflict model —
+    /// the scratch is plan-local computation, not shared state.
+    ///
     /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
     /// same World this plan was built from.
-    ///
-    /// Returns `Err(PlanExecError::JoinNotSupported)` if the plan contains
-    /// joins. Use [`execute`](Self::execute) instead, which collects entities
-    /// into a scratch buffer.
     pub fn for_each(
         &mut self,
         world: &mut World,
@@ -1542,26 +1617,41 @@ impl QueryPlanResult {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
-        let Some(compiled) = self.compiled_for_each.as_mut() else {
-            return Err(PlanExecError::JoinNotSupported);
-        };
-        let tick = self.last_read_tick;
-        compiled(&*world, tick, &mut callback);
-        self.last_read_tick = world.next_tick();
+        if self.join_exec.is_some() {
+            self.run_join(&*world);
+            for &entity in self.scratch.as_ref().unwrap().as_slice() {
+                callback(entity);
+            }
+            self.last_read_tick = world.next_tick();
+        } else if let Some(compiled) = self.compiled_for_each.as_mut() {
+            let tick = self.last_read_tick;
+            compiled(&*world, tick, &mut callback);
+            self.last_read_tick = world.next_tick();
+        } else {
+            panic!(
+                "for_each() called on a plan with no join executor and no compiled scan — \
+                 this indicates a bug in plan compilation"
+            );
+        }
         Ok(())
     }
 
-    /// Execute the compiled scan with read-only world access.
+    /// Execute the plan with read-only world access.
     ///
     /// For use inside transactions where only `&World` is available.
     /// No query cache mutation, no tick advancement. Requires the plan's
     /// query to be `ReadOnlyWorldQuery`.
     ///
+    /// For scan-only plans this is a streaming pass with no intermediate
+    /// allocation. For join plans, entities are materialised into the plan's
+    /// internal scratch buffer before being streamed through the callback.
+    /// The scratch is plan-local computation — ephemeral, thread-local, and
+    /// invisible to the transaction's conflict model. This is the same
+    /// principle as morsel-style pipeline-internal buffers: they hold data
+    /// during execution but are not observable outside the pipeline.
+    ///
     /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
     /// same World this plan was built from.
-    ///
-    /// Returns `Err(PlanExecError::JoinNotSupported)` if the plan contains
-    /// joins. Use [`execute`](Self::execute) instead.
     pub fn for_each_raw(
         &mut self,
         world: &World,
@@ -1570,11 +1660,20 @@ impl QueryPlanResult {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
-        let Some(compiled) = self.compiled_for_each_raw.as_mut() else {
-            return Err(PlanExecError::JoinNotSupported);
-        };
-        let tick = self.last_read_tick;
-        compiled(world, tick, &mut callback);
+        if self.join_exec.is_some() {
+            self.run_join(world);
+            for &entity in self.scratch.as_ref().unwrap().as_slice() {
+                callback(entity);
+            }
+        } else if let Some(compiled) = self.compiled_for_each_raw.as_mut() {
+            let tick = self.last_read_tick;
+            compiled(world, tick, &mut callback);
+        } else {
+            panic!(
+                "for_each_raw() called on a plan with no join executor and no compiled scan — \
+                 this indicates a bug in plan compilation"
+            );
+        }
         Ok(())
     }
 
@@ -1645,38 +1744,15 @@ impl QueryPlanResult {
                     }
                 }
             });
-        } else if let Some(join) = &mut self.join_exec {
-            // Join plans: collect entities first then aggregate per-entity.
+        } else if self.join_exec.is_some() {
+            // Join plans: materialise into scratch, then aggregate per-entity.
+            self.run_join(&*world);
             let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
                 .aggregate_exprs
                 .iter()
                 .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
                 .collect();
-            let scratch = self
-                .scratch
-                .as_mut()
-                .expect("aggregate on join plan requires scratch buffer");
-            scratch.clear();
-
-            (join.left_collector)(&*world, tick, scratch);
-            for step in &mut join.steps {
-                let left_len = scratch.len();
-                (step.right_collector)(&*world, tick, scratch);
-                match step.join_kind {
-                    JoinKind::Inner => {
-                        let match_count = scratch.sorted_intersection(left_len).len();
-                        if match_count > 0 {
-                            let total = scratch.entities.len();
-                            scratch.entities.copy_within(total - match_count.., 0);
-                        }
-                        scratch.entities.truncate(match_count);
-                    }
-                    JoinKind::Left => {
-                        scratch.entities.truncate(left_len);
-                    }
-                }
-            }
-            for &entity in scratch.as_slice() {
+            for &entity in self.scratch.as_ref().unwrap().as_slice() {
                 for (i, (op, extractor)) in extractors.iter().enumerate() {
                     if *op == AggregateOp::Count {
                         accums[i].feed_count();
@@ -1757,38 +1833,15 @@ impl QueryPlanResult {
                     }
                 }
             });
-        } else if let Some(join) = &mut self.join_exec {
-            // Join path: collect entities then aggregate per-entity.
+        } else if self.join_exec.is_some() {
+            // Join path: materialise into scratch, then aggregate per-entity.
+            self.run_join(world);
             let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
                 .aggregate_exprs
                 .iter()
                 .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
                 .collect();
-            let scratch = self
-                .scratch
-                .as_mut()
-                .expect("aggregate on join plan requires scratch buffer");
-            scratch.clear();
-
-            (join.left_collector)(world, tick, scratch);
-            for step in &mut join.steps {
-                let left_len = scratch.len();
-                (step.right_collector)(world, tick, scratch);
-                match step.join_kind {
-                    JoinKind::Inner => {
-                        let match_count = scratch.sorted_intersection(left_len).len();
-                        if match_count > 0 {
-                            let total = scratch.entities.len();
-                            scratch.entities.copy_within(total - match_count.., 0);
-                        }
-                        scratch.entities.truncate(match_count);
-                    }
-                    JoinKind::Left => {
-                        scratch.entities.truncate(left_len);
-                    }
-                }
-            }
-            for &entity in scratch.as_slice() {
+            for &entity in self.scratch.as_ref().unwrap().as_slice() {
                 for (i, (op, extractor)) in extractors.iter().enumerate() {
                     if *op == AggregateOp::Count {
                         accums[i].feed_count();
@@ -8092,31 +8145,125 @@ mod tests {
     }
 
     #[test]
-    fn for_each_returns_err_on_join_plan() {
+    fn for_each_supports_join_plan() {
         let mut world = World::new();
-        world.spawn((Score(1), Health(100)));
+        let e = world.spawn((Score(1), Health(100)));
 
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
-        let result = plan.for_each(&mut world, |_| {});
-        assert!(matches!(result, Err(PlanExecError::JoinNotSupported)));
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity))
+            .unwrap();
+        assert_eq!(results, vec![e]);
     }
 
     #[test]
-    fn for_each_raw_returns_err_on_join_plan() {
+    fn for_each_raw_supports_join_plan() {
         let mut world = World::new();
-        world.spawn((Score(1), Health(100)));
+        let e = world.spawn((Score(1), Health(100)));
 
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
-        let result = plan.for_each_raw(&world, |_| {});
-        assert!(matches!(result, Err(PlanExecError::JoinNotSupported)));
+        let mut results = Vec::new();
+        plan.for_each_raw(&world, |entity| results.push(entity))
+            .unwrap();
+        assert_eq!(results, vec![e]);
+    }
+
+    #[test]
+    fn execute_raw_supports_join_plan() {
+        let mut world = World::new();
+        let e = world.spawn((Score(1), Health(100)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+        let result = plan.execute_raw(&world).unwrap();
+        assert_eq!(result, &[e]);
+    }
+
+    #[test]
+    fn execute_raw_scan_only() {
+        let mut world = World::new();
+        let e = world.spawn((Score(42),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        let result = plan.execute_raw(&world).unwrap();
+        assert_eq!(result, &[e]);
+    }
+
+    #[test]
+    fn execute_raw_returns_err_on_wrong_world() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        world_a.spawn((Score(1),));
+        world_b.spawn((Score(2),));
+
+        let planner = QueryPlanner::new(&world_a);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        let result = plan.execute_raw(&world_b);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn execute_raw_does_not_advance_tick() {
+        let mut world = World::new();
+        world.spawn((Score(1),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        // Execute raw twice — both should succeed without tick advancement.
+        let r1 = plan.execute_raw(&world).unwrap();
+        assert_eq!(r1.len(), 1);
+        let r2 = plan.execute_raw(&world).unwrap();
+        assert_eq!(r2.len(), 1);
+    }
+
+    #[test]
+    fn for_each_raw_join_inner_filters_non_matching() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(1), Health(50)));
+        world.spawn((Score(2),)); // no Health — should not appear in join
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+        let mut results = Vec::new();
+        plan.for_each_raw(&world, |entity| results.push(entity))
+            .unwrap();
+        assert_eq!(results, vec![e1]);
+    }
+
+    #[test]
+    fn for_each_raw_join_left_preserves_all_left() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(1), Health(50)));
+        let e2 = world.spawn((Score(2),)); // no Health
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Left)
+            .build();
+        let mut results = Vec::new();
+        plan.for_each_raw(&world, |entity| results.push(entity))
+            .unwrap();
+        results.sort_by_key(|e| e.to_bits());
+        let mut expected = vec![e1, e2];
+        expected.sort_by_key(|e| e.to_bits());
+        assert_eq!(results, expected);
     }
 
     #[test]
