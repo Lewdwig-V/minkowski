@@ -25,7 +25,7 @@ world.query::<(&mut Pos, &Vel)>().for_each_chunk(|(positions, velocities)| {
 
 ## Query Planner
 
-`QueryPlanner` compiles queries into cost-optimized execution plans using a [morsel-driven][morsel-driven] push-based optimizer with automatic index selection, then executes them against the live world. Plans compile to reusable closures that process data in morsel-sized batches over 64-byte-aligned column slices, enabling SIMD auto-vectorization. Three execution modes: `execute(&mut World) -> &[Entity]` (collects into plan-owned scratch buffer, supports joins), `for_each(&mut World, callback)` (zero-allocation scan iteration), and `for_each_raw(&World, callback)` (transactional read-only path).
+`QueryPlanner` compiles queries into cost-optimized execution plans using a [compiled push-based][push-compiled] optimizer with automatic index selection, then executes them against the live world. Plans compile to reusable closures that process data in batches over 64-byte-aligned column slices, enabling SIMD auto-vectorization. Four execution modes: `execute(&mut World) -> &[Entity]` and `execute_raw(&World) -> &[Entity]` (collect into plan-owned scratch buffer, support joins), `for_each(&mut World, callback)` (streaming iteration, supports both scan-only and join plans), and `for_each_raw(&World, callback)` (transactional read-only path, supports both scan-only and join plans).
 
 ```rust
 use minkowski::{QueryPlanner, Predicate, JoinKind};
@@ -98,7 +98,7 @@ for &entity in view.entities() {
 }
 ```
 
-## Relationship to morsel-driven execution and reducers
+## Relationship to compiled execution, morsel scheduling, and reducers
 
 The compiled query pipeline and a [typed reducer](../README.md#typed-reducers) are structurally similar — both are closed-over access declarations that the runtime can reason about externally. The divergence is in what that reasoning is *for*.
 
@@ -106,9 +106,10 @@ In the [morsel-driven model][morsel-driven], the unit of scheduling is a data fr
 
 Reducers solve a different problem: scheduling *multiple independent computations* that may conflict. The `Access` bitset is the consistency boundary — the registry and scheduler use it to prove disjointness or route through a transaction strategy (`Sequential`, `Optimistic`, `Pessimistic`). The type signature does the job that pipeline topology does in the morsel model.
 
-Minkowski's query planner borrows the morsel execution model (push-based compiled closures, batch granularity over 64-byte-aligned column slices) but lives in a world where the *inter-query* problem — "can these two things run concurrently?" — is solved by a completely different mechanism. The planner handles intra-query execution; reducers and transactions handle inter-query isolation. They compose but don't overlap.
+Minkowski's query planner uses the [Neumann compilation model][push-compiled] (push-based compiled closures, batch granularity over 64-byte-aligned column slices) but lives in a world where the *inter-query* problem — "can these two things run concurrently?" — is solved by a completely different mechanism. The planner handles intra-query execution; reducers and transactions handle inter-query isolation. They compose but don't overlap.
 
 <!-- Link definitions -->
 [rayon]: https://github.com/rayon-rs/rayon
 [simd]: https://en.wikipedia.org/wiki/Single_instruction,_multiple_data
+[push-compiled]: https://www.vldb.org/pvldb/vol4/p539-neumann.pdf
 [morsel-driven]: https://db.in.tum.de/~leis/papers/morsels.pdf

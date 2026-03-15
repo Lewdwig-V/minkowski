@@ -12,7 +12,7 @@
 | [Miri][miri] | An interpreter for Rust's Mid-level IR that detects undefined behavior (aliasing violations, use-after-free, data races) at runtime. |
 | [OCC][occ] | Optimistic concurrency control — transactions execute without locks, then validate at commit that no conflicting writes occurred. |
 | [PCC][pcc] | Pessimistic concurrency control — transactions acquire locks before accessing data, preventing conflicts at the cost of potential contention. |
-| [Query planner](queries.md#query-planner) | A morsel-driven push-based optimizer that compiles queries into vectorized execution plans with automatic index selection. |
+| [Query planner](queries.md#query-planner) | A compiled push-based optimizer that compiles queries into execution plans with automatic index selection. Based on the [Neumann compilation model][push-compiled]. |
 | [Rayon][rayon] | A Rust library for data parallelism. Used here for `par_for_each` parallel query iteration. |
 | [Reducer](../README.md#typed-reducers) | A registered closure whose type signature declares its data access. The registry extracts conflict metadata at registration time. |
 | [SIMD][simd] | Single Instruction, Multiple Data — CPU instructions that process multiple values in parallel. Minkowski's 64-byte column alignment enables auto-vectorization. |
@@ -41,4 +41,5 @@
 [cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
 [tsan]: https://clang.llvm.org/docs/ThreadSanitizer.html
 [loom]: https://github.com/tokio-rs/loom
+[push-compiled]: https://www.vldb.org/pvldb/vol4/p539-neumann.pdf
 [wal]: https://en.wikipedia.org/wiki/Write-ahead_logging

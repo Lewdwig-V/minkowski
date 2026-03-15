@@ -1,4 +1,4 @@
-//! Morsel-driven query planner — cost-based plan compilation with index selection,
+//! Compiled push-based query planner — cost-based plan compilation with index selection,
 //! join optimization, subscription queries, constraint validation, and spatial
 //! index execution.
 //!

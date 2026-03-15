@@ -131,10 +131,15 @@ pub enum PlanExecError {
     /// **Deprecated**: join plans are now supported by all execution methods.
     /// This variant is retained for backward compatibility but is no longer
     /// returned by any method in this crate.
+    #[deprecated(
+        since = "1.3.0",
+        note = "join plans are now supported by all execution methods; this variant is never returned"
+    )]
     JoinNotSupported,
 }
 
 impl fmt::Display for PlanExecError {
+    #[allow(deprecated)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlanExecError::WorldMismatch(e) => write!(f, "{e}"),
@@ -147,6 +152,7 @@ impl fmt::Display for PlanExecError {
 }
 
 impl std::error::Error for PlanExecError {
+    #[allow(deprecated)]
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PlanExecError::WorldMismatch(e) => Some(e),
@@ -1462,8 +1468,10 @@ impl QueryPlanResult {
     /// preserves left (left join). The result is left in the scratch buffer.
     ///
     /// This is pure computation over `&World` — the scratch is plan-local
-    /// and invisible to the conflict model. Both the mutable (`execute`)
-    /// and read-only (`execute_raw`, `for_each_raw`) paths use this.
+    /// and invisible to the conflict model. All six execution methods
+    /// (`execute`, `execute_raw`, `for_each`, `for_each_raw`,
+    /// `execute_aggregates`, `execute_aggregates_raw`) delegate here for
+    /// join plans.
     fn run_join(&mut self, world: &World) {
         let tick = self.last_read_tick;
         let join = self
@@ -1645,10 +1653,10 @@ impl QueryPlanResult {
     /// For scan-only plans this is a streaming pass with no intermediate
     /// allocation. For join plans, entities are materialised into the plan's
     /// internal scratch buffer before being streamed through the callback.
-    /// The scratch is plan-local computation — ephemeral, thread-local, and
+    /// The scratch is plan-local computation — ephemeral, plan-owned, and
     /// invisible to the transaction's conflict model. This is the same
-    /// principle as morsel-style pipeline-internal buffers: they hold data
-    /// during execution but are not observable outside the pipeline.
+    /// principle as pipeline-internal buffers: they hold data during execution
+    /// but are not observable outside the pipeline.
     ///
     /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
     /// same World this plan was built from.
@@ -3446,8 +3454,8 @@ enum SpatialLookupResult {
     NoIndex,
 }
 
-/// Morsel-driven query planner that composes index lookups, filters, and joins
-/// into cost-optimized execution plans.
+/// Compiled push-based query planner that composes index lookups, filters, and
+/// joins into cost-optimized execution plans.
 ///
 /// The planner operates on metadata only — it never touches actual component
 /// data during planning. Registering indexes captures type-erased lookup
@@ -8264,6 +8272,133 @@ mod tests {
         let mut expected = vec![e1, e2];
         expected.sort_by_key(|e| e.to_bits());
         assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn for_each_join_advances_tick() {
+        let mut world = World::new();
+        for i in 0..5u32 {
+            world.spawn((Score(i), Health(i * 10)));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(Changed<Score>, &Score)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+        // First call: all changed — should see all 5.
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1).unwrap();
+        assert_eq!(count, 5);
+        // Second call: tick advanced, nothing mutated — should see 0.
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn execute_raw_join_does_not_advance_tick() {
+        let mut world = World::new();
+        for i in 0..5u32 {
+            world.spawn((Score(i), Health(i * 10)));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(Changed<Score>, &Score)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+        // Both calls should see all 5 — execute_raw does not advance tick.
+        let r1 = plan.execute_raw(&world).unwrap();
+        assert_eq!(r1.len(), 5);
+        let r2 = plan.execute_raw(&world).unwrap();
+        assert_eq!(r2.len(), 5);
+    }
+
+    #[test]
+    fn for_each_join_inner_filters_non_matching() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(1), Health(50)));
+        world.spawn((Score(2),)); // no Health — filtered by inner join
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity))
+            .unwrap();
+        assert_eq!(results, vec![e1]);
+    }
+
+    #[test]
+    fn for_each_join_left_preserves_all_left() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(1), Health(50)));
+        let e2 = world.spawn((Score(2),)); // no Health
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Left)
+            .build();
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity))
+            .unwrap();
+        results.sort_by_key(|e| e.to_bits());
+        let mut expected = vec![e1, e2];
+        expected.sort_by_key(|e| e.to_bits());
+        assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn for_each_raw_multi_step_join() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(1), Health(50), Team(0)));
+        world.spawn((Score(2), Health(60))); // no Team — filtered by second join
+        world.spawn((Score(3),)); // no Health — filtered by first join
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+        let mut results = Vec::new();
+        plan.for_each_raw(&world, |entity| results.push(entity))
+            .unwrap();
+        assert_eq!(results, vec![e1]);
+    }
+
+    #[test]
+    fn execute_raw_multi_step_join() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(1), Health(50), Team(0)));
+        world.spawn((Score(2), Health(60))); // no Team
+        world.spawn((Score(3),)); // no Health
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+        let result = plan.execute_raw(&world).unwrap();
+        assert_eq!(result, &[e1]);
+    }
+
+    #[test]
+    fn execute_raw_empty_join_result() {
+        let mut world = World::new();
+        world.spawn((Score(1),)); // no Health — inner join yields empty
+        world.spawn((Score(2),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+        let result = plan.execute_raw(&world).unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]

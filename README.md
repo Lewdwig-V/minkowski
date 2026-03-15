@@ -117,7 +117,7 @@ world.remove::<Health>(e);      // migrates it back
 
 Queries are tuple-typed and cached — `world.query::<(&mut Pos, &Vel)>()` iterates all matching entities with near-zero overhead on repeat calls. `Changed<T>` enables incremental processing, `par_for_each` distributes work across threads, and `for_each_chunk` yields typed slices for SIMD auto-vectorization.
 
-The **query planner** compiles queries into cost-optimized [morsel-driven][morsel-driven] execution plans with automatic index selection. **Subscription queries** guarantee at compile time that every predicate is index-backed. **Materialized views** cache query results with configurable debounce policies.
+The **query planner** compiles queries into cost-optimized [push-based][push-compiled] execution plans with automatic index selection. **Subscription queries** guarantee at compile time that every predicate is index-backed. **Materialized views** cache query results with configurable debounce policies.
 
 [Full documentation →](docs/queries.md)
 
@@ -320,5 +320,5 @@ This project is licensed under the [Mozilla Public License 2.0](https://www.mozi
 [loom]: https://github.com/tokio-rs/loom
 [mmap]: https://en.wikipedia.org/wiki/Mmap
 [tigerbeetle]: https://tigerbeetle.com/
-[morsel-driven]: https://db.in.tum.de/~leis/papers/morsels.pdf
+[push-compiled]: https://www.vldb.org/pvldb/vol4/p539-neumann.pdf
 [wal]: https://en.wikipedia.org/wiki/Write-ahead_logging

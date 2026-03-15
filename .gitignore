@@ -1,7 +1,7 @@
 /target
 **/target
 Cargo.lock
-.claude/settings.local.json
+.claude/**/*.local.*
 .gitconfig
 .gitmodules
 .idea
