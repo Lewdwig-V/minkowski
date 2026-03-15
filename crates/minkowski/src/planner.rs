@@ -1446,6 +1446,12 @@ pub struct QueryPlanResult {
     /// Reusable buffer for row indices in batch execution methods.
     /// Cleared and repopulated on each `for_each_join_chunk` call.
     row_indices: Vec<usize>,
+    /// Component requirements for the direct archetype iteration fast path.
+    /// `Some` when the plan is scan-only with no custom predicates.
+    /// `None` when the plan has joins or custom filter closures.
+    scan_required: Option<FixedBitSet>,
+    /// Changed-component bitset for the direct archetype iteration fast path.
+    scan_changed: FixedBitSet,
 }
 
 impl QueryPlanResult {
@@ -1790,6 +1796,34 @@ impl QueryPlanResult {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
 
+        // Fast path: scan-only plan with no custom predicates.
+        // Walk archetypes directly — no ScratchBuffer, no sort.
+        if let Some(ref required) = self.scan_required {
+            let changed = &self.scan_changed;
+            let tick = self.last_read_tick;
+            let q_required = Q::required_ids(&world.components);
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, changed, tick) {
+                    continue;
+                }
+                if !q_required.is_subset(&arch.component_ids) {
+                    return Err(PlanExecError::ComponentMismatch {
+                        query: std::any::type_name::<Q>(),
+                        archetype_id: arch.id,
+                    });
+                }
+                let fetch = Q::init_fetch(arch, &world.components);
+                for (row, &entity) in arch.entities.iter().enumerate() {
+                    let item = unsafe { Q::fetch(&fetch, row) };
+                    callback(entity, item);
+                }
+            }
+            return Ok(());
+        }
+
         // Phase 1: Populate scratch buffer.
         if self.join_exec.is_some() {
             self.run_join(world);
@@ -1921,6 +1955,36 @@ impl QueryPlanResult {
                     }
                 }
             }
+        }
+
+        // Fast path: scan-only plan with no custom predicates.
+        // Walk archetypes directly — no ScratchBuffer, no sort.
+        if let Some(ref required) = self.scan_required {
+            let changed = &self.scan_changed;
+            let tick = self.last_read_tick;
+            let q_required = Q::required_ids(&world.components);
+            let mut row_buf = Vec::new();
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, changed, tick) {
+                    continue;
+                }
+                if !q_required.is_subset(&arch.component_ids) {
+                    return Err(PlanExecError::ComponentMismatch {
+                        query: std::any::type_name::<Q>(),
+                        archetype_id: arch.id,
+                    });
+                }
+                let fetch = Q::init_fetch(arch, &world.components);
+                let slice = unsafe { Q::as_slice(&fetch, arch.len()) };
+                row_buf.clear();
+                row_buf.extend(0..arch.len());
+                callback(&arch.entities, &row_buf, slice);
+            }
+            self.last_read_tick = world.next_tick();
+            return Ok(());
         }
 
         // Phase 1: Populate scratch buffer.
@@ -2229,6 +2293,8 @@ impl fmt::Debug for QueryPlanResult {
                 &self.compiled_agg_scan_raw.is_some(),
             )
             .field("row_indices_cap", &self.row_indices.capacity())
+            .field("has_scan_required", &self.scan_required.is_some())
+            .field("scan_changed", &self.scan_changed)
             .finish()
     }
 }
@@ -2899,6 +2965,8 @@ impl ScanBuilder<'_> {
                 filter_preds.push(pred);
             }
         }
+
+        let has_custom_filters = !filter_preds.is_empty();
 
         // Phase 2: Order index lookups by selectivity (most selective first).
         index_preds.sort_by(|a, b| a.0.selectivity.total_cmp(&b.0.selectivity));
@@ -3833,6 +3901,12 @@ impl ScanBuilder<'_> {
             compiled_agg_scan,
             compiled_agg_scan_raw,
             row_indices: Vec::new(),
+            scan_required: if !has_custom_filters && self.joins.is_empty() {
+                self.left_required.clone()
+            } else {
+                None
+            },
+            scan_changed: self.left_changed.clone().unwrap_or_default(),
         }
     }
 }
@@ -10286,5 +10360,134 @@ mod tests {
         let scan_result = scan_plan.execute(&mut world).unwrap().to_vec();
         assert_eq!(join_result.len(), scan_result.len());
         assert_eq!(join_result.len(), 1000);
+    }
+
+    // ── Direct archetype iteration tests ──────────────────────────────
+
+    #[test]
+    fn direct_iter_batched_scan_only() {
+        let mut world = World::new();
+        // Archetype A: Score only
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        // Archetype B: Score + Team
+        for i in 10..15 {
+            world.spawn((Score(i), Team(1)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        // scan_required should be set (scan-only, no custom predicates).
+        assert!(plan.scan_required.is_some());
+
+        let mut results = Vec::new();
+        plan.for_each_batched::<(&Score,), _>(&mut world, |entity, (score,)| {
+            results.push((entity, *score));
+        })
+        .unwrap();
+
+        // All 10 entities should be visited.
+        assert_eq!(results.len(), 10);
+        let mut scores: Vec<u32> = results.iter().map(|(_, s)| s.0).collect();
+        scores.sort_unstable();
+        assert_eq!(scores, vec![0, 1, 2, 3, 4, 10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn direct_iter_batched_with_custom_predicate_uses_scratch() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom::<Score>("score < 5", 0.5, |w, e| {
+                w.get::<Score>(e).is_some_and(|s| s.0 < 5)
+            }))
+            .build();
+
+        // scan_required should be None (custom predicate present).
+        assert!(plan.scan_required.is_none());
+
+        let mut results = Vec::new();
+        plan.for_each_batched::<(&Score,), _>(&mut world, |_entity, (score,)| {
+            results.push(score.0);
+        })
+        .unwrap();
+
+        results.sort_unstable();
+        assert_eq!(results, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn direct_iter_chunk_scan_only() {
+        let mut world = World::new();
+        // Single archetype: Score only
+        for i in 0..8 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        assert!(plan.scan_required.is_some());
+
+        let mut chunk_count = 0;
+        let mut total_entities = 0;
+        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
+            chunk_count += 1;
+            assert_eq!(entities.len(), rows.len());
+            // Row indices should be sequential 0..N for direct iteration.
+            for (i, &row) in rows.iter().enumerate() {
+                assert_eq!(row, i, "row indices should be sequential");
+                assert!(row < scores.len());
+            }
+            total_entities += entities.len();
+        })
+        .unwrap();
+
+        assert_eq!(total_entities, 8);
+        assert!(chunk_count >= 1);
+    }
+
+    #[test]
+    fn direct_iter_batched_eliminated_join() {
+        let mut world = World::new();
+        // Archetype A: Score only (will not match eliminated inner join)
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        // Archetype B: Score + Team (matches)
+        for i in 10..15 {
+            world.spawn((Score(i), Team(1)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        // The inner join should be eliminated (no predicates on right side).
+        assert!(
+            plan.warnings()
+                .iter()
+                .any(|w| matches!(w, PlanWarning::JoinEliminated { .. })),
+            "inner join should be eliminated"
+        );
+        // After elimination, scan_required should be set.
+        assert!(plan.scan_required.is_some());
+
+        let mut results = Vec::new();
+        plan.for_each_batched::<(&Score,), _>(&mut world, |_entity, (score,)| {
+            results.push(score.0);
+        })
+        .unwrap();
+
+        results.sort_unstable();
+        assert_eq!(results, vec![10, 11, 12, 13, 14]);
     }
 }
