@@ -3891,20 +3891,20 @@ impl CardinalityConstraint {
     }
 }
 
-/// Options for plan cost estimation.
+/// Options for plan cost estimation (internal).
 #[derive(Clone, Copy, Debug)]
-pub struct VectorizeOpts {
+pub(crate) struct VectorizeOpts {
     /// L2 cache size in bytes. Used to partition hash join build tables
     /// so each partition fits in cache. Default: 256 KiB.
-    pub l2_cache_bytes: usize,
+    pub(crate) l2_cache_bytes: usize,
 
     /// Average component size in bytes. Used to estimate how many rows
     /// fit in a cache line / partition. Default: 16 bytes.
-    pub avg_component_bytes: usize,
+    pub(crate) avg_component_bytes: usize,
 
     /// Target archetype chunk size. Scans that produce chunks larger than
     /// this will note it in the plan for monitoring. Default: 4096 rows.
-    pub target_chunk_rows: usize,
+    pub(crate) target_chunk_rows: usize,
 }
 
 impl Default for VectorizeOpts {
@@ -5964,7 +5964,7 @@ mod tests {
     }
 
     #[test]
-    fn vectorized_execution_produces_correct_results() {
+    fn execution_produces_correct_results() {
         // End-to-end: vectorized plan must produce the same results as
         // a naive query would.
         let mut world = World::new();
@@ -6894,7 +6894,7 @@ mod tests {
     }
 
     #[test]
-    fn spatial_lookup_vectorizes_to_spatial_gather() {
+    fn spatial_lookup_uses_spatial_gather() {
         let mut world = World::new();
         for i in 0..100 {
             world.spawn((Pos {

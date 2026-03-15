@@ -309,7 +309,7 @@ After presenting the report and discussing findings with the user, add `// PERF:
 Format: `// PERF: <concise rationale for why this is intentional or unavoidable>`
 
 Place the comment immediately above or on the line containing the pattern. Examples:
-- `// PERF: No for_each_chunk — WritableRef indirection is inherent to buffered writes.`
+- `// PERF: Per-item iteration only — WritableRef indirection is inherent to buffered writes.`
 - `// PERF: Per-row Vec::new() unavoidable — ColumnData::values owns Vec<Vec<u8>>.`
 - `// PERF: Full WAL scan on open required for crash recovery — no index or footer.`
 

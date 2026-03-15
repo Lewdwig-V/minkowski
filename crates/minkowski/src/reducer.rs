@@ -1014,8 +1014,8 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
     /// Advances the change detection tick: entities matched here will NOT
     /// be matched again on the next call unless their columns are modified.
     ///
-    // PERF: No for_each_chunk variant — WritableRef indirection is inherent
-    // to buffered writes. A chunk API would imply contiguous-slice performance
+    // PERF: Per-item iteration only — WritableRef indirection is inherent
+    // to buffered writes. A slice API would imply contiguous-slice performance
     // characteristics that the changeset buffering cannot deliver.
     pub fn for_each(&mut self, mut f: impl FnMut(Q::WriterItem<'_>)) {
         self.queried.store(true, Ordering::Relaxed);

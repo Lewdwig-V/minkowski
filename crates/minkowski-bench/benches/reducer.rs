@@ -49,34 +49,6 @@ fn bench_query_mut(c: &mut Criterion) {
     drop(strategy);
 }
 
-fn bench_query_mut_chunk(c: &mut Criterion) {
-    let mut world = setup_world();
-    let strategy = Optimistic::new(&world);
-    let mut registry = ReducerRegistry::new();
-    let id = registry
-        .register_query::<(&mut Position, &Velocity), (), _>(
-            &mut world,
-            "integrate_chunk",
-            |mut query: QueryMut<'_, (&mut Position, &Velocity)>, (): ()| {
-                query.for_each(|(positions, velocities)| {
-                    for i in 0..positions.len() {
-                        positions[i].x += velocities[i].dx;
-                        positions[i].y += velocities[i].dy;
-                        positions[i].z += velocities[i].dz;
-                    }
-                });
-            },
-        )
-        .unwrap();
-
-    c.bench_function("reducer/query_mut_chunk_10k", |b| {
-        b.iter(|| {
-            registry.run(&mut world, id, ()).unwrap();
-        });
-    });
-    drop(strategy);
-}
-
 fn bench_query_writer(c: &mut Criterion) {
     let mut world = setup_world();
     let strategy = Optimistic::new(&world);
@@ -144,52 +116,10 @@ fn bench_dynamic_for_each(c: &mut Criterion) {
     });
 }
 
-fn bench_dynamic_for_each_chunk(c: &mut Criterion) {
-    let mut world = setup_world();
-    let strategy = Optimistic::new(&world);
-    let mut registry = ReducerRegistry::new();
-    let id = registry
-        .dynamic("integrate_dynamic_chunk", &mut world)
-        .can_read::<Position>()
-        .can_read::<Velocity>()
-        .can_write::<Position>()
-        .build(|ctx: &mut DynamicCtx, _args: &()| {
-            let mut updates = Vec::new();
-            ctx.for_each::<(minkowski::Entity, &Position, &Velocity)>(
-                |(entities, positions, velocities)| {
-                    for i in 0..entities.len() {
-                        updates.push((
-                            entities[i],
-                            Position {
-                                x: positions[i].x + velocities[i].dx,
-                                y: positions[i].y + velocities[i].dy,
-                                z: positions[i].z + velocities[i].dz,
-                            },
-                        ));
-                    }
-                },
-            );
-            for (entity, pos) in updates {
-                ctx.write(entity, pos);
-            }
-        })
-        .unwrap();
-
-    c.bench_function("reducer/dynamic_for_each_chunk_10k", |b| {
-        b.iter(|| {
-            registry
-                .dynamic_call(&strategy, &mut world, id, &())
-                .unwrap();
-        });
-    });
-}
-
 criterion_group!(
     benches,
     bench_query_mut,
-    bench_query_mut_chunk,
     bench_query_writer,
     bench_dynamic_for_each,
-    bench_dynamic_for_each_chunk,
 );
 criterion_main!(benches);
