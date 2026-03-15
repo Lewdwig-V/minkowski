@@ -8,8 +8,11 @@
 use std::alloc::Layout;
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::AtomicU64 as StdAtomicU64;
 
-use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
+#[cfg(loom)]
+use crate::sync::Mutex;
+use crate::sync::{Arc, AtomicUsize, Ordering};
 
 /// Error returned when the memory pool is exhausted.
 #[derive(Debug, Clone)]
@@ -69,6 +72,16 @@ pub unsafe trait PoolAllocator: Send + Sync {
 
     /// Bytes currently allocated. `None` if not tracked.
     fn used(&self) -> Option<usize> {
+        None
+    }
+
+    /// Per-class active overflow count. `None` if not tracked.
+    fn overflow_active_counts(&self) -> Option<[u64; 6]> {
+        None
+    }
+
+    /// Per-class cumulative overflow count. `None` if not tracked.
+    fn overflow_total_counts(&self) -> Option<[u64; 6]> {
         None
     }
 }
@@ -271,6 +284,111 @@ impl MmapRegion {
     }
 }
 
+// ── Lock-free intrusive stack ────────────────────────────────────────
+
+/// Tagged pointer for ABA-safe lock-free stack operations.
+///
+/// Packed as a `u128`: low 64 bits = pointer, high 64 bits = monotonic tag.
+/// The tag increments on every push/pop, preventing ABA — even if a pointer
+/// is recycled to the same address, the tag will differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+struct TaggedPtr(u128);
+
+impl TaggedPtr {
+    /// Empty stack head (null pointer, tag 0).
+    const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Create a tagged pointer with the given raw pointer and tag.
+    fn new(ptr: *mut u8, tag: u64) -> Self {
+        Self((ptr as u64 as u128) | ((tag as u128) << 64))
+    }
+
+    /// The raw pointer (null if empty).
+    fn ptr(self) -> *mut u8 {
+        self.0 as u64 as *mut u8
+    }
+
+    /// The monotonic tag.
+    fn tag(self) -> u64 {
+        (self.0 >> 64) as u64
+    }
+
+    /// True if the pointer is null (stack is empty).
+    fn is_empty(self) -> bool {
+        (self.0 as u64) == 0
+    }
+
+    /// Return a new TaggedPtr with the same tag incremented by 1.
+    fn with_next(self, ptr: *mut u8) -> Self {
+        Self::new(ptr, self.tag() + 1)
+    }
+}
+
+impl fmt::Debug for TaggedPtr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TaggedPtr({:p}, tag={})", self.ptr(), self.tag())
+    }
+}
+
+/// Atomic head for a lock-free intrusive stack.
+///
+/// Under `cfg(loom)`, falls back to a Mutex because loom cannot model
+/// 128-bit atomic operations. The Mutex shim verifies logical correctness
+/// (no lost blocks, no duplicates) but not CAS retry paths.
+#[cfg(not(loom))]
+type AtomicHead = atomic::Atomic<u128>;
+
+#[cfg(loom)]
+type AtomicHead = Mutex<u128>;
+
+/// Load the current head of a free list.
+#[inline]
+fn load_head(head: &AtomicHead) -> TaggedPtr {
+    #[cfg(not(loom))]
+    {
+        TaggedPtr(head.load(Ordering::Acquire))
+    }
+    #[cfg(loom)]
+    {
+        TaggedPtr(*head.lock())
+    }
+}
+
+/// Compare-and-swap the head of a free list. Returns `true` on success.
+#[inline]
+fn cas_head(head: &AtomicHead, current: TaggedPtr, new: TaggedPtr) -> bool {
+    #[cfg(not(loom))]
+    {
+        head.compare_exchange(current.0, new.0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    #[cfg(loom)]
+    {
+        let mut guard = head.lock();
+        if *guard == current.0 {
+            *guard = new.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Create a new AtomicHead initialized with the given TaggedPtr.
+fn new_atomic_head(tp: TaggedPtr) -> AtomicHead {
+    #[cfg(not(loom))]
+    {
+        atomic::Atomic::new(tp.0)
+    }
+    #[cfg(loom)]
+    {
+        Mutex::new(tp.0)
+    }
+}
+
 // ── SlabPool ────────────────────────────────────────────────────────
 
 const NUM_SIZE_CLASSES: usize = 6;
@@ -285,6 +403,15 @@ const SIZE_CLASSES: [usize; NUM_SIZE_CLASSES] = [64, 256, 1024, 4096, 65_536, 1_
 /// - Class 5 (1 MB):  33% — bulk column pre-allocation
 const PROPORTIONS: [usize; NUM_SIZE_CLASSES] = [1, 2, 4, 20, 40, 33];
 
+/// Sentinel value for unallocated side table entries.
+const SIDE_TABLE_UNALLOCATED: u8 = 0xFF;
+
+/// Mask for the class index in a side table entry (bits 0..3).
+const SIDE_TABLE_CLASS_MASK: u8 = 0x0F;
+
+/// Bit flag indicating this allocation overflowed from a smaller class.
+const SIDE_TABLE_OVERFLOW_BIT: u8 = 0x80;
+
 /// Return the size-class index for a given layout, or `None` if too large.
 fn size_class_for(layout: Layout) -> Option<usize> {
     // The effective allocation size must satisfy both size and alignment.
@@ -295,11 +422,13 @@ fn size_class_for(layout: Layout) -> Option<usize> {
 /// TigerBeetle-style slab allocator backed by a single mmap'd region.
 ///
 /// Memory is partitioned into fixed-size blocks across six size classes.
-/// Allocation and deallocation are serialized per size class via `Mutex`.
+/// Allocation and deallocation use a lock-free intrusive stack per class
+/// via `AtomicHead` (128-bit tagged pointer CAS).
 ///
-// PERF: Mutex is a single atomic CAS on uncontended paths.
-// If profiling shows contention, consider upgrading to a lock-free
-// structure with ABA protection (tagged pointers or epoch-based reclamation).
+// PERF: Lock-free intrusive stack via AtomicHead (Atomic<u128> tagged pointer).
+// ABA prevention via 64-bit monotonic tag. Side table routes deallocation to
+// the correct class regardless of the caller's Layout. Single-step overflow
+// from exhausted class to the next larger class.
 pub(crate) struct SlabPool {
     /// Keeps the mmap alive. Never re-borrowed after construction —
     /// use `base` and `total` instead to avoid Tree Borrows invalidation.
@@ -310,14 +439,35 @@ pub(crate) struct SlabPool {
     /// under Tree Borrows.
     base: *mut u8,
     total: usize,
-    free_lists: [Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES],
+    heads: [AtomicHead; NUM_SIZE_CLASSES],
+    /// Deallocation class routing table. One byte per MIN_BLOCK_SIZE slot.
+    /// Owned raw pointer — written after successful CAS (single-owner),
+    /// read before CAS on dealloc (single-owner). No concurrent access.
+    side_table: *mut u8,
+    side_table_len: usize,
     used_bytes: AtomicUsize,
+    overflow_active: [AtomicUsize; NUM_SIZE_CLASSES],
+    overflow_total: [AtomicUsize; NUM_SIZE_CLASSES],
 }
 
-// SAFETY: `*mut u8` inside the Mutex Vecs points into the mmap region which
-// is owned by SlabPool and outlives all allocations. The Mutex provides
-// exclusive access to the free list vectors. The raw pointers are never
-// dereferenced outside the lock — they are just addresses returned to callers.
+impl Drop for SlabPool {
+    fn drop(&mut self) {
+        if self.side_table_len > 0 {
+            // SAFETY: side_table was allocated via Box::into_raw in new().
+            // Reconstruct the Box to let it deallocate.
+            unsafe {
+                let slice = std::slice::from_raw_parts_mut(self.side_table, self.side_table_len);
+                let _ = Box::from_raw(slice);
+            }
+        }
+    }
+}
+
+// SAFETY: Pointers into the mmap region are only accessed through atomic CAS
+// operations (or Mutex under loom). The mmap region is owned by SlabPool and
+// outlives all allocations. The side table raw pointer is written only by
+// the thread that owns the block (after successful CAS) and read before
+// the CAS that returns it — single-owner access, no concurrent mutation.
 unsafe impl Send for SlabPool {}
 unsafe impl Sync for SlabPool {}
 
@@ -333,56 +483,103 @@ impl SlabPool {
         let base = region.as_mut_ptr();
         let total = region.len();
 
-        // Initialize free lists as empty Vecs.
-        let free_lists: [Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES] =
-            std::array::from_fn(|_| Mutex::new(Vec::new()));
+        // Allocate side table as raw pointer (see struct doc for rationale).
+        // Box::into_raw transfers ownership; Drop reconstructs via Box::from_raw.
+        let side_table_len = total / SIZE_CLASSES[0];
+        let st_box = vec![SIDE_TABLE_UNALLOCATED; side_table_len].into_boxed_slice();
+        let side_table = Box::into_raw(st_box) as *mut u8;
 
-        // Partition the region into size-class blocks proportionally.
         let proportion_sum: usize = PROPORTIONS.iter().sum();
+
+        // Build intrusive linked lists and heads in a single pass.
         let mut offset: usize = 0;
+        let mut head_values: [TaggedPtr; NUM_SIZE_CLASSES] = [TaggedPtr::empty(); NUM_SIZE_CLASSES];
 
         for class in 0..NUM_SIZE_CLASSES {
             let block_size = SIZE_CLASSES[class];
 
             // Align the absolute address (base + offset) to block_size, not just offset.
-            // The mmap base is page-aligned (4KB) but may not be aligned to larger
-            // block sizes (64KB, 1MB). Without this, blocks in those classes could
-            // be misaligned for components with align > page_size.
             let abs_addr = base as usize + offset;
             let aligned_addr = (abs_addr + block_size - 1) & !(block_size - 1);
             offset = aligned_addr - base as usize;
 
-            // Bytes allocated to this size class (rounded down to whole blocks).
             let class_bytes = total * PROPORTIONS[class] / proportion_sum;
             let block_count = class_bytes / block_size;
 
-            let mut list = free_lists[class].lock();
-            list.reserve(block_count);
-
-            // Push blocks from first to last so that pop yields the lowest
-            // address first (better cache locality).
-            for i in 0..block_count {
+            // Chain blocks as intrusive linked list (reverse iteration
+            // so head points to lowest address for cache locality).
+            let mut first_block: *mut u8 = std::ptr::null_mut();
+            for i in (0..block_count).rev() {
                 let block_offset = offset + i * block_size;
                 if block_offset + block_size > total {
-                    break;
+                    continue;
                 }
-                // SAFETY: `block_offset + block_size <= total` (checked above),
-                // and `base` points to the start of a valid mmap region of
-                // `total` bytes. Each block is at least 64 bytes.
+                // SAFETY: block_offset + block_size <= total, base is valid
+                // for total bytes. Block is >= 64 bytes (MIN_BLOCK_SIZE invariant),
+                // so writing 8 bytes of next-pointer is within bounds.
                 let block_ptr = unsafe { base.add(block_offset) };
-                list.push(block_ptr);
+                // Use atomic store for formal correctness: runtime reads
+                // are atomic (StdAtomicU64::load), so init writes must
+                // also be atomic to avoid mixed-access UB.
+                unsafe {
+                    (*(block_ptr as *const StdAtomicU64))
+                        .store(first_block as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                first_block = block_ptr;
             }
 
+            head_values[class] = TaggedPtr::new(first_block, 0);
             offset += block_count * block_size;
         }
+
+        let heads: [AtomicHead; NUM_SIZE_CLASSES] =
+            std::array::from_fn(|i| new_atomic_head(head_values[i]));
 
         Ok(Self {
             _region: region,
             base,
             total,
-            free_lists,
+            heads,
+            side_table,
+            side_table_len,
             used_bytes: AtomicUsize::new(0),
+            overflow_active: std::array::from_fn(|_| AtomicUsize::new(0)),
+            overflow_total: std::array::from_fn(|_| AtomicUsize::new(0)),
         })
+    }
+
+    /// Number of blocks in `class` currently serving overflow requests
+    /// from smaller classes.
+    #[cfg(test)]
+    fn overflow_active(&self, class: usize) -> u64 {
+        self.overflow_active[class].load(Ordering::Relaxed) as u64
+    }
+
+    /// Cumulative count of overflow allocations served by `class`.
+    #[cfg(test)]
+    fn overflow_total(&self, class: usize) -> u64 {
+        self.overflow_total[class].load(Ordering::Relaxed) as u64
+    }
+
+    /// Derive a valid pointer into the mmap region from a raw address.
+    ///
+    /// `TaggedPtr` stores addresses as `u64` inside a `u128` atomic — this
+    /// round-trip strips pointer provenance. Under Tree Borrows, reading
+    /// or writing through a provenance-less pointer is UB. This method
+    /// restores provenance by computing the offset from `self.base` and
+    /// re-deriving the pointer.
+    #[inline]
+    fn block_ptr(&self, addr: u64) -> *mut u8 {
+        let addr_usize = addr as usize;
+        debug_assert!(
+            addr_usize >= self.base as usize && addr_usize < self.base as usize + self.total,
+            "block_ptr: address {addr:#x} is outside pool region"
+        );
+        let offset = addr_usize - self.base as usize;
+        // SAFETY: `addr` was originally derived from `self.base + offset`
+        // during `new()` or a prior `deallocate`. The offset is within the
+        // mmap region (checked by debug_assert above).
+        unsafe { self.base.add(offset) }
     }
 }
 
@@ -390,7 +587,7 @@ impl SlabPool {
 // Each block is a fixed-size slab from the mmap region. Blocks within each
 // size class are aligned to their class size. Size classes are chosen such
 // that `layout.size() <= block_size` and `layout.align() <= block_size`.
-// The Mutex serializes access to each free list.
+// Lock-free CAS on AtomicHead serializes access to each free list.
 unsafe impl PoolAllocator for SlabPool {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
         if layout.size() == 0 {
@@ -399,55 +596,152 @@ unsafe impl PoolAllocator for SlabPool {
 
         let class = size_class_for(layout).ok_or(PoolExhausted { requested: layout })?;
 
-        // No cross-class fallback: each class is a fixed partition.
-        // If this class is exhausted, return Err — the user adjusts
-        // their budget or size-class proportions. This matches TigerBeetle's
-        // fixed-partition model and avoids the dealloc class-mismatch bug
-        // where a block promoted to a larger class gets returned to the
-        // smaller class's free list on deallocation.
-        let mut list = self.free_lists[class].lock();
-        if let Some(ptr) = list.pop() {
-            drop(list); // release lock before atomic
-            self.used_bytes
-                .fetch_add(SIZE_CLASSES[class], Ordering::Relaxed);
+        // Try the target class, then overflow to the next larger class.
+        // Indexing multiple arrays (heads, overflow_active, overflow_total,
+        // SIZE_CLASSES) by try_class — iterator+enumerate would be less clear.
+        #[allow(clippy::needless_range_loop)]
+        for try_class in class..NUM_SIZE_CLASSES.min(class + 2) {
+            loop {
+                let head = load_head(&self.heads[try_class]);
+                if head.is_empty() {
+                    break; // This class is exhausted, try next.
+                }
 
-            debug_assert!(
-                (ptr as usize).is_multiple_of(layout.align()),
-                "SlabPool: block at {ptr:p} is not aligned to {}",
-                layout.align()
-            );
+                // Restore provenance from self.base to read the next-pointer.
+                // SAFETY: head.ptr() is a valid block address within the mmap
+                // region. The block is >= 64 bytes and 8-byte aligned (min
+                // class is 64B), so an AtomicU64 read at offset 0 is safe.
+                // Atomic load is required because a concurrent deallocate
+                // may be writing a next-pointer into this block (CAS retry
+                // loop in deallocate).
+                let block = self.block_ptr(head.ptr() as u64);
+                let next_raw = unsafe {
+                    (*(block as *const StdAtomicU64)).load(std::sync::atomic::Ordering::Acquire)
+                };
+                let next_ptr = if next_raw == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    next_raw as *mut u8
+                };
+                let new_head = head.with_next(next_ptr);
 
-            return Ok(NonNull::new(ptr).expect("free list block is non-null"));
+                if cas_head(&self.heads[try_class], head, new_head) {
+                    // CAS succeeded — we own this block now.
+                    let block_size = SIZE_CLASSES[try_class];
+                    self.used_bytes.fetch_add(block_size, Ordering::Relaxed);
+
+                    // Update side table: record actual class + overflow flag.
+                    // SAFETY: index is within bounds (ptr is in the mmap region),
+                    // and the block is owned by this thread (CAS succeeded).
+                    let index = (head.ptr() as usize - self.base as usize) / SIZE_CLASSES[0];
+                    let overflow = try_class != class;
+                    let entry =
+                        try_class as u8 | if overflow { SIDE_TABLE_OVERFLOW_BIT } else { 0 };
+                    unsafe { self.side_table.add(index).write(entry) };
+
+                    if overflow {
+                        self.overflow_active[try_class].fetch_add(1, Ordering::Relaxed);
+                        self.overflow_total[try_class].fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    debug_assert!(
+                        (block as usize).is_multiple_of(layout.align()),
+                        "SlabPool: block at {block:p} is not aligned to {}",
+                        layout.align()
+                    );
+
+                    return Ok(NonNull::new(block).expect("free list block is non-null"));
+                }
+                // CAS failed — another thread popped. Retry with spin hint.
+                std::hint::spin_loop();
+            }
         }
 
         Err(PoolExhausted { requested: layout })
     }
 
+    /// Return a block to the pool.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must have been returned by a prior call to `allocate` on this
+    /// pool. The caller must not use `ptr` after this call. The `layout`
+    /// parameter is accepted for API compatibility but is not used for
+    /// class routing — the side table is authoritative.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         if layout.size() == 0 {
             return;
         }
 
-        let class = size_class_for(layout);
-        debug_assert!(
-            class.is_some(),
-            "SlabPool::deallocate: layout (size={}, align={}) exceeds max size class — \
-             caller violated the allocate/deallocate contract",
-            layout.size(),
-            layout.align()
-        );
-        let Some(class) = class else { return };
+        let addr = ptr.as_ptr() as usize;
 
-        debug_assert!(
-            ptr.as_ptr() >= self.base && (ptr.as_ptr() as usize) < self.base as usize + self.total,
-            "SlabPool::deallocate: pointer {:p} is outside pool region",
-            ptr.as_ptr()
+        // assert! not debug_assert!: a foreign pointer causes UB via
+        // block_ptr() (wrapping ptr::add). Two comparisons prevent the
+        // entire class of foreign-pointer bugs from becoming silent UB.
+        assert!(
+            addr >= self.base as usize && addr < self.base as usize + self.total,
+            "SlabPool::deallocate: pointer {:p} is outside pool region [{:p}..+{:#x})",
+            ptr.as_ptr(),
+            self.base,
+            self.total
         );
 
-        let mut list = self.free_lists[class].lock();
-        list.push(ptr.as_ptr());
-        self.used_bytes
-            .fetch_sub(SIZE_CLASSES[class], Ordering::Relaxed);
+        // Restore provenance from self.base for all block access.
+        let block = self.block_ptr(addr as u64);
+
+        // Read actual class from side table (authoritative — ignores layout).
+        // SAFETY: index is within bounds, block is owned by this thread.
+        let index = (addr - self.base as usize) / SIZE_CLASSES[0];
+        let entry = unsafe { self.side_table.add(index).read() };
+        let actual_class = (entry & SIDE_TABLE_CLASS_MASK) as usize;
+        let was_overflow = (entry & SIDE_TABLE_OVERFLOW_BIT) != 0;
+
+        // assert! not debug_assert!: an OOB index on self.heads[] is instant
+        // UB. This catches double-free and foreign-pointer contract violations.
+        assert!(
+            actual_class < NUM_SIZE_CLASSES,
+            "SlabPool::deallocate: side table entry {entry:#x} has invalid class {actual_class} \
+             — possible double-free or foreign pointer"
+        );
+
+        // Mark side table entry as unallocated BEFORE pushing the block
+        // back. Once the CAS below succeeds, another thread can immediately
+        // pop the block and write its own side table entry — writing after
+        // the CAS would be a data race.
+        // SAFETY: block is owned by this thread (not yet pushed).
+        unsafe { self.side_table.add(index).write(SIDE_TABLE_UNALLOCATED) };
+
+        // Push block back onto its actual class's free list.
+        loop {
+            let head = load_head(&self.heads[actual_class]);
+            // Write current head pointer into block's first 8 bytes.
+            // Use provenance-valid pointer derived from self.base.
+            // Atomic store is required because a concurrent allocate may
+            // be reading the next-pointer from this block (CAS retry loop
+            // in allocate).
+            unsafe {
+                (*(block as *const StdAtomicU64))
+                    .store(head.ptr() as u64, std::sync::atomic::Ordering::Release);
+            }
+            let new_head = head.with_next(block);
+
+            if cas_head(&self.heads[actual_class], head, new_head) {
+                self.used_bytes
+                    .fetch_sub(SIZE_CLASSES[actual_class], Ordering::Relaxed);
+
+                if was_overflow {
+                    let prev = self.overflow_active[actual_class].fetch_sub(1, Ordering::Relaxed);
+                    debug_assert!(
+                        prev > 0,
+                        "overflow_active underflow for class {actual_class}"
+                    );
+                }
+
+                return;
+            }
+            // CAS failed — another thread pushed. Retry with spin hint.
+            std::hint::spin_loop();
+        }
     }
 
     fn capacity(&self) -> Option<usize> {
@@ -456,6 +750,18 @@ unsafe impl PoolAllocator for SlabPool {
 
     fn used(&self) -> Option<usize> {
         Some(self.used_bytes.load(Ordering::Relaxed))
+    }
+
+    fn overflow_active_counts(&self) -> Option<[u64; 6]> {
+        Some(std::array::from_fn(|i| {
+            self.overflow_active[i].load(Ordering::Relaxed) as u64
+        }))
+    }
+
+    fn overflow_total_counts(&self) -> Option<[u64; 6]> {
+        Some(std::array::from_fn(|i| {
+            self.overflow_total[i].load(Ordering::Relaxed) as u64
+        }))
     }
 }
 
@@ -506,6 +812,59 @@ mod tests {
         assert!(msg.contains("64"));
     }
 
+    // ── Side table tests ─────────────────────────────────────────────
+
+    #[test]
+    fn side_table_index_computation() {
+        let base = 0x1000_usize as *mut u8;
+        let min_block = SIZE_CLASSES[0]; // 64
+        // Block at base+0 -> index 0
+        assert_eq!((0x1000 - base as usize) / min_block, 0);
+        // Block at base+64 -> index 1
+        assert_eq!((0x1040 - base as usize) / min_block, 1);
+        // Block at base+128 -> index 2
+        assert_eq!((0x1080 - base as usize) / min_block, 2);
+    }
+
+    #[test]
+    fn side_table_overflow_flag() {
+        let entry_normal: u8 = 3; // class 3, no overflow
+        let entry_overflow: u8 = 3 | SIDE_TABLE_OVERFLOW_BIT;
+        assert_eq!(entry_normal & SIDE_TABLE_CLASS_MASK, 3);
+        assert_eq!(entry_overflow & SIDE_TABLE_CLASS_MASK, 3);
+        assert_eq!(entry_normal & SIDE_TABLE_OVERFLOW_BIT, 0);
+        assert_ne!(entry_overflow & SIDE_TABLE_OVERFLOW_BIT, 0);
+    }
+
+    // ── TaggedPtr tests ──────────────────────────────────────────────
+
+    #[test]
+    fn tagged_ptr_round_trip() {
+        let ptr = 0xDEAD_BEEF_u64;
+        let tag = 42_u64;
+        let packed = (ptr as u128) | ((tag as u128) << 64);
+        let (got_ptr, got_tag) = (packed as u64, (packed >> 64) as u64);
+        assert_eq!(got_ptr, ptr);
+        assert_eq!(got_tag, tag);
+    }
+
+    #[test]
+    fn tagged_ptr_empty() {
+        let tp = TaggedPtr::empty();
+        assert!(tp.is_empty());
+        assert_eq!(tp.ptr(), std::ptr::null_mut());
+    }
+
+    #[test]
+    fn tagged_ptr_with_real_pointer() {
+        let mut val = 0u64;
+        let ptr = &mut val as *mut u64 as *mut u8;
+        let tp = TaggedPtr::new(ptr, 7);
+        assert!(!tp.is_empty());
+        assert_eq!(tp.ptr(), ptr);
+        assert_eq!(tp.tag(), 7);
+    }
+
     // ── SlabPool tests ──────────────────────────────────────────────
 
     #[test]
@@ -549,7 +908,49 @@ mod tests {
     }
 
     #[test]
-    fn slab_pool_concurrent_allocate() {
+    fn slab_pool_concurrent_allocate_no_duplicates() {
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let layout = Layout::from_size_align(64, 64).unwrap();
+
+        let all_ptrs: Vec<Vec<usize>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let pool = Arc::clone(&pool);
+                    s.spawn(move || {
+                        let mut ptrs = Vec::new();
+                        for _ in 0..200 {
+                            if let Ok(ptr) = pool.allocate(layout) {
+                                ptrs.push(ptr.as_ptr() as usize);
+                            }
+                        }
+                        ptrs
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Verify no duplicates across all threads.
+        let mut all: Vec<usize> = all_ptrs.iter().flatten().copied().collect();
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            total,
+            "duplicate pointers returned across threads"
+        );
+
+        // Deallocate all.
+        for addr in all_ptrs.iter().flatten() {
+            let ptr = NonNull::new(*addr as *mut u8).unwrap();
+            unsafe { pool.deallocate(ptr, layout) };
+        }
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_concurrent_alloc_dealloc_interleaved() {
         let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
         let layout = Layout::from_size_align(64, 64).unwrap();
 
@@ -557,20 +958,16 @@ mod tests {
             for _ in 0..4 {
                 let pool = Arc::clone(&pool);
                 s.spawn(move || {
-                    let mut ptrs = Vec::new();
-                    for _ in 0..100 {
-                        if let Ok(ptr) = pool.allocate(layout) {
-                            ptrs.push(ptr);
-                        }
-                    }
-                    for ptr in ptrs {
-                        // SAFETY: each ptr was returned by `allocate` and is
-                        // only deallocated once by this thread.
+                    for _ in 0..1000 {
+                        let ptr = pool.allocate(layout).unwrap();
+                        // SAFETY: ptr was just allocated.
                         unsafe { pool.deallocate(ptr, layout) };
                     }
                 });
             }
         });
+
+        assert_eq!(pool.used(), Some(0));
     }
 
     #[test]
@@ -635,43 +1032,261 @@ mod tests {
     }
 
     #[test]
-    fn slab_pool_no_cross_class_fallback() {
-        // Verify that exhausting one size class does NOT spill into larger
-        // classes. Each class is a fixed partition — this matches TigerBeetle's
-        // model and avoids the dealloc class-mismatch bug.
+    fn slab_pool_overflow_enabled() {
+        // Verify that exhausting one size class DOES spill into the next
+        // larger class (one step up). This replaced the old
+        // no_cross_class_fallback test.
         let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
-        // Exhaust class 0 (64B blocks).
+        // Exhaust class 0 (64B blocks) — overflow should kick in.
+        let proportion_sum: usize = PROPORTIONS.iter().sum();
+        let class0_blocks = 1024 * 1024 * PROPORTIONS[0] / proportion_sum / SIZE_CLASSES[0];
+
+        let mut ptrs = Vec::new();
+        // Allocate more than class 0 can hold.
+        for _ in 0..class0_blocks + 5 {
+            ptrs.push(pool.allocate(layout_small).unwrap());
+        }
+
+        assert!(
+            ptrs.len() > class0_blocks,
+            "overflow should provide extra blocks"
+        );
+
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout_small) };
+        }
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_overflow_to_next_class() {
+        // Small pool so class 0 exhausts quickly.
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+
+        // Exhaust all classes by allocating until failure.
         let mut ptrs = Vec::new();
         while let Ok(ptr) = pool.allocate(layout_small) {
             ptrs.push(ptr);
         }
 
-        // Calculate how many blocks class 0 should have had.
+        // With overflow, we should get MORE blocks than class 0 alone:
         let proportion_sum: usize = PROPORTIONS.iter().sum();
         let class0_bytes = 1024 * 1024 * PROPORTIONS[0] / proportion_sum;
         let class0_blocks = class0_bytes / SIZE_CLASSES[0];
 
-        // Should have gotten exactly class 0's block count — no spill.
-        assert_eq!(
-            ptrs.len(),
-            class0_blocks,
-            "expected exactly {class0_blocks} blocks from class 0, got {}",
-            ptrs.len()
-        );
-
-        // Class 1 (256B) should still have blocks available.
-        let layout_medium = Layout::from_size_align(200, 8).unwrap();
+        // With overflow, we should get MORE than class 0's block count.
         assert!(
-            pool.allocate(layout_medium).is_ok(),
-            "class 1 should still have blocks after class 0 is exhausted"
+            ptrs.len() > class0_blocks,
+            "expected overflow: got {} blocks, class 0 has {} blocks",
+            ptrs.len(),
+            class0_blocks
         );
 
         // Clean up.
+        let layout_for_dealloc = layout_small;
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout_for_dealloc) };
+        }
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_overflow_dealloc_returns_to_correct_class() {
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+
+        // Exhaust class 0, forcing overflow to class 1.
+        let proportion_sum: usize = PROPORTIONS.iter().sum();
+        let class0_blocks = 1024 * 1024 * PROPORTIONS[0] / proportion_sum / SIZE_CLASSES[0];
+
+        let mut ptrs = Vec::new();
+        for _ in 0..=class0_blocks {
+            ptrs.push(pool.allocate(layout_small).unwrap());
+        }
+
+        // The last allocation overflowed. Deallocate it — used_bytes should
+        // decrease by the OVERFLOW class size (256), not the requested class (64).
+        let used_before = pool.used().unwrap();
+        unsafe { pool.deallocate(ptrs.pop().unwrap(), layout_small) };
+        let used_after = pool.used().unwrap();
+        let freed = used_before - used_after;
+        // Overflow block came from class 1 (256B).
+        assert_eq!(
+            freed, SIZE_CLASSES[1],
+            "overflow block should free class 1 size"
+        );
+
         for ptr in ptrs {
             unsafe { pool.deallocate(ptr, layout_small) };
         }
+    }
+
+    #[test]
+    fn slab_pool_exhaust_both_target_and_overflow_class() {
+        // Small pool: exhaust class 0 AND class 1, verify PoolExhausted.
+        let pool = SlabPool::new(512 * 1024, HugePages::Off).unwrap();
+        let layout_small = Layout::from_size_align(32, 8).unwrap(); // class 0
+        let layout_medium = Layout::from_size_align(200, 8).unwrap(); // class 1
+
+        // Exhaust class 1 first (overflow target for class 0).
+        let mut ptrs1 = Vec::new();
+        while let Ok(ptr) = pool.allocate(layout_medium) {
+            ptrs1.push(ptr);
+        }
+
+        // Now exhaust class 0 — overflow to class 1 will also fail.
+        let mut ptrs0 = Vec::new();
+        while let Ok(ptr) = pool.allocate(layout_small) {
+            ptrs0.push(ptr);
+        }
+
+        // Both classes exhausted — next alloc must fail.
+        assert!(pool.allocate(layout_small).is_err());
+
+        for ptr in ptrs0 {
+            unsafe { pool.deallocate(ptr, layout_small) };
+        }
+        for ptr in ptrs1 {
+            unsafe { pool.deallocate(ptr, layout_medium) };
+        }
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_overflow_telemetry() {
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+
+        // Exhaust class 0 to force overflow.
+        let proportion_sum: usize = PROPORTIONS.iter().sum();
+        let class0_blocks = 1024 * 1024 * PROPORTIONS[0] / proportion_sum / SIZE_CLASSES[0];
+
+        let mut ptrs = Vec::new();
+        for _ in 0..class0_blocks {
+            ptrs.push(pool.allocate(layout_small).unwrap());
+        }
+
+        // No overflow yet.
+        assert_eq!(pool.overflow_active(1), 0);
+        assert_eq!(pool.overflow_total(1), 0);
+
+        // Next allocation overflows to class 1.
+        let overflow_ptr = pool.allocate(layout_small).unwrap();
+        assert_eq!(pool.overflow_active(1), 1);
+        assert_eq!(pool.overflow_total(1), 1);
+
+        // Deallocate the overflow block — active drops, total stays.
+        unsafe { pool.deallocate(overflow_ptr, layout_small) };
+        assert_eq!(pool.overflow_active(1), 0);
+        assert_eq!(pool.overflow_total(1), 1);
+
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout_small) };
+        }
+    }
+
+    #[test]
+    fn slab_pool_largest_class_no_overflow() {
+        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off).unwrap();
+        let layout_large = Layout::from_size_align(1_000_000, 8).unwrap(); // class 5
+
+        // Exhaust class 5 (1MB blocks).
+        let mut ptrs = Vec::new();
+        while let Ok(ptr) = pool.allocate(layout_large) {
+            ptrs.push(ptr);
+        }
+
+        // Class 5 is the largest — no overflow possible, must get error.
+        assert!(pool.allocate(layout_large).is_err());
+
+        // Smaller classes should still work.
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+        let small_ptr = pool.allocate(layout_small).unwrap();
+        unsafe { pool.deallocate(small_ptr, layout_small) };
+
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout_large) };
+        }
+    }
+
+    #[test]
+    fn slab_pool_concurrent_multi_class() {
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let layout_small = Layout::from_size_align(64, 64).unwrap();
+        let layout_large = Layout::from_size_align(4000, 8).unwrap();
+
+        std::thread::scope(|s| {
+            // 4 threads on class 0.
+            for _ in 0..4 {
+                let pool = Arc::clone(&pool);
+                s.spawn(move || {
+                    for _ in 0..200 {
+                        let ptr = pool.allocate(layout_small).unwrap();
+                        unsafe { pool.deallocate(ptr, layout_small) };
+                    }
+                });
+            }
+            // 4 threads on class 3.
+            for _ in 0..4 {
+                let pool = Arc::clone(&pool);
+                s.spawn(move || {
+                    for _ in 0..50 {
+                        let ptr = pool.allocate(layout_large).unwrap();
+                        unsafe { pool.deallocate(ptr, layout_large) };
+                    }
+                });
+            }
+        });
+
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_small_budget_empty_classes() {
+        // 128KB budget — class 5 (1MB) gets zero blocks.
+        let pool = SlabPool::new(128 * 1024, HugePages::Off).unwrap();
+        let layout_huge = Layout::from_size_align(1_000_000, 8).unwrap();
+        assert!(pool.allocate(layout_huge).is_err());
+
+        // Small classes should still work.
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+        let ptr = pool.allocate(layout_small).unwrap();
+        unsafe { pool.deallocate(ptr, layout_small) };
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_multi_class_used_bytes_tracking() {
+        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off).unwrap();
+        assert_eq!(pool.used(), Some(0));
+
+        let l0 = Layout::from_size_align(32, 8).unwrap(); // class 0 (64B)
+        let l2 = Layout::from_size_align(900, 8).unwrap(); // class 2 (1KB)
+        let l4 = Layout::from_size_align(60_000, 8).unwrap(); // class 4 (64KB)
+
+        let p0 = pool.allocate(l0).unwrap();
+        assert_eq!(pool.used(), Some(SIZE_CLASSES[0]));
+
+        let p2 = pool.allocate(l2).unwrap();
+        assert_eq!(pool.used(), Some(SIZE_CLASSES[0] + SIZE_CLASSES[2]));
+
+        let p4 = pool.allocate(l4).unwrap();
+        assert_eq!(
+            pool.used(),
+            Some(SIZE_CLASSES[0] + SIZE_CLASSES[2] + SIZE_CLASSES[4])
+        );
+
+        unsafe { pool.deallocate(p4, l4) };
+        assert_eq!(pool.used(), Some(SIZE_CLASSES[0] + SIZE_CLASSES[2]));
+
+        unsafe { pool.deallocate(p2, l2) };
+        assert_eq!(pool.used(), Some(SIZE_CLASSES[0]));
+
+        unsafe { pool.deallocate(p0, l0) };
+        assert_eq!(pool.used(), Some(0));
     }
 }
 
@@ -683,40 +1298,8 @@ mod loom_tests {
     use loom::thread;
     use std::alloc::Layout;
 
-    /// Two threads concurrently allocate and deallocate from the same pool.
-    /// Verifies: (1) no double-allocation (all pointers unique), (2) `used_bytes`
-    /// returns to zero after all deallocations.
     #[test]
-    fn loom_concurrent_allocate_deallocate() {
-        loom::model(|| {
-            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
-            let layout = Layout::from_size_align(64, 64).unwrap();
-
-            let p1 = pool.clone();
-            let t1 = thread::spawn(move || {
-                let ptr = p1.allocate(layout).unwrap();
-                // SAFETY: ptr from allocate, deallocated once.
-                unsafe { p1.deallocate(ptr, layout) };
-            });
-
-            let p2 = pool.clone();
-            let t2 = thread::spawn(move || {
-                let ptr = p2.allocate(layout).unwrap();
-                // SAFETY: ptr from allocate, deallocated once.
-                unsafe { p2.deallocate(ptr, layout) };
-            });
-
-            t1.join().unwrap();
-            t2.join().unwrap();
-
-            assert_eq!(pool.used(), Some(0));
-        });
-    }
-
-    /// Two threads allocate from the same size class. Verifies no duplicate
-    /// pointers are returned (the Mutex serializes access correctly).
-    #[test]
-    fn loom_no_duplicate_allocations() {
+    fn loom_concurrent_pop_no_duplicates() {
         loom::model(|| {
             let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
             let layout = Layout::from_size_align(64, 64).unwrap();
@@ -729,12 +1312,62 @@ mod loom_tests {
 
             let ptr1 = t1.join().unwrap();
             let ptr2 = t2.join().unwrap();
-
             assert_ne!(
                 ptr1.as_ptr(),
                 ptr2.as_ptr(),
                 "two threads got the same block"
             );
+        });
+    }
+
+    #[test]
+    fn loom_concurrent_push_no_lost_blocks() {
+        loom::model(|| {
+            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+            let layout = Layout::from_size_align(64, 64).unwrap();
+
+            // Allocate two blocks.
+            let ptr1 = pool.allocate(layout).unwrap();
+            let ptr2 = pool.allocate(layout).unwrap();
+
+            // Deallocate concurrently.
+            let p1 = pool.clone();
+            let t1 = thread::spawn(move || unsafe { p1.deallocate(ptr1, layout) });
+
+            let p2 = pool.clone();
+            let t2 = thread::spawn(move || unsafe { p2.deallocate(ptr2, layout) });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert_eq!(
+                pool.used(),
+                Some(0),
+                "blocks were lost during concurrent push"
+            );
+        });
+    }
+
+    #[test]
+    fn loom_push_pop_concurrent() {
+        loom::model(|| {
+            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+            let layout = Layout::from_size_align(64, 64).unwrap();
+
+            let ptr = pool.allocate(layout).unwrap();
+
+            let p1 = pool.clone();
+            let t1 = thread::spawn(move || unsafe { p1.deallocate(ptr, layout) });
+
+            let p2 = pool.clone();
+            let t2 = thread::spawn(move || p2.allocate(layout));
+
+            t1.join().unwrap();
+            let _ = t2.join().unwrap(); // may or may not succeed
+
+            // Final state: either 0 or 1 block allocated.
+            let used = pool.used().unwrap();
+            assert!(used == 0 || used == SIZE_CLASSES[0]);
         });
     }
 }
