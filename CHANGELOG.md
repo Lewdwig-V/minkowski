@@ -1,5 +1,59 @@
 # Changelog
 
+## 1.3.0
+
+### Query Planner (`minkowski`)
+
+- **Build-time join elimination** — inner joins that are pure component-presence filters are merged into the left-side scan at plan build time. No `run_join()` materialization, no sort, no intersection. `PlanWarning::JoinEliminated` informs users when the optimization fires. (#122)
+- **Direct archetype iteration** — scan-only plans (no joins, custom predicates, or index/spatial drivers) bypass ScratchBuffer entirely and walk archetypes with `init_fetch`/`fetch` inline. `scan_for_each_10k`: 9.5 µs → 5.3 ns. (#123, #131)
+- **Archetype-sorted batch execution** — after join materialization, entities are sorted by packed `(archetype_id << 32 | row)` key. Walk archetype runs with `init_fetch` once per archetype. `for_each_batched`, `for_each_batched_raw`, `for_each_join_chunk` on `QueryPlanResult`. (#120)
+- **ER joins** — entity-reference components (fields typed as `Entity`) can be joined via streaming hash join. Deferred resolution via `OnceLock`, join ordering enforcement. (#124, #126)
+- **Aggregate extractor optimization** — cached extractors/accumulators with specialized inner loops. `aggregate_count_sum_10k`: 76.1 µs → 5.8 µs (13x improvement, now faster than manual loop). (#111, #128)
+- **`execute_raw` + join support in `for_each_raw`** — pipeline breakers as transaction-invisible computation. (#116)
+- **Simplified execution layer** — removed separate vectorized execution nodes; push-based execution handles all plan shapes. (#112)
+- **Archetype caching for index candidates** — refactored index validation with archetype-level caching. (#110)
+- **Scan-only plan bypass** — `CompiledForEach` dispatch skipped for plans that can iterate archetypes directly. (#131)
+
+### Performance (`minkowski`)
+
+- **Streaming archetype buffers for QueryWriter** — fast lane on `EnumChangeSet` with pre-resolved per-archetype, per-component batch buffers. `WritableRef::set()` routes directly to `ColumnBatch` via pre-resolved `column_slot`. Apply phase: zero per-entity lookups (no `is_alive`, `entity_locations`, `column_index`, `ComponentRegistry::info`). `query_writer_10k`: 93 µs → 64 µs. Sparse updates (10% of entities modified): 5.9 µs. (#125, #130)
+- **Thread-local cache (TLC) for SlabPool** — per-thread L1 cache with 32-slot bins per size class. 15/16 allocations hit L1 (~3 instructions) instead of lock-free stack (~7 CAS ops). Epoch-based lazy flush for Rayon hoarding prevention. `add_remove/pool`: 8.03 ms → 1.35 ms (6x improvement, within 5% of jemalloc). (#118)
+- **Lock-free slab pool allocator** — Atomic<u128> tagged pointer CAS with overflow and side table. ABA prevention via 64-bit monotonic tag. (#113)
+- **`World::spawn_batch()`** — batched homogeneous entity spawning. Resolves archetype once, reserves capacity, pushes in a tight loop. `simple_insert/spawn_batch`: 343 µs (5.2x faster than individual spawns). (#129)
+- **Batch consecutive Insert overwrites** — `apply_mutations` groups consecutive same-archetype overwrites, resolving column/drop_fn once per batch. (#125)
+
+### CI & Infrastructure
+
+- **Curated Miri subset** — ~93 tests exercising unsafe code paths, replacing full-suite Miri run. `ci/miri-subset.txt` with selection criteria. (#119)
+- **CLAUDE.md → AGENTS.md** — project instructions renamed for clarity. (#117)
+
+### Documentation
+
+- **README reorganization** — TOC, extracted long sections into `docs/`. (#114)
+- **Morsel-driven execution docs** — relationship between morsel-driven execution and reducers. (#115)
+
+### Cleanup
+
+- Removed dead `_has_custom_filters` variable and stale comments. (#132)
+
+### Verification
+
+- 848 unit tests (up from 730).
+- Miri subset: 93 tests covering all unsafe code paths.
+
+### Performance Baselines (v1.3.0)
+
+| Benchmark | v1.2.0 | v1.3.0 | Improvement |
+|---|---|---|---|
+| `join/for_each_batched_10k` | 103 µs | **300 ns** | 343x |
+| `planner/scan_for_each_10k` | 9.5 µs | **5.3 ns** | 1,792x |
+| `planner/aggregate_count_sum_10k` | 76.1 µs | **5.8 µs** | 13x |
+| `add_remove/pool` | 8.03 ms | **1.35 ms** | 6x |
+| `reducer/query_writer_10k` | 93 µs | **64 µs** | 1.5x |
+| `simple_insert/spawn_batch` | — | **343 µs** | new |
+| `reducer/query_writer_sparse_10k` | — | **5.9 µs** | new |
+| `planner/query_for_each_10k` | 3.9 µs | **5.9 µs** | -1.5x (tick tracking) |
+
 ## 1.2.0
 
 ### Query Planner (`minkowski`)

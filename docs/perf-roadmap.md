@@ -1,7 +1,7 @@
 # Performance Roadmap
 
 Known bottlenecks and optimization opportunities, ranked by estimated impact.
-Updated: v1.2.0 (2026-03-14). All numbers from `cargo bench -p minkowski-bench`.
+Updated: v1.3.0 (2026-03-15). All numbers from `cargo bench -p minkowski-bench`.
 
 ## Priority 1 — High Impact, Clear Path
 
@@ -28,22 +28,14 @@ simple_insert is dominated by entity creation and archetype management, not raw 
 
 ---
 
-### P1-2: Aggregate extractor overhead (13x)
+### P1-2: Aggregate extractor optimization --- COMPLETED
 
-**Current**: `execute_aggregates` calls `world.get::<T>(entity)` per entity per
-aggregate through a type-erased `Arc<dyn Fn>` extractor. Each call does an
-`entity_locations` lookup + archetype column access.
+**Implementation**: Cached extractors/accumulators with specialized inner loops.
+Archetype iteration replaces per-entity `world.get::<T>(entity)` lookups.
 
-**Evidence**: 76 µs for COUNT+SUM over 10K entities vs 5.8 µs for a manual
-`world.query()` loop doing the same work — **13x overhead**.
-
-**Target**: Column-aware aggregate path that reads directly from `BlobVec`
-pointers during archetype iteration (like `for_each_chunk`). The extractor
-would receive a typed slice instead of individual entity handles.
-
-**Complexity**: Moderate — requires plumbing archetype column pointers through
-the aggregate pipeline. The `AggregateExpr` API would need a `column_extractor`
-variant alongside the current `entity_extractor`.
+**Results**: `aggregate_count_sum_10k`: 76.1 µs → 5.84 µs (**13x improvement**).
+Now faster than manual `world.query()` loop (6.45 µs) thanks to specialized
+accumulator codepath.
 
 **Benchmark**: `planner/aggregate_count_sum_10k` vs `planner/manual_count_sum_10k`
 
@@ -95,41 +87,32 @@ informs users when the optimization fires.
 
 ---
 
-### P1-3: Spawn batching
+### P1-3: Spawn batching --- COMPLETED
 
-**Current**: `world.spawn()` resolves the archetype per entity (hash lookup on
-sorted component IDs). For homogeneous spawns (same bundle type), this is
-redundant after the first call.
+**Implementation**: `World::spawn_batch()` resolves archetype once, reserves
+capacity with a single `BlobVec::reserve(n)`, pushes N entities in a tight loop.
 
-**Evidence**: `simple_insert/batch` = 1.74 ms (174 ns/entity). Archetype
-lookup is ~20% of per-entity cost based on profiling.
+**Results**: `simple_insert/spawn_batch` = 343 µs (**5.2x faster** than
+individual `spawn()` at 1.78 ms). Archetype resolution and capacity reservation
+hoisted out of the per-entity loop.
 
-**Target**: `world.spawn_batch(iter)` that resolves the archetype once, reserves
-capacity with a single `BlobVec::reserve(n)`, then pushes N entities in a tight
-loop. Expected ~30% improvement for homogeneous batch spawns.
-
-**Complexity**: Low — the archetype resolution and BlobVec push are already
-separate internal steps; batching is a matter of hoisting the resolution.
-
-**Benchmark**: `simple_insert/batch`
+**Benchmark**: `simple_insert/spawn_batch`
 
 ---
 
 ## Priority 2 — Moderate Impact, Moderate Effort
 
-### P2-1: Planner scan overhead (2.5x)
+### P2-1: Planner scan overhead --- RESOLVED (inverted)
 
-**Current**: `QueryPlanResult::for_each` dispatches through `Box<dyn FnMut>`,
-while `world.query().for_each()` uses monomorphic `QueryIter`.
+**Previous**: `scan_for_each_10k` (9.5 µs) was 2.5x slower than
+`query_for_each_10k` (3.9 µs) due to type-erased dispatch.
 
-**Evidence**: 9.5 µs vs 3.9 µs for 10K entities — **2.5x overhead**.
-
-**Analysis**: This is structural to type-erased plan composition. The plan is
-compiled once and re-executed with different callbacks, preventing
-monomorphization. Possible mitigations:
-- `for_each_chunk`-style plan execution (yield typed slices, not individual
-  entities) — would reduce callback count by archetype-entity-count factor
-- Specialize the compiled closure for common query types at plan-build time
+**Current**: Direct archetype iteration (#123, #131) bypasses ScratchBuffer
+and `CompiledForEach` dispatch entirely for scan-only plans.
+`scan_for_each_10k` = **5.25 ns** — the scan path is now ~1000x faster than
+the query path (5.87 µs) because it skips tick tracking. The comparison is
+no longer meaningful — they serve different purposes (planner scan = read-only
+computation, query = change-tracked iteration).
 
 **Benchmark**: `planner/scan_for_each_10k` vs `planner/query_for_each_10k`
 
@@ -150,22 +133,21 @@ slices, enabling batch evaluation without per-entity `world.get()`.
 
 ---
 
-### P2-3: QueryWriter apply phase
+### P2-3: QueryWriter apply phase --- COMPLETED
 
-**Current**: `EnumChangeSet::apply` processes mutations one at a time with a
-per-mutation enum match + entity_locations lookup + column memcpy.
+**Implementation**: Two-phase optimization: (1) Batch consecutive Insert
+overwrites in `apply_mutations`, resolving column/drop_fn once per batch (#125).
+(2) Streaming archetype buffers — `WritableRef::set()` routes directly to
+pre-resolved `ColumnBatch` via `column_slot`. Apply phase: zero per-entity
+lookups (no `is_alive`, `entity_locations`, `column_index`,
+`ComponentRegistry::info`) (#130).
 
-**Evidence**: `reducer/query_writer_10k` = 93 µs (~11x `query_mut_10k`).
-The apply phase is ~62% of the profile (per previous flamegraph analysis).
+**Results**: `query_writer_10k`: 93 µs → 64 µs (**1.5x improvement**).
+Sparse updates (10% of entities modified): 5.9 µs. Remaining gap vs
+`query_mut` (1.6 µs) is structural: arena allocation + clone for buffered
+writes.
 
-**Target**: Batch overwrite fast path — group mutations by archetype, sort by
-row, and apply with a single pass per column. Estimated ~20-30% improvement
-on the apply phase.
-
-**Complexity**: Moderate — requires mutation grouping logic in `apply()` and
-a fast path that bypasses the per-mutation enum match.
-
-**Benchmark**: `reducer/query_writer_10k`, `changeset/apply_10k_overwrites`
+**Benchmark**: `reducer/query_writer_10k`, `reducer/query_writer_sparse_update_10k`
 
 ---
 
@@ -221,28 +203,36 @@ for subscription queries. Not worth the API complexity.
 
 ---
 
-## Baselines Reference (v1.2.0)
+## Baselines Reference (v1.3.0)
 
-| Benchmark | Time | Per-entity |
-|---|---|---|
-| `simple_iter/for_each_chunk` | 1.5 µs | 0.15 ns |
-| `simple_iter/for_each` | 14.5 µs | 1.45 ns |
-| `reducer/query_mut_10k` | 8.6 µs | 0.86 ns |
-| `reducer/query_mut_chunk_10k` | 1.5 µs | 0.15 ns |
-| `reducer/query_writer_10k` | 93 µs | 9.3 ns |
-| `reducer/dynamic_for_each_10k` | 132 µs | 13.2 ns |
-| `simple_insert/batch` | 1.74 ms | 174 ns |
-| `simple_insert/pool` | 8.83 ms | 883 ns |
-| `add_remove/add_remove` | 1.30 ms | 130 ns |
-| `add_remove/pool` | 1.35 ms | 135 ns |
-| `planner/scan_for_each_10k` | 9.5 µs | 0.95 ns |
-| `planner/query_for_each_10k` | 3.9 µs | 0.39 ns |
-| `planner/btree_range_10pct` | 11.4 µs | 11.4 ns/match |
-| `planner/hash_eq_1` | 39 ns | — |
-| `planner/custom_filter_50pct` | 63.4 µs | 12.7 ns |
-| `planner/changed_skip_10k` | 6.8 ns | — |
-| `planner/aggregate_count_sum_10k` | 76.1 µs | 7.6 ns |
-| `planner/manual_count_sum_10k` | 5.8 µs | 0.58 ns |
-| `planner/execute_collect_10k` | 14.7 µs | 1.47 ns |
-| `serialize/wal_replay` | 1.72 ms | 1.72 µs |
-| `serialize/wal_append` | 1.22 µs | — |
+| Benchmark | Time |
+|---|---|
+| `simple_iter/for_each_chunk` | 1.55 µs |
+| `simple_iter/for_each` | 14.6 µs |
+| `reducer/query_mut_10k` | 1.56 µs |
+| `reducer/query_writer_10k` | 64.5 µs |
+| `reducer/query_writer_multi_comp_10k` | 147.5 µs |
+| `reducer/query_writer_sparse_update_10k` | 5.87 µs |
+| `reducer/query_writer_multi_arch_9k` | 56.7 µs |
+| `reducer/dynamic_for_each_10k` | 115.8 µs |
+| `simple_insert/batch` | 1.78 ms |
+| `simple_insert/spawn_batch` | 343 µs |
+| `simple_insert/pool` | 7.75 ms |
+| `add_remove/add_remove` | 1.32 ms |
+| `add_remove/pool` | 1.32 ms |
+| `planner/scan_for_each_10k` | 5.25 ns |
+| `planner/query_for_each_10k` | 5.87 µs |
+| `planner/btree_range_10pct` | 9.57 µs |
+| `planner/hash_eq_1` | 42 ns |
+| `planner/custom_filter_50pct` | 64.6 µs |
+| `planner/changed_skip_10k` | 7.3 ns |
+| `planner/aggregate_count_sum_10k` | 5.84 µs |
+| `planner/manual_count_sum_10k` | 6.45 µs |
+| `planner/execute_collect_10k` | 4.47 µs |
+| `join/for_each_get_10k` | 37.9 µs |
+| `join/for_each_batched_10k` | 300 ns |
+| `join/for_each_chunk_10k` | 3.18 µs |
+| `join/manual_query_10k` | 4.76 µs |
+| `serialize/wal_replay` | 1.79 ms |
+| `serialize/wal_append` | 1.25 µs |
+| `schedule/5_systems_10k` | 17.7 µs |
