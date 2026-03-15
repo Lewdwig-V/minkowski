@@ -59,7 +59,7 @@ struct ColumnBatch {
     col_idx: usize,
     drop_fn: Option<unsafe fn(*mut u8)>,
     layout: Layout,
-    entries: Vec<(usize, Entity, *const u8)>,  // (row, entity, arena_ptr)
+    entries: Vec<(usize, Entity, usize)>,  // (row, entity, arena_offset)
 }
 
 /// All buffered overwrites for a single archetype, grouped by component.
@@ -159,8 +159,7 @@ pub fn set(&mut self, value: T) {
         &*value as *const T as *const u8,
         Layout::new::<T>(),
     );
-    let ptr = cs.arena.get(offset);
-    col_batch.entries.push((self.row, self.entity, ptr));
+    col_batch.entries.push((self.row, self.entity, offset));
 
     if std::mem::needs_drop::<T>() {
         cs.drop_entries.push(DropEntry {
@@ -177,7 +176,7 @@ pub fn set(&mut self, value: T) {
 No separate handling needed.
 ```
 
-Per-entity cost: arena alloc + push `(row, ptr)` + conditional drop entry.
+Per-entity cost: arena alloc + push `(row, entity, offset)` + conditional drop entry.
 No generation check, no location lookup, no column resolution, no bitset
 check.
 
@@ -200,8 +199,9 @@ fn apply_mutations(&self, world: &mut World, tick: Tick)
             let col = &mut arch.columns[col_batch.col_idx];
             col.mark_changed(tick);
             let size = col_batch.layout.size();
-            for &(row, _entity, src) in &col_batch.entries {
+            for &(row, _entity, offset) in &col_batch.entries {
                 unsafe {
+                    let src = self.arena.get(offset);
                     let dst = col.get_ptr(row);
                     if let Some(drop_fn) = col_batch.drop_fn {
                         drop_fn(dst);
@@ -334,9 +334,7 @@ for the common case.
 pub(crate) fn drain_fast_lane_to_mutations(&mut self) {
     for batch in self.archetype_batches.drain(..) {
         for col_batch in batch.columns {
-            for (row, entity, ptr) in col_batch.entries {
-                let _ = row; // not needed for Mutation::Insert
-                let offset = self.arena.offset_of(ptr);
+            for (_row, entity, offset) in col_batch.entries {
                 let mutation_idx = self.mutations.len();
                 self.mutations.push(Mutation::Insert {
                     entity,
@@ -365,6 +363,14 @@ The `Entity` stored in `ColumnBatch.entries` is what makes this possible —
 without it, the drain function would need `&World` access to recover entity
 handles from row indices. The 8-byte per-entry cost of storing `Entity` is
 justified by keeping the drain function self-contained.
+
+**Entries store arena offsets, not pointers**: `ColumnBatch.entries` stores
+`(row, Entity, usize)` where the third element is an arena offset, not a
+`*const u8`. This is critical because the arena may reallocate during
+recording (when `set()` triggers `arena.alloc()` → `grow()`), invalidating
+all previously issued pointers. Offsets survive reallocation. Pointers are
+resolved at apply time via `self.arena.get(offset)`, when no further
+allocations occur. This matches the existing `Mutation::Insert` design.
 
 **Drop entry rebasing**: After drain, fast-lane `DropEntry` records have real
 `mutation_idx` values, so the partial-failure retain filter
