@@ -1473,8 +1473,8 @@ mod tests {
         let used_before = pool.used().unwrap();
         unsafe {
             pool.inner
-                .global_deallocate(ptrs.pop().unwrap(), layout_small)
-        };
+                .global_deallocate(ptrs.pop().unwrap(), layout_small);
+        }
         let used_after = pool.used().unwrap();
         let freed = used_before - used_after;
         // Overflow block came from class 1 (256B).
