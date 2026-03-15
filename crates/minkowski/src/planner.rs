@@ -1794,6 +1794,37 @@ impl QueryPlanResult {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
 
+        // Fast path: scan-only plan with no custom predicates or index drivers.
+        // Bypass CompiledForEach and push entities directly into scratch.
+        if self.scan_required.is_some() {
+            let Self {
+                scan_required,
+                scan_changed,
+                last_read_tick,
+                scratch,
+                ..
+            } = self;
+            let required = scan_required.as_ref().unwrap();
+            let scratch = scratch
+                .as_mut()
+                .expect("execute() requires a plan with a scratch buffer");
+            scratch.clear();
+            let tick = *last_read_tick;
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, scan_changed, tick) {
+                    continue;
+                }
+                for &entity in &arch.entities {
+                    scratch.push(entity);
+                }
+            }
+            *last_read_tick = world.next_tick();
+            return Ok(scratch.as_slice());
+        }
+
         if self.join_exec.is_some() {
             self.run_join(&*world);
             self.last_read_tick = world.next_tick();
@@ -1841,6 +1872,35 @@ impl QueryPlanResult {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
 
+        // Fast path: scan-only plan with no custom predicates or index drivers.
+        if self.scan_required.is_some() {
+            let Self {
+                scan_required,
+                scan_changed,
+                last_read_tick,
+                scratch,
+                ..
+            } = self;
+            let required = scan_required.as_ref().unwrap();
+            let scratch = scratch
+                .as_mut()
+                .expect("execute_raw() requires a plan with a scratch buffer");
+            scratch.clear();
+            let tick = *last_read_tick;
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, scan_changed, tick) {
+                    continue;
+                }
+                for &entity in &arch.entities {
+                    scratch.push(entity);
+                }
+            }
+            return Ok(scratch.as_slice());
+        }
+
         if self.join_exec.is_some() {
             self.run_join(world);
             Ok(self.scratch.as_ref().unwrap().as_slice())
@@ -1886,6 +1946,33 @@ impl QueryPlanResult {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
+        // Fast path: scan-only plan with no custom predicates or index drivers.
+        // Walk archetypes directly — the callback is monomorphic (`impl FnMut`),
+        // so this avoids the double trait-object dispatch through CompiledForEach
+        // (`Box<dyn FnMut>` outer + `&mut dyn FnMut` inner).
+        if self.scan_required.is_some() {
+            let Self {
+                scan_required,
+                scan_changed,
+                last_read_tick,
+                ..
+            } = self;
+            let required = scan_required.as_ref().unwrap();
+            let tick = *last_read_tick;
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, scan_changed, tick) {
+                    continue;
+                }
+                for &entity in &arch.entities {
+                    callback(entity);
+                }
+            }
+            *last_read_tick = world.next_tick();
+            return Ok(());
+        }
         if self.join_exec.is_some() {
             self.run_join(&*world);
             for &entity in self.scratch.as_ref().unwrap().as_slice() {
@@ -1928,6 +2015,30 @@ impl QueryPlanResult {
     ) -> Result<(), PlanExecError> {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
+        }
+        // Fast path: scan-only plan with no custom predicates or index drivers.
+        // Same as for_each but without tick advancement (transactional read).
+        if self.scan_required.is_some() {
+            let Self {
+                scan_required,
+                scan_changed,
+                last_read_tick,
+                ..
+            } = self;
+            let required = scan_required.as_ref().unwrap();
+            let tick = *last_read_tick;
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, scan_changed, tick) {
+                    continue;
+                }
+                for &entity in &arch.entities {
+                    callback(entity);
+                }
+            }
+            return Ok(());
         }
         if self.join_exec.is_some() {
             self.run_join(world);
@@ -3363,7 +3474,7 @@ impl ScanBuilder<'_> {
             }
         }
 
-        let has_custom_filters = !filter_preds.is_empty();
+        let _has_custom_filters = !filter_preds.is_empty();
 
         // Phase 2: Order index lookups by selectivity (most selective first).
         index_preds.sort_by(|a, b| a.0.selectivity.total_cmp(&b.0.selectivity));
@@ -3411,6 +3522,10 @@ impl ScanBuilder<'_> {
                     .filter_map(|p| p.filter_fn.as_ref().map(Arc::clone)),
             )
             .collect();
+        // Capture before all_filter_fns is moved into compiled closures.
+        // Includes spatial/index predicate filters that has_custom_filters
+        // misses (it only checks filter_preds).
+        let has_any_filters = !all_filter_fns.is_empty();
 
         // Phase 3: Build the logical plan tree.
         //
@@ -4396,9 +4511,12 @@ impl ScanBuilder<'_> {
             cached_accums,
             row_indices: Vec::new(),
             // Direct archetype iteration: only for pure scans with no
-            // predicates, indexes, or spatial drivers. Plans with index/spatial
-            // drivers use compiled closures that execute the index lookup.
-            scan_required: if !has_custom_filters
+            // predicates, indexes, or spatial drivers. Check all_filter_fns
+            // (not just has_custom_filters) because spatial predicates
+            // registered via add_spatial_index (cost-only, no lookup) land
+            // in spatial_preds with a filter_fn but leave has_custom_filters
+            // false — the fast path must not bypass those filters.
+            scan_required: if !has_any_filters
                 && !has_any_joins
                 && index_driver.is_none()
                 && spatial_driver.is_none()
@@ -11579,6 +11697,65 @@ mod tests {
         assert!(
             explain.contains("ErJoin"),
             "explain should contain ErJoin: {explain}"
+        );
+    }
+
+    /// Regression: add_spatial_index (cost-only, no lookup) registers a
+    /// spatial predicate's filter_fn in all_filter_fns while leaving
+    /// has_custom_filters false.  The scan_required fast path must NOT
+    /// activate for such plans, otherwise the filter is never evaluated.
+    #[test]
+    fn spatial_cost_only_filter_applied_in_for_each() {
+        let mut world = World::new();
+        // 10 entities at x=0..9; only x < 5 should pass the filter.
+        for i in 0..10u32 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },));
+        }
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        // Cost-only registration — no lookup closure.
+        planner
+            .add_spatial_index::<Pos>(Arc::new(grid), &world)
+            .unwrap();
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(
+                Predicate::within::<Pos>(
+                    [2.5, 0.0],
+                    100.0, // large radius, but filter rejects x >= 5
+                    |w: &World, e| w.get::<Pos>(e).is_some_and(|p| p.x < 5.0),
+                )
+                .unwrap(),
+            )
+            .build();
+        drop(planner);
+
+        // for_each must apply the spatial filter.
+        let mut count = 0u32;
+        plan.for_each(&mut world, |_| count += 1).unwrap();
+        assert_eq!(count, 5, "for_each should apply the spatial filter");
+
+        // execute must apply it too.
+        let entities = plan.execute(&mut world).unwrap();
+        assert_eq!(entities.len(), 5, "execute should apply the spatial filter");
+
+        // for_each_raw / execute_raw (transactional paths).
+        let mut count_raw = 0u32;
+        plan.for_each_raw(&world, |_| count_raw += 1).unwrap();
+        assert_eq!(count_raw, 5, "for_each_raw should apply the spatial filter");
+
+        let entities_raw = plan.execute_raw(&world).unwrap();
+        assert_eq!(
+            entities_raw.len(),
+            5,
+            "execute_raw should apply the spatial filter"
         );
     }
 }
