@@ -4490,4 +4490,177 @@ mod tests {
         let result = registry.dynamic_reducer_info(bogus);
         assert!(matches!(result, Err(ReducerError::InvalidId { .. })));
     }
+
+    // ── Fast-lane integration tests ─────────────────────────────────
+
+    #[test]
+    fn query_writer_fast_lane_roundtrip() {
+        let mut world = World::new();
+        // Spawn 100 entities: Pos(0.0), Vel(i as f32)
+        let entities: Vec<Entity> = (0..100)
+            .map(|i| world.spawn((Pos(0.0), Vel(i as f32))))
+            .collect();
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+
+        let id = registry
+            .register_query_writer::<(&mut Pos, &Vel), (), _>(
+                &mut world,
+                "apply_vel_roundtrip",
+                |mut query, ()| {
+                    query.for_each(|(mut pos, vel)| {
+                        pos.modify(|p| p.0 += vel.0);
+                    });
+                },
+            )
+            .unwrap();
+
+        registry.call(&strategy, &mut world, id, ()).unwrap();
+
+        // Verify each entity: Pos should equal its Vel value
+        for (i, &e) in entities.iter().enumerate() {
+            let pos = world.get::<Pos>(e).unwrap().0;
+            assert_eq!(
+                pos, i as f32,
+                "entity {i}: expected Pos({i}.0), got Pos({pos})"
+            );
+        }
+    }
+
+    #[test]
+    fn query_writer_fast_lane_change_detection() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(10.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+
+        // First reducer: writes Pos via fast lane
+        let writer_id = registry
+            .register_query_writer::<(&mut Pos, &Vel), (), _>(
+                &mut world,
+                "move_pos",
+                |mut query, ()| {
+                    query.for_each(|(mut pos, vel)| {
+                        pos.modify(|p| p.0 += vel.0);
+                    });
+                },
+            )
+            .unwrap();
+
+        // Second reducer: reads Pos with Changed filter
+        let visit_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = visit_count.clone();
+
+        let changed_id = registry
+            .register_query_writer::<(Changed<Pos>, &mut Pos), (), _>(
+                &mut world,
+                "detect_changed",
+                move |mut query, ()| {
+                    query.for_each(|((), mut pos)| {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Touch pos so the write goes through the fast lane
+                        pos.modify(|p| p.0 += 0.0);
+                    });
+                },
+            )
+            .unwrap();
+
+        // Call the writer — this updates Pos via fast lane
+        registry.call(&strategy, &mut world, writer_id, ()).unwrap();
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 11.0);
+
+        // Changed<Pos> should match because the writer just modified Pos
+        visit_count.store(0, std::sync::atomic::Ordering::Relaxed);
+        registry
+            .call(&strategy, &mut world, changed_id, ())
+            .unwrap();
+        assert_eq!(
+            visit_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Changed<Pos> should match after fast-lane write"
+        );
+
+        // Call again with no intervening mutation — Changed should NOT match
+        visit_count.store(0, std::sync::atomic::Ordering::Relaxed);
+        registry
+            .call(&strategy, &mut world, changed_id, ())
+            .unwrap();
+        assert_eq!(
+            visit_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "Changed<Pos> should not match when nothing changed"
+        );
+    }
+
+    #[test]
+    fn query_writer_conditional_update() {
+        let mut world = World::new();
+        let entities: Vec<Entity> = (0..100).map(|i| world.spawn((Pos(i as f32),))).collect();
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+
+        let id = registry
+            .register_query_writer::<(&mut Pos,), (), _>(
+                &mut world,
+                "conditional_update",
+                |mut query, ()| {
+                    query.for_each(|(mut pos,)| {
+                        if pos.get().0 > 50.0 {
+                            pos.modify(|p| p.0 *= 2.0);
+                        }
+                    });
+                },
+            )
+            .unwrap();
+
+        registry.call(&strategy, &mut world, id, ()).unwrap();
+
+        for (i, &e) in entities.iter().enumerate() {
+            let val = world.get::<Pos>(e).unwrap().0;
+            let expected = if (i as f32) > 50.0 {
+                (i as f32) * 2.0
+            } else {
+                i as f32
+            };
+            assert_eq!(val, expected, "entity {i}: expected {expected}, got {val}");
+        }
+    }
+
+    #[test]
+    fn query_writer_read_only_components() {
+        let mut world = World::new();
+        let entities: Vec<Entity> = (0..50)
+            .map(|i| world.spawn((Pos(i as f32), Vel(i as f32 * 10.0))))
+            .collect();
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+
+        let id = registry
+            .register_query_writer::<(&Pos, &mut Vel), (), _>(
+                &mut world,
+                "read_pos_write_vel",
+                |mut query, ()| {
+                    query.for_each(|(pos, mut vel)| {
+                        // Read Pos, use its value to modify Vel
+                        vel.modify(|v| v.0 += pos.0);
+                    });
+                },
+            )
+            .unwrap();
+
+        registry.call(&strategy, &mut world, id, ()).unwrap();
+
+        for (i, &e) in entities.iter().enumerate() {
+            let pos_val = world.get::<Pos>(e).unwrap().0;
+            let vel_val = world.get::<Vel>(e).unwrap().0;
+            // Pos should be unchanged
+            assert_eq!(pos_val, i as f32, "entity {i}: Pos should be unchanged");
+            // Vel should be original + Pos value
+            let expected_vel = (i as f32 * 10.0) + i as f32;
+            assert_eq!(
+                vel_val, expected_vel,
+                "entity {i}: Vel should be {expected_vel}, got {vel_val}"
+            );
+        }
+    }
 }
