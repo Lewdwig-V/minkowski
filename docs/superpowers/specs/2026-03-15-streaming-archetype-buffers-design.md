@@ -59,7 +59,7 @@ struct ColumnBatch {
     col_idx: usize,
     drop_fn: Option<unsafe fn(*mut u8)>,
     layout: Layout,
-    entries: Vec<(usize, *const u8)>,  // (row, arena_ptr) pairs
+    entries: Vec<(usize, Entity, *const u8)>,  // (row, entity, arena_ptr)
 }
 
 /// All buffered overwrites for a single archetype, grouped by component.
@@ -152,6 +152,7 @@ pub fn set(&mut self, value: T) {
     let batch = cs.archetype_batches.last_mut().unwrap();
     let col_batch = &mut batch.columns[self.column_slot];
     debug_assert_eq!(col_batch.comp_id, self.comp_id);
+    debug_assert_eq!(col_batch.layout, Layout::new::<T>());
 
     let value = std::mem::ManuallyDrop::new(value);
     let offset = cs.arena.alloc(
@@ -159,7 +160,7 @@ pub fn set(&mut self, value: T) {
         Layout::new::<T>(),
     );
     let ptr = cs.arena.get(offset);
-    col_batch.entries.push((self.row, ptr));
+    col_batch.entries.push((self.row, self.entity, ptr));
 
     if std::mem::needs_drop::<T>() {
         cs.drop_entries.push(DropEntry {
@@ -169,6 +170,11 @@ pub fn set(&mut self, value: T) {
         });
     }
 }
+```
+
+**`modify()` inherits the fast lane**: `WritableRef::modify()` calls
+`self.set(val)` internally, so it routes through the fast lane automatically.
+No separate handling needed.
 ```
 
 Per-entity cost: arena alloc + push `(row, ptr)` + conditional drop entry.
@@ -188,10 +194,13 @@ fn apply_mutations(&self, world: &mut World, tick: Tick)
     for batch in &self.archetype_batches {
         let arch = &mut world.archetypes.archetypes[batch.arch_idx];
         for col_batch in &batch.columns {
+            if col_batch.entries.is_empty() {
+                continue;
+            }
             let col = &mut arch.columns[col_batch.col_idx];
             col.mark_changed(tick);
             let size = col_batch.layout.size();
-            for &(row, src) in &col_batch.entries {
+            for &(row, _entity, src) in &col_batch.entries {
                 unsafe {
                     let dst = col.get_ptr(row);
                     if let Some(drop_fn) = col_batch.drop_fn {
@@ -318,6 +327,51 @@ The fast lane is invisible to WAL. The `Durable` strategy serializes
 calls it once before serialization, converting `ArchetypeBatch` entries into
 synthetic `Mutation::Insert` entries. This keeps the fast lane zero-overhead
 for the common case.
+
+**`drain_fast_lane_to_mutations` implementation:**
+
+```rust
+pub(crate) fn drain_fast_lane_to_mutations(&mut self) {
+    for batch in self.archetype_batches.drain(..) {
+        for col_batch in batch.columns {
+            for (row, entity, ptr) in col_batch.entries {
+                let _ = row; // not needed for Mutation::Insert
+                let offset = self.arena.offset_of(ptr);
+                let mutation_idx = self.mutations.len();
+                self.mutations.push(Mutation::Insert {
+                    entity,
+                    component_id: col_batch.comp_id,
+                    offset,
+                    layout: col_batch.layout,
+                });
+                // Rebase any fast-lane drop entries for this offset
+                // from usize::MAX to the real mutation_idx, so the
+                // partial-failure retain logic works correctly.
+                for entry in &mut self.drop_entries {
+                    if entry.offset == offset
+                        && entry.mutation_idx == usize::MAX
+                    {
+                        entry.mutation_idx = mutation_idx;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+The `Entity` stored in `ColumnBatch.entries` is what makes this possible —
+without it, the drain function would need `&World` access to recover entity
+handles from row indices. The 8-byte per-entry cost of storing `Entity` is
+justified by keeping the drain function self-contained.
+
+**Drop entry rebasing**: After drain, fast-lane `DropEntry` records have real
+`mutation_idx` values, so the partial-failure retain filter
+(`entry.mutation_idx >= failed_idx`) works correctly without the
+`usize::MAX` exclusion. The WAL path and non-WAL path use different retain
+logic — this is acceptable because `drain_fast_lane_to_mutations` converts
+fast-lane entries into regular entries, unifying both paths.
 
 ### Read-only Components
 
