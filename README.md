@@ -85,7 +85,7 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 
 ## Deep Dive
 
-For a comprehensive walkthrough of the internals — storage model, query engine, transaction system, persistence layer, memory management — see the [DeepWiki](https://deepwiki.com/Lewdwig-V/minkowski). It's auto-generated from the source and always up to date.
+For a comprehensive walkthrough of the internals — storage model, query engine, transaction system, persistence layer, memory management — [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Lewdwig-V/minkowski). It's auto-generated from the source and always up to date.
 
 ## Soundness
 
