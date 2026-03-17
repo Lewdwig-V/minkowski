@@ -77,7 +77,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
-use std::sync::OnceLock;
 
 use fixedbitset::FixedBitSet;
 
@@ -119,8 +118,9 @@ use std::sync::Arc;
 /// // the parent entity has (&Pos, &Name).
 /// let plan = planner
 ///     .scan::<(&ChildTag, &Parent)>()
-///     .er_join::<Parent, (&Pos, &Name)>(JoinKind::Inner)
+///     .er_join::<Parent, (&Pos, &Name)>(JoinKind::Inner)?
 ///     .build();
+/// # Ok::<(), minkowski::PlannerError>(())
 /// ```
 pub trait AsEntityRef: Component {
     /// Extract the referenced entity from this component value.
@@ -1534,10 +1534,6 @@ pub enum PlanWarning {
     /// were merged into the scan's bitset. The plan executes as a pure
     /// archetype scan instead of materializing a join.
     JoinEliminated { right_name: &'static str },
-    /// The entity-reference component for an ER join was not registered at
-    /// build time. The join will attempt deferred resolution at execution time,
-    /// but may produce empty results if the component is never registered.
-    UnregisteredErComponent { component_name: &'static str },
 }
 
 impl fmt::Display for PlanWarning {
@@ -1596,13 +1592,6 @@ impl fmt::Display for PlanWarning {
                     f,
                     "inner join with `{right_name}` eliminated — merged into scan \
                      (use scan::<(Left, Right)>() directly to avoid this)"
-                )
-            }
-            PlanWarning::UnregisteredErComponent { component_name } => {
-                write!(
-                    f,
-                    "ER join reference component `{component_name}` not registered at build \
-                     time — will attempt deferred resolution at execution time"
                 )
             }
         }
@@ -3004,8 +2993,8 @@ struct ErJoinStep {
 /// arbitrary join chains: `A JOIN B JOIN C` becomes
 /// `left_collector(A) → step[0](B) → step[1](C)`.
 ///
-/// ER join steps execute after all regular join steps (enforced by the builder
-/// API — `join()` panics if called after `er_join()`). Each ER step builds
+/// ER join steps execute after all regular join steps (the builder accepts
+/// `join()` and `er_join()` in any order; `build()` sequences them). Each ER step builds
 /// a `HashSet<Entity>` from the right side, then filters left-side entities
 /// by probing via entity reference extraction. Left ER joins short-circuit
 /// and skip right-side collection entirely.
@@ -3391,43 +3380,37 @@ impl ScanBuilder<'_> {
     /// //  parent entity has Pos and Name."
     /// let plan = planner
     ///     .scan::<(&ChildTag, &Parent)>()
-    ///     .er_join::<Parent, (&Pos, &Name)>(JoinKind::Inner)
+    ///     .er_join::<Parent, (&Pos, &Name)>(JoinKind::Inner)?
     ///     .build();
+    /// # Ok::<(), minkowski::PlannerError>(())
     /// ```
-    pub fn er_join<R, Q>(mut self, join_kind: JoinKind) -> Self
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(PlannerError::UnregisteredComponent)` if the reference
+    /// component `R` has not been registered in the World. Register it with
+    /// `world.register_component::<R>()` before building the plan.
+    pub fn er_join<R, Q>(mut self, join_kind: JoinKind) -> Result<Self, PlannerError>
     where
         R: AsEntityRef,
         Q: crate::query::fetch::WorldQuery + 'static,
     {
+        let ref_comp_id =
+            self.planner
+                .components
+                .id::<R>()
+                .ok_or(PlannerError::UnregisteredComponent(
+                    std::any::type_name::<R>(),
+                ))?;
+
         let right_rows = self.planner.total_entities;
         let required = Q::required_ids(self.planner.components);
         let changed = Q::changed_ids(self.planner.components);
 
-        // Pre-resolve ComponentId for R at plan-build time so execution
-        // avoids per-entity registry lookups. If R is not registered yet,
-        // defer resolution to execution time via OnceLock — a long-lived plan
-        // built before any R entities exist will still work once they appear.
-        let ref_extractor: EntityRefExtractor =
-            if let Some(ref_comp_id) = self.planner.components.id::<R>() {
-                Arc::new(move |world: &World, entity: Entity| {
-                    let r: &R = world.get_by_id(entity, ref_comp_id)?;
-                    Some(r.entity_ref())
-                })
-            } else {
-                // Component not registered at build time — defer resolution.
-                // OnceLock caches the ComponentId on first execution call.
-                self.deferred_warnings
-                    .push(PlanWarning::UnregisteredErComponent {
-                        component_name: std::any::type_name::<R>(),
-                    });
-                let cached_id: Arc<OnceLock<Option<ComponentId>>> = Arc::new(OnceLock::new());
-                Arc::new(move |world: &World, entity: Entity| {
-                    let comp_id = *cached_id.get_or_init(|| world.components.id::<R>());
-                    let comp_id = comp_id?;
-                    let r: &R = world.get_by_id(entity, comp_id)?;
-                    Some(r.entity_ref())
-                })
-            };
+        let ref_extractor: EntityRefExtractor = Arc::new(move |world: &World, entity: Entity| {
+            let r: &R = world.get_by_id(entity, ref_comp_id)?;
+            Some(r.entity_ref())
+        });
 
         let idx = self.er_joins.len();
         self.er_joins.push(ErJoinSpec {
@@ -3440,7 +3423,7 @@ impl ScanBuilder<'_> {
             ref_extractor,
         });
         self.last_join = Some(LastJoinKind::Er(idx));
-        self
+        Ok(self)
     }
 
     /// Compile the scan into an optimized execution plan.
@@ -11472,6 +11455,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let entities = plan.execute(&mut world).unwrap();
@@ -11504,6 +11488,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Left)
+            .unwrap()
             .build();
 
         let entities = plan.execute(&mut world).unwrap();
@@ -11534,6 +11519,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let entities = plan.execute(&mut world).unwrap();
@@ -11553,6 +11539,7 @@ mod tests {
         let plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let explain = plan.explain();
@@ -11580,6 +11567,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let mut found = Vec::new();
@@ -11605,6 +11593,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let mut found = Vec::new();
@@ -11629,6 +11618,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent, &Team)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let entities = plan.execute(&mut world).unwrap();
@@ -11639,6 +11629,7 @@ mod tests {
     #[test]
     fn er_join_no_matching_children() {
         let mut world = World::new();
+        world.register_component::<Parent>();
 
         // Parents exist but no children.
         world.spawn((Name("Alice"),));
@@ -11647,6 +11638,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let entities = plan.execute(&mut world).unwrap();
@@ -11669,6 +11661,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let mut scores = Vec::new();
@@ -11720,8 +11713,10 @@ mod tests {
             .scan::<(&ChildTag, &Parent, &Owner)>()
             // First ER join: parent must have Name.
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             // Second ER join: owner must have Score.
             .er_join::<Owner, (&Score,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let entities = plan.execute(&mut world).unwrap();
@@ -11750,6 +11745,7 @@ mod tests {
             // c1 doesn't have Team, so it should be filtered out.
             .join::<(&Team,)>(JoinKind::Inner)
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let entities = plan.execute(&mut world).unwrap();
@@ -11771,6 +11767,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .join::<(&Score,)>(JoinKind::Inner)
             .build();
 
@@ -11781,12 +11778,10 @@ mod tests {
     }
 
     #[test]
-    fn er_join_unregistered_component_deferred() {
+    fn er_join_unregistered_component_returns_error() {
         let mut world = World::new();
 
-        // Build plan BEFORE any entity with UnknownRef exists.
-        // UnknownRef is never registered — the plan should emit a warning
-        // and produce empty results on inner join.
+        // UnknownRef is never registered — er_join should return an error.
         #[derive(Clone, Copy, Debug)]
         struct UnknownRef(Entity);
         impl super::AsEntityRef for UnknownRef {
@@ -11798,18 +11793,14 @@ mod tests {
         world.spawn((ChildTag,));
 
         let planner = QueryPlanner::new(&world);
-        let plan = planner
+        let result = planner
             .scan::<(&ChildTag,)>()
-            .er_join::<UnknownRef, (&Name,)>(JoinKind::Inner)
-            .build();
+            .er_join::<UnknownRef, (&Name,)>(JoinKind::Inner);
 
-        // Should have a warning about unregistered component.
+        let err = result.err().expect("expected UnregisteredComponent error");
         assert!(
-            plan.warnings()
-                .iter()
-                .any(|w| matches!(w, PlanWarning::UnregisteredErComponent { .. })),
-            "expected UnregisteredErComponent warning, got: {:?}",
-            plan.warnings()
+            matches!(err, PlannerError::UnregisteredComponent(_)),
+            "expected UnregisteredComponent, got: {err:?}",
         );
     }
 
@@ -11830,6 +11821,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Left)
+            .unwrap()
             .build();
 
         let entities = plan.execute(&mut world).unwrap();
@@ -11855,6 +11847,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .build();
 
         let entities = plan.execute(&mut world).unwrap();
@@ -11880,6 +11873,7 @@ mod tests {
         let plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .unwrap()
             .with_right_estimate(42)
             .unwrap()
             .build();
