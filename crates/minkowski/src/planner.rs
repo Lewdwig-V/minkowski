@@ -4022,7 +4022,7 @@ impl ScanBuilder<'_> {
                     let left_rows = self.estimated_rows;
                     let right_rows = join.right_estimated_rows;
                     let build_rows = left_rows.min(right_rows);
-                    let build_bytes = build_rows * opts.avg_component_bytes;
+                    let build_bytes = build_rows.saturating_mul(opts.avg_component_bytes);
                     let l2 = opts.l2_cache_bytes.max(1);
                     let partitions = build_bytes.div_ceil(l2).max(1);
                     JoinStep {
@@ -5373,19 +5373,35 @@ impl ScratchBuffer {
     /// intersected independently so the working set fits in L2 cache.
     /// Matches are appended to the end of the buffer. Returns a slice over
     /// the matches.
+    ///
+    /// `partitions` is clamped to the actual build-side cardinality (and
+    /// capped at 4096) so that overestimated planner row counts cannot
+    /// cause unbounded bucket allocation at runtime.
     fn partitioned_intersection(&mut self, left_len: usize, partitions: usize) -> &[Entity] {
-        debug_assert!(partitions > 1);
+        assert!(
+            partitions > 0,
+            "partitioned_intersection: partitions must be > 0, got {partitions}"
+        );
         let total = self.entities.len();
         assert!(
             left_len <= total,
             "partitioned_intersection: left_len ({left_len}) exceeds buffer length ({total})"
         );
 
+        // Clamp partition count to runtime cardinality: more buckets than
+        // entities wastes memory with no cache benefit. The hard cap prevents
+        // a wildly overestimated row count from causing OOM.
+        const MAX_PARTITIONS: usize = 4096;
+        let partitions = partitions.min(left_len).min(MAX_PARTITIONS);
+        if partitions <= 1 {
+            return self.sorted_intersection(left_len);
+        }
+
         // Bucket left and right entities by partition.
         let mut left_buckets: Vec<Vec<u64>> = vec![Vec::new(); partitions];
         for &e in &self.entities[..left_len] {
             let bits = e.to_bits();
-            left_buckets[bits as usize % partitions].push(bits);
+            left_buckets[(bits % partitions as u64) as usize].push(bits);
         }
         // Sort each left bucket for binary search.
         for bucket in &mut left_buckets {
@@ -5397,7 +5413,7 @@ impl ScratchBuffer {
         for i in left_len..total {
             let entity = self.entities[i];
             let bits = entity.to_bits();
-            let bucket = &left_buckets[bits as usize % partitions];
+            let bucket = &left_buckets[(bits % partitions as u64) as usize];
             if bucket.binary_search(&bits).is_ok() {
                 self.entities.push(entity);
                 match_count += 1;
@@ -7548,6 +7564,42 @@ mod tests {
             .map(|&idx| Entity::new(idx, 0).to_bits())
             .collect();
         assert_eq!(bits, expected);
+    }
+
+    #[test]
+    fn scratch_buffer_partitioned_intersection_clamps_overestimate() {
+        // Partition count far exceeding actual entity count is clamped to
+        // left_len, falling back to sorted_intersection when <= 1.
+        let mut buf = ScratchBuffer::new(10);
+        for idx in [1, 2, 3] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let left_len = buf.len();
+        for idx in [2, 3, 4] {
+            buf.push(Entity::new(idx, 0));
+        }
+        // 1_000_000 partitions for 3 left entities → clamped to 3.
+        let result = buf.partitioned_intersection(left_len, 1_000_000);
+        let mut bits: Vec<u64> = result.iter().map(|e| e.to_bits()).collect();
+        bits.sort_unstable();
+        let expected: Vec<u64> = [2, 3]
+            .iter()
+            .map(|&idx| Entity::new(idx, 0).to_bits())
+            .collect();
+        assert_eq!(bits, expected);
+    }
+
+    #[test]
+    fn scratch_buffer_partitioned_intersection_fallback_when_empty() {
+        // Zero left entities → partitions clamped to 0 → falls back to
+        // sorted_intersection (which returns empty).
+        let mut buf = ScratchBuffer::new(10);
+        let left_len = buf.len(); // 0
+        for idx in [1, 2, 3] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let result = buf.partitioned_intersection(left_len, 100);
+        assert!(result.is_empty());
     }
 
     // ── Execute with ScratchBuffer ─────────────────────────────────
