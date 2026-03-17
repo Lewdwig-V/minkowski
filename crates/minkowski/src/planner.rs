@@ -5379,6 +5379,10 @@ impl ScratchBuffer {
     /// intersected independently so the working set fits in L2 cache.
     /// Matches are appended to the end of the buffer. Returns a slice over
     /// the matches.
+    ///
+    /// `partitions` is clamped to the actual build-side cardinality (and
+    /// capped at 4096) so that overestimated planner row counts cannot
+    /// cause unbounded bucket allocation at runtime.
     fn partitioned_intersection(&mut self, left_len: usize, partitions: usize) -> &[Entity] {
         debug_assert!(partitions > 1);
         let total = self.entities.len();
@@ -5386,6 +5390,15 @@ impl ScratchBuffer {
             left_len <= total,
             "partitioned_intersection: left_len ({left_len}) exceeds buffer length ({total})"
         );
+
+        // Clamp partition count to runtime cardinality: more buckets than
+        // entities wastes memory with no cache benefit. The hard cap prevents
+        // a wildly overestimated row count from causing OOM.
+        const MAX_PARTITIONS: usize = 4096;
+        let partitions = partitions.min(left_len).min(MAX_PARTITIONS);
+        if partitions <= 1 {
+            return self.sorted_intersection(left_len);
+        }
 
         // Bucket left and right entities by partition.
         let mut left_buckets: Vec<Vec<u64>> = vec![Vec::new(); partitions];
@@ -7554,6 +7567,42 @@ mod tests {
             .map(|&idx| Entity::new(idx, 0).to_bits())
             .collect();
         assert_eq!(bits, expected);
+    }
+
+    #[test]
+    fn scratch_buffer_partitioned_intersection_clamps_overestimate() {
+        // Partition count far exceeding actual entity count is clamped to
+        // left_len, falling back to sorted_intersection when <= 1.
+        let mut buf = ScratchBuffer::new(10);
+        for idx in [1, 2, 3] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let left_len = buf.len();
+        for idx in [2, 3, 4] {
+            buf.push(Entity::new(idx, 0));
+        }
+        // 1_000_000 partitions for 3 left entities → clamped to 3.
+        let result = buf.partitioned_intersection(left_len, 1_000_000);
+        let mut bits: Vec<u64> = result.iter().map(|e| e.to_bits()).collect();
+        bits.sort_unstable();
+        let expected: Vec<u64> = [2, 3]
+            .iter()
+            .map(|&idx| Entity::new(idx, 0).to_bits())
+            .collect();
+        assert_eq!(bits, expected);
+    }
+
+    #[test]
+    fn scratch_buffer_partitioned_intersection_fallback_when_empty() {
+        // Zero left entities → partitions clamped to 0 → falls back to
+        // sorted_intersection (which returns empty).
+        let mut buf = ScratchBuffer::new(10);
+        let left_len = buf.len(); // 0
+        for idx in [1, 2, 3] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let result = buf.partitioned_intersection(left_len, 100);
+        assert!(result.is_empty());
     }
 
     // ── Execute with ScratchBuffer ─────────────────────────────────
