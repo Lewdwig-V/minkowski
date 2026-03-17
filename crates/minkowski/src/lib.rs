@@ -121,5 +121,5 @@ pub use transaction::{
     Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, TransactError, Tx,
     WorldMismatch,
 };
-pub use view::{DebouncePolicy, MaterializedView};
+pub use view::{DebouncePolicy, MaterializedView, RefreshOutcome};
 pub use world::{DeadEntity, InsertError, QueryTickInfo, World, WorldBuilder, WorldStats};

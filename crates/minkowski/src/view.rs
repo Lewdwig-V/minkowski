@@ -61,6 +61,36 @@ use crate::entity::Entity;
 use crate::planner::{PlanExecError, QueryPlanResult};
 use crate::world::{World, WorldId};
 
+/// Outcome of a [`MaterializedView::refresh`] call.
+///
+/// Replaces a raw `bool` return to make the semantics unambiguous:
+/// `Refreshed` means the plan executed and the cache was updated;
+/// `Suppressed` means the debounce policy prevented re-execution and
+/// the cached snapshot remains unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RefreshOutcome {
+    /// The plan was re-executed and the cached entity list was updated.
+    Refreshed,
+    /// The debounce policy suppressed re-execution. The cached snapshot
+    /// is still available via [`MaterializedView::entities`] but may be
+    /// stale.
+    Suppressed,
+}
+
+impl RefreshOutcome {
+    /// Returns `true` if the view was actually re-materialized.
+    #[inline]
+    pub fn was_refreshed(self) -> bool {
+        matches!(self, Self::Refreshed)
+    }
+
+    /// Returns `true` if the debounce policy suppressed the refresh.
+    #[inline]
+    pub fn was_suppressed(self) -> bool {
+        matches!(self, Self::Suppressed)
+    }
+}
+
 /// Controls how often a [`MaterializedView`] re-materializes its cached result.
 ///
 /// The plan's own `Changed<T>` filter provides archetype-granular change
@@ -146,8 +176,9 @@ impl MaterializedView {
     /// When the policy is [`DebouncePolicy::EveryNTicks`], the plan is
     /// re-executed only when the tick counter reaches the threshold.
     ///
-    /// Returns `true` if the view was actually re-materialized, `false` if
-    /// the debounce policy suppressed the refresh.
+    /// Returns [`RefreshOutcome::Refreshed`] if the view was actually
+    /// re-materialized, or [`RefreshOutcome::Suppressed`] if the debounce
+    /// policy prevented re-execution.
     ///
     /// # Errors
     ///
@@ -156,7 +187,7 @@ impl MaterializedView {
     /// including debounce-suppressed ones.
     ///
     /// Supports both scan-only and join plans.
-    pub fn refresh(&mut self, world: &mut World) -> Result<bool, PlanExecError> {
+    pub fn refresh(&mut self, world: &mut World) -> Result<RefreshOutcome, PlanExecError> {
         // World identity check runs unconditionally — even suppressed calls
         // must not silently serve stale data from a different world.
         if self.world_id != world.world_id() {
@@ -174,7 +205,7 @@ impl MaterializedView {
 
         if !should_refresh {
             self.ticks_since_refresh += 1;
-            return Ok(false);
+            return Ok(RefreshOutcome::Suppressed);
         }
 
         let entities = self.plan.execute(world)?;
@@ -184,7 +215,7 @@ impl MaterializedView {
         self.ticks_since_refresh = 0;
         self.refresh_count += 1;
 
-        Ok(true)
+        Ok(RefreshOutcome::Refreshed)
     }
 
     /// The cached entity snapshot from the last refresh.
@@ -326,8 +357,8 @@ mod tests {
     fn immediate_refresh_populates() {
         let (mut world, plan) = score_world_and_plan(10);
         let mut view = MaterializedView::new(plan);
-        let refreshed = view.refresh(&mut world).unwrap();
-        assert!(refreshed);
+        let outcome = view.refresh(&mut world).unwrap();
+        assert_eq!(outcome, RefreshOutcome::Refreshed);
         assert!(view.is_populated());
         assert_eq!(view.len(), 10);
         assert_eq!(view.refresh_count(), 1);
@@ -356,8 +387,8 @@ mod tests {
         let (mut world, plan) = score_world_and_plan(10);
         let mut view =
             MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(5)));
-        let refreshed = view.refresh(&mut world).unwrap();
-        assert!(refreshed);
+        let outcome = view.refresh(&mut world).unwrap();
+        assert_eq!(outcome, RefreshOutcome::Refreshed);
         assert_eq!(view.len(), 10);
     }
 
@@ -371,14 +402,20 @@ mod tests {
         assert_eq!(view.refresh_count(), 1);
 
         // Next two calls are suppressed.
-        assert!(!view.refresh(&mut world).unwrap());
-        assert!(!view.refresh(&mut world).unwrap());
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
         assert_eq!(view.refresh_count(), 1);
         // The cached data is still available.
         assert_eq!(view.len(), 10);
 
         // Third call triggers refresh.
-        assert!(view.refresh(&mut world).unwrap());
+        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Refreshed);
         assert_eq!(view.refresh_count(), 2);
     }
 
@@ -389,7 +426,7 @@ mod tests {
             MaterializedView::new(plan).with_debounce(DebouncePolicy::EveryNTicks(nz(1)));
         view.refresh(&mut world).unwrap();
         // EveryNTicks(1) refreshes every call — same as Immediate.
-        assert!(view.refresh(&mut world).unwrap());
+        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Refreshed);
         assert_eq!(view.refresh_count(), 2);
     }
 
@@ -431,12 +468,15 @@ mod tests {
         assert_eq!(view.refresh_count(), 1);
 
         // Normally suppressed for 99 more calls.
-        assert!(!view.refresh(&mut world).unwrap());
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
 
         // Invalidate forces the next refresh and resets tick counter.
         view.invalidate();
         assert_eq!(view.ticks_since_refresh(), 0);
-        assert!(view.refresh(&mut world).unwrap());
+        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Refreshed);
         assert_eq!(view.refresh_count(), 2);
     }
 
@@ -450,11 +490,14 @@ mod tests {
         view.refresh(&mut world).unwrap();
 
         // One tick elapsed — next would be suppressed.
-        assert!(!view.refresh(&mut world).unwrap());
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
 
         // Switch to immediate — resets counter, next call refreshes.
         view.set_policy(DebouncePolicy::Immediate);
-        assert!(view.refresh(&mut world).unwrap());
+        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Refreshed);
     }
 
     #[test]
@@ -467,9 +510,15 @@ mod tests {
         // Switch to debounced — first call under new policy is suppressed
         // (ticks_since_refresh was reset to 0 by set_policy, needs 3).
         view.set_policy(DebouncePolicy::EveryNTicks(nz(3)));
-        assert!(!view.refresh(&mut world).unwrap());
-        assert!(!view.refresh(&mut world).unwrap());
-        assert!(view.refresh(&mut world).unwrap());
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
+        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Refreshed);
     }
 
     // ── WorldMismatch ───────────────────────────────────────────────────
@@ -561,7 +610,10 @@ mod tests {
 
         // Despawn during suppression window — cache is stale.
         world.despawn(entities[0]);
-        assert!(!view.refresh(&mut world).unwrap()); // suppressed
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
         assert_eq!(view.len(), 5); // still 5 in cache
         assert!(!world.is_alive(entities[0])); // but entity 0 is dead
     }

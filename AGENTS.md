@@ -189,7 +189,7 @@ BTree and Hash index lookup functions (`eq_lookup_fn`, `range_lookup_fn`) captur
 
 Two debounce modes: `DebouncePolicy::Immediate` (default — refresh every call, relying on `Changed<T>` for efficiency) and `DebouncePolicy::EveryNTicks(n)` (refresh at most once per `n` calls). `invalidate()` forces the next call to refresh regardless of policy. `set_policy()` switches policies at runtime.
 
-The view is external to World (same composition pattern as `SpatialIndex`, `BTreeIndex`, `ReducerRegistry`). It owns its `QueryPlanResult` and manages tick advancement. `entities()` returns `&[Entity]` from the cached snapshot. `refresh()` returns `Result<bool, PlanExecError>` — `true` if re-materialized, `false` if debounce-suppressed.
+The view is external to World (same composition pattern as `SpatialIndex`, `BTreeIndex`, `ReducerRegistry`). It owns its `QueryPlanResult` and manages tick advancement. `entities()` returns `&[Entity]` from the cached snapshot. `refresh()` returns `Result<RefreshOutcome, PlanExecError>` — `RefreshOutcome::Refreshed` if re-materialized, `RefreshOutcome::Suppressed` if debounce-suppressed. `RefreshOutcome` provides `was_refreshed()` and `was_suppressed()` convenience methods.
 
 ### System Scheduling Primitives
 

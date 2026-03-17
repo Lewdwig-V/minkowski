@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use minkowski::{
     BTreeIndex, Changed, DebouncePolicy, HashIndex, Indexed, MaterializedView, Predicate,
-    QueryPlanner, SpatialIndex, World,
+    QueryPlanner, RefreshOutcome, SpatialIndex, World,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -125,24 +125,24 @@ fn main() {
             .with_debounce(DebouncePolicy::EveryNTicks(NonZeroU64::new(5).unwrap()));
 
         // First call always refreshes.
-        let refreshed = view.refresh(&mut world).unwrap();
-        println!("Call 1: refreshed={refreshed}, len={}", view.len());
-        assert!(refreshed);
+        let outcome = view.refresh(&mut world).unwrap();
+        println!("Call 1: outcome={outcome:?}, len={}", view.len());
+        assert_eq!(outcome, RefreshOutcome::Refreshed);
 
         // Calls 2..5 are suppressed (ticks_since_refresh: 1, 2, 3, 4).
         for call in 2..=5 {
-            let refreshed = view.refresh(&mut world).unwrap();
+            let outcome = view.refresh(&mut world).unwrap();
             println!(
-                "Call {call}: refreshed={refreshed}, len={} (cached)",
+                "Call {call}: outcome={outcome:?}, len={} (cached)",
                 view.len()
             );
-            assert!(!refreshed);
+            assert_eq!(outcome, RefreshOutcome::Suppressed);
         }
 
         // Call 6 triggers refresh (ticks_since_refresh reaches 5).
-        let refreshed = view.refresh(&mut world).unwrap();
-        println!("Call 6: refreshed={refreshed}, len={}", view.len());
-        assert!(refreshed);
+        let outcome = view.refresh(&mut world).unwrap();
+        println!("Call 6: outcome={outcome:?}, len={}", view.len());
+        assert_eq!(outcome, RefreshOutcome::Refreshed);
         assert_eq!(view.refresh_count(), 2);
     }
 
@@ -163,18 +163,18 @@ fn main() {
         );
 
         // Would normally be suppressed for 99 more calls.
-        let suppressed = !view.refresh(&mut world).unwrap();
-        println!("After 1 call: suppressed={suppressed}");
-        assert!(suppressed);
+        let outcome = view.refresh(&mut world).unwrap();
+        println!("After 1 call: outcome={outcome:?}");
+        assert_eq!(outcome, RefreshOutcome::Suppressed);
 
         // Force refresh via invalidate.
         view.invalidate();
-        let refreshed = view.refresh(&mut world).unwrap();
+        let outcome = view.refresh(&mut world).unwrap();
         println!(
-            "After invalidate: refreshed={refreshed}, refresh_count={}",
+            "After invalidate: outcome={outcome:?}, refresh_count={}",
             view.refresh_count()
         );
-        assert!(refreshed);
+        assert_eq!(outcome, RefreshOutcome::Refreshed);
         assert_eq!(view.refresh_count(), 2);
     }
 
