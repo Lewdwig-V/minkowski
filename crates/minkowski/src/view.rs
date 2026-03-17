@@ -402,8 +402,14 @@ mod tests {
         assert_eq!(view.refresh_count(), 1);
 
         // Next two calls are suppressed.
-        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Suppressed);
-        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Suppressed);
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
         assert_eq!(view.refresh_count(), 1);
         // The cached data is still available.
         assert_eq!(view.len(), 10);
@@ -462,7 +468,10 @@ mod tests {
         assert_eq!(view.refresh_count(), 1);
 
         // Normally suppressed for 99 more calls.
-        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Suppressed);
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
 
         // Invalidate forces the next refresh and resets tick counter.
         view.invalidate();
@@ -481,7 +490,10 @@ mod tests {
         view.refresh(&mut world).unwrap();
 
         // One tick elapsed — next would be suppressed.
-        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Suppressed);
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
 
         // Switch to immediate — resets counter, next call refreshes.
         view.set_policy(DebouncePolicy::Immediate);
@@ -498,8 +510,14 @@ mod tests {
         // Switch to debounced — first call under new policy is suppressed
         // (ticks_since_refresh was reset to 0 by set_policy, needs 3).
         view.set_policy(DebouncePolicy::EveryNTicks(nz(3)));
-        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Suppressed);
-        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Suppressed);
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
         assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Refreshed);
     }
 
@@ -592,7 +610,10 @@ mod tests {
 
         // Despawn during suppression window — cache is stale.
         world.despawn(entities[0]);
-        assert_eq!(view.refresh(&mut world).unwrap(), RefreshOutcome::Suppressed);
+        assert_eq!(
+            view.refresh(&mut world).unwrap(),
+            RefreshOutcome::Suppressed
+        );
         assert_eq!(view.len(), 5); // still 5 in cache
         assert!(!world.is_alive(entities[0])); // but entity 0 is dead
     }
