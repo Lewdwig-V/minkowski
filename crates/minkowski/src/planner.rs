@@ -3321,19 +3321,13 @@ impl ScanBuilder<'_> {
     /// The planner will choose between hash join and nested-loop join based
     /// on estimated cardinalities.
     ///
-    /// # Panics
-    ///
-    /// Panics if called after [`er_join`](Self::er_join). Regular joins must
-    /// be added before ER joins because they execute first (sorted intersection)
-    /// and ER joins filter the result (hash probe).
+    /// Regular joins and ER joins may be added in any order — `build()`
+    /// always executes regular joins first (sorted intersection), then ER
+    /// joins (hash probe on entity references).
     pub fn join<Q: crate::query::fetch::WorldQuery + 'static>(
         mut self,
         join_kind: JoinKind,
     ) -> Self {
-        assert!(
-            self.er_joins.is_empty(),
-            "join() called after er_join() — regular joins must be added before ER joins"
-        );
         // Estimate right-side rows from total entity count (conservative).
         let right_rows = self.planner.total_entities;
         let required = Q::required_ids(self.planner.components);
@@ -11761,18 +11755,26 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "join() called after er_join()")]
-    fn er_join_then_regular_panics() {
+    fn er_join_then_regular_join_order_independent() {
+        // Verify that join() and er_join() can be called in any order.
+        // build() always executes regular joins first, then ER joins.
         let mut world = World::new();
-        world.spawn((Name("Alice"),));
+        let p1 = world.spawn((Name("Alice"), Score(10)));
+        // Child has Score (matches regular join) + Parent ref (matches ER join)
+        let c1 = world.spawn((ChildTag, Parent(p1), Score(50)));
 
         let planner = QueryPlanner::new(&world);
-        // This should panic: regular join after ER join is not allowed.
-        let _plan = planner
+        // ER join first, then regular join — previously panicked.
+        let mut plan = planner
             .scan::<(&ChildTag, &Parent)>()
             .er_join::<Parent, (&Name,)>(JoinKind::Inner)
             .join::<(&Score,)>(JoinKind::Inner)
             .build();
+
+        let entities = plan.execute(&mut world).unwrap();
+        // c1 has Score (passes regular join) and Parent→Alice who has Name
+        // (passes ER join), so c1 should be in results.
+        assert!(entities.contains(&c1));
     }
 
     #[test]
