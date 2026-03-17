@@ -1723,7 +1723,15 @@ impl QueryPlanResult {
             (step.right_collector)(world, tick, scratch);
             match step.join_kind {
                 JoinKind::Inner => {
-                    let match_count = scratch.sorted_intersection(left_len).len();
+                    let match_count = if step.partitions > 1 {
+                        // Cache-aware path: partition entities into L2-sized
+                        // buckets so each intersection fits in cache.
+                        scratch
+                            .partitioned_intersection(left_len, step.partitions)
+                            .len()
+                    } else {
+                        scratch.sorted_intersection(left_len).len()
+                    };
                     if match_count > 0 {
                         let total = scratch.entities.len();
                         scratch.entities.copy_within(total - match_count.., 0);
@@ -2970,6 +2978,10 @@ type EntityCollector = Box<dyn FnMut(&World, Tick, &mut ScratchBuffer)>;
 struct JoinStep {
     right_collector: EntityCollector,
     join_kind: JoinKind,
+    /// Number of hash partitions for cache-aware join execution.
+    /// When > 1, entities are bucketed by `Entity::to_bits() % partitions`
+    /// so each partition fits in L2 cache during intersection.
+    partitions: usize,
 }
 
 /// Type-erased entity-reference extractor: given `&World` and `Entity`, reads
@@ -4011,6 +4023,14 @@ impl ScanBuilder<'_> {
                 .map(|join| {
                     let right_required = join.right_required.clone();
                     let right_changed = join.right_changed.clone();
+                    // Compute partition count using the same formula as Phase 5:
+                    // build side = smaller of left and right estimates.
+                    let left_rows = self.estimated_rows;
+                    let right_rows = join.right_estimated_rows;
+                    let build_rows = left_rows.min(right_rows);
+                    let build_bytes = build_rows * opts.avg_component_bytes;
+                    let l2 = opts.l2_cache_bytes.max(1);
+                    let partitions = build_bytes.div_ceil(l2).max(1);
                     JoinStep {
                         right_collector: Box::new(
                             move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
@@ -4024,6 +4044,7 @@ impl ScanBuilder<'_> {
                             },
                         ),
                         join_kind: join.join_kind,
+                        partitions,
                     }
                 })
                 .collect();
@@ -5351,6 +5372,48 @@ impl ScratchBuffer {
         &self.entities[final_len - match_count..final_len]
     }
 
+    /// Cache-aware partitioned intersection of two entity sets stored as
+    /// `[left_0..left_len | right_0..right_len]`.
+    ///
+    /// Entities are bucketed by `to_bits() % partitions`. Each partition is
+    /// intersected independently so the working set fits in L2 cache.
+    /// Matches are appended to the end of the buffer. Returns a slice over
+    /// the matches.
+    fn partitioned_intersection(&mut self, left_len: usize, partitions: usize) -> &[Entity] {
+        debug_assert!(partitions > 1);
+        let total = self.entities.len();
+        assert!(
+            left_len <= total,
+            "partitioned_intersection: left_len ({left_len}) exceeds buffer length ({total})"
+        );
+
+        // Bucket left and right entities by partition.
+        let mut left_buckets: Vec<Vec<u64>> = vec![Vec::new(); partitions];
+        for &e in &self.entities[..left_len] {
+            let bits = e.to_bits();
+            left_buckets[bits as usize % partitions].push(bits);
+        }
+        // Sort each left bucket for binary search.
+        for bucket in &mut left_buckets {
+            bucket.sort_unstable();
+        }
+
+        // Probe right entities against their corresponding left bucket.
+        let mut match_count = 0;
+        for i in left_len..total {
+            let entity = self.entities[i];
+            let bits = entity.to_bits();
+            let bucket = &left_buckets[bits as usize % partitions];
+            if bucket.binary_search(&bits).is_ok() {
+                self.entities.push(entity);
+                match_count += 1;
+            }
+        }
+
+        let final_len = self.entities.len();
+        &self.entities[final_len - match_count..final_len]
+    }
+
     /// Sort entities by (ArchetypeId, Row) to restore cache locality after
     /// join materialisation. Entities from the same archetype become
     /// contiguous, and within each archetype group, rows are in physical
@@ -6546,6 +6609,33 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_join_plan_node_has_multiple_partitions() {
+        // Enough entities to trigger partitions > 1 (default L2 = 256 KiB,
+        // avg_component_bytes = 16 → 16K entities per partition).
+        let mut world = World::new();
+        for i in 0..20_000 {
+            world.spawn((Score(i),));
+        }
+        for i in 0..20_000 {
+            world.spawn((Team(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        // Use Left join — inner joins are eliminated at build time.
+        let plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Left)
+            .build();
+
+        match plan.root() {
+            PlanNode::HashJoin { partitions, .. } => {
+                assert!(*partitions > 1, "expected partitions > 1, got {partitions}");
+            }
+            other => panic!("expected HashJoin, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn nested_loop_for_small_cardinality() {
         let mut world = World::new();
         for i in 0..10 {
@@ -7408,6 +7498,62 @@ mod tests {
         }
         let result = buf.sorted_intersection(left_len);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scratch_buffer_partitioned_intersection() {
+        let mut buf = ScratchBuffer::new(20);
+        // Left: 1, 3, 5, 7, 9
+        for idx in [1, 3, 5, 7, 9] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let left_len = buf.len();
+        // Right: 2, 3, 6, 7, 10
+        for idx in [2, 3, 6, 7, 10] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let result = buf.partitioned_intersection(left_len, 3);
+        let mut bits: Vec<u64> = result.iter().map(|e| e.to_bits()).collect();
+        bits.sort_unstable();
+        let expected: Vec<u64> = [3, 7]
+            .iter()
+            .map(|&idx| Entity::new(idx, 0).to_bits())
+            .collect();
+        assert_eq!(bits, expected);
+    }
+
+    #[test]
+    fn scratch_buffer_partitioned_intersection_no_overlap() {
+        let mut buf = ScratchBuffer::new(10);
+        for idx in [1, 3, 5] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let left_len = buf.len();
+        for idx in [2, 4, 6] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let result = buf.partitioned_intersection(left_len, 2);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scratch_buffer_partitioned_intersection_complete_overlap() {
+        let mut buf = ScratchBuffer::new(10);
+        for idx in [10, 20, 30] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let left_len = buf.len();
+        for idx in [10, 20, 30] {
+            buf.push(Entity::new(idx, 0));
+        }
+        let result = buf.partitioned_intersection(left_len, 4);
+        let mut bits: Vec<u64> = result.iter().map(|e| e.to_bits()).collect();
+        bits.sort_unstable();
+        let expected: Vec<u64> = [10, 20, 30]
+            .iter()
+            .map(|&idx| Entity::new(idx, 0).to_bits())
+            .collect();
+        assert_eq!(bits, expected);
     }
 
     // ── Execute with ScratchBuffer ─────────────────────────────────
