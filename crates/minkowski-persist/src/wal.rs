@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 
@@ -301,6 +302,144 @@ pub(crate) fn apply_record(
     Ok(())
 }
 
+/// A collected WAL record with its CRC proof and optional ID remap.
+type CollectedRecord = (
+    crate::record::WalRecord,
+    CrcProof,
+    Option<Arc<HashMap<ComponentId, ComponentId>>>,
+);
+
+/// Apply all collected WAL records as a single batched changeset.
+/// All mutations are kept in WAL order to preserve replay semantics:
+/// insert-then-despawn and insert-then-remove sequences must apply in
+/// the same order they were originally recorded.
+///
+/// # Error Recovery
+///
+/// If replay fails (codec error, dead entity, corrupt frame), the World
+/// may be in a partially-applied state. Callers should discard the World
+/// and rebuild from the last known-good snapshot. This matches the WAL
+/// error classification: replay failure is fatal, not operational.
+fn apply_records_batched(
+    records: &[CollectedRecord],
+    world: &mut World,
+    codecs: &CodecRegistry,
+) -> Result<(), WalError> {
+    let mut changeset = EnumChangeSet::new();
+
+    /// Wrap an error with record sequence number and mutation index context.
+    #[expect(clippy::needless_pass_by_value)]
+    fn wrap_err(seq: u64, mut_idx: usize, e: WalError) -> WalError {
+        WalError::Format(format!("record seq={seq}, mutation {mut_idx}: {e}"))
+    }
+
+    for (record, proof, remap) in records {
+        let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
+            match remap.as_deref() {
+                None => Ok(id),
+                Some(r) => r
+                    .get(&id)
+                    .copied()
+                    .ok_or(WalError::Codec(CodecError::UnregisteredComponent(id))),
+            }
+        };
+
+        for (mut_idx, mutation) in record.mutations.iter().enumerate() {
+            match mutation {
+                SerializedMutation::Spawn { entity, components } => {
+                    let entity = Entity::from_bits(*entity);
+                    world.alloc_entity();
+                    let mut raw_components: Vec<(ComponentId, Vec<u8>, std::alloc::Layout)> =
+                        Vec::new();
+                    for (comp_id, data) in components {
+                        let local_id =
+                            remap_id(*comp_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?;
+                        let raw = codecs
+                            .decode(local_id, data, Some(proof))
+                            .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
+                        let layout = codecs
+                            .layout(local_id)
+                            .ok_or(CodecError::UnregisteredComponent(local_id))
+                            .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
+                        raw_components.push((local_id, raw, layout));
+                    }
+                    let ptrs: Vec<_> = raw_components
+                        .iter()
+                        .map(|(id, raw, layout)| (*id, raw.as_ptr(), *layout))
+                        .collect();
+                    changeset.record_spawn(entity, &ptrs);
+                }
+                SerializedMutation::Despawn { entity } => {
+                    changeset.record_despawn(Entity::from_bits(*entity));
+                }
+                SerializedMutation::Insert {
+                    entity,
+                    component_id,
+                    data,
+                } => {
+                    let local_id =
+                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?;
+                    let raw = codecs
+                        .decode(local_id, data, Some(proof))
+                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
+                    let layout = codecs
+                        .layout(local_id)
+                        .ok_or(CodecError::UnregisteredComponent(local_id))
+                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
+                    changeset.record_insert(
+                        Entity::from_bits(*entity),
+                        local_id,
+                        raw.as_ptr(),
+                        layout,
+                    );
+                }
+                SerializedMutation::Remove {
+                    entity,
+                    component_id,
+                } => {
+                    changeset.record_remove(
+                        Entity::from_bits(*entity),
+                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?,
+                    );
+                }
+                SerializedMutation::SparseInsert {
+                    entity,
+                    component_id,
+                    data,
+                } => {
+                    let local_id =
+                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?;
+                    let raw = codecs
+                        .decode(local_id, data, Some(proof))
+                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
+                    let layout = codecs
+                        .layout(local_id)
+                        .ok_or(CodecError::UnregisteredComponent(local_id))
+                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
+                    changeset.record_sparse_insert(
+                        Entity::from_bits(*entity),
+                        local_id,
+                        raw.as_ptr(),
+                        layout,
+                    );
+                }
+                SerializedMutation::SparseRemove {
+                    entity,
+                    component_id,
+                } => {
+                    changeset.record_sparse_remove(
+                        Entity::from_bits(*entity),
+                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?,
+                    );
+                }
+            }
+        }
+    }
+
+    changeset.apply(world).map_err(WalError::Apply)?;
+    Ok(())
+}
+
 /// Read-only snapshot of WAL statistics. Plain data struct — no references
 /// to internal state.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -581,6 +720,21 @@ impl Wal {
     /// Replay records starting from (and including) a given sequence number.
     /// Iterates across all segments. Schema preambles are used for component
     /// ID remapping from the sender's ID space to the receiver's.
+    ///
+    /// Uses batched replay: all matching records are collected first, their
+    /// mutations decoded and applied as a single `EnumChangeSet`. Mutation
+    /// order within and across records is preserved so that sequences like
+    /// insert-then-despawn replay correctly.
+    ///
+    /// # Error Recovery
+    ///
+    /// If replay fails (codec error, dead entity, corrupt frame), the World
+    /// may be in a partially-applied state. Callers should discard the World
+    /// and rebuild from the last known-good snapshot. This matches the WAL
+    /// error classification: replay failure is fatal, not operational.
+    ///
+    /// On error, the returned `WalError` does not indicate how far replay
+    /// progressed. The World should be discarded entirely.
     pub fn replay_from(
         &mut self,
         from_seq: u64,
@@ -590,21 +744,25 @@ impl Wal {
         let segments = list_segments(&self.dir)?;
         let mut last_seq = if from_seq > 0 { from_seq - 1 } else { 0 };
 
+        // Phase 1: Read all matching records with their proofs and remaps.
+        let mut pending: Vec<CollectedRecord> = Vec::new();
+
         for (_, seg_path) in &segments {
             let seg_file = File::open(seg_path)?;
             validate_segment_magic(&seg_file, seg_path)?;
             let mut pos: u64 = SEGMENT_MAGIC_SIZE;
-            let mut remap: Option<HashMap<ComponentId, ComponentId>> = None;
+            // Each segment has its own schema preamble; remap is scoped per segment.
+            let mut remap: Option<Arc<HashMap<ComponentId, ComponentId>>> = None;
 
             while let Some((entry, next_pos, proof)) = read_next_frame(&seg_file, pos)? {
                 match entry {
                     WalEntry::Schema(schema) => {
-                        remap = Some(codecs.build_remap(&schema.components)?);
+                        remap = Some(Arc::new(codecs.build_remap(&schema.components)?));
                     }
                     WalEntry::Mutations(record) => {
                         if record.seq >= from_seq {
-                            apply_record(&record, world, codecs, remap.as_ref(), Some(&proof))?;
                             last_seq = record.seq;
+                            pending.push((record, proof, remap.clone()));
                         }
                     }
                     WalEntry::Checkpoint { .. } => {}
@@ -612,6 +770,13 @@ impl Wal {
                 pos = next_pos;
             }
         }
+
+        if pending.is_empty() {
+            return Ok(last_seq);
+        }
+
+        // Phase 2: Decode all mutations in WAL order and apply as one changeset.
+        apply_records_batched(&pending, world, codecs)?;
 
         Ok(last_seq)
     }
@@ -2412,5 +2577,115 @@ mod tests {
         let data = std::fs::read(&seg_path).unwrap();
         assert!(data.len() >= 4);
         assert_eq!(&data[0..4], b"MKW2", "segment must start with v2 magic");
+    }
+
+    #[test]
+    fn replay_insert_then_despawn_preserves_order() {
+        // Regression: batched replay must not reorder Insert before Despawn.
+        // WAL: spawn(e) / insert(e, Health) / despawn(e)
+        // After replay the entity must be dead.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("insert_despawn.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+
+        // Record 1: spawn with Pos
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world).unwrap();
+
+        // Record 2: insert Health then despawn in the same record
+        let mut cs2 = EnumChangeSet::new();
+        cs2.insert::<Health>(&mut world, e, Health(99));
+        cs2.record_despawn(e);
+        wal.append(&cs2, &codecs).unwrap();
+        cs2.apply(&mut world).unwrap();
+
+        assert!(!world.is_alive(e));
+
+        // Replay into fresh world (must re-register codecs on the new world)
+        drop(wal);
+        let mut world2 = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register::<Pos>(&mut world2).unwrap();
+        codecs2.register::<Health>(&mut world2).unwrap();
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay(&mut world2, &codecs2).unwrap();
+
+        assert!(!world2.is_alive(e), "entity must be dead after replay");
+        assert_eq!(
+            world2.query::<(&Pos,)>().count(),
+            0,
+            "no Pos components should remain"
+        );
+        assert_eq!(
+            world2.query::<(&Health,)>().count(),
+            0,
+            "no Health components should remain"
+        );
+    }
+
+    #[test]
+    fn replay_insert_then_remove_preserves_order() {
+        // Regression: batched replay must not reorder Insert before Remove.
+        // WAL: spawn(e, Pos+Health) / insert(e, Health(new)) / remove(e, Health)
+        // After replay the entity must exist with Pos but without Health.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("insert_remove.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+
+        // Record 1: spawn with Pos + Health
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 }, Health(10)))
+            .unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world).unwrap();
+
+        // Record 2: overwrite Health, then remove it
+        let mut cs2 = EnumChangeSet::new();
+        cs2.insert::<Health>(&mut world, e, Health(99));
+        cs2.remove::<Health>(&mut world, e);
+        wal.append(&cs2, &codecs).unwrap();
+        cs2.apply(&mut world).unwrap();
+
+        assert!(world.is_alive(e));
+        assert_eq!(world.get::<Health>(e), None);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+
+        // Replay into fresh world (must re-register codecs on the new world)
+        drop(wal);
+        let mut world2 = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register::<Pos>(&mut world2).unwrap();
+        codecs2.register::<Health>(&mut world2).unwrap();
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay(&mut world2, &codecs2).unwrap();
+
+        assert!(world2.is_alive(e), "entity must be alive after replay");
+        assert_eq!(
+            world2.get::<Health>(e),
+            None,
+            "Health must be removed after replay"
+        );
+        assert_eq!(
+            world2.get::<Pos>(e),
+            Some(&Pos { x: 1.0, y: 2.0 }),
+            "Pos must survive replay"
+        );
     }
 }
