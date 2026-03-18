@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 
@@ -302,12 +303,23 @@ pub(crate) fn apply_record(
 }
 
 /// A collected WAL record with its CRC proof and optional ID remap.
-type CollectedRecord = (crate::record::WalRecord, CrcProof, Option<HashMap<ComponentId, ComponentId>>);
+type CollectedRecord = (
+    crate::record::WalRecord,
+    CrcProof,
+    Option<Arc<HashMap<ComponentId, ComponentId>>>,
+);
 
 /// Apply all collected WAL records as a single batched changeset.
 /// All mutations are kept in WAL order to preserve replay semantics:
 /// insert-then-despawn and insert-then-remove sequences must apply in
 /// the same order they were originally recorded.
+///
+/// # Error Recovery
+///
+/// If replay fails (codec error, dead entity, corrupt frame), the World
+/// may be in a partially-applied state. Callers should discard the World
+/// and rebuild from the last known-good snapshot. This matches the WAL
+/// error classification: replay failure is fatal, not operational.
 fn apply_records_batched(
     records: &[CollectedRecord],
     world: &mut World,
@@ -315,9 +327,15 @@ fn apply_records_batched(
 ) -> Result<(), WalError> {
     let mut changeset = EnumChangeSet::new();
 
+    /// Wrap an error with record sequence number and mutation index context.
+    #[expect(clippy::needless_pass_by_value)]
+    fn wrap_err(seq: u64, mut_idx: usize, e: WalError) -> WalError {
+        WalError::Format(format!("record seq={seq}, mutation {mut_idx}: {e}"))
+    }
+
     for (record, proof, remap) in records {
         let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
-            match remap {
+            match remap.as_deref() {
                 None => Ok(id),
                 Some(r) => r
                     .get(&id)
@@ -326,7 +344,7 @@ fn apply_records_batched(
             }
         };
 
-        for mutation in &record.mutations {
+        for (mut_idx, mutation) in record.mutations.iter().enumerate() {
             match mutation {
                 SerializedMutation::Spawn { entity, components } => {
                     let entity = Entity::from_bits(*entity);
@@ -334,11 +352,15 @@ fn apply_records_batched(
                     let mut raw_components: Vec<(ComponentId, Vec<u8>, std::alloc::Layout)> =
                         Vec::new();
                     for (comp_id, data) in components {
-                        let local_id = remap_id(*comp_id)?;
-                        let raw = codecs.decode(local_id, data, Some(proof))?;
+                        let local_id =
+                            remap_id(*comp_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?;
+                        let raw = codecs
+                            .decode(local_id, data, Some(proof))
+                            .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
                         let layout = codecs
                             .layout(local_id)
-                            .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                            .ok_or(CodecError::UnregisteredComponent(local_id))
+                            .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
                         raw_components.push((local_id, raw, layout));
                     }
                     let ptrs: Vec<_> = raw_components
@@ -355,11 +377,15 @@ fn apply_records_batched(
                     component_id,
                     data,
                 } => {
-                    let local_id = remap_id(*component_id)?;
-                    let raw = codecs.decode(local_id, data, Some(proof))?;
+                    let local_id =
+                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?;
+                    let raw = codecs
+                        .decode(local_id, data, Some(proof))
+                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
                     let layout = codecs
                         .layout(local_id)
-                        .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                        .ok_or(CodecError::UnregisteredComponent(local_id))
+                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
                     changeset.record_insert(
                         Entity::from_bits(*entity),
                         local_id,
@@ -371,19 +397,25 @@ fn apply_records_batched(
                     entity,
                     component_id,
                 } => {
-                    changeset
-                        .record_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
+                    changeset.record_remove(
+                        Entity::from_bits(*entity),
+                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?,
+                    );
                 }
                 SerializedMutation::SparseInsert {
                     entity,
                     component_id,
                     data,
                 } => {
-                    let local_id = remap_id(*component_id)?;
-                    let raw = codecs.decode(local_id, data, Some(proof))?;
+                    let local_id =
+                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?;
+                    let raw = codecs
+                        .decode(local_id, data, Some(proof))
+                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
                     let layout = codecs
                         .layout(local_id)
-                        .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                        .ok_or(CodecError::UnregisteredComponent(local_id))
+                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
                     changeset.record_sparse_insert(
                         Entity::from_bits(*entity),
                         local_id,
@@ -397,7 +429,7 @@ fn apply_records_batched(
                 } => {
                     changeset.record_sparse_remove(
                         Entity::from_bits(*entity),
-                        remap_id(*component_id)?,
+                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?,
                     );
                 }
             }
@@ -693,6 +725,16 @@ impl Wal {
     /// mutations decoded and applied as a single `EnumChangeSet`. Mutation
     /// order within and across records is preserved so that sequences like
     /// insert-then-despawn replay correctly.
+    ///
+    /// # Error Recovery
+    ///
+    /// If replay fails (codec error, dead entity, corrupt frame), the World
+    /// may be in a partially-applied state. Callers should discard the World
+    /// and rebuild from the last known-good snapshot. This matches the WAL
+    /// error classification: replay failure is fatal, not operational.
+    ///
+    /// On error, the returned `WalError` does not indicate how far replay
+    /// progressed. The World should be discarded entirely.
     pub fn replay_from(
         &mut self,
         from_seq: u64,
@@ -704,17 +746,18 @@ impl Wal {
 
         // Phase 1: Read all matching records with their proofs and remaps.
         let mut pending: Vec<CollectedRecord> = Vec::new();
-        let mut remap: Option<HashMap<ComponentId, ComponentId>> = None;
 
         for (_, seg_path) in &segments {
             let seg_file = File::open(seg_path)?;
             validate_segment_magic(&seg_file, seg_path)?;
             let mut pos: u64 = SEGMENT_MAGIC_SIZE;
+            // Each segment has its own schema preamble; remap is scoped per segment.
+            let mut remap: Option<Arc<HashMap<ComponentId, ComponentId>>> = None;
 
             while let Some((entry, next_pos, proof)) = read_next_frame(&seg_file, pos)? {
                 match entry {
                     WalEntry::Schema(schema) => {
-                        remap = Some(codecs.build_remap(&schema.components)?);
+                        remap = Some(Arc::new(codecs.build_remap(&schema.components)?));
                     }
                     WalEntry::Mutations(record) => {
                         if record.seq >= from_seq {

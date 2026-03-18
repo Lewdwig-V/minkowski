@@ -154,12 +154,12 @@ writes.
 ### P2-4: WAL replay throughput --- COMPLETED
 
 **Implementation**: Two-phase batched replay in `replay_from`. Phase 1 reads
-all WAL frames and decodes mutations in bulk. Phase 2 separates Insert
-mutations from ordering-sensitive ops (Spawn, Despawn, Remove), sorts Inserts
-by `(component_id, entity)` for cache locality, then builds a single
-`EnumChangeSet` and applies once. This eliminates per-record changeset
-allocation, per-record `apply()` overhead, and per-record tick advancement.
-The sorted Insert order maximizes batch-continuation hits in `apply_mutations`.
+all WAL frames and collects matching mutation records. Phase 2 decodes all
+mutations in strict WAL order into a single `EnumChangeSet` and applies once.
+No sorting or separation of mutation types — WAL order is preserved so that
+ordering-sensitive sequences (insert-then-despawn, insert-then-remove) replay
+correctly. The gain comes from eliminating per-record changeset allocation,
+per-record `apply()` overhead, and per-record tick advancement.
 
 **Results**: `serialize/wal_replay`: 1.79 ms → 1.06 ms (**1.7x improvement**,
 1.06 µs/mutation). Throughput improved from 581K to 943K mutations/second.
