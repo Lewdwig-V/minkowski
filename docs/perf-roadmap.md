@@ -151,15 +151,18 @@ writes.
 
 ---
 
-### P2-4: WAL replay throughput
+### P2-4: WAL replay throughput --- COMPLETED
 
-**Current**: Per-mutation deserialization + entity lookup + changeset apply.
+**Implementation**: Two-phase batched replay in `replay_from`. Phase 1 reads
+all WAL frames and decodes mutations in bulk. Phase 2 separates Insert
+mutations from ordering-sensitive ops (Spawn, Despawn, Remove), sorts Inserts
+by `(component_id, entity)` for cache locality, then builds a single
+`EnumChangeSet` and applies once. This eliminates per-record changeset
+allocation, per-record `apply()` overhead, and per-record tick advancement.
+The sorted Insert order maximizes batch-continuation hits in `apply_mutations`.
 
-**Evidence**: `serialize/wal_replay` = 1.72 ms for 1K mutations (1.72 µs/mutation),
-while `wal_append` is 1.22 µs for a single mutation.
-
-**Target**: Batch deserialization + archetype-grouped apply. Sort decoded
-mutations by archetype before applying to improve cache locality.
+**Results**: `serialize/wal_replay`: 1.79 ms → 1.06 ms (**1.7x improvement**,
+1.06 µs/mutation). Throughput improved from 581K to 943K mutations/second.
 
 **Benchmark**: `serialize/wal_replay`
 
@@ -233,6 +236,6 @@ for subscription queries. Not worth the API complexity.
 | `join/for_each_batched_10k` | 300 ns |
 | `join/for_each_chunk_10k` | 3.18 µs |
 | `join/manual_query_10k` | 4.76 µs |
-| `serialize/wal_replay` | 1.79 ms |
+| `serialize/wal_replay` | 1.06 ms |
 | `serialize/wal_append` | 1.25 µs |
 | `schedule/5_systems_10k` | 17.7 µs |

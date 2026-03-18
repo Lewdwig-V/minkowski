@@ -301,6 +301,190 @@ pub(crate) fn apply_record(
     Ok(())
 }
 
+/// A collected WAL record with its CRC proof and optional ID remap.
+type CollectedRecord = (crate::record::WalRecord, CrcProof, Option<HashMap<ComponentId, ComponentId>>);
+
+/// Non-Insert mutations that preserve their original order.
+enum OrderedMutation {
+    Spawn {
+        entity: Entity,
+        components: Vec<(ComponentId, Vec<u8>, std::alloc::Layout)>,
+    },
+    Despawn {
+        entity: Entity,
+    },
+    Remove {
+        entity: Entity,
+        component_id: ComponentId,
+    },
+    SparseInsert {
+        entity: Entity,
+        component_id: ComponentId,
+        data: Vec<u8>,
+        layout: std::alloc::Layout,
+    },
+    SparseRemove {
+        entity: Entity,
+        component_id: ComponentId,
+    },
+}
+
+/// Apply all collected WAL records as a single batched changeset.
+/// Insert mutations are sorted by `(component_id, entity)` for cache locality;
+/// ordering-sensitive mutations (Spawn, Despawn, Remove) are applied first
+/// in original order.
+fn apply_records_batched(
+    records: &[CollectedRecord],
+    world: &mut World,
+    codecs: &CodecRegistry,
+) -> Result<(), WalError> {
+    // Estimate total mutation count for pre-allocation.
+    let total_mutations: usize = records.iter().map(|(r, _, _)| r.mutations.len()).sum();
+
+    let mut ordered: Vec<OrderedMutation> = Vec::new();
+    let mut inserts: Vec<(ComponentId, Entity, Vec<u8>, std::alloc::Layout)> =
+        Vec::with_capacity(total_mutations);
+
+    // Phase 1: Decode all mutations, separating inserts from ordered ops.
+    for (record, proof, remap) in records {
+        let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
+            match remap {
+                None => Ok(id),
+                Some(r) => r
+                    .get(&id)
+                    .copied()
+                    .ok_or(WalError::Codec(CodecError::UnregisteredComponent(id))),
+            }
+        };
+
+        for mutation in &record.mutations {
+            match mutation {
+                SerializedMutation::Spawn { entity, components } => {
+                    let entity = Entity::from_bits(*entity);
+                    let mut raw_components: Vec<(ComponentId, Vec<u8>, std::alloc::Layout)> =
+                        Vec::new();
+                    for (comp_id, data) in components {
+                        let local_id = remap_id(*comp_id)?;
+                        let raw = codecs.decode(local_id, data, Some(proof))?;
+                        let layout = codecs
+                            .layout(local_id)
+                            .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                        raw_components.push((local_id, raw, layout));
+                    }
+                    ordered.push(OrderedMutation::Spawn {
+                        entity,
+                        components: raw_components,
+                    });
+                }
+                SerializedMutation::Despawn { entity } => {
+                    ordered.push(OrderedMutation::Despawn {
+                        entity: Entity::from_bits(*entity),
+                    });
+                }
+                SerializedMutation::Insert {
+                    entity,
+                    component_id,
+                    data,
+                } => {
+                    let local_id = remap_id(*component_id)?;
+                    let raw = codecs.decode(local_id, data, Some(proof))?;
+                    let layout = codecs
+                        .layout(local_id)
+                        .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                    inserts.push((local_id, Entity::from_bits(*entity), raw, layout));
+                }
+                SerializedMutation::Remove {
+                    entity,
+                    component_id,
+                } => {
+                    ordered.push(OrderedMutation::Remove {
+                        entity: Entity::from_bits(*entity),
+                        component_id: remap_id(*component_id)?,
+                    });
+                }
+                SerializedMutation::SparseInsert {
+                    entity,
+                    component_id,
+                    data,
+                } => {
+                    let local_id = remap_id(*component_id)?;
+                    let raw = codecs.decode(local_id, data, Some(proof))?;
+                    let layout = codecs
+                        .layout(local_id)
+                        .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                    ordered.push(OrderedMutation::SparseInsert {
+                        entity: Entity::from_bits(*entity),
+                        component_id: local_id,
+                        data: raw,
+                        layout,
+                    });
+                }
+                SerializedMutation::SparseRemove {
+                    entity,
+                    component_id,
+                } => {
+                    ordered.push(OrderedMutation::SparseRemove {
+                        entity: Entity::from_bits(*entity),
+                        component_id: remap_id(*component_id)?,
+                    });
+                }
+            }
+        }
+    }
+
+    // Phase 2: Sort inserts by (component_id, entity) for cache locality.
+    // Entities in the same archetype tend to have nearby indices (especially
+    // after snapshot restore), so sorting by entity within component groups
+    // maximizes batch-continuation hits in apply_mutations.
+    inserts.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.to_bits().cmp(&b.1.to_bits())));
+
+    // Phase 3: Build single changeset — ordered ops first, then sorted inserts.
+    let mut changeset = EnumChangeSet::new();
+
+    for op in &ordered {
+        match op {
+            OrderedMutation::Spawn { entity, components } => {
+                world.alloc_entity();
+                let ptrs: Vec<_> = components
+                    .iter()
+                    .map(|(id, raw, layout)| (*id, raw.as_ptr(), *layout))
+                    .collect();
+                changeset.record_spawn(*entity, &ptrs);
+            }
+            OrderedMutation::Despawn { entity } => {
+                changeset.record_despawn(*entity);
+            }
+            OrderedMutation::Remove {
+                entity,
+                component_id,
+            } => {
+                changeset.record_remove(*entity, *component_id);
+            }
+            OrderedMutation::SparseInsert {
+                entity,
+                component_id,
+                data,
+                layout,
+            } => {
+                changeset.record_sparse_insert(*entity, *component_id, data.as_ptr(), *layout);
+            }
+            OrderedMutation::SparseRemove {
+                entity,
+                component_id,
+            } => {
+                changeset.record_sparse_remove(*entity, *component_id);
+            }
+        }
+    }
+
+    for (component_id, entity, data, layout) in &inserts {
+        changeset.record_insert(*entity, *component_id, data.as_ptr(), *layout);
+    }
+
+    changeset.apply(world).map_err(WalError::Apply)?;
+    Ok(())
+}
+
 /// Read-only snapshot of WAL statistics. Plain data struct — no references
 /// to internal state.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -581,6 +765,11 @@ impl Wal {
     /// Replay records starting from (and including) a given sequence number.
     /// Iterates across all segments. Schema preambles are used for component
     /// ID remapping from the sender's ID space to the receiver's.
+    ///
+    /// Uses batched replay: all matching records are collected first, their
+    /// mutations decoded and sorted by `(component_id, entity)` for Insert
+    /// mutations, then applied as a single `EnumChangeSet`. This improves
+    /// cache locality and amortizes per-apply overhead.
     pub fn replay_from(
         &mut self,
         from_seq: u64,
@@ -590,11 +779,14 @@ impl Wal {
         let segments = list_segments(&self.dir)?;
         let mut last_seq = if from_seq > 0 { from_seq - 1 } else { 0 };
 
+        // Phase 1: Read all matching records with their proofs and remaps.
+        let mut pending: Vec<CollectedRecord> = Vec::new();
+        let mut remap: Option<HashMap<ComponentId, ComponentId>> = None;
+
         for (_, seg_path) in &segments {
             let seg_file = File::open(seg_path)?;
             validate_segment_magic(&seg_file, seg_path)?;
             let mut pos: u64 = SEGMENT_MAGIC_SIZE;
-            let mut remap: Option<HashMap<ComponentId, ComponentId>> = None;
 
             while let Some((entry, next_pos, proof)) = read_next_frame(&seg_file, pos)? {
                 match entry {
@@ -603,8 +795,8 @@ impl Wal {
                     }
                     WalEntry::Mutations(record) => {
                         if record.seq >= from_seq {
-                            apply_record(&record, world, codecs, remap.as_ref(), Some(&proof))?;
                             last_seq = record.seq;
+                            pending.push((record, proof, remap.clone()));
                         }
                     }
                     WalEntry::Checkpoint { .. } => {}
@@ -612,6 +804,14 @@ impl Wal {
                 pos = next_pos;
             }
         }
+
+        if pending.is_empty() {
+            return Ok(last_seq);
+        }
+
+        // Phase 2: Decode all mutations. Separate ordering-sensitive mutations
+        // (Spawn, Despawn, Remove) from Insert mutations that can be sorted.
+        apply_records_batched(&pending, world, codecs)?;
 
         Ok(last_seq)
     }
