@@ -7433,7 +7433,7 @@ mod tests {
         let mut world = World::new();
         let e1 = world.spawn((Score(1),));
         let e2 = world.spawn((Score(2),));
-        let e3 = world.spawn((Score(3),));
+        let _e3 = world.spawn((Score(3),));
 
         // Health is stored as sparse — not in archetype columns.
         world.insert_sparse(e1, Health(100));
@@ -11285,7 +11285,7 @@ mod tests {
         plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
             assert!(!entities.is_empty());
             assert_eq!(entities.len(), rows.len());
-            for &row in rows.iter() {
+            for &row in rows {
                 assert!(row < scores.len());
                 collected.push(scores[row]);
             }
