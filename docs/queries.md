@@ -130,7 +130,7 @@ let mut plan = planner
     .build();
 ```
 
-**Combining with regular joins**: Regular `join()` calls must come before any `er_join()` calls. The builder panics if you call `join()` after `er_join()`, because regular joins (sorted intersection) execute before ER joins (hash probing).
+**Combining with regular joins**: Regular `join()` and `er_join()` calls may be added in any order. `build()` always executes regular joins first (sorted intersection), then ER joins (hash probing).
 
 ```rust
 let mut plan = planner
@@ -142,7 +142,7 @@ let mut plan = planner
 
 **Dead references**: If the referenced entity has been despawned, the reference extractor returns `None` and the entity is filtered out (inner join) or kept (left join). Generational entity IDs prevent false matches with reused indices.
 
-**Cost hints**: The planner automatically estimates right-side cardinality by counting entities in matching archetypes. Use `with_right_estimate(n)` after a `join()` or `er_join()` to override this when you have better domain knowledge:
+**Cost hints**: The planner estimates right-side cardinality from precomputed per-component entity counts (an upper bound derived in a single archetype walk at `QueryPlanner::new()`). Use `with_right_estimate(n)` after a `join()` or `er_join()` to override this when you have better domain knowledge:
 
 ```rust
 let mut plan = planner
