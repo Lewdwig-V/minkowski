@@ -198,7 +198,7 @@ fn main() {
         let team_w = Indexed::hash(&*team_idx);
 
         let plan = planner
-            .subscribe::<(&Score, &Team)>()
+            .subscribe::<(Changed<Score>, &Score, &Team)>()
             .where_range(
                 score_w,
                 Predicate::range::<Score, _>(Score(0)..Score(50)).with_selectivity(0.25),

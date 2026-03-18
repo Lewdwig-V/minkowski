@@ -145,7 +145,7 @@ fn main() {
     let team_witness = Indexed::hash(&team_hash);
 
     let sub = planner
-        .subscribe::<(&Score, &Team)>()
+        .subscribe::<(Changed<Score>, &Score, &Team)>()
         .where_eq(
             score_witness,
             Predicate::eq(Score(42)).with_selectivity(0.001), // very selective
