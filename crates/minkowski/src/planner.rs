@@ -4,7 +4,7 @@
 //! The planner is designed for an in-memory ECS where data already lives in L1/L2
 //! cache. Planning overhead is kept to O(indexes + predicates). Plans are
 //! executable against live world data: scan-only plans without a spatial driver
-//! use zero-alloc `for_each` with fused filter closures; join plans use a
+//! use zero-alloc `execute_stream` with fused filter closures; join plans use a
 //! scratch-buffer intersection model.
 //!
 //! All plans execute via chunked, slice-based iteration over 64-byte-aligned
@@ -155,14 +155,14 @@ impl fmt::Display for PlannerError {
 
 impl std::error::Error for PlannerError {}
 
-/// Error returned by plan execution methods (`execute`, `execute_raw`,
-/// `for_each`, `for_each_raw`, `execute_aggregates`, `execute_aggregates_raw`).
+/// Error returned by plan execution methods (`execute_collect`, `execute_collect_raw`,
+/// `execute_stream`, `execute_stream_raw`, `aggregate`, `aggregate_raw`).
 #[derive(Clone, Debug)]
 pub enum PlanExecError {
     /// Plan was built from a different World.
     WorldMismatch(WorldMismatch),
-    /// `for_each` / `for_each_raw` called on a plan that contains joins.
-    /// Use `execute()` instead, which collects entities into a scratch buffer.
+    /// `execute_stream` / `execute_stream_raw` called on a plan that contains joins.
+    /// Use `execute_collect()` instead, which collects entities into a scratch buffer.
     ///
     /// **Deprecated**: join plans are now supported by all execution methods.
     /// This variant is retained for backward compatibility but is no longer
@@ -189,7 +189,7 @@ impl fmt::Display for PlanExecError {
             PlanExecError::WorldMismatch(e) => write!(f, "{e}"),
             PlanExecError::JoinNotSupported => write!(
                 f,
-                "for_each/for_each_raw do not support join plans — use execute() instead"
+                "execute_stream/execute_stream_raw do not support join plans — use execute_collect() instead"
             ),
             PlanExecError::ComponentMismatch {
                 query,
@@ -520,7 +520,7 @@ impl<T: Component, F: Fn(&T) -> f64 + Send> BatchExtractor for TypedBatch<T, F> 
 
 /// Factory that produces fresh `Box<dyn BatchExtractor>` instances.
 /// Created at `ScanBuilder::build()` time when `ComponentId` is resolved.
-/// Called once per `execute_aggregates` invocation.
+/// Called once per `aggregate` invocation.
 type BatchFactory = Box<dyn Fn() -> Box<dyn BatchExtractor> + Send + Sync>;
 
 /// Builder that captures the typed closure and produces a `BatchFactory`
@@ -979,7 +979,7 @@ impl fmt::Debug for IndexDescriptor {
 
 // IndexDescriptor methods removed: lookup_fn_for was part of the old
 // ExecNode-based execution engine. Index-driven execution now uses an
-// IndexDriver pre-bound at Phase 3 and compiled into the for_each closure.
+// IndexDriver pre-bound at Phase 3 and compiled into the execute_stream closure.
 
 // ── Predicates ───────────────────────────────────────────────────────
 
@@ -1611,16 +1611,16 @@ pub struct QueryPlanResult {
     warnings: Vec<PlanWarning>,
     last_read_tick: Tick,
     world_id: WorldId,
-    /// Aggregate expressions for `execute_aggregates()`. Empty if no aggregates.
+    /// Aggregate expressions for `aggregate()`. Empty if no aggregates.
     aggregate_exprs: Vec<AggregateExpr>,
-    /// Compiled batch aggregate scan (for `execute_aggregates`).
+    /// Compiled batch aggregate scan (for `aggregate`).
     compiled_agg_scan: Option<CompiledAggScan>,
-    /// Compiled batch aggregate scan for raw path (for `execute_aggregates_raw`).
+    /// Compiled batch aggregate scan for raw path (for `aggregate_raw`).
     compiled_agg_scan_raw: Option<CompiledAggScan>,
     /// Reusable buffer for row indices in batch execution methods.
-    /// Cleared and repopulated on each `for_each_join_chunk` call.
+    /// Cleared and repopulated on each `execute_stream_join_chunk` call.
     row_indices: Vec<usize>,
-    /// Cached batch extractors for `execute_aggregates`. Initialized at
+    /// Cached batch extractors for `aggregate`. Initialized at
     /// build time and reused across calls to avoid per-call heap allocation.
     cached_batch_extractors: Vec<Option<Box<dyn BatchExtractor>>>,
     /// Same for the raw (transactional) path.
@@ -1687,8 +1687,8 @@ impl QueryPlanResult {
     ///
     /// This is pure computation over `&World` — the scratch is plan-local
     /// and invisible to the conflict model. All six execution methods
-    /// (`execute`, `execute_raw`, `for_each`, `for_each_raw`,
-    /// `execute_aggregates`, `execute_aggregates_raw`) delegate here for
+    /// (`execute_collect`, `execute_collect_raw`, `execute_stream`, `execute_stream_raw`,
+    /// `aggregate`, `aggregate_raw`) delegate here for
     /// join plans.
     fn run_join(&mut self, world: &World) {
         let tick = self.last_read_tick;
@@ -1776,7 +1776,7 @@ impl QueryPlanResult {
     ///
     /// For scan-only plans without joins, this collects entities into the
     /// scratch buffer using the compiled scan closure (with filter fusion).
-    /// Prefer [`for_each`](Self::for_each) for scan-only plans to avoid the
+    /// Prefer [`execute_stream`](Self::execute_stream) for scan-only plans to avoid the
     /// intermediate buffer entirely.
     ///
     /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
@@ -1786,7 +1786,7 @@ impl QueryPlanResult {
     ///
     /// Panics if the plan has no scratch buffer (should not happen for plans
     /// built via [`ScanBuilder::build`]).
-    pub fn execute(&mut self, world: &mut World) -> Result<&[Entity], PlanExecError> {
+    pub fn execute_collect(&mut self, world: &mut World) -> Result<&[Entity], PlanExecError> {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
@@ -1804,7 +1804,7 @@ impl QueryPlanResult {
             let required = scan_required.as_ref().unwrap();
             let scratch = scratch
                 .as_mut()
-                .expect("execute() requires a plan with a scratch buffer");
+                .expect("execute_collect() requires a plan with a scratch buffer");
             scratch.clear();
             let tick = *last_read_tick;
             for arch in &world.archetypes.archetypes {
@@ -1830,7 +1830,7 @@ impl QueryPlanResult {
             let scratch = self
                 .scratch
                 .as_mut()
-                .expect("execute() requires a plan with a scratch buffer");
+                .expect("execute_collect() requires a plan with a scratch buffer");
             scratch.clear();
             let tick = self.last_read_tick;
             compiled(&*world, tick, &mut |entity: Entity| {
@@ -1840,7 +1840,7 @@ impl QueryPlanResult {
             Ok(scratch.as_slice())
         } else {
             panic!(
-                "execute() called on a plan with no join executor and no compiled scan — \
+                "execute_collect() called on a plan with no join executor and no compiled scan — \
                  this indicates a bug in plan compilation"
             );
         }
@@ -1848,7 +1848,7 @@ impl QueryPlanResult {
 
     /// Execute the plan with read-only world access, returning matching entities.
     ///
-    /// Like [`execute`](Self::execute) but takes `&World` instead of `&mut World`.
+    /// Like [`execute_collect`](Self::execute_collect) but takes `&World` instead of `&mut World`.
     /// No tick advancement, no query cache mutation. Safe for use inside
     /// transactions where only `&World` is available.
     ///
@@ -1864,7 +1864,7 @@ impl QueryPlanResult {
     ///
     /// Panics if the plan has no scratch buffer (should not happen for plans
     /// built via [`ScanBuilder::build`]).
-    pub fn execute_raw(&mut self, world: &World) -> Result<&[Entity], PlanExecError> {
+    pub fn execute_collect_raw(&mut self, world: &World) -> Result<&[Entity], PlanExecError> {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
@@ -1881,7 +1881,7 @@ impl QueryPlanResult {
             let required = scan_required.as_ref().unwrap();
             let scratch = scratch
                 .as_mut()
-                .expect("execute_raw() requires a plan with a scratch buffer");
+                .expect("execute_collect_raw() requires a plan with a scratch buffer");
             scratch.clear();
             let tick = *last_read_tick;
             for arch in &world.archetypes.archetypes {
@@ -1905,7 +1905,7 @@ impl QueryPlanResult {
             let scratch = self
                 .scratch
                 .as_mut()
-                .expect("execute_raw() requires a plan with a scratch buffer");
+                .expect("execute_collect_raw() requires a plan with a scratch buffer");
             scratch.clear();
             let tick = self.last_read_tick;
             compiled(world, tick, &mut |entity: Entity| {
@@ -1914,7 +1914,7 @@ impl QueryPlanResult {
             Ok(scratch.as_slice())
         } else {
             panic!(
-                "execute_raw() called on a plan with no join executor and no compiled scan — \
+                "execute_collect_raw() called on a plan with no join executor and no compiled scan — \
                  this indicates a bug in plan compilation"
             );
         }
@@ -1935,7 +1935,7 @@ impl QueryPlanResult {
     ///
     /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
     /// same World this plan was built from.
-    pub fn for_each(
+    pub fn execute_stream(
         &mut self,
         world: &mut World,
         mut callback: impl FnMut(Entity),
@@ -1982,7 +1982,7 @@ impl QueryPlanResult {
             self.last_read_tick = world.next_tick();
         } else {
             panic!(
-                "for_each() called on a plan with no join executor and no compiled scan — \
+                "execute_stream() called on a plan with no join executor and no compiled scan — \
                  this indicates a bug in plan compilation"
             );
         }
@@ -2005,7 +2005,7 @@ impl QueryPlanResult {
     ///
     /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
     /// same World this plan was built from.
-    pub fn for_each_raw(
+    pub fn execute_stream_raw(
         &mut self,
         world: &World,
         mut callback: impl FnMut(Entity),
@@ -2014,7 +2014,7 @@ impl QueryPlanResult {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
         // Fast path: scan-only plan with no custom predicates or index drivers.
-        // Same as for_each but without tick advancement (transactional read).
+        // Same as execute_stream but without tick advancement (transactional read).
         if self.scan_required.is_some() {
             let Self {
                 scan_required,
@@ -2047,7 +2047,7 @@ impl QueryPlanResult {
             compiled(world, tick, &mut callback);
         } else {
             panic!(
-                "for_each_raw() called on a plan with no join executor and no compiled scan — \
+                "execute_stream_raw() called on a plan with no join executor and no compiled scan — \
                  this indicates a bug in plan compilation"
             );
         }
@@ -2067,8 +2067,8 @@ impl QueryPlanResult {
     /// each archetype's component set. Returns `Err(ComponentMismatch)` if
     /// `Q`'s required components are missing from any matched archetype.
     ///
-    /// Advances the read tick (same as `for_each`).
-    pub fn for_each_batched<Q, F>(
+    /// Advances the read tick (same as `execute_stream`).
+    pub fn execute_stream_batched<Q, F>(
         &mut self,
         world: &mut World,
         mut callback: F,
@@ -2094,15 +2094,15 @@ impl QueryPlanResult {
                 }
             }
         }
-        self.for_each_batched_inner::<Q, F>(world, &mut callback)?;
+        self.execute_stream_batched_inner::<Q, F>(world, &mut callback)?;
         self.last_read_tick = world.next_tick();
         Ok(())
     }
 
-    /// Read-only variant of [`for_each_batched`](Self::for_each_batched).
+    /// Read-only variant of [`execute_stream_batched`](Self::execute_stream_batched).
     /// No tick advancement.
     /// Safe for use inside transactions where only `&World` is available.
-    pub fn for_each_batched_raw<Q, F>(
+    pub fn execute_stream_batched_raw<Q, F>(
         &mut self,
         world: &World,
         mut callback: F,
@@ -2111,11 +2111,11 @@ impl QueryPlanResult {
         Q: ReadOnlyWorldQuery,
         F: FnMut(Entity, Q::Item<'_>),
     {
-        self.for_each_batched_inner::<Q, F>(world, &mut callback)
+        self.execute_stream_batched_inner::<Q, F>(world, &mut callback)
     }
 
-    /// Shared implementation for `for_each_batched` and `for_each_batched_raw`.
-    fn for_each_batched_inner<Q, F>(
+    /// Shared implementation for `execute_stream_batched` and `execute_stream_batched_raw`.
+    fn execute_stream_batched_inner<Q, F>(
         &mut self,
         world: &World,
         callback: &mut F,
@@ -2163,7 +2163,7 @@ impl QueryPlanResult {
             let scratch = self
                 .scratch
                 .as_mut()
-                .expect("for_each_batched requires a scratch buffer");
+                .expect("execute_stream_batched requires a scratch buffer");
             scratch.clear();
             let tick = self.last_read_tick;
             compiled(world, tick, &mut |entity: Entity| {
@@ -2179,7 +2179,7 @@ impl QueryPlanResult {
         let scratch = self
             .scratch
             .as_mut()
-            .expect("for_each_batched requires a scratch buffer");
+            .expect("execute_stream_batched requires a scratch buffer");
         scratch.sort_by_archetype(&world.entity_locations);
 
         // Phase 3: Walk archetype runs with pre-resolved fetch.
@@ -2258,7 +2258,7 @@ impl QueryPlanResult {
     ///
     /// This enables SIMD-friendly access patterns on join results.
     /// Advances the read tick.
-    pub fn for_each_join_chunk<Q, F>(
+    pub fn execute_stream_join_chunk<Q, F>(
         &mut self,
         world: &mut World,
         mut callback: F,
@@ -2333,7 +2333,7 @@ impl QueryPlanResult {
             let scratch = self
                 .scratch
                 .as_mut()
-                .expect("for_each_join_chunk requires a scratch buffer");
+                .expect("execute_stream_join_chunk requires a scratch buffer");
             scratch.clear();
             let tick = self.last_read_tick;
             compiled(&*world, tick, &mut |entity: Entity| {
@@ -2349,7 +2349,7 @@ impl QueryPlanResult {
         let scratch = self
             .scratch
             .as_mut()
-            .expect("for_each_join_chunk requires a scratch buffer");
+            .expect("execute_stream_join_chunk requires a scratch buffer");
         scratch.sort_by_archetype(&world.entity_locations);
 
         // Early exit if scratch is empty (before destructuring self).
@@ -2439,10 +2439,7 @@ impl QueryPlanResult {
     ///
     /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
     /// same World this plan was built from.
-    pub fn execute_aggregates(
-        &mut self,
-        world: &mut World,
-    ) -> Result<AggregateResult, PlanExecError> {
+    pub fn aggregate(&mut self, world: &mut World) -> Result<AggregateResult, PlanExecError> {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
@@ -2509,9 +2506,7 @@ impl QueryPlanResult {
                 }
             }
         } else {
-            panic!(
-                "execute_aggregates() called on a plan with no compiled scan and no join executor"
-            );
+            panic!("aggregate() called on a plan with no compiled scan and no join executor");
         }
 
         self.last_read_tick = world.next_tick();
@@ -2534,10 +2529,7 @@ impl QueryPlanResult {
     ///
     /// Returns `Err(PlanExecError::WorldMismatch)` if `world` is not the
     /// same World this plan was built from.
-    pub fn execute_aggregates_raw(
-        &mut self,
-        world: &World,
-    ) -> Result<AggregateResult, PlanExecError> {
+    pub fn aggregate_raw(&mut self, world: &World) -> Result<AggregateResult, PlanExecError> {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
@@ -2721,8 +2713,8 @@ impl<T: Component> fmt::Debug for Indexed<T> {
 /// `where_eq` or `where_range` requires an `Indexed<T>` witness, which can
 /// only be obtained from an actual index instance.
 ///
-/// Produces a [`QueryPlanResult`] with full execution support (`execute`,
-/// `for_each`, `for_each_raw`), backed by `IndexDriver` for index-gather
+/// Produces a [`QueryPlanResult`] with full execution support (`execute_collect`,
+/// `execute_stream`, `execute_stream_raw`), backed by `IndexDriver` for index-gather
 /// execution.
 pub struct SubscriptionBuilder<'w> {
     scan: ScanBuilder<'w>,
@@ -2950,7 +2942,7 @@ impl SubscriptionBuilder<'_> {
 /// Type-erased scan execution captured at `build()` time.
 /// The monomorphic `Q` iteration code is baked in at compile time.
 /// Takes `&World` (shared ref) because the compiled scan only reads archetype
-/// data. The outer `for_each` method takes `&mut World` for tick advancement
+/// data. The outer `execute_stream` method takes `&mut World` for tick advancement
 /// (via `next_tick()`), then reborrows as `&World` for the closure.
 type CompiledForEach = Box<dyn FnMut(&World, Tick, &mut dyn FnMut(Entity))>;
 
@@ -3336,9 +3328,9 @@ impl ScanBuilder<'_> {
         mut self,
         join_kind: JoinKind,
     ) -> Self {
-        // Estimate right-side rows from total entity count (conservative).
-        let right_rows = self.planner.total_entities;
         let required = Q::required_ids(self.planner.components);
+        // Count entities in archetypes matching the right query's components.
+        let right_rows = self.planner.count_matching_entities(&required);
         let changed = Q::changed_ids(self.planner.components);
         let idx = self.joins.len();
         self.joins.push(JoinSpec {
@@ -3422,8 +3414,9 @@ impl ScanBuilder<'_> {
                     std::any::type_name::<R>(),
                 ))?;
 
-        let right_rows = self.planner.total_entities;
         let required = Q::required_ids(self.planner.components);
+        // Count entities in archetypes matching the right query's components.
+        let right_rows = self.planner.count_matching_entities(&required);
         let changed = Q::changed_ids(self.planner.components);
 
         let ref_extractor: EntityRefExtractor = Arc::new(move |world: &World, entity: Entity| {
@@ -4076,7 +4069,7 @@ impl ScanBuilder<'_> {
             None
         };
 
-        // Phase 8: Compile for_each / for_each_raw closures for scan-only plans.
+        // Phase 8: Compile execute_stream / execute_stream_raw closures for scan-only plans.
         // Enabled when there are no joins — predicates are fused as
         // per-entity filters into the scan closure.
         //
@@ -4488,7 +4481,7 @@ impl ScanBuilder<'_> {
             Some(ScratchBuffer::new(pre_agg_rows as usize))
         };
 
-        // Pre-allocate batch extractors and accumulators so execute_aggregates
+        // Pre-allocate batch extractors and accumulators so aggregate
         // doesn't heap-allocate on every call.
         let cached_batch_extractors: Vec<Option<Box<dyn BatchExtractor>>> = aggregate_exprs
             .iter()
@@ -4600,6 +4593,8 @@ pub struct QueryPlanner<'w> {
     total_entities: usize,
     /// Component registry for resolving query type → component bitset.
     components: &'w ComponentRegistry,
+    /// Archetype slice for counting matching entities in join cost estimation.
+    archetypes: &'w [Archetype],
     world_id: WorldId,
     _world: PhantomData<&'w World>,
 }
@@ -4615,9 +4610,19 @@ impl<'w> QueryPlanner<'w> {
             spatial_indexes: HashMap::new(),
             total_entities: world.entity_count(),
             components: &world.components,
+            archetypes: &world.archetypes.archetypes,
             world_id: world.world_id(),
             _world: PhantomData,
         }
+    }
+
+    /// Count entities across archetypes matching a required component bitset.
+    fn count_matching_entities(&self, required: &FixedBitSet) -> usize {
+        self.archetypes
+            .iter()
+            .filter(|arch| !arch.is_empty() && required.is_subset(&arch.component_ids))
+            .map(|arch| arch.entities.len())
+            .sum()
     }
 
     /// Register a `BTreeIndex` for cost-based index selection.
@@ -4765,11 +4770,13 @@ impl<'w> QueryPlanner<'w> {
         let changed_for_each_raw = changed.clone();
         let left_required = required.clone();
         let left_changed = changed.clone();
+        // Count entities matching the scan's required components.
+        let estimated_rows = self.count_matching_entities(&required);
         ScanBuilder {
             planner: self,
             world_id: self.world_id,
             query_name: std::any::type_name::<Q>(),
-            estimated_rows: self.total_entities,
+            estimated_rows,
             predicates: Vec::new(),
             joins: Vec::new(),
             er_joins: Vec::new(),
@@ -6109,7 +6116,7 @@ mod tests {
             .unwrap();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], e1);
@@ -6136,7 +6143,7 @@ mod tests {
             .unwrap();
 
         let mut results = Vec::new();
-        plan.for_each_raw(&world, |entity| results.push(entity))
+        plan.execute_stream_raw(&world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], e1);
@@ -6256,7 +6263,7 @@ mod tests {
 
         // First call: all matching entities are "changed" (never read before).
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.contains(&e1));
@@ -6264,7 +6271,7 @@ mod tests {
 
         // Second call with no mutations: nothing changed → zero results.
         results.clear();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results.len(), 0, "no mutations → no results");
 
@@ -6276,7 +6283,7 @@ mod tests {
         // archetype-granular — both pass. This is correct per the engine's
         // change detection semantics.
         results.clear();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert!(results.contains(&e1));
         // e2 is in the same archetype as e1, so it also passes Changed<Score>.
@@ -6832,7 +6839,7 @@ mod tests {
 
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let mut result = plan.execute(&mut world).unwrap().to_vec();
+        let mut result = plan.execute_collect(&mut world).unwrap().to_vec();
         result.sort_by_key(|e| e.to_bits());
         expected.sort_by_key(|e| e.to_bits());
         assert_eq!(result, expected);
@@ -6848,7 +6855,7 @@ mod tests {
 
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         assert_eq!(result, vec![e1]);
     }
 
@@ -6864,7 +6871,7 @@ mod tests {
             .scan::<(&Score,)>()
             .filter(Predicate::eq(Score(42)))
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 1);
         assert_eq!(*world.get::<Score>(result[0]).unwrap(), Score(42));
     }
@@ -6881,7 +6888,7 @@ mod tests {
             .scan::<(&Score,)>()
             .filter(Predicate::range::<Score, _>(Score(10)..Score(20)))
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 10);
         for e in &result {
             let s = world.get::<Score>(*e).unwrap().0;
@@ -6905,7 +6912,7 @@ mod tests {
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(2)))
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 20); // 100 / 5 teams
         for e in &result {
             assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
@@ -6925,7 +6932,7 @@ mod tests {
             .filter(Predicate::eq(Team(2)))
             .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         for e in &result {
             let s = world.get::<Score>(*e).unwrap().0;
             let t = world.get::<Team>(*e).unwrap().0;
@@ -6954,7 +6961,7 @@ mod tests {
             .scan::<(&Score,)>()
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let mut result = plan.execute(&mut world).unwrap().to_vec();
+        let mut result = plan.execute_collect(&mut world).unwrap().to_vec();
         result.sort_by_key(|e| e.to_bits());
         both.sort_by_key(|e| e.to_bits());
         assert_eq!(result, both);
@@ -6976,7 +6983,7 @@ mod tests {
                 |world, entity| world.get::<Score>(entity).is_some_and(|s| s.0 % 2 == 0),
             ))
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 25);
         for e in &result {
             assert!(world.get::<Score>(*e).unwrap().0.is_multiple_of(2));
@@ -6988,7 +6995,7 @@ mod tests {
         let mut world = World::new();
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         assert!(result.is_empty());
     }
 
@@ -7005,7 +7012,7 @@ mod tests {
         // Despawn e2 after plan construction
         world.despawn(e2);
 
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         // Scan walks archetypes — despawned entity is replaced via swap_remove,
         // so the archetype only contains live entities.
         assert_eq!(result.len(), 2);
@@ -7039,7 +7046,7 @@ mod tests {
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(1)))
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         // Only entities with both Score AND Team(1) should appear
         for e in &result {
             assert!(world.get::<Score>(*e).is_some(), "missing Score");
@@ -7069,7 +7076,7 @@ mod tests {
             .scan::<(&Score,)>()
             .filter(Predicate::eq(Score(42)))
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 1);
         assert_eq!(*world.get::<Score>(result[0]).unwrap(), Score(42));
     }
@@ -7092,7 +7099,7 @@ mod tests {
             .scan::<(&Score,)>()
             .filter(Predicate::range::<Score, _>(Score(10)..Score(20)))
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 10); // scores 10..20
         for e in &result {
             let s = world.get::<Score>(*e).unwrap().0;
@@ -7118,7 +7125,7 @@ mod tests {
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(3)))
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 20); // 200 / 10 teams
         for e in &result {
             assert_eq!(*world.get::<Team>(*e).unwrap(), Team(3));
@@ -7141,7 +7148,7 @@ mod tests {
             .scan::<(&Score,)>()
             .filter(Predicate::eq(Score(999)))
             .build();
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         assert!(result.is_empty());
     }
 
@@ -7161,7 +7168,7 @@ mod tests {
             .scan::<(&Team,)>()
             .filter(Predicate::eq(Team(999)))
             .build();
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         assert!(result.is_empty());
     }
 
@@ -7187,8 +7194,8 @@ mod tests {
             .filter(Predicate::eq(Score(42)))
             .build();
 
-        // First execute: should find Score(42)
-        let result = plan.execute(&mut world).unwrap();
+        // First execute_collect: should find Score(42)
+        let result = plan.execute_collect(&mut world).unwrap();
         assert_eq!(result.len(), 1);
 
         // Spawn more entities and rebuild the index via a new Arc.
@@ -7202,7 +7209,7 @@ mod tests {
         // Verify scan (non-index) path sees new entities immediately
         let planner2 = QueryPlanner::new(&world);
         let mut scan_plan = planner2.scan::<(&Score,)>().build();
-        assert_eq!(scan_plan.execute(&mut world).unwrap().len(), 100);
+        assert_eq!(scan_plan.execute_collect(&mut world).unwrap().len(), 100);
     }
 
     #[test]
@@ -7223,7 +7230,7 @@ mod tests {
             .filter(Predicate::eq(Team(2)))
             .build();
 
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 10); // 50 / 5 teams
         for e in &result {
             assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
@@ -7254,7 +7261,7 @@ mod tests {
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
 
-        let entities = plan.execute(&mut world).unwrap().to_vec();
+        let entities = plan.execute_collect(&mut world).unwrap().to_vec();
         // All 500 entities have Team, so the join doesn't reduce the set.
         // The range filter should give us Score 100..300 = 200 entities.
         assert_eq!(entities.len(), 200);
@@ -7286,7 +7293,7 @@ mod tests {
             .scan::<(&Score,)>()
             .join::<(&Team,)>(JoinKind::Left)
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         // All 30 Score entities must be present.
         assert_eq!(result.len(), 30);
         for e in &score_only {
@@ -7316,7 +7323,7 @@ mod tests {
             .scan::<(&Score,)>()
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let result = plan.execute(&mut world).unwrap().to_vec();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 10);
         for e in &both {
             assert!(result.contains(e));
@@ -7343,7 +7350,7 @@ mod tests {
             .with_right_estimate(3)
             .unwrap()
             .build();
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         // Left join: all 8 Score entities preserved.
         assert_eq!(result.len(), 8);
     }
@@ -7371,7 +7378,7 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
 
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         // Score ∩ Team ∩ Health = the 10 entities with all three
         let mut found: Vec<Entity> = result.to_vec();
         found.sort_by_key(|e| e.to_bits());
@@ -7601,7 +7608,7 @@ mod tests {
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
 
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         let mut found: Vec<Entity> = result.to_vec();
         found.sort_by_key(|e| e.to_bits());
         expected.sort_by_key(|e| e.to_bits());
@@ -7620,12 +7627,12 @@ mod tests {
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
 
-        let _ = plan.execute(&mut world).unwrap();
-        let result = plan.execute(&mut world).unwrap();
+        let _ = plan.execute_collect(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         assert_eq!(result.len(), 10);
     }
 
-    // ── CompiledScan for_each ──────────────────────────────────────
+    // ── CompiledScan execute_stream ──────────────────────────────────────
 
     #[test]
     fn compiled_scan_for_each_yields_all_entities() {
@@ -7640,7 +7647,7 @@ mod tests {
         let mut plan = planner.scan::<(&Score,)>().build();
 
         let mut found = Vec::new();
-        plan.for_each(&mut world, |entity: Entity| {
+        plan.execute_stream(&mut world, |entity: Entity| {
             found.push(entity);
         })
         .unwrap();
@@ -7665,7 +7672,7 @@ mod tests {
         let mut plan = planner.scan::<(&Score,)>().build();
 
         let mut found = Vec::new();
-        plan.for_each(&mut world, |entity: Entity| {
+        plan.execute_stream(&mut world, |entity: Entity| {
             found.push(entity);
         })
         .unwrap();
@@ -7688,7 +7695,7 @@ mod tests {
         let mut plan = planner.scan::<(&Score,)>().build();
 
         let mut found = Vec::new();
-        plan.for_each_raw(&world, |entity: Entity| {
+        plan.execute_stream_raw(&world, |entity: Entity| {
             found.push(entity);
         })
         .unwrap();
@@ -7710,7 +7717,7 @@ mod tests {
             .build();
 
         let mut found = Vec::new();
-        plan.for_each(&mut world, |entity: Entity| {
+        plan.execute_stream(&mut world, |entity: Entity| {
             found.push(entity);
         })
         .unwrap();
@@ -7732,7 +7739,7 @@ mod tests {
             .build();
 
         let mut found = Vec::new();
-        plan.for_each(&mut world, |entity: Entity| {
+        plan.execute_stream(&mut world, |entity: Entity| {
             found.push(entity);
         })
         .unwrap();
@@ -7756,7 +7763,7 @@ mod tests {
             .build();
 
         let mut found = Vec::new();
-        plan.for_each(&mut world, |entity: Entity| {
+        plan.execute_stream(&mut world, |entity: Entity| {
             found.push(entity);
         })
         .unwrap();
@@ -7775,7 +7782,7 @@ mod tests {
         let mut plan = planner.scan::<(&Score,)>().build();
 
         let mut found = Vec::new();
-        plan.for_each_raw(&world, |entity: Entity| {
+        plan.execute_stream_raw(&world, |entity: Entity| {
             found.push(entity);
         })
         .unwrap();
@@ -7795,7 +7802,7 @@ mod tests {
             .build();
 
         let mut found = Vec::new();
-        plan.for_each_raw(&world, |entity: Entity| {
+        plan.execute_stream_raw(&world, |entity: Entity| {
             found.push(entity);
         })
         .unwrap();
@@ -7815,12 +7822,12 @@ mod tests {
 
         // First call: everything is new (changed since tick 0).
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 5);
 
         // Second call: nothing changed since the last read tick.
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -7834,13 +7841,13 @@ mod tests {
         let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
 
         // Drain initial changes.
-        plan.for_each(&mut world, |_| {}).unwrap();
+        plan.execute_stream(&mut world, |_| {}).unwrap();
 
         // Mutate one archetype's Score column via get_mut.
         let _ = world.get_mut::<Score>(e);
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         // Only the archetype containing `e` was mutated.
         assert_eq!(count, 1);
     }
@@ -7856,12 +7863,12 @@ mod tests {
 
         // for_each_raw does not advance the tick.
         let mut count = 0;
-        plan.for_each_raw(&world, |_| count += 1).unwrap();
+        plan.execute_stream_raw(&world, |_| count += 1).unwrap();
         assert_eq!(count, 3);
 
         // Same tick — still sees changes.
         let mut count = 0;
-        plan.for_each_raw(&world, |_| count += 1).unwrap();
+        plan.execute_stream_raw(&world, |_| count += 1).unwrap();
         assert_eq!(count, 3);
     }
 
@@ -7874,8 +7881,8 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
 
-        assert_eq!(plan.execute(&mut world).unwrap().len(), 5);
-        assert_eq!(plan.execute(&mut world).unwrap().len(), 0);
+        assert_eq!(plan.execute_collect(&mut world).unwrap().len(), 5);
+        assert_eq!(plan.execute_collect(&mut world).unwrap().len(), 0);
     }
 
     #[test]
@@ -7889,11 +7896,11 @@ mod tests {
 
         // Without Changed<T>, every call sees all entities.
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 5);
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 5);
     }
 
@@ -7908,8 +7915,8 @@ mod tests {
             .scan::<(Changed<Score>, &Score)>()
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        assert_eq!(plan.execute(&mut world).unwrap().len(), 5);
-        assert_eq!(plan.execute(&mut world).unwrap().len(), 0);
+        assert_eq!(plan.execute_collect(&mut world).unwrap().len(), 5);
+        assert_eq!(plan.execute_collect(&mut world).unwrap().len(), 0);
     }
 
     #[test]
@@ -7924,10 +7931,10 @@ mod tests {
             .join::<(Changed<Team>, &Team)>(JoinKind::Inner)
             .build();
         // First: all changed
-        assert_eq!(plan.execute(&mut world).unwrap().len(), 5);
+        assert_eq!(plan.execute_collect(&mut world).unwrap().len(), 5);
         // Second: right side not changed, right yields 0 entities.
         // Inner join of 5 and 0 = 0.
-        assert_eq!(plan.execute(&mut world).unwrap().len(), 0);
+        assert_eq!(plan.execute_collect(&mut world).unwrap().len(), 0);
     }
 
     #[test]
@@ -7940,15 +7947,15 @@ mod tests {
         let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
         // for_each_raw: sees everything, doesn't advance tick
         let mut count = 0;
-        plan.for_each_raw(&world, |_| count += 1).unwrap();
+        plan.execute_stream_raw(&world, |_| count += 1).unwrap();
         assert_eq!(count, 3);
-        // for_each: also sees everything (tick still at 0), and advances
+        // execute_stream: also sees everything (tick still at 0), and advances
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 3);
-        // for_each again: tick advanced, nothing changed
+        // execute_stream again: tick advanced, nothing changed
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -7962,12 +7969,12 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
         // Consume initial changes
-        plan.for_each(&mut world, |_| {}).unwrap();
+        plan.execute_stream(&mut world, |_| {}).unwrap();
         // Mutate only archetype 1
         let _ = world.get_mut::<Score>(e1);
         // Only archetype 1 should be returned
         let mut found = Vec::new();
-        plan.for_each(&mut world, |entity| found.push(entity))
+        plan.execute_stream(&mut world, |entity| found.push(entity))
             .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], e1);
@@ -7992,12 +7999,12 @@ mod tests {
 
         // First call: Changed passes (everything new), predicate filters to 5
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 5);
 
         // Second call: Changed skips the archetype entirely
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -8012,13 +8019,13 @@ mod tests {
         let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
 
         // Drain initial changes
-        let _ = plan.execute(&mut world).unwrap();
+        let _ = plan.execute_collect(&mut world).unwrap();
 
         // Mutate only the (Score,) archetype
         let _ = world.get_mut::<Score>(e);
 
-        // execute path (scratch buffer) should see only the changed archetype
-        let result = plan.execute(&mut world).unwrap();
+        // execute_collect path (scratch buffer) should see only the changed archetype
+        let result = plan.execute_collect(&mut world).unwrap();
         assert_eq!(result.len(), 1);
     }
 
@@ -8031,7 +8038,7 @@ mod tests {
         let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
 
         // Drain initial changes
-        plan.for_each(&mut world, |_| {}).unwrap();
+        plan.execute_stream(&mut world, |_| {}).unwrap();
 
         // Spawn new entities into a new archetype AFTER plan was built.
         // The compiled scan iterates world.archetypes at execution time,
@@ -8041,7 +8048,7 @@ mod tests {
         world.spawn((Score(3), Team(1)));
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 2);
     }
 
@@ -8059,10 +8066,10 @@ mod tests {
             .build();
 
         // First call: all changed, left join preserves left = 5
-        assert_eq!(plan.execute(&mut world).unwrap().len(), 5);
+        assert_eq!(plan.execute_collect(&mut world).unwrap().len(), 5);
 
         // Second call: right side stale, but Left join keeps all left entities
-        assert_eq!(plan.execute(&mut world).unwrap().len(), 5);
+        assert_eq!(plan.execute_collect(&mut world).unwrap().len(), 5);
     }
 
     // ── Spatial predicate tests ──────────────────────────────────
@@ -8474,7 +8481,7 @@ mod tests {
             },));
         }
 
-        // Even without a spatial index, for_each should work via filter fallback.
+        // Even without a spatial index, execute_stream should work via filter fallback.
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Pos,)>()
@@ -8489,7 +8496,7 @@ mod tests {
             .build();
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 20); // All within radius 100
     }
 
@@ -8824,7 +8831,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| {
+        plan.execute_stream(&mut world, |entity| {
             results.push(entity);
         })
         .unwrap();
@@ -8866,7 +8873,7 @@ mod tests {
             .join::<(&Score,)>(JoinKind::Inner)
             .build();
 
-        let results = plan.execute(&mut world).unwrap();
+        let results = plan.execute_collect(&mut world).unwrap();
         assert!(
             call_count.load(Ordering::Relaxed) > 0,
             "query not called in join"
@@ -8891,7 +8898,7 @@ mod tests {
             .filter(Predicate::within::<Pos>([1.5, 1.5], 5.0, |_, _| true).unwrap())
             .build();
 
-        let results = plan.execute(&mut world).unwrap();
+        let results = plan.execute_collect(&mut world).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.contains(&e1));
         assert!(results.contains(&e2));
@@ -8918,7 +8925,7 @@ mod tests {
         world.despawn(e2);
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -8951,7 +8958,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each_raw(&world, |entity| results.push(entity))
+        plan.execute_stream_raw(&world, |entity| results.push(entity))
             .unwrap();
 
         assert!(call_count.load(Ordering::Relaxed) > 0);
@@ -8983,7 +8990,7 @@ mod tests {
             .build();
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 10);
     }
 
@@ -9013,7 +9020,7 @@ mod tests {
 
         // First scan — all entities "changed" (never read before by this plan).
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results.len(), 3, "all entities pass on first scan");
 
@@ -9024,7 +9031,7 @@ mod tests {
         // Second scan — only the archetype containing e1/e2 (which was mutated) passes
         // Changed<Pos>. e3's (Pos, Score) archetype was not touched, so it is filtered out.
         results.clear();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(
             results.len(),
@@ -9054,7 +9061,7 @@ mod tests {
             .build();
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 0, "empty lookup should yield zero results");
     }
 
@@ -9079,7 +9086,7 @@ mod tests {
         world.despawn(e2);
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 0, "all-stale lookup should yield zero results");
     }
 
@@ -9102,7 +9109,7 @@ mod tests {
         world.despawn(e2);
 
         let mut results = Vec::new();
-        plan.for_each_raw(&world, |entity| results.push(entity))
+        plan.execute_stream_raw(&world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results.len(), 1, "raw path must filter stale entities");
         assert_eq!(results[0], e1);
@@ -9127,7 +9134,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(
             results.len(),
@@ -9155,7 +9162,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(
             results.len(),
@@ -9184,7 +9191,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.contains(&e1));
@@ -9232,7 +9239,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
 
         assert!(call_count.load(Ordering::Relaxed) > 0);
@@ -9249,7 +9256,7 @@ mod tests {
         assert!((center[2] - 30.0).abs() < f64::EPSILON);
     }
 
-    // ── IndexDriver for_each execution ──────────────────────────────
+    // ── IndexDriver execute_stream execution ──────────────────────────────
 
     #[test]
     fn index_for_each_uses_btree_lookup() {
@@ -9270,7 +9277,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
 
         assert_eq!(results.len(), 2);
@@ -9297,7 +9304,7 @@ mod tests {
             .join::<(&Pos,)>(JoinKind::Inner)
             .build();
 
-        let results = plan.execute(&mut world).unwrap();
+        let results = plan.execute_collect(&mut world).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.contains(&e1));
         assert!(results.contains(&e2));
@@ -9322,7 +9329,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
 
         assert_eq!(results.len(), 2);
@@ -9350,7 +9357,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
 
         assert_eq!(results.len(), 3);
@@ -9380,7 +9387,7 @@ mod tests {
         world.despawn(e2);
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -9406,7 +9413,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
 
         assert_eq!(results.len(), 1, "entity missing Pos should be filtered");
@@ -9424,7 +9431,7 @@ mod tests {
 
         let planner = QueryPlanner::new(&world_a);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.execute(&mut world_b);
+        let result = plan.execute_collect(&mut world_b);
         assert!(result.is_err());
     }
 
@@ -9437,7 +9444,7 @@ mod tests {
 
         let planner = QueryPlanner::new(&world_a);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.for_each(&mut world_b, |_| {});
+        let result = plan.execute_stream(&mut world_b, |_| {});
         assert!(result.is_err());
     }
 
@@ -9449,7 +9456,7 @@ mod tests {
 
         let planner = QueryPlanner::new(&world_a);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.for_each_raw(&world_b, |_| {});
+        let result = plan.execute_stream_raw(&world_b, |_| {});
         assert!(result.is_err());
     }
 
@@ -9460,7 +9467,7 @@ mod tests {
 
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.execute(&mut world);
+        let result = plan.execute_collect(&mut world);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1);
     }
@@ -9476,7 +9483,7 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results, vec![e]);
     }
@@ -9492,7 +9499,7 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
         let mut results = Vec::new();
-        plan.for_each_raw(&world, |entity| results.push(entity))
+        plan.execute_stream_raw(&world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results, vec![e]);
     }
@@ -9507,7 +9514,7 @@ mod tests {
             .scan::<(&Score,)>()
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
-        let result = plan.execute_raw(&world).unwrap();
+        let result = plan.execute_collect_raw(&world).unwrap();
         assert_eq!(result, &[e]);
     }
 
@@ -9518,7 +9525,7 @@ mod tests {
 
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.execute_raw(&world).unwrap();
+        let result = plan.execute_collect_raw(&world).unwrap();
         assert_eq!(result, &[e]);
     }
 
@@ -9531,7 +9538,7 @@ mod tests {
 
         let planner = QueryPlanner::new(&world_a);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.execute_raw(&world_b);
+        let result = plan.execute_collect_raw(&world_b);
         assert!(result.is_err());
     }
 
@@ -9544,9 +9551,9 @@ mod tests {
         let mut plan = planner.scan::<(&Score,)>().build();
 
         // Execute raw twice — both should succeed without tick advancement.
-        let r1 = plan.execute_raw(&world).unwrap();
+        let r1 = plan.execute_collect_raw(&world).unwrap();
         assert_eq!(r1.len(), 1);
-        let r2 = plan.execute_raw(&world).unwrap();
+        let r2 = plan.execute_collect_raw(&world).unwrap();
         assert_eq!(r2.len(), 1);
     }
 
@@ -9562,7 +9569,7 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
         let mut results = Vec::new();
-        plan.for_each_raw(&world, |entity| results.push(entity))
+        plan.execute_stream_raw(&world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results, vec![e1]);
     }
@@ -9579,7 +9586,7 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Left)
             .build();
         let mut results = Vec::new();
-        plan.for_each_raw(&world, |entity| results.push(entity))
+        plan.execute_stream_raw(&world, |entity| results.push(entity))
             .unwrap();
         results.sort_by_key(|e| e.to_bits());
         let mut expected = vec![e1, e2];
@@ -9600,11 +9607,11 @@ mod tests {
             .build();
         // First call: all changed — should see all 5.
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 5);
         // Second call: tick advanced, nothing mutated — should see 0.
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -9620,9 +9627,9 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
         // Both calls should see all 5 — execute_raw does not advance tick.
-        let r1 = plan.execute_raw(&world).unwrap();
+        let r1 = plan.execute_collect_raw(&world).unwrap();
         assert_eq!(r1.len(), 5);
-        let r2 = plan.execute_raw(&world).unwrap();
+        let r2 = plan.execute_collect_raw(&world).unwrap();
         assert_eq!(r2.len(), 5);
     }
 
@@ -9638,7 +9645,7 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results, vec![e1]);
     }
@@ -9655,7 +9662,7 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Left)
             .build();
         let mut results = Vec::new();
-        plan.for_each(&mut world, |entity| results.push(entity))
+        plan.execute_stream(&mut world, |entity| results.push(entity))
             .unwrap();
         results.sort_by_key(|e| e.to_bits());
         let mut expected = vec![e1, e2];
@@ -9677,7 +9684,7 @@ mod tests {
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
         let mut results = Vec::new();
-        plan.for_each_raw(&world, |entity| results.push(entity))
+        plan.execute_stream_raw(&world, |entity| results.push(entity))
             .unwrap();
         assert_eq!(results, vec![e1]);
     }
@@ -9695,7 +9702,7 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Inner)
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let result = plan.execute_raw(&world).unwrap();
+        let result = plan.execute_collect_raw(&world).unwrap();
         assert_eq!(result, &[e1]);
     }
 
@@ -9710,7 +9717,7 @@ mod tests {
             .scan::<(&Score,)>()
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
-        let result = plan.execute_raw(&world).unwrap();
+        let result = plan.execute_collect_raw(&world).unwrap();
         assert!(result.is_empty());
     }
 
@@ -9764,7 +9771,7 @@ mod tests {
             .aggregate(AggregateExpr::count())
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result.get(0), Some(0.0));
     }
@@ -9781,7 +9788,7 @@ mod tests {
             .aggregate(AggregateExpr::count())
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(100.0));
     }
 
@@ -9797,7 +9804,7 @@ mod tests {
             .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         // sum(0..10) = 45
         assert_eq!(result.get(0), Some(45.0));
     }
@@ -9815,7 +9822,7 @@ mod tests {
             .aggregate(AggregateExpr::max::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(5.0));
         assert_eq!(result.get(1), Some(14.0));
     }
@@ -9832,7 +9839,7 @@ mod tests {
             .aggregate(AggregateExpr::avg::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         // avg(0..10) = 4.5
         assert_eq!(result.get(0), Some(4.5));
     }
@@ -9853,7 +9860,7 @@ mod tests {
             .aggregate(AggregateExpr::avg::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(5.0)); // count
         assert_eq!(result.get(1), Some(15.0)); // sum(1+2+3+4+5)
         assert_eq!(result.get(2), Some(1.0)); // min
@@ -9881,7 +9888,7 @@ mod tests {
             .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(50.0)); // 50 entities match
         // sum(50..100) = 50*75-1 = 3725
         let expected_sum: f64 = (50..100).map(|i| i as f64).sum();
@@ -9901,7 +9908,7 @@ mod tests {
             .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get_by_label("COUNT(*)"), Some(5.0));
         assert_eq!(result.get_by_label("SUM(Score)"), Some(10.0));
         assert_eq!(result.get_by_label("NONEXISTENT"), None);
@@ -9966,7 +9973,7 @@ mod tests {
             .aggregate(AggregateExpr::avg::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert!(result.get(0).unwrap().is_nan()); // min on empty
         assert!(result.get(1).unwrap().is_nan()); // max on empty
         assert!(result.get(2).unwrap().is_nan()); // avg on empty
@@ -9985,7 +9992,7 @@ mod tests {
             .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates_raw(&world).unwrap();
+        let result = plan.aggregate_raw(&world).unwrap();
         assert_eq!(result.get(0), Some(10.0));
         assert_eq!(result.get(1), Some(45.0));
     }
@@ -10010,7 +10017,7 @@ mod tests {
             .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(40.0)); // 10..50 = 40 entities
         let expected_sum: f64 = (10..50).map(|i| i as f64).sum();
         assert_eq!(result.get(1), Some(expected_sum));
@@ -10072,7 +10079,7 @@ mod tests {
             .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(10.0)); // all 10 entities
         assert_eq!(result.get(1), Some(45.0)); // sum(0..10)
     }
@@ -10095,7 +10102,7 @@ mod tests {
         world.despawn(entities[3]);
         world.despawn(entities[4]);
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(3.0)); // 3 surviving
         assert_eq!(result.get(1), Some(3.0)); // 0+1+2 = 3
     }
@@ -10113,11 +10120,11 @@ mod tests {
             .build();
 
         // First call sees all entities (all columns are new).
-        let r1 = plan.execute_aggregates(&mut world).unwrap();
+        let r1 = plan.aggregate(&mut world).unwrap();
         assert_eq!(r1.get(0), Some(5.0));
 
         // No mutations — second call should see 0 (Changed filter skips).
-        let r2 = plan.execute_aggregates(&mut world).unwrap();
+        let r2 = plan.aggregate(&mut world).unwrap();
         assert_eq!(r2.get(0), Some(0.0));
     }
 
@@ -10136,13 +10143,13 @@ mod tests {
             .build();
 
         // First call sees all.
-        let _ = plan.execute_aggregates(&mut world).unwrap();
+        let _ = plan.aggregate(&mut world).unwrap();
 
         // Mutate one entity.
         *world.get_mut::<Score>(e).unwrap() = Score(42);
 
         // Second call sees only the mutated entity's archetype.
-        let r = plan.execute_aggregates(&mut world).unwrap();
+        let r = plan.aggregate(&mut world).unwrap();
         // Changed<T> is archetype-granular, so all entities in the archetype
         // are visited (all 5 are in the same archetype).
         assert_eq!(r.get(0), Some(5.0));
@@ -10156,7 +10163,7 @@ mod tests {
         let mut plan = planner.scan::<(&Score,)>().build();
 
         // No panic — returns empty result.
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert!(result.is_empty());
     }
 
@@ -10167,7 +10174,7 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score,)>().build();
 
-        let result = plan.execute_aggregates_raw(&world).unwrap();
+        let result = plan.aggregate_raw(&world).unwrap();
         assert!(result.is_empty());
     }
 
@@ -10182,7 +10189,7 @@ mod tests {
             .build();
 
         let mut world_b = World::new();
-        assert!(plan.execute_aggregates(&mut world_b).is_err());
+        assert!(plan.aggregate(&mut world_b).is_err());
     }
 
     #[test]
@@ -10196,7 +10203,7 @@ mod tests {
             .build();
 
         let world_b = World::new();
-        assert!(plan.execute_aggregates_raw(&world_b).is_err());
+        assert!(plan.aggregate_raw(&world_b).is_err());
     }
 
     #[test]
@@ -10212,8 +10219,8 @@ mod tests {
             .build();
 
         // _raw does not advance ticks, so repeated calls see the same result.
-        let r1 = plan.execute_aggregates_raw(&world).unwrap();
-        let r2 = plan.execute_aggregates_raw(&world).unwrap();
+        let r1 = plan.aggregate_raw(&world).unwrap();
+        let r2 = plan.aggregate_raw(&world).unwrap();
         assert_eq!(r1.get(0), r2.get(0));
     }
 
@@ -10237,7 +10244,7 @@ mod tests {
             .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(5.0)); // only 5 have both
         assert_eq!(result.get(1), Some(10.0)); // sum(0..5)
     }
@@ -10261,7 +10268,7 @@ mod tests {
             .build();
 
         // _raw now supports join plans too.
-        let result = plan.execute_aggregates_raw(&world).unwrap();
+        let result = plan.aggregate_raw(&world).unwrap();
         assert_eq!(result.get(0), Some(5.0));
         assert_eq!(result.get(1), Some(10.0));
     }
@@ -10286,7 +10293,7 @@ mod tests {
             }))
             .build();
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         // NaN propagates via f64::min/max — result should be NaN.
         assert!(result.get(0).unwrap().is_nan());
         assert!(result.get(1).unwrap().is_nan());
@@ -10304,14 +10311,14 @@ mod tests {
             .aggregate(AggregateExpr::count())
             .build();
 
-        let r1 = plan.execute_aggregates(&mut world).unwrap();
+        let r1 = plan.aggregate(&mut world).unwrap();
         assert_eq!(r1.get(0), Some(5.0));
 
         // Spawn more entities — visible on next execution.
         for i in 5..8 {
             world.spawn((Score(i),));
         }
-        let r2 = plan.execute_aggregates(&mut world).unwrap();
+        let r2 = plan.aggregate(&mut world).unwrap();
         assert_eq!(r2.get(0), Some(8.0));
     }
 
@@ -10441,7 +10448,7 @@ mod tests {
         let dbg = format!("{plan:?}");
         assert!(dbg.contains("has_compiled_agg_scan: true"));
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(10.0)); // count
         let expected_sum: f64 = (0..10).map(|i| i as f64).sum();
         assert_eq!(result.get(1), Some(expected_sum)); // sum(0..10) = 45
@@ -10472,7 +10479,7 @@ mod tests {
             .build();
         drop(planner);
 
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(8.0)); // count: 5 + 3
         // sum of Health: only from archetype 2 = 0 + 10 + 20 = 30
         assert_eq!(result.get(1), Some(30.0));
@@ -10515,16 +10522,15 @@ mod tests {
         drop(planner);
 
         // First call: the filter panics. catch_unwind captures it.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            plan.execute_aggregates(&mut world)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plan.aggregate(&mut world)));
         assert!(result.is_err(), "expected panic from filter");
 
-        // Disable the panic and execute again — plan must still work.
+        // Disable the panic and execute_collect again — plan must still work.
         // Without AccumGuard, cached_accums would be empty after the
         // panic, causing indexing failures or wrong results.
         should_panic.store(false, Ordering::Relaxed);
-        let result = plan.execute_aggregates(&mut world).unwrap();
+        let result = plan.aggregate(&mut world).unwrap();
         assert_eq!(result.get(0), Some(10.0)); // count
         let expected_sum: f64 = (0..10).map(|i| i as f64).sum();
         assert_eq!(result.get(1), Some(expected_sum)); // sum
@@ -10532,7 +10538,7 @@ mod tests {
 
     #[test]
     fn aggregate_accum_guard_restores_on_panic_raw() {
-        // Same as above but for execute_aggregates_raw.
+        // Same as above but for aggregate_raw.
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut world = World::new();
@@ -10562,14 +10568,13 @@ mod tests {
             .build();
         drop(planner);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            plan.execute_aggregates_raw(&world)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plan.aggregate_raw(&world)));
         assert!(result.is_err(), "expected panic from filter");
 
         // Plan is structurally intact — cached_accums was restored by guard.
         should_panic.store(false, Ordering::Relaxed);
-        let result = plan.execute_aggregates_raw(&world).unwrap();
+        let result = plan.aggregate_raw(&world).unwrap();
         assert_eq!(result.get(0), Some(10.0));
         let expected_sum: f64 = (0..10).map(|i| i as f64).sum();
         assert_eq!(result.get(1), Some(expected_sum));
@@ -10613,7 +10618,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_batched_yields_all_join_results() {
+    fn execute_stream_batched_yields_all_join_results() {
         let mut world = World::new();
         // Score-only entities (should NOT appear in inner join)
         for i in 0..5 {
@@ -10633,7 +10638,7 @@ mod tests {
             .build();
 
         let mut results: Vec<(Entity, Score)> = Vec::new();
-        plan.for_each_batched::<(&Score,), _>(&mut world, |entity, (score,)| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |entity, (score,)| {
             results.push((entity, *score));
         })
         .unwrap();
@@ -10645,7 +10650,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_join_chunk_yields_correct_slices() {
+    fn execute_stream_join_chunk_yields_correct_slices() {
         let mut world = World::new();
         // Archetype A: Score only (will not match inner join)
         for i in 0..3 {
@@ -10665,7 +10670,7 @@ mod tests {
         let mut total_entities = 0;
         let mut chunk_count = 0;
         let mut collected_scores = Vec::new();
-        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
+        plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
             // rows and entities must have the same length.
             assert_eq!(entities.len(), rows.len());
             // Each row index must be valid for the slice.
@@ -10690,7 +10695,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_batched_raw_no_tick_advance() {
+    fn execute_stream_batched_raw_no_tick_advance() {
         let mut world = World::new();
         world.spawn((Score(1), Team(1)));
 
@@ -10702,18 +10707,18 @@ mod tests {
 
         // Call raw twice — both should succeed (no tick advancement).
         let mut count1 = 0u32;
-        plan.for_each_batched_raw::<(&Score,), _>(&world, |_, _| count1 += 1)
+        plan.execute_stream_batched_raw::<(&Score,), _>(&world, |_, _| count1 += 1)
             .unwrap();
         assert_eq!(count1, 1);
 
         let mut count2 = 0u32;
-        plan.for_each_batched_raw::<(&Score,), _>(&world, |_, _| count2 += 1)
+        plan.execute_stream_batched_raw::<(&Score,), _>(&world, |_, _| count2 += 1)
             .unwrap();
         assert_eq!(count2, 1);
     }
 
     #[test]
-    fn for_each_join_chunk_works_for_scan_plans() {
+    fn execute_stream_join_chunk_works_for_scan_plans() {
         let mut world = World::new();
         world.spawn((Score(1),));
         world.spawn((Score(2),));
@@ -10723,7 +10728,7 @@ mod tests {
         let mut plan = planner.scan::<(&Score,)>().build();
 
         let mut total = 0;
-        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
+        plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
             assert_eq!(entities.len(), rows.len());
             total += entities.len();
             // For scan plans, rows should be 0..len (all entities in the archetype).
@@ -10737,7 +10742,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_batched_left_join() {
+    fn execute_stream_batched_left_join() {
         let mut world = World::new();
         // 5 Score-only, 5 Score+Team
         let mut all_score = Vec::new();
@@ -10755,7 +10760,7 @@ mod tests {
             .build();
 
         let mut results = Vec::new();
-        plan.for_each_batched::<(&Score,), _>(&mut world, |entity, _| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |entity, _| {
             results.push(entity);
         })
         .unwrap();
@@ -10768,7 +10773,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_join_chunk_multi_archetype() {
+    fn execute_stream_join_chunk_multi_archetype() {
         let mut world = World::new();
         // 3 different archetypes, all with Score
         world.spawn((Score(1),));
@@ -10784,7 +10789,7 @@ mod tests {
 
         // Collect chunk info: (entity_count, first_entity) per chunk.
         let mut chunk_entities: Vec<Vec<Entity>> = Vec::new();
-        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, _, _| {
+        plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |entities, _, _| {
             assert!(!entities.is_empty());
             chunk_entities.push(entities.to_vec());
         })
@@ -10800,7 +10805,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_batched_empty_join() {
+    fn execute_stream_batched_empty_join() {
         let mut world = World::new();
         // Score-only entities, no Team — inner join produces empty result.
         for i in 0..5 {
@@ -10814,7 +10819,7 @@ mod tests {
             .build();
 
         let mut called = false;
-        plan.for_each_batched::<(&Score,), _>(&mut world, |_, _| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |_, _| {
             called = true;
         })
         .unwrap();
@@ -10822,7 +10827,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_batched_world_mismatch() {
+    fn execute_stream_batched_world_mismatch() {
         let mut world_a = World::new();
         let mut world_b = World::new();
         world_a.spawn((Score(1),));
@@ -10830,12 +10835,12 @@ mod tests {
 
         let planner = QueryPlanner::new(&world_a);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.for_each_batched::<(&Score,), _>(&mut world_b, |_, _| {});
+        let result = plan.execute_stream_batched::<(&Score,), _>(&mut world_b, |_, _| {});
         assert!(result.is_err());
     }
 
     #[test]
-    fn for_each_batched_component_mismatch() {
+    fn execute_stream_batched_component_mismatch() {
         let mut world = World::new();
         // Entities have Score only — no Health component.
         world.spawn((Score(1),));
@@ -10845,7 +10850,7 @@ mod tests {
         let mut plan = planner.scan::<(&Score,)>().build();
 
         // Request (&Health,) via Q, but no archetype has Health.
-        let result = plan.for_each_batched::<(&Health,), _>(&mut world, |_, _| {});
+        let result = plan.execute_stream_batched::<(&Health,), _>(&mut world, |_, _| {});
         assert!(
             matches!(result, Err(PlanExecError::ComponentMismatch { .. })),
             "expected ComponentMismatch, got {result:?}"
@@ -10853,14 +10858,14 @@ mod tests {
     }
 
     #[test]
-    fn for_each_join_chunk_component_mismatch() {
+    fn execute_stream_join_chunk_component_mismatch() {
         let mut world = World::new();
         world.spawn((Score(1),));
 
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score,)>().build();
 
-        let result = plan.for_each_join_chunk::<(&Health,), _>(&mut world, |_, _, _| {});
+        let result = plan.execute_stream_join_chunk::<(&Health,), _>(&mut world, |_, _, _| {});
         assert!(
             matches!(result, Err(PlanExecError::ComponentMismatch { .. })),
             "expected ComponentMismatch, got {result:?}"
@@ -10868,7 +10873,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_join_chunk_world_mismatch() {
+    fn execute_stream_join_chunk_world_mismatch() {
         let mut world_a = World::new();
         let mut world_b = World::new();
         world_a.spawn((Score(1),));
@@ -10876,12 +10881,12 @@ mod tests {
 
         let planner = QueryPlanner::new(&world_a);
         let mut plan = planner.scan::<(&Score,)>().build();
-        let result = plan.for_each_join_chunk::<(&Score,), _>(&mut world_b, |_, _, _| {});
+        let result = plan.execute_stream_join_chunk::<(&Score,), _>(&mut world_b, |_, _, _| {});
         assert!(result.is_err());
     }
 
     #[test]
-    fn for_each_join_chunk_empty_join() {
+    fn execute_stream_join_chunk_empty_join() {
         let mut world = World::new();
         for i in 0..5 {
             world.spawn((Score(i),));
@@ -10894,7 +10899,7 @@ mod tests {
             .build();
 
         let mut called = false;
-        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |_, _, _| {
+        plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |_, _, _| {
             called = true;
         })
         .unwrap();
@@ -10902,7 +10907,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_batched_scan_only_happy_path() {
+    fn execute_stream_batched_scan_only_happy_path() {
         let mut world = World::new();
         world.spawn((Score(10),));
         world.spawn((Score(20),));
@@ -10912,7 +10917,7 @@ mod tests {
         let mut plan = planner.scan::<(&Score,)>().build();
 
         let mut sum = 0u32;
-        plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |_, (score,)| {
             sum += score.0;
         })
         .unwrap();
@@ -10920,7 +10925,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_batched_multi_archetype_values() {
+    fn execute_stream_batched_multi_archetype_values() {
         let mut world = World::new();
         // Archetype A: Score + Team
         world.spawn((Score(10), Team(1)));
@@ -10936,7 +10941,7 @@ mod tests {
             .build();
 
         let mut scores = Vec::new();
-        plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |_, (score,)| {
             scores.push(score.0);
         })
         .unwrap();
@@ -10945,7 +10950,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_batched_marks_mutable_changed() {
+    fn execute_stream_batched_marks_mutable_changed() {
         let mut world = World::new();
         world.spawn((Score(1), Team(1)));
 
@@ -10954,27 +10959,27 @@ mod tests {
         let mut changed_plan = planner.scan::<(Changed<Score>, &Score)>().build();
 
         // First call: all entities are new, so Changed sees them.
-        let r1 = changed_plan.execute(&mut world).unwrap().len();
+        let r1 = changed_plan.execute_collect(&mut world).unwrap().len();
         assert_eq!(r1, 1);
 
         // Second call: nothing mutated, Changed skips.
-        let r2 = changed_plan.execute(&mut world).unwrap().len();
+        let r2 = changed_plan.execute_collect(&mut world).unwrap().len();
         assert_eq!(r2, 0);
 
-        // Now mutate via for_each_batched with &mut Score.
+        // Now mutate via execute_stream_batched with &mut Score.
         let scan_planner = QueryPlanner::new(&world);
         let mut scan_plan = scan_planner.scan::<(&Score,)>().build();
         scan_plan
-            .for_each_batched::<(&mut Score,), _>(&mut world, |_, (score,)| {
+            .execute_stream_batched::<(&mut Score,), _>(&mut world, |_, (score,)| {
                 score.0 += 1;
             })
             .unwrap();
 
         // Changed<Score> should now see the mutation.
-        let r3 = changed_plan.execute(&mut world).unwrap().len();
+        let r3 = changed_plan.execute_collect(&mut world).unwrap().len();
         assert_eq!(
             r3, 1,
-            "Changed<Score> should detect mutation from for_each_batched"
+            "Changed<Score> should detect mutation from execute_stream_batched"
         );
     }
 
@@ -11005,8 +11010,8 @@ mod tests {
         let mut scan_plan = planner.scan::<(&Score, &Team)>().build();
 
         // Both should produce the same entity set.
-        let mut join_result = join_plan.execute(&mut world).unwrap().to_vec();
-        let mut scan_result = scan_plan.execute(&mut world).unwrap().to_vec();
+        let mut join_result = join_plan.execute_collect(&mut world).unwrap().to_vec();
+        let mut scan_result = scan_plan.execute_collect(&mut world).unwrap().to_vec();
         join_result.sort_by_key(|e| e.to_bits());
         scan_result.sort_by_key(|e| e.to_bits());
         assert_eq!(join_result, scan_result);
@@ -11041,7 +11046,7 @@ mod tests {
         }
 
         // Left join preserves all 10 Score entities.
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         assert_eq!(result.len(), 10);
     }
 
@@ -11071,7 +11076,7 @@ mod tests {
 
         // Inner join on Team narrows to 2 entities (Score+Team).
         // Left join on Health preserves both.
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         assert_eq!(result.len(), 2);
     }
 
@@ -11101,7 +11106,7 @@ mod tests {
 
         // Only entity with Score+Team+Health survives the merged inner joins.
         // Left join on Pos preserves it (no Pos, but Left keeps it).
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         assert_eq!(result.len(), 1);
     }
 
@@ -11119,11 +11124,11 @@ mod tests {
             .build();
 
         // First call: all entities are "changed" (new).
-        let r1 = plan.execute(&mut world).unwrap().len();
+        let r1 = plan.execute_collect(&mut world).unwrap().len();
         assert_eq!(r1, 2);
 
         // Second call: nothing changed, should return 0.
-        let r2 = plan.execute(&mut world).unwrap().len();
+        let r2 = plan.execute_collect(&mut world).unwrap().len();
         assert_eq!(r2, 0);
 
         // Mutate Score on e1.
@@ -11132,13 +11137,13 @@ mod tests {
         // Third call: only e1 has Changed<Score>, but we also need Changed<Team>.
         // Since Team wasn't changed, the merged change filter should still require
         // both Score AND Team to be changed. Result: 0.
-        let r3 = plan.execute(&mut world).unwrap().len();
+        let r3 = plan.execute_collect(&mut world).unwrap().len();
         assert_eq!(r3, 0);
 
         // Fourth call: only Team changed (right side of the eliminated join).
         // Score not changed → merged filter requires both → 0.
         *world.get_mut::<Team>(e1).unwrap() = Team(99);
-        let r4 = plan.execute(&mut world).unwrap().len();
+        let r4 = plan.execute_collect(&mut world).unwrap().len();
         assert_eq!(r4, 0);
 
         // Fifth call: mutate BOTH Score and Team on e1. Now both columns
@@ -11146,7 +11151,7 @@ mod tests {
         // archetype pass (Changed<T> is per-column, not per-entity).
         *world.get_mut::<Score>(e1).unwrap() = Score(100);
         *world.get_mut::<Team>(e1).unwrap() = Team(100);
-        let r5 = plan.execute(&mut world).unwrap().len();
+        let r5 = plan.execute_collect(&mut world).unwrap().len();
         assert_eq!(r5, 2);
     }
 
@@ -11163,7 +11168,7 @@ mod tests {
             .join::<(&Score,)>(JoinKind::Inner)
             .build();
 
-        let result = plan.execute(&mut world).unwrap();
+        let result = plan.execute_collect(&mut world).unwrap();
         assert_eq!(result.len(), 2);
 
         // Should be eliminated.
@@ -11220,19 +11225,19 @@ mod tests {
                 .any(|w| matches!(w, PlanWarning::JoinEliminated { .. }))
         );
 
-        // execute_raw — should yield same entities as execute.
-        let raw_result = plan.execute_raw(&world).unwrap().to_vec();
+        // execute_collect_raw — should yield same entities as execute_collect.
+        let raw_result = plan.execute_collect_raw(&world).unwrap().to_vec();
         assert_eq!(raw_result.len(), 5);
 
         // for_each_raw — should yield same entities.
         let mut raw_entities = Vec::new();
-        plan.for_each_raw(&world, |entity| raw_entities.push(entity))
+        plan.execute_stream_raw(&world, |entity| raw_entities.push(entity))
             .unwrap();
         assert_eq!(raw_entities.len(), 5);
 
-        // for_each_batched_raw — pre-resolved column pointers via eliminated path.
+        // execute_stream_batched_raw — pre-resolved column pointers via eliminated path.
         let mut batched_scores = Vec::new();
-        plan.for_each_batched_raw::<(&Score,), _>(&world, |_, (score,)| {
+        plan.execute_stream_batched_raw::<(&Score,), _>(&world, |_, (score,)| {
             batched_scores.push(score.0);
         })
         .unwrap();
@@ -11259,8 +11264,8 @@ mod tests {
             .build();
         let mut scan_plan = planner.scan::<(&Score, &Team)>().build();
 
-        let join_result = join_plan.execute(&mut world).unwrap().to_vec();
-        let scan_result = scan_plan.execute(&mut world).unwrap().to_vec();
+        let join_result = join_plan.execute_collect(&mut world).unwrap().to_vec();
+        let scan_result = scan_plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(join_result.len(), scan_result.len());
         assert_eq!(join_result.len(), 1000);
     }
@@ -11286,7 +11291,7 @@ mod tests {
         assert!(plan.scan_required.is_some());
 
         let mut results = Vec::new();
-        plan.for_each_batched::<(&Score,), _>(&mut world, |entity, (score,)| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |entity, (score,)| {
             results.push((entity, *score));
         })
         .unwrap();
@@ -11317,7 +11322,7 @@ mod tests {
         assert!(plan.scan_required.is_none());
 
         let mut results = Vec::new();
-        plan.for_each_batched::<(&Score,), _>(&mut world, |_entity, (score,)| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |_entity, (score,)| {
             results.push(score.0);
         })
         .unwrap();
@@ -11340,7 +11345,7 @@ mod tests {
 
         let mut chunk_count = 0;
         let mut total_entities = 0;
-        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
+        plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
             chunk_count += 1;
             assert_eq!(entities.len(), rows.len());
             // Row indices should be sequential 0..N for direct iteration.
@@ -11385,7 +11390,7 @@ mod tests {
         assert!(plan.scan_required.is_some());
 
         let mut results = Vec::new();
-        plan.for_each_batched::<(&Score,), _>(&mut world, |_entity, (score,)| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |_entity, (score,)| {
             results.push(score.0);
         })
         .unwrap();
@@ -11423,7 +11428,7 @@ mod tests {
         // Verify the plan still produces correct results (index-driven path).
         let mut plan = plan;
         let mut results = Vec::new();
-        plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |_, (score,)| {
             results.push(score.0);
         })
         .unwrap();
@@ -11472,7 +11477,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         let mut ids: Vec<u64> = entities.iter().map(|e| e.to_bits()).collect();
         ids.sort_unstable();
 
@@ -11505,7 +11510,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         assert_eq!(
             entities.len(),
             2,
@@ -11536,7 +11541,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         let ids: Vec<u64> = entities.iter().map(|e| e.to_bits()).collect();
         assert_eq!(ids.len(), 1, "dead reference target should not match");
         assert!(ids.contains(&c1.to_bits()));
@@ -11585,7 +11590,7 @@ mod tests {
             .build();
 
         let mut found = Vec::new();
-        plan.for_each(&mut world, |e| found.push(e)).unwrap();
+        plan.execute_stream(&mut world, |e| found.push(e)).unwrap();
         found.sort_by_key(|e| e.to_bits());
 
         let mut expected = vec![c1, c2];
@@ -11611,7 +11616,7 @@ mod tests {
             .build();
 
         let mut found = Vec::new();
-        plan.for_each_raw(&world, |e| found.push(e)).unwrap();
+        plan.execute_stream_raw(&world, |e| found.push(e)).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], c1);
     }
@@ -11635,7 +11640,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         // Both children's parents have Name, so both match.
         assert_eq!(entities.len(), 2);
     }
@@ -11655,12 +11660,12 @@ mod tests {
             .unwrap()
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         assert_eq!(entities.len(), 0);
     }
 
     #[test]
-    fn er_join_for_each_batched() {
+    fn er_join_execute_stream_batched() {
         let mut world = World::new();
 
         let p1 = world.spawn((Name("Alice"),));
@@ -11679,7 +11684,7 @@ mod tests {
             .build();
 
         let mut scores = Vec::new();
-        plan.for_each_batched::<(&Score,), _>(&mut world, |_, (s,)| {
+        plan.execute_stream_batched::<(&Score,), _>(&mut world, |_, (s,)| {
             scores.push(s.0);
         })
         .unwrap();
@@ -11733,7 +11738,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         // child: parent has Name ✓, owner has Score ✓ → kept
         // child2: parent has Name ✓, owner has no Score ✗ → filtered
         assert_eq!(entities.len(), 1);
@@ -11762,7 +11767,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         // c1 has no Team, so the regular join filters it out.
         assert!(entities.is_empty() || !entities.contains(&c1));
     }
@@ -11785,7 +11790,7 @@ mod tests {
             .join::<(&Score,)>(JoinKind::Inner)
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         // c1 has Score (passes regular join) and Parent→Alice who has Name
         // (passes ER join), so c1 should be in results.
         assert!(entities.contains(&c1));
@@ -11838,7 +11843,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         // Left join: both children survive, even with dead reference.
         assert_eq!(entities.len(), 2);
         let ids: Vec<u64> = entities.iter().map(|e| e.to_bits()).collect();
@@ -11864,7 +11869,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         // All five children should match — their shared parent has Name.
         assert_eq!(entities.len(), 5);
         for child in &children {
@@ -11937,21 +11942,21 @@ mod tests {
             .build();
         drop(planner);
 
-        // for_each must apply the spatial filter.
+        // execute_stream must apply the spatial filter.
         let mut count = 0u32;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
-        assert_eq!(count, 5, "for_each should apply the spatial filter");
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
+        assert_eq!(count, 5, "execute_stream should apply the spatial filter");
 
         // execute must apply it too.
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         assert_eq!(entities.len(), 5, "execute should apply the spatial filter");
 
         // for_each_raw / execute_raw (transactional paths).
         let mut count_raw = 0u32;
-        plan.for_each_raw(&world, |_| count_raw += 1).unwrap();
+        plan.execute_stream_raw(&world, |_| count_raw += 1).unwrap();
         assert_eq!(count_raw, 5, "for_each_raw should apply the spatial filter");
 
-        let entities_raw = plan.execute_raw(&world).unwrap();
+        let entities_raw = plan.execute_collect_raw(&world).unwrap();
         assert_eq!(
             entities_raw.len(),
             5,

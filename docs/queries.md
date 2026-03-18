@@ -25,7 +25,7 @@ world.query::<(&mut Pos, &Vel)>().for_each_chunk(|(positions, velocities)| {
 
 ## Query Planner
 
-`QueryPlanner` compiles queries into cost-optimized execution plans using a [compiled push-based][push-compiled] optimizer with automatic index selection, then executes them against the live world. Plans compile to reusable closures that process data in batches over 64-byte-aligned column slices, enabling SIMD auto-vectorization. Four execution modes: `execute(&mut World) -> &[Entity]` and `execute_raw(&World) -> &[Entity]` (collect into plan-owned scratch buffer, support joins), `for_each(&mut World, callback)` (streaming iteration, supports both scan-only and join plans), and `for_each_raw(&World, callback)` (transactional read-only path, supports both scan-only and join plans).
+`QueryPlanner` compiles queries into cost-optimized execution plans using a [compiled push-based][push-compiled] optimizer with automatic index selection, then executes them against the live world. Plans compile to reusable closures that process data in batches over 64-byte-aligned column slices, enabling SIMD auto-vectorization. Four execution modes: `execute_collect(&mut World) -> &[Entity]` and `execute_collect_raw(&World) -> &[Entity]` (collect into plan-owned scratch buffer, support joins), `execute_stream(&mut World, callback)` (streaming iteration, supports both scan-only and join plans), and `execute_stream_raw(&World, callback)` (transactional read-only path, supports both scan-only and join plans).
 
 ```rust
 use minkowski::{QueryPlanner, Predicate, JoinKind};
@@ -43,14 +43,14 @@ let mut plan = planner
 println!("{}", plan.explain());  // shows vectorized execution plan
 
 // Execute: collect matching entities into plan-owned scratch buffer
-let entities = plan.execute(&mut world);  // returns &[Entity]
+let entities = plan.execute_collect(&mut world);  // returns &[Entity]
 for e in entities {
     let score = world.get::<Score>(*e).unwrap();
     // only entities with Score in [10..50) are returned
 }
 
-// Zero-alloc iteration for scan-only plans
-plan.for_each(&mut world, |entity| {
+// Zero-alloc streaming iteration
+plan.execute_stream(&mut world, |entity| {
     // process each matching entity directly — no intermediate buffer
 });
 ```
@@ -71,7 +71,7 @@ let mut sub = planner
 // HashDebounce filters false positives from archetype-granular Changed<T>.
 let mut debounce = HashDebounce::<Score>::new();
 
-sub.for_each(&mut world, |entity| {
+sub.execute_stream(&mut world, |entity| {
     let score = world.get::<Score>(entity).unwrap();
     if debounce.is_changed(entity, score) {
         // genuinely changed — react
@@ -114,7 +114,7 @@ let mut plan = planner
     .er_join::<Parent, (&Pos, &Name)>(JoinKind::Inner)
     .build();
 
-let entities = plan.execute(&mut world).unwrap();
+let entities = plan.execute_collect(&mut world).unwrap();
 // Only children whose parent has Pos and Name are returned.
 ```
 
@@ -142,7 +142,7 @@ let mut plan = planner
 
 **Dead references**: If the referenced entity has been despawned, the reference extractor returns `None` and the entity is filtered out (inner join) or kept (left join). Generational entity IDs prevent false matches with reused indices.
 
-**Cost hints**: Use `with_right_estimate(n)` after an `er_join()` to provide a cardinality hint for the right side, improving the cost model's accuracy:
+**Cost hints**: The planner automatically estimates right-side cardinality by counting entities in matching archetypes. Use `with_right_estimate(n)` after a `join()` or `er_join()` to override this when you have better domain knowledge:
 
 ```rust
 let mut plan = planner

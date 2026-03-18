@@ -9,13 +9,13 @@
 //!         via `registry.run()`. Strategy-agnostic, with free conflict detection.
 //!
 //! Part 3: Join plans inside transactions — demonstrates that query planner
-//!         joins work through `for_each_raw`/`execute_raw` with `&World`.
+//!         joins work through `execute_stream_raw`/`execute_collect_raw` with `&World`.
 //!         The plan's internal scratch buffer is invisible to the conflict
 //!         model — it's computation, not state.
 
 use minkowski::{
     Access, Entity, JoinKind, Optimistic, QueryMut, QueryPlanResult, QueryPlanner, QueryReducerId,
-    ReducerRegistry, Sequential, Transact, World,
+    ReducerRegistry, Sequential, Transact, TxScope, World,
 };
 
 // ── Components ──────────────────────────────────────────────────────
@@ -230,15 +230,15 @@ fn run_transactional_join(world: &mut World) {
     // Build the join plan outside the transaction — plans are reusable.
     let mut plan = build_join_plan(world);
 
-    // Use execute_raw inside a transaction to get joined entity list.
+    // Use execute_collect_raw inside a transaction to get joined entity list.
     strategy
         .transact(world, &access, |tx, world| {
             let joined = plan
-                .execute_raw(world)
+                .execute_collect_raw(world)
                 .expect("same world, plan supports joins");
 
             println!(
-                "    execute_raw: {count} entities in join result",
+                "    execute_collect_raw: {count} entities in join result",
                 count = joined.len()
             );
 
@@ -253,18 +253,18 @@ fn run_transactional_join(world: &mut World) {
         })
         .expect("clean commit");
 
-    // Use for_each_raw inside a transaction — collect join results, then mutate.
-    // for_each_raw borrows &World, so we collect entities first, then process.
+    // Use execute_stream_raw inside a transaction — collect join results, then mutate.
+    // execute_stream_raw borrows &World, so we collect entities first, then process.
     strategy
         .transact(world, &access, |tx, world| {
             let mut joined = Vec::new();
-            plan.for_each_raw(world, |entity| {
+            plan.execute_stream_raw(world, |entity| {
                 joined.push(entity);
             })
-            .expect("for_each_raw supports joins");
+            .expect("execute_stream_raw supports joins");
 
             println!(
-                "    for_each_raw: collected {count} joined entities",
+                "    execute_stream_raw: collected {count} joined entities",
                 count = joined.len()
             );
 
@@ -301,8 +301,8 @@ fn run_left_join_demo(world: &mut World) {
         .join::<(&Health,)>(JoinKind::Left)
         .build();
 
-    let inner = inner_plan.execute_raw(world).unwrap().len();
-    let left = left_plan.execute_raw(world).unwrap().len();
+    let inner = inner_plan.execute_collect_raw(world).unwrap().len();
+    let left = left_plan.execute_collect_raw(world).unwrap().len();
     println!("    inner join: {inner} entities (Pos ∩ Health)");
     println!("    left join:  {left} entities (all Pos, including those without Health)");
 }
@@ -361,14 +361,54 @@ fn main() {
     println!("=== Part 3: Join plans inside transactions ===");
     println!();
 
-    println!("6. execute_raw + for_each_raw with join plans inside Optimistic Tx");
+    println!("6. execute_collect_raw + execute_stream_raw with join plans inside Optimistic Tx");
     let (mut world3, _) = spawn_world();
     run_transactional_join(&mut world3);
     println!();
 
-    println!("7. Inner vs Left join comparison (execute_raw)");
+    println!("7. Inner vs Left join comparison (execute_collect_raw)");
     run_left_join_demo(&mut world3);
     println!();
 
+    // ── Part 4: Ergonomic TxScope API ──────────────────────────────
+
+    println!("=== Part 4: Ergonomic TxScope API (transact_with) ===");
+    println!();
+
+    println!("8. transact_with — no need to pass `world` to every call");
+    run_scoped_optimistic(&mut world3);
+    println!();
+
     println!("Done.");
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Part 4: Ergonomic TxScope API
+// ════════════════════════════════════════════════════════════════════
+
+fn run_scoped_optimistic(world: &mut World) {
+    let access = Access::of::<(&Health, &mut Health)>(world);
+    let strategy = Optimistic::new(world);
+
+    // Compare: transact requires `(tx, world)` on every call.
+    // transact_with wraps both into a TxScope — no `world` parameter needed.
+    for _ in 0..10 {
+        strategy
+            .transact_with(world, &access, |scope: &mut TxScope<'_, '_>| {
+                // query() — no world parameter
+                let healths: Vec<(Entity, u32)> = scope
+                    .query::<(Entity, &Health)>()
+                    .map(|(e, hp)| (e, hp.0))
+                    .collect();
+
+                // write() — no world parameter
+                for (e, hp) in healths {
+                    scope.write::<Health>(e, Health(hp.saturating_sub(2)));
+                }
+            })
+            .expect("no concurrent modification = clean commit");
+    }
+
+    let avg = avg_health(world);
+    println!("  after 10 steps with TxScope: avg health = {avg:.0}");
 }

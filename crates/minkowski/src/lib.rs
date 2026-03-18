@@ -119,7 +119,7 @@ pub use retention::Expiry;
 pub use tick::ChangeTick;
 pub use transaction::{
     Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, TransactError, Tx,
-    WorldMismatch,
+    TxScope, WorldMismatch,
 };
 pub use view::{DebouncePolicy, MaterializedView, RefreshOutcome};
 pub use world::{DeadEntity, InsertError, QueryTickInfo, World, WorldBuilder, WorldStats};
