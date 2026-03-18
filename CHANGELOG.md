@@ -7,12 +7,18 @@
 - **Build-time join elimination** — inner joins that are pure component-presence filters are merged into the left-side scan at plan build time. No `run_join()` materialization, no sort, no intersection. `PlanWarning::JoinEliminated` informs users when the optimization fires. (#122)
 - **Direct archetype iteration** — scan-only plans (no joins, custom predicates, or index/spatial drivers) bypass ScratchBuffer entirely and walk archetypes with `init_fetch`/`fetch` inline. `scan_for_each_10k`: 9.5 µs → 5.3 ns. (#123, #131)
 - **Archetype-sorted batch execution** — after join materialization, entities are sorted by packed `(archetype_id << 32 | row)` key. Walk archetype runs with `init_fetch` once per archetype. `for_each_batched`, `for_each_batched_raw`, `for_each_join_chunk` on `QueryPlanResult`. (#120)
-- **ER joins** — entity-reference components (fields typed as `Entity`) can be joined via streaming hash join. Deferred resolution via `OnceLock`, join ordering enforcement. (#124, #126)
+- **ER joins** — entity-reference components (fields typed as `Entity`) can be joined via streaming hash join. `er_join()` returns `Result` for unregistered components instead of deferred `OnceLock` resolution. Join ordering enforcement removed — `join()` and `er_join()` can be called in any order. (#124, #126, #136, #140)
 - **Aggregate extractor optimization** — cached extractors/accumulators with specialized inner loops. `aggregate_count_sum_10k`: 76.1 µs → 5.8 µs (13x improvement, now faster than manual loop). (#111, #128)
 - **`execute_raw` + join support in `for_each_raw`** — pipeline breakers as transaction-invisible computation. (#116)
 - **Simplified execution layer** — removed separate vectorized execution nodes; push-based execution handles all plan shapes. (#112)
 - **Archetype caching for index candidates** — refactored index validation with archetype-level caching. (#110)
 - **Scan-only plan bypass** — `CompiledForEach` dispatch skipped for plans that can iterate archetypes directly. (#131)
+- **Cache-aware partitioned hash joins** — entities bucketed by `Entity::to_bits() % partitions` so each partition fits in L2 cache during intersection. Partition count computed from estimated row counts and L2 cache size. (#135, #137)
+- **Column-aware custom filters** — `Predicate::custom_column::<T>()` receives `&T` directly from column slices instead of per-entity `world.get()`. Boolean mask ANDed per archetype. Sparse component fallback. (#144)
+- **Subscription `Changed<T>` validation** — `SubscriptionBuilder::build()` returns `SubscriptionError::NoChangedFilter` if the query type has no `Changed<T>` filter. (#139)
+- **`SpatialIndex::query` trait method** — replaces closure-based `SpatialLookupFn`. `supports()` and `query()` are both required methods — the type system enforces that capability declaration implies execution capability. `add_spatial_index_with_lookup` removed. (#142)
+- **Execution method rename** — `execute` → `execute_collect`, `for_each` → `execute_stream` for clarity. (#141)
+- **`MaterializedView::refresh` returns `RefreshOutcome`** — replaces `bool` return with a named enum. (#138)
 
 ### Performance (`minkowski`)
 
@@ -21,6 +27,7 @@
 - **Lock-free slab pool allocator** — Atomic<u128> tagged pointer CAS with overflow and side table. ABA prevention via 64-bit monotonic tag. (#113)
 - **`World::spawn_batch()`** — batched homogeneous entity spawning. Resolves archetype once, reserves capacity, pushes in a tight loop. `simple_insert/spawn_batch`: 343 µs (5.2x faster than individual spawns). (#129)
 - **Batch consecutive Insert overwrites** — `apply_mutations` groups consecutive same-archetype overwrites, resolving column/drop_fn once per batch. (#125)
+- **WAL replay batching** — two-phase replay collects all records then decodes into a single `EnumChangeSet`. Eliminates per-record changeset allocation and apply overhead. `wal_replay`: 1.79 ms → 1.06 ms (1.7x, 943K mutations/sec). (#145)
 
 ### CI & Infrastructure
 
@@ -32,13 +39,21 @@
 - **README reorganization** — TOC, extracted long sections into `docs/`. (#114)
 - **Morsel-driven execution docs** — relationship between morsel-driven execution and reducers. (#115)
 
+### Crate Organization
+
+- **`planner.rs` split into `query/planner/` submodule** — 12,570 lines → 12 focused files (max 1,800 lines). Private submodules with public re-exports preserve the API. (#146, #147)
+- **`reducer.rs` split into `reducer/` submodule** — 4,767 lines → 5 files: registry, handles, writer, dynamic, tests. (#148)
+- **Performance documentation** — `perf-roadmap.md` (task tracker) replaced with `performance.md` (optimization guide with methodology and structural limits). (#149)
+
 ### Cleanup
 
 - Removed dead `_has_custom_filters` variable and stale comments. (#132)
+- Avoid full archetype walks during plan construction. (#143)
+- DeepWiki badge link. (#134)
 
 ### Verification
 
-- 848 unit tests (up from 730).
+- 869 unit tests (up from 730).
 - Miri subset: 93 tests covering all unsafe code paths.
 
 ### Performance Baselines (v1.3.0)
@@ -52,6 +67,7 @@
 | `reducer/query_writer_10k` | 93 µs | **64 µs** | 1.5x |
 | `simple_insert/spawn_batch` | — | **343 µs** | new |
 | `reducer/query_writer_sparse_10k` | — | **5.9 µs** | new |
+| `serialize/wal_replay` | 1.79 ms | **1.06 ms** | 1.7x |
 | `planner/query_for_each_10k` | 3.9 µs | **5.9 µs** | -1.5x (tick tracking) |
 
 ## 1.2.0
