@@ -209,7 +209,7 @@ pub(super) type BatchFactoryBuilder =
 /// # Example
 ///
 /// ```rust,ignore
-/// use minkowski::planner::{AggregateExpr, AggregateOp};
+/// use minkowski::{AggregateExpr, AggregateOp};
 ///
 /// // Count all matching entities.
 /// let count = AggregateExpr::count();

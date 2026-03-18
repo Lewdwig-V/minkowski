@@ -267,7 +267,7 @@ impl Predicate {
     /// # Example
     ///
     /// ```
-    /// # use minkowski::planner::Predicate;
+    /// # use minkowski::Predicate;
     /// # #[derive(Clone, Copy)] struct Score(u32);
     /// let pred = Predicate::custom_column::<Score>("score < 5000", 0.5, |s| s.0 < 5000);
     /// ```

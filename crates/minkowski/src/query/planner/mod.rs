@@ -33,7 +33,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use minkowski::planner::{QueryPlanner, Predicate, JoinKind};
+//! use minkowski::{QueryPlanner, Predicate, JoinKind};
 //!
 //! let mut planner = QueryPlanner::new(&world);
 //!

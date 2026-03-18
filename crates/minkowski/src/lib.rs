@@ -79,7 +79,6 @@ pub mod debounce;
 pub mod entity;
 pub mod index;
 pub(crate) mod lock_table;
-pub mod planner;
 pub(crate) mod pool;
 pub mod query;
 pub mod reducer;
@@ -102,14 +101,14 @@ pub use index::{
     BTreeIndex, HasBTreeIndex, HasHashIndex, HashIndex, SpatialCost, SpatialExpr, SpatialIndex,
 };
 pub use minkowski_derive::Table;
-pub use planner::{
+pub use pool::{HugePages, PoolExhausted};
+pub use query::fetch::{Changed, ReadOnlyWorldQuery};
+pub use query::planner::{
     AggregateExpr, AggregateOp, AggregateResult, AsEntityRef, CardinalityConstraint, Cost,
     IndexKind, Indexed, JoinKind, PlanExecError, PlanNode, PlanWarning, PlannerError, Predicate,
     QueryPlanResult, QueryPlanner, SpatialPredicate, SubscriptionBuilder, SubscriptionError,
     TablePlanner,
 };
-pub use pool::{HugePages, PoolExhausted};
-pub use query::fetch::{Changed, ReadOnlyWorldQuery};
 pub use reducer::{
     ComponentSet, Contains, DynamicCtx, DynamicReducerBuilder, DynamicReducerId, EntityMut,
     EntityRef, QueryMut, QueryReducerId, QueryRef, QueryWriter, ReducerError, ReducerId,

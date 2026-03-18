@@ -58,7 +58,7 @@
 //!   internal cache, populated by `refresh()`.
 
 use crate::entity::Entity;
-use crate::planner::{PlanExecError, QueryPlanResult};
+use crate::query::planner::{PlanExecError, QueryPlanResult};
 use crate::world::{World, WorldId};
 
 /// Outcome of a [`MaterializedView::refresh`] call.
@@ -309,8 +309,8 @@ impl std::fmt::Debug for MaterializedView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planner::{JoinKind, PlanExecError, Predicate, QueryPlanner};
     use crate::query::fetch::Changed;
+    use crate::query::planner::{JoinKind, PlanExecError, Predicate, QueryPlanner};
     use std::num::NonZeroU64;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -722,7 +722,7 @@ mod tests {
     #[test]
     fn subscription_backed_view() {
         use crate::index::{BTreeIndex, SpatialIndex};
-        use crate::planner::Indexed;
+        use crate::query::planner::Indexed;
         use std::sync::Arc;
 
         let mut world = World::new();
