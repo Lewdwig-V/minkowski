@@ -3329,8 +3329,8 @@ impl ScanBuilder<'_> {
         join_kind: JoinKind,
     ) -> Self {
         let required = Q::required_ids(self.planner.components);
-        // Count entities in archetypes matching the right query's components.
-        let right_rows = self.planner.count_matching_entities(&required);
+        // Estimate entities matching the right query's components.
+        let right_rows = self.planner.estimate_matching_entities(&required);
         let changed = Q::changed_ids(self.planner.components);
         let idx = self.joins.len();
         self.joins.push(JoinSpec {
@@ -3415,8 +3415,8 @@ impl ScanBuilder<'_> {
                 ))?;
 
         let required = Q::required_ids(self.planner.components);
-        // Count entities in archetypes matching the right query's components.
-        let right_rows = self.planner.count_matching_entities(&required);
+        // Estimate entities matching the right query's components.
+        let right_rows = self.planner.estimate_matching_entities(&required);
         let changed = Q::changed_ids(self.planner.components);
 
         let ref_extractor: EntityRefExtractor = Arc::new(move |world: &World, entity: Entity| {
@@ -4593,8 +4593,11 @@ pub struct QueryPlanner<'w> {
     total_entities: usize,
     /// Component registry for resolving query type → component bitset.
     components: &'w ComponentRegistry,
-    /// Archetype slice for counting matching entities in join cost estimation.
-    archetypes: &'w [Archetype],
+    /// Per-component entity counts: `component_entity_counts[comp_id]` holds the
+    /// total number of entities across non-empty archetypes that contain that
+    /// component.  Built once in `new()` so that `estimate_matching_entities()`
+    /// can answer in O(|required|) instead of scanning every archetype.
+    component_entity_counts: Vec<usize>,
     world_id: WorldId,
     _world: PhantomData<&'w World>,
 }
@@ -4605,24 +4608,56 @@ impl<'w> QueryPlanner<'w> {
     /// Captures the total entity count for cost estimation. The world is not
     /// borrowed beyond this call.
     pub fn new(world: &'w World) -> Self {
+        // Single archetype walk to build per-component entity counts.
+        // This turns every subsequent estimate_matching_entities() call from
+        // O(archetypes) into O(|required_components|).
+        let mut component_entity_counts = Vec::new();
+        for arch in &world.archetypes.archetypes {
+            if arch.is_empty() {
+                continue;
+            }
+            let n = arch.entities.len();
+            for comp_id in arch.component_ids.ones() {
+                if comp_id >= component_entity_counts.len() {
+                    component_entity_counts.resize(comp_id + 1, 0);
+                }
+                component_entity_counts[comp_id] += n;
+            }
+        }
+
         QueryPlanner {
             indexes: HashMap::new(),
             spatial_indexes: HashMap::new(),
             total_entities: world.entity_count(),
             components: &world.components,
-            archetypes: &world.archetypes.archetypes,
+            component_entity_counts,
             world_id: world.world_id(),
             _world: PhantomData,
         }
     }
 
-    /// Count entities across archetypes matching a required component bitset.
-    fn count_matching_entities(&self, required: &FixedBitSet) -> usize {
-        self.archetypes
-            .iter()
-            .filter(|arch| !arch.is_empty() && required.is_subset(&arch.component_ids))
-            .map(|arch| arch.entities.len())
-            .sum()
+    /// Estimate entities matching a required component bitset.
+    ///
+    /// Uses the precomputed per-component entity counts to answer in
+    /// O(|required|) — the minimum entity count across required components.
+    /// This is an upper bound on the true count (intersection ≤ smallest
+    /// individual set), which is acceptable for cost-based plan selection.
+    fn estimate_matching_entities(&self, required: &FixedBitSet) -> usize {
+        let mut min_count = usize::MAX;
+        for comp_id in required.ones() {
+            let count = self
+                .component_entity_counts
+                .get(comp_id)
+                .copied()
+                .unwrap_or(0);
+            min_count = min_count.min(count);
+        }
+        // Empty required set → all entities match.
+        if min_count == usize::MAX {
+            self.total_entities
+        } else {
+            min_count
+        }
     }
 
     /// Register a `BTreeIndex` for cost-based index selection.
@@ -4770,8 +4805,8 @@ impl<'w> QueryPlanner<'w> {
         let changed_for_each_raw = changed.clone();
         let left_required = required.clone();
         let left_changed = changed.clone();
-        // Count entities matching the scan's required components.
-        let estimated_rows = self.count_matching_entities(&required);
+        // Estimate entities matching the scan's required components.
+        let estimated_rows = self.estimate_matching_entities(&required);
         ScanBuilder {
             planner: self,
             world_id: self.world_id,
