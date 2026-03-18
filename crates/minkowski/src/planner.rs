@@ -2520,15 +2520,13 @@ impl QueryPlanResult {
                     row_indices.extend(
                         (0..arch.len()).filter(|&i| column_filter_mask[i]),
                     );
-                    // Build filtered entity slice via scratch-style collect.
-                    // The callback receives only passing entities/rows.
-                    // Note: we need to pass matching entities and row indices.
-                    // Collect matching entities into a temporary buffer.
-                    let entities: Vec<Entity> = row_indices
-                        .iter()
-                        .map(|&row| arch.entities[row])
-                        .collect();
-                    callback(&entities, row_indices, slice);
+                    if !row_indices.is_empty() {
+                        let entities: Vec<Entity> = row_indices
+                            .iter()
+                            .map(|&row| arch.entities[row])
+                            .collect();
+                        callback(&entities, row_indices, slice);
+                    }
                 }
             }
             *last_read_tick = world.next_tick();
@@ -11220,6 +11218,86 @@ mod tests {
         // Verify we read the correct score values (10..15).
         collected_scores.sort_by_key(|s| s.0);
         assert_eq!(collected_scores, (10..15).map(Score).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn join_chunk_column_filter_no_empty_chunks() {
+        // A column filter that rejects every entity must not invoke the
+        // callback at all. Previously the column-filter path in
+        // execute_stream_join_chunk emitted zero-length chunks, which
+        // could break consumers that assume non-empty callbacks.
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Score>(
+                "reject all",
+                0.0,
+                |_| false,
+            ))
+            .build();
+
+        let mut invocations = 0u32;
+        plan.execute_stream_join_chunk::<(&Score,), _>(
+            &mut world,
+            |entities, rows, (_scores,)| {
+                assert!(
+                    !entities.is_empty(),
+                    "callback invoked with empty entity slice"
+                );
+                assert!(
+                    !rows.is_empty(),
+                    "callback invoked with empty row indices"
+                );
+                invocations += 1;
+            },
+        )
+        .unwrap();
+        assert_eq!(invocations, 0, "no chunks should be emitted when all entities are filtered out");
+    }
+
+    #[test]
+    fn join_chunk_column_filter_partial() {
+        // Verify that a column filter that passes some entities produces
+        // correct non-empty chunks with valid row indices.
+        let mut world = World::new();
+        for i in 0..20 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Score>(
+                "even",
+                0.5,
+                |s| s.0 % 2 == 0,
+            ))
+            .build();
+
+        let mut total = 0u32;
+        let mut collected = Vec::new();
+        plan.execute_stream_join_chunk::<(&Score,), _>(
+            &mut world,
+            |entities, rows, (scores,)| {
+                assert!(!entities.is_empty());
+                assert_eq!(entities.len(), rows.len());
+                for &row in rows.iter() {
+                    assert!(row < scores.len());
+                    collected.push(scores[row]);
+                }
+                total += entities.len() as u32;
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 10);
+        collected.sort_by_key(|s| s.0);
+        let expected: Vec<Score> = (0..20).filter(|i| i % 2 == 0).map(Score).collect();
+        assert_eq!(collected, expected);
     }
 
     #[test]
