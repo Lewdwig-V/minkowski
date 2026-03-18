@@ -11,6 +11,7 @@ Most ECS engines give you fast iteration but no persistence, no rollback, no con
 - [Quick Start](#quick-start)
 - [Design Principles](#design-principles)
 - [Deep Dive](#deep-dive)
+- [Performance](#performance)
 - [Soundness](#soundness)
 - [Storage](#storage)
 - [Queries](#queries)
@@ -66,7 +67,7 @@ registry.run(&mut world, move_id, ());
 ### Building & testing
 
 ```
-cargo test -p minkowski                # 730+ tests
+cargo test -p minkowski                # 869 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
@@ -87,6 +88,25 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 
 For a comprehensive walkthrough of the internals — storage model, query engine, transaction system, persistence layer, memory management — [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Lewdwig-V/minkowski). It's auto-generated from the source and always up to date.
 
+## Performance
+
+Minkowski is optimized for the ECS hot path — iterating components, executing queries, and applying mutations. Key results on 10K entities (v1.3.0):
+
+| Operation | Time | Technique |
+|---|---|---|
+| Chunk iteration (`for_each_chunk`) | 1.55 µs | SIMD-friendly typed slices |
+| Planner scan (no tick tracking) | 5.25 ns | Direct archetype iteration |
+| Inner join (component-presence) | 300 ns | Build-time join elimination |
+| Aggregate (COUNT + SUM) | 5.84 µs | Cached column extractors |
+| Batch spawn (10K entities) | 343 µs | Archetype resolved once |
+| Pool alloc/dealloc cycle | 1.32 ms | Lock-free pool + thread-local cache |
+| Transactional write (QueryWriter) | 64.5 µs | Streaming archetype buffers |
+| WAL replay (1K mutations) | 1.06 ms | Batched deserialization + single apply |
+
+Every optimization follows the same pattern: move per-entity work to per-archetype or per-batch granularity. Column metadata (type, layout, drop function) is resolved once and reused across all entities in the archetype.
+
+[Full documentation with profiling methodology and structural limits →](docs/performance.md)
+
 ## Soundness
 
 Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration — the performance-critical paths that make an ECS fast. Six layers of verification ensure these paths are correct:
@@ -94,7 +114,7 @@ Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration
 | Layer | What it catches | When it runs |
 |---|---|---|
 | **Type system + borrow checker** | Aliased `&mut T`, lifetime violations, `Send`/`Sync` misuse. `ReadOnlyWorldQuery` prevents `&mut T` through `&World`. | Every build |
-| **730 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries, query planner execution | Every PR (CI) |
+| **869 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries, query planner execution | Every PR (CI) |
 | **[Miri][miri] + [Tree Borrows][tree-borrows]** | Undefined behavior: use-after-free, uninitialized reads, aliasing violations in `unsafe` blocks. Full test suite passes under the strict Tree Borrows model. | Every PR (CI) |
 | **[ThreadSanitizer][tsan]** | Data races: unsynchronized concurrent memory accesses. Full test suite including rayon `par_for_each` passes under TSan instrumentation. | Every PR (CI) |
 | **[Loom][loom]** | Concurrency invariant violations: exhaustive thread interleaving enumeration over OrphanQueue push/drain, column lock acquire/upgrade/deadlock-freedom, and entity ID reservation contention. | Every PR (CI) |
