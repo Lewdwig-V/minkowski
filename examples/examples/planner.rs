@@ -11,9 +11,9 @@
 //! - Subscription queries with compiler-enforced indexes
 //! - Constraint-based validation
 //! - EXPLAIN output for plan inspection
-//! - Plan execution against a live World (execute returns &[Entity])
-//! - Zero-allocation for_each iteration for scan-only plans
-//! - Transactional for_each_raw with &World (no tick advancement)
+//! - Plan execution against a live World (execute_collect returns &[Entity])
+//! - Zero-allocation execute_stream iteration for scan-only plans
+//! - Transactional execute_stream_raw with &World (no tick advancement)
 //! - Spatial index execution via add_spatial_index_with_lookup
 
 use std::sync::Arc;
@@ -207,19 +207,19 @@ fn main() {
     println!("{}", plan.explain());
     println!("Plan cost: {:.1}", plan.cost().total());
 
-    // Drop planner to release the &world borrow before execute() needs &mut world.
+    // Drop planner to release the &world borrow before execute_collect() needs &mut world.
     drop(planner);
 
-    println!("=== 8. Plan Execution (execute → &[Entity]) ===\n");
+    println!("=== 8. Plan Execution (execute_collect → &[Entity]) ===\n");
 
-    // Plans aren't just advisory — execute() runs them against the live world.
-    // Each block builds a fresh planner because execute() takes &mut World.
+    // Plans aren't just advisory — execute_collect() runs them against the live world.
+    // Each block builds a fresh planner because execute_collect() takes &mut World.
 
     // Simple scan: find all entities with Score and Pos
     {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score, &Pos)>().build();
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         println!(
             "Scan(&Score, &Pos): {} entities (expected {})",
             entities.len(),
@@ -234,7 +234,7 @@ fn main() {
             .scan::<(&Score,)>()
             .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
             .build();
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         println!(
             "Score in [100..200): {} entities (expected 100)",
             entities.len()
@@ -254,7 +254,7 @@ fn main() {
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(2)))
             .build();
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         println!("Team == 2: {} entities (expected 200)", entities.len());
         for e in entities {
             assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
@@ -268,7 +268,7 @@ fn main() {
             .scan::<(&Score, &Pos)>()
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         println!("(&Score, &Pos) JOIN (&Team,): {} entities", entities.len());
         // All entities have both Score+Pos and Team, so all 1000 match
         assert_eq!(entities.len(), 1000);
@@ -283,31 +283,31 @@ fn main() {
                 w.get::<Score>(e).is_some_and(|s| s.0 % 2 == 0)
             }))
             .build();
-        let entities = plan.execute(&mut world).unwrap();
+        let entities = plan.execute_collect(&mut world).unwrap();
         println!("Even scores: {} entities (expected 500)", entities.len());
         assert_eq!(entities.len(), 500);
     }
 
-    println!("\n=== 9. Zero-Alloc Scan (for_each) ===\n");
+    println!("\n=== 9. Zero-Alloc Scan (execute_stream) ===\n");
 
-    // for_each avoids the scratch buffer entirely — no intermediate Vec.
+    // execute_stream avoids the scratch buffer entirely — no intermediate Vec.
     // Ideal for scan-only plans where you process entities one at a time.
     {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score, &Pos)>().build();
         let mut count = 0;
-        plan.for_each(&mut world, |_entity| {
+        plan.execute_stream(&mut world, |_entity| {
             count += 1;
         })
         .unwrap();
         println!(
-            "for_each scan: {count} entities (expected {})",
+            "execute_stream scan: {count} entities (expected {})",
             world.entity_count()
         );
         assert_eq!(count, world.entity_count());
     }
 
-    // for_each with filter: only high scores
+    // execute_stream with filter: only high scores
     {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
@@ -315,24 +315,24 @@ fn main() {
             .filter(Predicate::range::<Score, _>(Score(900)..Score(1000)))
             .build();
         let mut count = 0;
-        plan.for_each(&mut world, |_entity| {
+        plan.execute_stream(&mut world, |_entity| {
             count += 1;
         })
         .unwrap();
-        println!("for_each filtered [900..1000): {count} entities (expected 100)");
+        println!("execute_stream filtered [900..1000): {count} entities (expected 100)");
         assert_eq!(count, 100);
     }
 
-    println!("\n=== 10. Transactional Read (for_each_raw) ===\n");
+    println!("\n=== 10. Transactional Read (execute_stream_raw) ===\n");
 
-    // for_each_raw takes &World instead of &mut World — no tick advancement,
+    // execute_stream_raw takes &World instead of &mut World — no tick advancement,
     // no query cache mutation. Designed for use inside transactions where
     // only a shared reference is available.
     {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score, &Pos)>().build();
         let mut count = 0;
-        plan.for_each_raw(&world, |_entity| {
+        plan.execute_stream_raw(&world, |_entity| {
             count += 1;
         })
         .unwrap();
@@ -340,7 +340,7 @@ fn main() {
         assert_eq!(count, world.entity_count());
     }
 
-    // for_each_raw with filter
+    // execute_stream_raw with filter
     {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
@@ -348,7 +348,7 @@ fn main() {
             .filter(Predicate::eq(Score(42)))
             .build();
         let mut found = Vec::new();
-        plan.for_each_raw(&world, |entity| {
+        plan.execute_stream_raw(&world, |entity| {
             found.push(entity);
         })
         .unwrap();
@@ -363,7 +363,7 @@ fn main() {
     println!("\n=== 11. Changed<T> Filtering ===\n");
 
     // Changed<T> skips archetypes whose column tick hasn't advanced since
-    // the last for_each call. Entities in different archetypes can be
+    // the last execute_stream call. Entities in different archetypes can be
     // selectively matched — only archetypes with a mutated Score column
     // pass the filter.
     //
@@ -382,8 +382,11 @@ fn main() {
         // First call: both archetypes were written at spawn time, so
         // Changed<Score> matches both. Every entity is visible.
         let mut first_count = 0;
-        plan.for_each(&mut cworld, |_| first_count += 1).unwrap();
-        println!("First for_each (all new): {first_count} entities (expected 10, both archetypes)");
+        plan.execute_stream(&mut cworld, |_| first_count += 1)
+            .unwrap();
+        println!(
+            "First execute_stream (all new): {first_count} entities (expected 10, both archetypes)"
+        );
         assert_eq!(first_count, 10);
 
         // Mutate one entity in the Score-only archetype via get_mut,
@@ -393,17 +396,19 @@ fn main() {
         // Second call: only the Score-only archetype column was touched.
         // Score+Team archetype is stale — skipped entirely.
         let mut second_count = 0;
-        plan.for_each(&mut cworld, |_| second_count += 1).unwrap();
+        plan.execute_stream(&mut cworld, |_| second_count += 1)
+            .unwrap();
         println!(
-            "Second for_each (one archetype mutated): {second_count} entities (expected 5, Score-only archetype)"
+            "Second execute_stream (one archetype mutated): {second_count} entities (expected 5, Score-only archetype)"
         );
         assert_eq!(second_count, 5);
 
         // Third call: nothing changed since the last read tick.
         let mut third_count = 0;
-        plan.for_each(&mut cworld, |_| third_count += 1).unwrap();
+        plan.execute_stream(&mut cworld, |_| third_count += 1)
+            .unwrap();
         println!(
-            "Third for_each (no new changes): {third_count} entities (expected 0, nothing changed)"
+            "Third execute_stream (no new changes): {third_count} entities (expected 0, nothing changed)"
         );
         assert_eq!(third_count, 0);
     }
@@ -517,7 +522,7 @@ fn main() {
 
     // Execute: collect entities near (50, 0) within radius 10.
     let mut plan = plan;
-    let spatial_results = plan.execute(&mut world).unwrap();
+    let spatial_results = plan.execute_collect(&mut world).unwrap();
     println!(
         "Spatial within ({cx}, 0) r={radius}: {} entities",
         spatial_results.len()
@@ -535,7 +540,7 @@ fn main() {
     }
     println!("All results verified within radius.\n");
 
-    // for_each variant — zero-allocation iteration.
+    // execute_stream variant — zero-allocation iteration.
     // Build a fresh spatial index (needs &mut world) before creating the planner.
     let mut spatial_idx2 = LinearSpatialIndex::new();
     spatial_idx2.rebuild(&mut world);
@@ -572,8 +577,10 @@ fn main() {
         )
         .build();
     let mut spatial_count = 0;
-    plan2.for_each(&mut world, |_e| spatial_count += 1).unwrap();
-    println!("for_each spatial: {spatial_count} entities (matches execute result)");
+    plan2
+        .execute_stream(&mut world, |_e| spatial_count += 1)
+        .unwrap();
+    println!("execute_stream spatial: {spatial_count} entities (matches execute_collect result)");
     assert_eq!(spatial_count, spatial_results.len());
 
     println!("\n=== 13. Index-Driven Execution ===\n");
@@ -603,7 +610,7 @@ fn main() {
 
         let mut plan = plan;
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         println!("Index eq lookup Score(42): {count} entities");
         // Score(42) was spawned once in the range 0..500.
         assert_eq!(count, 1);
@@ -624,7 +631,7 @@ fn main() {
 
         let mut plan = plan;
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         println!("Hash eq lookup Team(2): {count} entities (expected 200)");
         assert_eq!(count, 200);
     }
@@ -645,15 +652,15 @@ fn main() {
             .build();
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1).unwrap();
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
         println!("BTree range lookup Score(100..200): {count} entities (expected 100)");
         assert_eq!(count, 100);
     }
 
     // ── 14. Subscription with Changed<T> ──────────────────────────────
     //
-    // Separate scope: QueryPlanner borrows &world, but for_each needs &mut world.
-    // Build the plan, drop the planner, then execute.
+    // Separate scope: QueryPlanner borrows &world, but execute_stream needs &mut world.
+    // Build the plan, drop the planner, then execute_stream.
     println!("\n=== 14. Subscription with Changed<T> ===\n");
     {
         let mut score_idx = BTreeIndex::<Score>::new();
@@ -674,12 +681,14 @@ fn main() {
 
         // First call: everything is "new" (never read before).
         let mut first_count = 0;
-        sub.for_each(&mut world, |_| first_count += 1).unwrap();
+        sub.execute_stream(&mut world, |_| first_count += 1)
+            .unwrap();
         println!("First call (all new):     {first_count} entities");
 
         // Second call: nothing changed → zero results.
         let mut second_count = 0;
-        sub.for_each(&mut world, |_| second_count += 1).unwrap();
+        sub.execute_stream(&mut world, |_| second_count += 1)
+            .unwrap();
         println!("Second call (no changes): {second_count} entities");
         assert_eq!(second_count, 0);
     }

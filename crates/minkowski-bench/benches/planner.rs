@@ -51,7 +51,7 @@ fn fat_join_world(n: u32, join_pct: f64) -> (World, u32) {
 fn planner(c: &mut Criterion) {
     let mut group = c.benchmark_group("planner");
 
-    // ── Scan: planner for_each vs world.query() for_each ────────────
+    // ── Scan: planner execute_stream vs world.query() iteration ────────────
     //
     // Measures the overhead of plan compilation + type-erased dispatch
     // (CompiledForEach Box<dyn FnMut>) vs monomorphic QueryIter.
@@ -64,7 +64,7 @@ fn planner(c: &mut Criterion) {
 
         b.iter(|| {
             let mut count = 0u32;
-            plan.for_each(&mut world, |_| count += 1).unwrap();
+            plan.execute_stream(&mut world, |_| count += 1).unwrap();
             count
         });
     });
@@ -102,7 +102,7 @@ fn planner(c: &mut Criterion) {
 
         b.iter(|| {
             let mut count = 0u32;
-            plan.for_each(&mut world, |_| count += 1).unwrap();
+            plan.execute_stream(&mut world, |_| count += 1).unwrap();
             count
         });
     });
@@ -125,7 +125,7 @@ fn planner(c: &mut Criterion) {
 
         b.iter(|| {
             let mut count = 0u32;
-            plan.for_each(&mut world, |_| count += 1).unwrap();
+            plan.execute_stream(&mut world, |_| count += 1).unwrap();
             count
         });
     });
@@ -149,7 +149,7 @@ fn planner(c: &mut Criterion) {
 
         b.iter(|| {
             let mut count = 0u32;
-            plan.for_each(&mut world, |_| count += 1).unwrap();
+            plan.execute_stream(&mut world, |_| count += 1).unwrap();
             count
         });
     });
@@ -166,19 +166,19 @@ fn planner(c: &mut Criterion) {
         drop(planner);
 
         // First call: populate last_read_tick.
-        plan.for_each(&mut world, |_| {}).unwrap();
+        plan.execute_stream(&mut world, |_| {}).unwrap();
 
         // Subsequent calls: all archetypes are skipped (no mutations).
         b.iter(|| {
             let mut count = 0u32;
-            plan.for_each(&mut world, |_| count += 1).unwrap();
+            plan.execute_stream(&mut world, |_| count += 1).unwrap();
             count
         });
     });
 
     // ── Aggregates ──────────────────────────────────────────────────
     //
-    // Single-pass COUNT + SUM over 10K entities via execute_aggregates.
+    // Single-pass COUNT + SUM over 10K entities via aggregate.
     // Measures type-erased extractor overhead (per-entity world.get()).
 
     group.bench_function("aggregate_count_sum_10k", |b| {
@@ -191,7 +191,7 @@ fn planner(c: &mut Criterion) {
             .build();
         drop(planner);
 
-        b.iter(|| plan.execute_aggregates(&mut world).unwrap());
+        b.iter(|| plan.aggregate(&mut world).unwrap());
     });
 
     // ── Manual aggregate baseline ───────────────────────────────────
@@ -224,7 +224,7 @@ fn planner(c: &mut Criterion) {
         let mut plan = planner.scan::<(&Score,)>().build();
         drop(planner);
 
-        b.iter(|| plan.execute(&mut world).unwrap().len());
+        b.iter(|| plan.execute_collect(&mut world).unwrap().len());
     });
 
     group.finish();
@@ -233,7 +233,7 @@ fn planner(c: &mut Criterion) {
 fn join_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("join");
 
-    // ── Baseline: execute() + world.get() ────────────────────────────
+    // ── Baseline: execute_collect() + world.get() ────────────────────────────
     group.bench_function("for_each_get_10k", |b| {
         let (mut world, _) = join_world(10_000, 0.8);
         let planner = QueryPlanner::new(&world);
@@ -244,7 +244,7 @@ fn join_benches(c: &mut Criterion) {
         drop(planner);
 
         b.iter(|| {
-            let entities = plan.execute(&mut world).unwrap();
+            let entities = plan.execute_collect(&mut world).unwrap();
             let mut sum = 0u64;
             for &entity in entities {
                 if let Some(score) = world.get::<Score>(entity) {
@@ -255,7 +255,7 @@ fn join_benches(c: &mut Criterion) {
         });
     });
 
-    // ── New: for_each_batched ───────────────────────────────────────
+    // ── New: execute_stream_batched ───────────────────────────────────────
     group.bench_function("for_each_batched_10k", |b| {
         let (mut world, _) = join_world(10_000, 0.8);
         let planner = QueryPlanner::new(&world);
@@ -267,7 +267,7 @@ fn join_benches(c: &mut Criterion) {
 
         b.iter(|| {
             let mut sum = 0u64;
-            plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+            plan.execute_stream_batched::<(&Score,), _>(&mut world, |_, (score,)| {
                 sum += score.0 as u64;
             })
             .unwrap();
@@ -287,7 +287,7 @@ fn join_benches(c: &mut Criterion) {
 
         b.iter(|| {
             let mut sum = 0u64;
-            plan.for_each_join_chunk::<(&Score,), _>(&mut world, |_, rows, (scores,)| {
+            plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |_, rows, (scores,)| {
                 for &row in rows {
                     sum += scores[row].0 as u64;
                 }
@@ -326,7 +326,7 @@ fn join_fat_benches(c: &mut Criterion) {
         drop(planner);
 
         b.iter(|| {
-            let entities = plan.execute(&mut world).unwrap();
+            let entities = plan.execute_collect(&mut world).unwrap();
             let mut sum = 0u64;
             for &entity in entities {
                 if let Some(fat) = world.get::<FatData>(entity) {
@@ -348,7 +348,7 @@ fn join_fat_benches(c: &mut Criterion) {
 
         b.iter(|| {
             let mut sum = 0u64;
-            plan.for_each_batched::<(&FatData,), _>(&mut world, |_, (fat,)| {
+            plan.execute_stream_batched::<(&FatData,), _>(&mut world, |_, (fat,)| {
                 sum += fat.data[0] as u64;
             })
             .unwrap();
@@ -367,7 +367,7 @@ fn join_fat_benches(c: &mut Criterion) {
 
         b.iter(|| {
             let mut sum = 0u64;
-            plan.for_each_join_chunk::<(&FatData,), _>(&mut world, |_, rows, (fats,)| {
+            plan.execute_stream_join_chunk::<(&FatData,), _>(&mut world, |_, rows, (fats,)| {
                 for &row in rows {
                     sum += fats[row].data[0] as u64;
                 }
@@ -406,7 +406,7 @@ fn join_selectivity_benches(c: &mut Criterion) {
             drop(planner);
 
             b.iter(|| {
-                let entities = plan.execute(&mut world).unwrap();
+                let entities = plan.execute_collect(&mut world).unwrap();
                 let mut sum = 0u64;
                 for &entity in entities {
                     if let Some(score) = world.get::<Score>(entity) {
@@ -428,7 +428,7 @@ fn join_selectivity_benches(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut sum = 0u64;
-                plan.for_each_join_chunk::<(&Score,), _>(&mut world, |_, rows, (scores,)| {
+                plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |_, rows, (scores,)| {
                     for &row in rows {
                         sum += scores[row].0 as u64;
                     }

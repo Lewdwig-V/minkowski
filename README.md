@@ -115,7 +115,7 @@ world.remove::<Health>(e);      // migrates it back
 
 ## Queries
 
-Queries are tuple-typed and cached — `world.query::<(&mut Pos, &Vel)>()` iterates all matching entities with near-zero overhead on repeat calls. `Changed<T>` enables incremental processing, `par_for_each` distributes work across threads, and `for_each_chunk` yields typed slices for SIMD auto-vectorization.
+Queries are tuple-typed and cached — `world.query::<(&mut Pos, &Vel)>()` iterates all matching entities with near-zero overhead on repeat calls. `Changed<T>` enables incremental processing, `par_for_each` distributes work across threads, and `for_each_chunk` yields typed slices for SIMD auto-vectorization. The query planner compiles queries into `execute_collect` (buffered) and `execute_stream` (streaming callback) execution modes with automatic index selection.
 
 The **query planner** compiles queries into cost-optimized [push-based][push-compiled] execution plans with automatic index selection. **Subscription queries** guarantee at compile time that every predicate is index-backed. **Materialized views** cache query results with configurable debounce policies.
 
@@ -145,7 +145,7 @@ Three strategies over a unified `Transact` trait, so you can swap concurrency po
 - **[Optimistic][occ]** — concurrent reads, buffered writes, validates at commit. Use when conflicts are rare.
 - **[Pessimistic][pcc]** — acquires locks up front, commit always succeeds. Use when conflicts are frequent.
 
-All strategies handle entity ID cleanup automatically — no IDs leak on abort, no manual drain step required.
+All strategies handle entity ID cleanup automatically — no IDs leak on abort, no manual drain step required. `transact_with` provides an ergonomic `TxScope` wrapper that bundles `Tx` + `World` so you don't need to pass `world` to every call.
 
 ## Persistence
 
@@ -156,7 +156,7 @@ Snapshots serialize the full world state via [rkyv][rkyv] and can be saved to di
 ```rust
 // Durable wraps any strategy — Optimistic, Pessimistic, or Sequential
 let durable = Durable::new(strategy, wal, codecs);  // S = Optimistic here
-durable.transact(&mut world, access, |tx, world| { /* ... */ });
+durable.transact_with(&mut world, access, |scope| { /* TxScope: no world param needed */ });
 // Changeset written to WAL on successful commit
 ```
 

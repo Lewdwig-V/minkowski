@@ -200,7 +200,7 @@ fn main() {
     );
     let mut planned_range_count = 0;
     range_plan
-        .for_each(&mut world, |_| planned_range_count += 1)
+        .execute_stream(&mut world, |_| planned_range_count += 1)
         .unwrap();
     println!("Planned range [150..160): {planned_range_count} entities (expected 10)");
     assert_eq!(planned_range_count, 10);
@@ -221,7 +221,7 @@ fn main() {
     println!("Planned eq explain:\n{}", eq_plan.explain());
     let mut planned_eq_count = 0;
     eq_plan
-        .for_each(&mut world, |_| planned_eq_count += 1)
+        .execute_stream(&mut world, |_| planned_eq_count += 1)
         .unwrap();
     println!("Planned eq Score(42): {planned_eq_count} entities (expected 1)");
     assert_eq!(planned_eq_count, 1);

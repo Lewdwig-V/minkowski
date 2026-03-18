@@ -208,7 +208,7 @@ impl MaterializedView {
             return Ok(RefreshOutcome::Suppressed);
         }
 
-        let entities = self.plan.execute(world)?;
+        let entities = self.plan.execute_collect(world)?;
         self.cached.clear();
         self.cached.extend_from_slice(entities);
         self.populated = true;
@@ -685,7 +685,7 @@ mod tests {
             .join::<(&Health,)>(JoinKind::Inner)
             .build();
         let mut view = MaterializedView::new(plan);
-        // execute() supports joins, so this should work.
+        // execute_collect() supports joins, so this should work.
         assert!(view.refresh(&mut world).is_ok());
     }
 

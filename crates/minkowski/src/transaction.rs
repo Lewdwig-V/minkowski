@@ -517,6 +517,105 @@ impl Drop for Tx<'_> {
     }
 }
 
+// ── TxScope ─────────────────────────────────────────────────────────
+
+/// Ergonomic wrapper that bundles a [`Tx`] and [`World`] reference together,
+/// eliminating the need to pass `world` to every method call.
+///
+/// Created by [`Transact::transact_with`] and passed to the user closure.
+/// All methods delegate to the underlying `Tx`, forwarding the world reference
+/// automatically.
+///
+/// # Example
+///
+/// ```ignore
+/// strategy.transact_with(&mut world, &access, |scope| {
+///     let healths: Vec<_> = scope.query::<(Entity, &Health)>().collect();
+///     for (e, hp) in healths {
+///         scope.write::<Health>(e, Health(hp.0 - 3));
+///     }
+/// });
+/// ```
+pub struct TxScope<'a, 'w> {
+    tx: &'a mut Tx<'w>,
+    world: &'a mut World,
+}
+
+impl<'a, 'w> TxScope<'a, 'w> {
+    /// Create a new scope wrapping a transaction and world reference.
+    pub(crate) fn new(tx: &'a mut Tx<'w>, world: &'a mut World) -> Self {
+        Self { tx, world }
+    }
+
+    /// Read through the transaction via shared World reference.
+    /// See [`Tx::query`] for details.
+    pub fn query<Q: crate::query::fetch::ReadOnlyWorldQuery + 'static>(
+        &self,
+    ) -> crate::query::iter::QueryIter<'_, Q> {
+        self.tx.query(self.world)
+    }
+
+    /// Read a single component from an entity.
+    /// See [`Tx::read`] for details.
+    pub fn read<T: Component>(&self, entity: Entity) -> Option<&T> {
+        self.tx.read(self.world, entity)
+    }
+
+    /// Buffer a component write.
+    /// See [`Tx::write`] for details.
+    pub fn write<T: Component>(&mut self, entity: Entity, value: T) {
+        self.tx.write(self.world, entity, value);
+    }
+
+    /// Buffer a component removal.
+    /// See [`Tx::remove`] for details.
+    pub fn remove<T: Component>(&mut self, entity: Entity) {
+        self.tx.remove::<T>(self.world, entity);
+    }
+
+    /// Buffer a sparse component write.
+    /// See [`Tx::write_sparse`] for details.
+    pub fn write_sparse<T: Component>(&mut self, entity: Entity, value: T) {
+        self.tx.write_sparse(self.world, entity, value);
+    }
+
+    /// Buffer a sparse component removal.
+    /// See [`Tx::remove_sparse`] for details.
+    pub fn remove_sparse<T: Component>(&mut self, entity: Entity) {
+        self.tx.remove_sparse::<T>(self.world, entity);
+    }
+
+    /// Allocate a new entity and buffer its initial components.
+    /// See [`Tx::spawn`] for details.
+    pub fn spawn<B: crate::bundle::Bundle>(&mut self, bundle: B) -> Entity {
+        self.tx.spawn(self.world, bundle)
+    }
+
+    /// Borrow the underlying [`Tx`] and [`World`] simultaneously.
+    ///
+    /// Use this when the convenience methods on `TxScope` are not
+    /// sufficient — for example, to call
+    /// [`QueryPlanResult::execute_collect_raw`] or other APIs that
+    /// take `(&mut Tx, &mut World)` directly.
+    ///
+    /// ```ignore
+    /// let (tx, world) = scope.parts();
+    /// let entities = plan.execute_collect_raw(world)?;
+    /// for &e in entities {
+    ///     tx.write(world, e, NewComponent(42));
+    /// }
+    /// ```
+    pub fn parts(&mut self) -> (&mut Tx<'w>, &mut World) {
+        (self.tx, self.world)
+    }
+
+    /// Access the underlying [`World`] for read-only operations
+    /// (e.g., passing to [`QueryPlanResult::execute_collect_raw`]).
+    pub fn world(&self) -> &World {
+        self.world
+    }
+}
+
 // ── Sequential ──────────────────────────────────────────────────────
 
 /// Zero-cost transaction strategy. All operations delegate directly to World.
@@ -701,6 +800,34 @@ pub trait Transact {
         f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
     ) -> Result<R, TransactError> {
         self.transact_inner(world, access, f)
+    }
+
+    /// Ergonomic variant of [`transact`](Transact::transact) that passes a
+    /// [`TxScope`] instead of separate `Tx` and `World` parameters.
+    ///
+    /// The scope bundles both references, so methods like `query`, `write`,
+    /// and `spawn` don't require passing `world` explicitly.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// strategy.transact_with(&mut world, &access, |scope| {
+    ///     let healths: Vec<_> = scope.query::<(Entity, &Health)>().collect();
+    ///     for (e, hp) in healths {
+    ///         scope.write::<Health>(e, Health(hp.0 - 3));
+    ///     }
+    /// });
+    /// ```
+    fn transact_with<R>(
+        &self,
+        world: &mut World,
+        access: &Access,
+        mut f: impl FnMut(&mut TxScope<'_, '_>) -> R,
+    ) -> Result<R, TransactError> {
+        self.transact(world, access, |tx, world| {
+            let mut scope = TxScope::new(tx, world);
+            f(&mut scope)
+        })
     }
 
     /// Default retry loop. Strategies that need custom behavior between
@@ -1542,5 +1669,55 @@ mod tests {
             msg.contains("World("),
             "message should contain World IDs: {msg}"
         );
+    }
+
+    // ── TxScope tests ───────────────────────────────────────────────
+
+    #[test]
+    fn transact_with_reads_and_writes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(10.0),));
+        let strategy = Optimistic::new(&world);
+        let access = Access::of::<(&Pos, &mut Pos)>(&mut world);
+
+        strategy
+            .transact_with(&mut world, &access, |scope| {
+                let val = scope.read::<Pos>(e).unwrap().0;
+                scope.write::<Pos>(e, Pos(val + 5.0));
+            })
+            .unwrap();
+
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 15.0);
+    }
+
+    #[test]
+    fn transact_with_query_and_spawn() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        world.spawn((Pos(2.0),));
+        let strategy = Optimistic::new(&world);
+        let access = Access::of::<(&Pos,)>(&mut world);
+
+        let count = strategy
+            .transact_with(&mut world, &access, |scope| {
+                scope.query::<(Entity, &Pos)>().count()
+            })
+            .unwrap();
+
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn transact_with_spawn_creates_entity() {
+        let mut world = World::new();
+        let strategy = Optimistic::new(&world);
+        let access = Access::of::<(&Pos,)>(&mut world);
+
+        let spawned = strategy
+            .transact_with(&mut world, &access, |scope| scope.spawn((Pos(42.0),)))
+            .unwrap();
+
+        assert!(world.is_alive(spawned));
+        assert_eq!(world.get::<Pos>(spawned).unwrap().0, 42.0);
     }
 }
