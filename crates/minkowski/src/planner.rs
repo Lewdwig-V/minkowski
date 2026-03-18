@@ -1148,24 +1148,39 @@ impl Predicate {
         let col_filter = {
             let filter = Arc::clone(&filter);
             Arc::new(
-                move |arch: &Archetype, registry: &ComponentRegistry, mask: &mut [bool]| {
-                    let Some(comp_id) = registry.id::<T>() else {
+                move |world: &World, arch: &Archetype, entities: &[Entity], mask: &mut [bool]| {
+                    let Some(comp_id) = world.components.id::<T>() else {
                         // Component not registered — no entity can pass.
                         mask.iter_mut().for_each(|m| *m = false);
                         return;
                     };
-                    let Some(col_idx) = arch.column_index(comp_id) else {
-                        // Archetype doesn't have this component — all fail.
-                        mask.iter_mut().for_each(|m| *m = false);
-                        return;
-                    };
-                    debug_assert_eq!(mask.len(), arch.len());
-                    let ptr = unsafe { arch.columns[col_idx].get_ptr(0) as *const T };
-                    let slice = unsafe { std::slice::from_raw_parts(ptr, arch.len()) };
-                    for (m, val) in mask.iter_mut().zip(slice.iter()) {
-                        if *m && !filter(val) {
-                            *m = false;
+                    if let Some(col_idx) = arch.column_index(comp_id) {
+                        // Dense path: iterate contiguous column slice.
+                        debug_assert_eq!(mask.len(), arch.len());
+                        let ptr = unsafe { arch.columns[col_idx].get_ptr(0) as *const T };
+                        let slice = unsafe { std::slice::from_raw_parts(ptr, arch.len()) };
+                        for (m, val) in mask.iter_mut().zip(slice.iter()) {
+                            if *m && !filter(val) {
+                                *m = false;
+                            }
                         }
+                    } else if world.components.is_sparse(comp_id) {
+                        // Sparse fallback: per-entity world.get().
+                        for (m, &entity) in mask.iter_mut().zip(entities.iter()) {
+                            if *m {
+                                let pass = world
+                                    .sparse
+                                    .get::<T>(comp_id, entity)
+                                    .is_some_and(|v| filter(v));
+                                if !pass {
+                                    *m = false;
+                                }
+                            }
+                        }
+                    } else {
+                        // Archetype doesn't have this component and it's not
+                        // sparse — no entity can pass.
+                        mask.iter_mut().for_each(|m| *m = false);
                     }
                 },
             ) as ColumnFilterFn
@@ -1920,7 +1935,7 @@ impl QueryPlanResult {
                     column_filter_mask.clear();
                     column_filter_mask.resize(arch.len(), true);
                     for cf in scan_column_filters.iter() {
-                        cf(arch, &world.components, column_filter_mask);
+                        cf(world, arch, &arch.entities, column_filter_mask);
                     }
                     for (i, &entity) in arch.entities.iter().enumerate() {
                         if column_filter_mask[i] {
@@ -2012,7 +2027,7 @@ impl QueryPlanResult {
                     column_filter_mask.clear();
                     column_filter_mask.resize(arch.len(), true);
                     for cf in scan_column_filters.iter() {
-                        cf(arch, &world.components, column_filter_mask);
+                        cf(world, arch, &arch.entities, column_filter_mask);
                     }
                     for (i, &entity) in arch.entities.iter().enumerate() {
                         if column_filter_mask[i] {
@@ -2101,7 +2116,7 @@ impl QueryPlanResult {
                     column_filter_mask.clear();
                     column_filter_mask.resize(arch.len(), true);
                     for cf in scan_column_filters.iter() {
-                        cf(arch, &world.components, column_filter_mask);
+                        cf(world, arch, &arch.entities, column_filter_mask);
                     }
                     for (i, &entity) in arch.entities.iter().enumerate() {
                         if column_filter_mask[i] {
@@ -2183,7 +2198,7 @@ impl QueryPlanResult {
                     column_filter_mask.clear();
                     column_filter_mask.resize(arch.len(), true);
                     for cf in scan_column_filters.iter() {
-                        cf(arch, &world.components, column_filter_mask);
+                        cf(world, arch, &arch.entities, column_filter_mask);
                     }
                     for (i, &entity) in arch.entities.iter().enumerate() {
                         if column_filter_mask[i] {
@@ -2314,7 +2329,7 @@ impl QueryPlanResult {
                     self.column_filter_mask.clear();
                     self.column_filter_mask.resize(arch.len(), true);
                     for cf in self.scan_column_filters.iter() {
-                        cf(arch, &world.components, &mut self.column_filter_mask);
+                        cf(world, arch, &arch.entities, &mut self.column_filter_mask);
                     }
                     for (row, &entity) in arch.entities.iter().enumerate() {
                         if self.column_filter_mask[row] {
@@ -2499,7 +2514,7 @@ impl QueryPlanResult {
                     column_filter_mask.clear();
                     column_filter_mask.resize(arch.len(), true);
                     for cf in scan_column_filters.iter() {
-                        cf(arch, &world.components, column_filter_mask);
+                        cf(world, arch, &arch.entities, column_filter_mask);
                     }
                     row_indices.clear();
                     row_indices.extend(
@@ -3164,15 +3179,15 @@ type IndexLookupFn = Arc<dyn Fn() -> Arc<[Entity]> + Send + Sync>;
 // filters would require codegen per plan.
 type FilterFn = Arc<dyn Fn(&World, Entity) -> bool + Send + Sync>;
 
-/// Column-aware filter function: given an archetype and component registry,
-/// AND the result into a pre-initialized boolean mask. The mask is
-/// `arch.len()` elements long and pre-filled with `true`. The filter sets
-/// `mask[i] = false` for entities that do not pass.
+/// Column-aware filter function: given a world reference, archetype, and the
+/// archetype's entity list, AND the result into a pre-initialized boolean
+/// mask. The mask is `arch.len()` elements long and pre-filled with `true`.
+/// The filter sets `mask[i] = false` for entities that do not pass.
 ///
-/// This avoids the per-entity `world.get()` overhead of `FilterFn` by
-/// operating on contiguous typed column slices — sequential memory access,
-/// one `ComponentId` resolution per archetype instead of per entity.
-type ColumnFilterFn = Arc<dyn Fn(&Archetype, &ComponentRegistry, &mut [bool]) + Send + Sync>;
+/// For dense components, operates on contiguous typed column slices —
+/// sequential memory access, one `ComponentId` resolution per archetype.
+/// For sparse components, falls back to per-entity `World::get()`.
+type ColumnFilterFn = Arc<dyn Fn(&World, &Archetype, &[Entity], &mut [bool]) + Send + Sync>;
 
 /// Type-erased closure that collects entities from a scan/index into a
 /// [`ScratchBuffer`]. Used by join plans to gather left and right entity sets.
@@ -5686,7 +5701,6 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug)]
-    #[expect(dead_code)]
     struct Health(u32);
 
     // ── Basic planner construction ──────────────────────────────────
@@ -7406,6 +7420,83 @@ mod tests {
         let result = plan.execute_collect(&mut world).unwrap().to_vec();
         // Even scores from 0..25: 0, 2, 4, ..., 24 = 13 values
         assert_eq!(result.len(), 13);
+    }
+
+    #[test]
+    fn custom_column_sparse_component_fallback() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(1),));
+        let e2 = world.spawn((Score(2),));
+        let e3 = world.spawn((Score(3),));
+
+        // Health is stored as sparse — not in archetype columns.
+        world.insert_sparse(e1, Health(100));
+        world.insert_sparse(e2, Health(50));
+        // e3 has no Health.
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Health>(
+                "health >= 80",
+                0.5,
+                |h| h.0 >= 80,
+            ))
+            .build();
+        // Column filter on sparse component should still use scan_required
+        // (it falls back to per-entity sparse.get inside the closure).
+        assert!(plan.scan_required.is_some());
+
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
+        // Only e1 (Health(100)) passes the filter.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], e1);
+    }
+
+    #[test]
+    fn custom_column_sparse_matches_custom_results() {
+        // Verify custom_column and custom produce identical results
+        // when filtering on a sparse component.
+        let mut world = World::new();
+        for i in 0..20 {
+            let e = world.spawn((Score(i),));
+            if i % 3 == 0 {
+                world.insert_sparse(e, Health(i * 10));
+            }
+        }
+
+        // custom_column variant
+        let planner = QueryPlanner::new(&world);
+        let mut plan_col = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Health>(
+                "health >= 30",
+                0.3,
+                |h| h.0 >= 30,
+            ))
+            .build();
+
+        // custom (per-entity) variant
+        let planner = QueryPlanner::new(&world);
+        let mut plan_old = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom::<Health>(
+                "health >= 30",
+                0.3,
+                |world, entity| world.get::<Health>(entity).is_some_and(|h| h.0 >= 30),
+            ))
+            .build();
+
+        let mut result_col = plan_col.execute_collect(&mut world).unwrap().to_vec();
+        let mut result_old = plan_old.execute_collect(&mut world).unwrap().to_vec();
+        result_col.sort_by_key(|e| e.to_bits());
+        result_old.sort_by_key(|e| e.to_bits());
+        assert_eq!(
+            result_col, result_old,
+            "custom_column and custom must produce identical results for sparse components"
+        );
+        // Entities with i=3 (Health(30)), 6 (60), 9 (90), 12 (120), 15 (150), 18 (180)
+        assert_eq!(result_col.len(), 6);
     }
 
     #[test]
