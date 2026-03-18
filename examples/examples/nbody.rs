@@ -421,6 +421,13 @@ impl SpatialIndex for BarnesHutTree {
         // Bottom-up aggregation pass
         self.aggregate(0);
     }
+
+    fn supports(&self, _expr: &minkowski::SpatialExpr) -> Option<minkowski::SpatialCost> {
+        None
+    }
+    fn query(&self, _expr: &minkowski::SpatialExpr) -> Vec<Entity> {
+        Vec::new()
+    }
 }
 
 // ── Components ──────────────────────────────────────────────────────

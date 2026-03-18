@@ -193,6 +193,13 @@ impl SpatialIndex for FoodGrid {
             self.cells[cy * self.grid_w + cx].push(i);
         }
     }
+
+    fn supports(&self, _expr: &minkowski::SpatialExpr) -> Option<minkowski::SpatialCost> {
+        None
+    }
+    fn query(&self, _expr: &minkowski::SpatialExpr) -> Vec<Entity> {
+        Vec::new()
+    }
 }
 
 // ── Constants ───────────────────────────────────────────────────────
