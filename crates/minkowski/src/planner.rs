@@ -3330,16 +3330,7 @@ impl ScanBuilder<'_> {
     ) -> Self {
         let required = Q::required_ids(self.planner.components);
         // Count entities in archetypes matching the right query's components.
-        // Falls back to total entity count when the bitset is empty (no
-        // required components registered yet).
-        let right_rows = {
-            let counted = self.planner.count_matching_entities(&required);
-            if counted > 0 || self.planner.total_entities == 0 {
-                counted
-            } else {
-                self.planner.total_entities
-            }
-        };
+        let right_rows = self.planner.count_matching_entities(&required);
         let changed = Q::changed_ids(self.planner.components);
         let idx = self.joins.len();
         self.joins.push(JoinSpec {
@@ -3425,14 +3416,7 @@ impl ScanBuilder<'_> {
 
         let required = Q::required_ids(self.planner.components);
         // Count entities in archetypes matching the right query's components.
-        let right_rows = {
-            let counted = self.planner.count_matching_entities(&required);
-            if counted > 0 || self.planner.total_entities == 0 {
-                counted
-            } else {
-                self.planner.total_entities
-            }
-        };
+        let right_rows = self.planner.count_matching_entities(&required);
         let changed = Q::changed_ids(self.planner.components);
 
         let ref_extractor: EntityRefExtractor = Arc::new(move |world: &World, entity: Entity| {
@@ -4824,12 +4808,7 @@ impl<'w> QueryPlanner<'w> {
         let left_required = required.clone();
         let left_changed = changed.clone();
         // Count entities matching the scan's required components.
-        let matching = self.count_matching_entities(&required);
-        let estimated_rows = if matching > 0 || self.total_entities == 0 {
-            matching
-        } else {
-            self.total_entities
-        };
+        let estimated_rows = self.count_matching_entities(&required);
         ScanBuilder {
             planner: self,
             world_id: self.world_id,
