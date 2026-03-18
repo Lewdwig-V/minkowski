@@ -154,6 +154,31 @@ fn planner(c: &mut Criterion) {
         });
     });
 
+    // ── Scan with column-aware custom filter ──────────────────────────
+    //
+    // Measures column-aware filter overhead: iterates typed column slices
+    // per archetype instead of per-entity world.get() dispatch.
+
+    group.bench_function("custom_column_50pct", |b| {
+        let mut world = score_world(10_000);
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Score>(
+                "score < 5000",
+                0.5,
+                |s| s.0 < 5000,
+            ))
+            .build();
+        drop(planner);
+
+        b.iter(|| {
+            let mut count = 0u32;
+            plan.execute_stream(&mut world, |_| count += 1).unwrap();
+            count
+        });
+    });
+
     // ── Changed<T> filtering ────────────────────────────────────────
     //
     // First call sees all entities (new). Second call sees 0 (no mutations).

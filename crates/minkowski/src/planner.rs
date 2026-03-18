@@ -1000,6 +1000,10 @@ pub struct Predicate {
     /// Type-erased filter closure for execution. Captured at predicate
     /// construction when the concrete value is available.
     filter_fn: Option<FilterFn>,
+    /// Column-aware filter closure. When present, the plan can evaluate the
+    /// filter by iterating contiguous column slices per archetype instead of
+    /// per-entity `world.get()` dispatch. See [`Predicate::custom_column`].
+    column_filter_fn: Option<ColumnFilterFn>,
     /// Type-erased predicate value for index lookups. Eq stores `Arc<T>`,
     /// Range stores `Arc<(Bound<T>, Bound<T>)>`. Downcast by the index's
     /// `eq_lookup_fn` / `range_lookup_fn` at plan-build time.
@@ -1011,7 +1015,8 @@ pub struct Predicate {
 enum PredicateKind {
     Eq,
     Range,
-    Custom(Box<str>), // description only — always post-filter
+    Custom(Box<str>),       // description only — always post-filter
+    CustomColumn(Box<str>), // column-aware custom — always post-filter
     Spatial(SpatialPredicate),
 }
 
@@ -1036,6 +1041,7 @@ impl Predicate {
             filter_fn: Some(Arc::new(move |world: &World, entity: Entity| {
                 world.get::<T>(entity).is_some_and(|v| *v == *filter_val)
             })),
+            column_filter_fn: None,
             lookup_value: Some(lookup_val),
         }
     }
@@ -1081,6 +1087,7 @@ impl Predicate {
                     lo_ok && hi_ok
                 })
             })),
+            column_filter_fn: None,
             lookup_value: Some(lookup_val),
         }
     }
@@ -1104,6 +1111,81 @@ impl Predicate {
             kind: PredicateKind::Custom(description.into()),
             selectivity: sanitize_selectivity(selectivity),
             filter_fn: Some(Arc::new(filter)),
+            column_filter_fn: None,
+            lookup_value: None,
+        }
+    }
+
+    /// Column-aware custom predicate with a per-element filter closure.
+    ///
+    /// Like [`custom`](Self::custom), always applied as a post-fetch filter
+    /// (cannot be pushed into an index). However, instead of receiving
+    /// `(&World, Entity)` and paying per-entity `world.get::<T>()` overhead,
+    /// the closure receives `&T` directly from the contiguous column slice.
+    ///
+    /// During scan execution, the planner iterates archetype columns and
+    /// applies the predicate per element with sequential memory access — one
+    /// `ComponentId` resolution per archetype instead of per entity. This
+    /// eliminates the dominant cost of `Predicate::custom` for scan plans.
+    ///
+    /// NaN selectivity is normalized to 1.0 (worst-case, full scan).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use minkowski::planner::Predicate;
+    /// # #[derive(Clone, Copy)] struct Score(u32);
+    /// let pred = Predicate::custom_column::<Score>("score < 5000", 0.5, |s| s.0 < 5000);
+    /// ```
+    pub fn custom_column<T: Component>(
+        description: &str,
+        selectivity: f64,
+        filter: impl Fn(&T) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let filter = Arc::new(filter);
+
+        // Column-aware filter: iterates the typed column slice per archetype.
+        let col_filter = {
+            let filter = Arc::clone(&filter);
+            Arc::new(
+                move |arch: &Archetype, registry: &ComponentRegistry, mask: &mut [bool]| {
+                    let Some(comp_id) = registry.id::<T>() else {
+                        // Component not registered — no entity can pass.
+                        mask.iter_mut().for_each(|m| *m = false);
+                        return;
+                    };
+                    let Some(col_idx) = arch.column_index(comp_id) else {
+                        // Archetype doesn't have this component — all fail.
+                        mask.iter_mut().for_each(|m| *m = false);
+                        return;
+                    };
+                    debug_assert_eq!(mask.len(), arch.len());
+                    let ptr = unsafe { arch.columns[col_idx].get_ptr(0) as *const T };
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, arch.len()) };
+                    for (m, val) in mask.iter_mut().zip(slice.iter()) {
+                        if *m && !filter(val) {
+                            *m = false;
+                        }
+                    }
+                },
+            ) as ColumnFilterFn
+        };
+
+        // Fallback per-entity filter for index-driven paths.
+        let per_entity_filter: FilterFn = {
+            let filter = Arc::clone(&filter);
+            Arc::new(move |world: &World, entity: Entity| {
+                world.get::<T>(entity).is_some_and(|v| filter(v))
+            })
+        };
+
+        Predicate {
+            component_type: TypeId::of::<T>(),
+            component_name: std::any::type_name::<T>(),
+            kind: PredicateKind::CustomColumn(description.into()),
+            selectivity: sanitize_selectivity(selectivity),
+            filter_fn: Some(per_entity_filter),
+            column_filter_fn: Some(col_filter),
             lookup_value: None,
         }
     }
@@ -1147,6 +1229,7 @@ impl Predicate {
             kind: PredicateKind::Spatial(SpatialPredicate::Within { center, radius }),
             selectivity,
             filter_fn: Some(Arc::new(filter)),
+            column_filter_fn: None,
             lookup_value: None,
         })
     }
@@ -1199,6 +1282,7 @@ impl Predicate {
             kind: PredicateKind::Spatial(SpatialPredicate::Intersects { min, max }),
             selectivity,
             filter_fn: Some(Arc::new(filter)),
+            column_filter_fn: None,
             lookup_value: None,
         })
     }
@@ -1235,6 +1319,9 @@ impl fmt::Debug for Predicate {
             PredicateKind::Eq => write!(f, "Eq({})", self.component_name),
             PredicateKind::Range => write!(f, "Range({})", self.component_name),
             PredicateKind::Custom(desc) => write!(f, "Custom({}: {})", self.component_name, desc),
+            PredicateKind::CustomColumn(desc) => {
+                write!(f, "CustomColumn({}: {})", self.component_name, desc)
+            }
             PredicateKind::Spatial(sp) => write!(f, "Spatial({}: {})", self.component_name, sp),
         }
     }
@@ -1628,11 +1715,20 @@ pub struct QueryPlanResult {
     /// Cached accumulators reused across calls (avoids String clones per call).
     cached_accums: Vec<AggregateAccum>,
     /// Component requirements for the direct archetype iteration fast path.
-    /// `Some` when the plan is scan-only with no custom predicates.
-    /// `None` when the plan has joins or custom filter closures.
+    /// `Some` when the plan is scan-only with no per-entity filter closures.
+    /// `None` when the plan has joins, index/spatial drivers, or per-entity
+    /// (non-column) custom filter closures.
     scan_required: Option<FixedBitSet>,
     /// Changed-component bitset for the direct archetype iteration fast path.
     scan_changed: FixedBitSet,
+    /// Column-aware filter closures for the scan fast path.
+    /// Applied per-archetype on typed column slices instead of per-entity
+    /// `world.get()` dispatch. Non-empty only when `scan_required.is_some()`
+    /// and the plan has `CustomColumn` predicates.
+    scan_column_filters: Vec<ColumnFilterFn>,
+    /// Reusable boolean mask for column filter evaluation.
+    /// Avoids per-archetype allocation in the scan fast path.
+    column_filter_mask: Vec<bool>,
 }
 
 impl QueryPlanResult {
@@ -1797,6 +1893,8 @@ impl QueryPlanResult {
             let Self {
                 scan_required,
                 scan_changed,
+                scan_column_filters,
+                column_filter_mask,
                 last_read_tick,
                 scratch,
                 ..
@@ -1814,8 +1912,21 @@ impl QueryPlanResult {
                 if !passes_change_filter(arch, scan_changed, tick) {
                     continue;
                 }
-                for &entity in &arch.entities {
-                    scratch.push(entity);
+                if scan_column_filters.is_empty() {
+                    for &entity in &arch.entities {
+                        scratch.push(entity);
+                    }
+                } else {
+                    column_filter_mask.clear();
+                    column_filter_mask.resize(arch.len(), true);
+                    for cf in scan_column_filters.iter() {
+                        cf(arch, &world.components, column_filter_mask);
+                    }
+                    for (i, &entity) in arch.entities.iter().enumerate() {
+                        if column_filter_mask[i] {
+                            scratch.push(entity);
+                        }
+                    }
                 }
             }
             *last_read_tick = world.next_tick();
@@ -1869,11 +1980,13 @@ impl QueryPlanResult {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
 
-        // Fast path: scan-only plan with no custom predicates or index drivers.
+        // Fast path: scan-only plan (no tick advancement).
         if self.scan_required.is_some() {
             let Self {
                 scan_required,
                 scan_changed,
+                scan_column_filters,
+                column_filter_mask,
                 last_read_tick,
                 scratch,
                 ..
@@ -1891,8 +2004,21 @@ impl QueryPlanResult {
                 if !passes_change_filter(arch, scan_changed, tick) {
                     continue;
                 }
-                for &entity in &arch.entities {
-                    scratch.push(entity);
+                if scan_column_filters.is_empty() {
+                    for &entity in &arch.entities {
+                        scratch.push(entity);
+                    }
+                } else {
+                    column_filter_mask.clear();
+                    column_filter_mask.resize(arch.len(), true);
+                    for cf in scan_column_filters.iter() {
+                        cf(arch, &world.components, column_filter_mask);
+                    }
+                    for (i, &entity) in arch.entities.iter().enumerate() {
+                        if column_filter_mask[i] {
+                            scratch.push(entity);
+                        }
+                    }
                 }
             }
             return Ok(scratch.as_slice());
@@ -1943,14 +2069,18 @@ impl QueryPlanResult {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
-        // Fast path: scan-only plan with no custom predicates or index drivers.
+        // Fast path: scan-only plan with no per-entity filter closures.
         // Walk archetypes directly — the callback is monomorphic (`impl FnMut`),
         // so this avoids the double trait-object dispatch through CompiledForEach
         // (`Box<dyn FnMut>` outer + `&mut dyn FnMut` inner).
+        // When column filters are present, they are applied per-archetype on
+        // typed column slices instead of per-entity world.get() dispatch.
         if self.scan_required.is_some() {
             let Self {
                 scan_required,
                 scan_changed,
+                scan_column_filters,
+                column_filter_mask,
                 last_read_tick,
                 ..
             } = self;
@@ -1963,8 +2093,21 @@ impl QueryPlanResult {
                 if !passes_change_filter(arch, scan_changed, tick) {
                     continue;
                 }
-                for &entity in &arch.entities {
-                    callback(entity);
+                if scan_column_filters.is_empty() {
+                    for &entity in &arch.entities {
+                        callback(entity);
+                    }
+                } else {
+                    column_filter_mask.clear();
+                    column_filter_mask.resize(arch.len(), true);
+                    for cf in scan_column_filters.iter() {
+                        cf(arch, &world.components, column_filter_mask);
+                    }
+                    for (i, &entity) in arch.entities.iter().enumerate() {
+                        if column_filter_mask[i] {
+                            callback(entity);
+                        }
+                    }
                 }
             }
             *last_read_tick = world.next_tick();
@@ -2013,12 +2156,13 @@ impl QueryPlanResult {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
-        // Fast path: scan-only plan with no custom predicates or index drivers.
-        // Same as execute_stream but without tick advancement (transactional read).
+        // Fast path: scan-only plan (same as execute_stream but no tick advancement).
         if self.scan_required.is_some() {
             let Self {
                 scan_required,
                 scan_changed,
+                scan_column_filters,
+                column_filter_mask,
                 last_read_tick,
                 ..
             } = self;
@@ -2031,8 +2175,21 @@ impl QueryPlanResult {
                 if !passes_change_filter(arch, scan_changed, tick) {
                     continue;
                 }
-                for &entity in &arch.entities {
-                    callback(entity);
+                if scan_column_filters.is_empty() {
+                    for &entity in &arch.entities {
+                        callback(entity);
+                    }
+                } else {
+                    column_filter_mask.clear();
+                    column_filter_mask.resize(arch.len(), true);
+                    for cf in scan_column_filters.iter() {
+                        cf(arch, &world.components, column_filter_mask);
+                    }
+                    for (i, &entity) in arch.entities.iter().enumerate() {
+                        if column_filter_mask[i] {
+                            callback(entity);
+                        }
+                    }
                 }
             }
             return Ok(());
@@ -2128,7 +2285,7 @@ impl QueryPlanResult {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
 
-        // Fast path: scan-only plan with no custom predicates.
+        // Fast path: scan-only plan.
         // Walk archetypes directly — no ScratchBuffer, no sort.
         if let Some(ref required) = self.scan_required {
             let changed = &self.scan_changed;
@@ -2148,9 +2305,23 @@ impl QueryPlanResult {
                     });
                 }
                 let fetch = Q::init_fetch(arch, &world.components);
-                for (row, &entity) in arch.entities.iter().enumerate() {
-                    let item = unsafe { Q::fetch(&fetch, row) };
-                    callback(entity, item);
+                if self.scan_column_filters.is_empty() {
+                    for (row, &entity) in arch.entities.iter().enumerate() {
+                        let item = unsafe { Q::fetch(&fetch, row) };
+                        callback(entity, item);
+                    }
+                } else {
+                    self.column_filter_mask.clear();
+                    self.column_filter_mask.resize(arch.len(), true);
+                    for cf in self.scan_column_filters.iter() {
+                        cf(arch, &world.components, &mut self.column_filter_mask);
+                    }
+                    for (row, &entity) in arch.entities.iter().enumerate() {
+                        if self.column_filter_mask[row] {
+                            let item = unsafe { Q::fetch(&fetch, row) };
+                            callback(entity, item);
+                        }
+                    }
                 }
             }
             return Ok(());
@@ -2289,13 +2460,15 @@ impl QueryPlanResult {
             }
         }
 
-        // Fast path: scan-only plan with no custom predicates or index drivers.
+        // Fast path: scan-only plan.
         // Walk archetypes directly — no ScratchBuffer, no sort.
         // Destructure self to borrow scan_required + row_indices disjointly.
         if self.scan_required.is_some() {
             let Self {
                 scan_required,
                 scan_changed,
+                scan_column_filters,
+                column_filter_mask,
                 last_read_tick,
                 row_indices,
                 ..
@@ -2318,9 +2491,30 @@ impl QueryPlanResult {
                 }
                 let fetch = Q::init_fetch(arch, &world.components);
                 let slice = unsafe { Q::as_slice(&fetch, arch.len()) };
-                row_indices.clear();
-                row_indices.extend(0..arch.len());
-                callback(&arch.entities, row_indices, slice);
+                if scan_column_filters.is_empty() {
+                    row_indices.clear();
+                    row_indices.extend(0..arch.len());
+                    callback(&arch.entities, row_indices, slice);
+                } else {
+                    column_filter_mask.clear();
+                    column_filter_mask.resize(arch.len(), true);
+                    for cf in scan_column_filters.iter() {
+                        cf(arch, &world.components, column_filter_mask);
+                    }
+                    row_indices.clear();
+                    row_indices.extend(
+                        (0..arch.len()).filter(|&i| column_filter_mask[i]),
+                    );
+                    // Build filtered entity slice via scratch-style collect.
+                    // The callback receives only passing entities/rows.
+                    // Note: we need to pass matching entities and row indices.
+                    // Collect matching entities into a temporary buffer.
+                    let entities: Vec<Entity> = row_indices
+                        .iter()
+                        .map(|&row| arch.entities[row])
+                        .collect();
+                    callback(&entities, row_indices, slice);
+                }
             }
             *last_read_tick = world.next_tick();
             return Ok(());
@@ -2643,6 +2837,7 @@ impl fmt::Debug for QueryPlanResult {
             .field("cached_accums_len", &self.cached_accums.len())
             .field("row_indices_cap", &self.row_indices.capacity())
             .field("has_scan_required", &self.scan_required.is_some())
+            .field("scan_column_filters", &self.scan_column_filters.len())
             .field("scan_changed", &self.scan_changed)
             .finish()
     }
@@ -2968,6 +3163,16 @@ type IndexLookupFn = Arc<dyn Fn() -> Arc<[Entity]> + Send + Sync>;
 // vtable call). Inherent to type-erased plan composition — monomorphic
 // filters would require codegen per plan.
 type FilterFn = Arc<dyn Fn(&World, Entity) -> bool + Send + Sync>;
+
+/// Column-aware filter function: given an archetype and component registry,
+/// AND the result into a pre-initialized boolean mask. The mask is
+/// `arch.len()` elements long and pre-filled with `true`. The filter sets
+/// `mask[i] = false` for entities that do not pass.
+///
+/// This avoids the per-entity `world.get()` overhead of `FilterFn` by
+/// operating on contiguous typed column slices — sequential memory access,
+/// one `ComponentId` resolution per archetype instead of per entity.
+type ColumnFilterFn = Arc<dyn Fn(&Archetype, &ComponentRegistry, &mut [bool]) + Send + Sync>;
 
 /// Type-erased closure that collects entities from a scan/index into a
 /// [`ScratchBuffer`]. Used by join plans to gather left and right entity sets.
@@ -3495,13 +3700,15 @@ impl ScanBuilder<'_> {
         debug_assert!(
             index_preds
                 .iter()
-                .all(|(p, _)| p.filter_fn.is_some() || matches!(p.kind, PredicateKind::Custom(_))),
+                .all(|(p, _)| p.filter_fn.is_some()
+                    || matches!(p.kind, PredicateKind::Custom(_) | PredicateKind::CustomColumn(_))),
             "Eq/Range predicate with filter_fn: None — plan would show filter but not apply it"
         );
         debug_assert!(
             filter_preds
                 .iter()
-                .all(|p| p.filter_fn.is_some() || matches!(p.kind, PredicateKind::Custom(_))),
+                .all(|p| p.filter_fn.is_some()
+                    || matches!(p.kind, PredicateKind::Custom(_) | PredicateKind::CustomColumn(_))),
             "Eq/Range predicate with filter_fn: None — plan would show filter but not apply it"
         );
         debug_assert!(
@@ -3524,6 +3731,21 @@ impl ScanBuilder<'_> {
             .collect();
         // Capture before all_filter_fns is moved into compiled closures.
         let has_any_filters = !all_filter_fns.is_empty();
+
+        // Collect column-aware filter closures from filter predicates.
+        // Column filters enable the scan_required fast path even when custom
+        // predicates are present, by operating on typed column slices per
+        // archetype instead of per-entity world.get() dispatch.
+        let all_column_filter_fns: Vec<ColumnFilterFn> = filter_preds
+            .iter()
+            .filter_map(|p| p.column_filter_fn.as_ref().map(Arc::clone))
+            .collect();
+        // All filters are column-aware when every filter_pred has a column_filter_fn
+        // and there are no index/spatial predicates contributing per-entity filters.
+        let all_filters_are_column = !filter_preds.is_empty()
+            && index_preds.is_empty()
+            && spatial_preds.is_empty()
+            && filter_preds.len() == all_column_filter_fns.len();
 
         // Phase 3: Build the logical plan tree.
         //
@@ -4513,18 +4735,25 @@ impl ScanBuilder<'_> {
             cached_batch_extractors_raw,
             cached_accums,
             row_indices: Vec::new(),
-            // Direct archetype iteration: only for pure scans with no
-            // predicates, indexes, or spatial drivers.
-            scan_required: if !has_any_filters
-                && !has_any_joins
+            // Direct archetype iteration: enabled for pure scans with no
+            // per-entity filters, indexes, or spatial drivers. Also enabled
+            // when all filters are column-aware (CustomColumn predicates).
+            scan_required: if !has_any_joins
                 && index_driver.is_none()
                 && spatial_driver.is_none()
+                && (!has_any_filters || all_filters_are_column)
             {
                 self.left_required.clone()
             } else {
                 None
             },
             scan_changed: self.left_changed.clone().unwrap_or_default(),
+            scan_column_filters: if all_filters_are_column {
+                all_column_filter_fns
+            } else {
+                Vec::new()
+            },
+            column_filter_mask: Vec::new(),
         }
     }
 }
@@ -4986,7 +5215,7 @@ impl<'w> QueryPlanner<'w> {
     /// Generate warnings for predicates that can't use an index.
     fn warn_missing_index(&self, pred: &Predicate, warnings: &mut Vec<PlanWarning>) {
         match &pred.kind {
-            PredicateKind::Custom(_) => {
+            PredicateKind::Custom(_) | PredicateKind::CustomColumn(_) => {
                 // Custom predicates never use indexes — no warning needed.
             }
             PredicateKind::Eq => {
@@ -7023,6 +7252,160 @@ mod tests {
         for e in &result {
             assert!(world.get::<Score>(*e).unwrap().0.is_multiple_of(2));
         }
+    }
+
+    #[test]
+    fn execute_custom_column_filter() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Score>(
+                "even scores",
+                0.5,
+                |s| s.0 % 2 == 0,
+            ))
+            .build();
+        // Column-filter plans should use the scan_required fast path.
+        assert!(plan.scan_required.is_some());
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
+        assert_eq!(result.len(), 25);
+        for e in &result {
+            assert!(world.get::<Score>(*e).unwrap().0.is_multiple_of(2));
+        }
+    }
+
+    #[test]
+    fn custom_column_filter_multi_archetype() {
+        let mut world = World::new();
+        // Archetype 1: Score only
+        for i in 0..30 {
+            world.spawn((Score(i),));
+        }
+        // Archetype 2: Score + Team
+        for i in 30..50 {
+            world.spawn((Score(i), Team(0)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Score>(
+                "score < 25",
+                0.5,
+                |s| s.0 < 25,
+            ))
+            .build();
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
+        assert_eq!(result.len(), 25);
+        for e in &result {
+            assert!(world.get::<Score>(*e).unwrap().0 < 25);
+        }
+    }
+
+    #[test]
+    fn custom_column_filter_stream() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Score>(
+                "score >= 90",
+                0.1,
+                |s| s.0 >= 90,
+            ))
+            .build();
+        let mut count = 0u32;
+        plan.execute_stream(&mut world, |_| count += 1).unwrap();
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn custom_column_filter_stream_raw() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Score>(
+                "score >= 90",
+                0.1,
+                |s| s.0 >= 90,
+            ))
+            .build();
+        let mut count = 0u32;
+        plan.execute_stream_raw(&world, |_| count += 1).unwrap();
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn custom_column_multiple_filters() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Score>(
+                "score >= 20",
+                0.8,
+                |s| s.0 >= 20,
+            ))
+            .filter(Predicate::custom_column::<Score>(
+                "score < 30",
+                0.1,
+                |s| s.0 < 30,
+            ))
+            .build();
+        // Should use scan_required fast path with both column filters.
+        assert!(plan.scan_required.is_some());
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
+        assert_eq!(result.len(), 10);
+        for e in &result {
+            let s = world.get::<Score>(*e).unwrap().0;
+            assert!((20..30).contains(&s));
+        }
+    }
+
+    #[test]
+    fn custom_column_mixed_with_per_entity_disables_fast_path() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom_column::<Score>(
+                "even",
+                0.5,
+                |s| s.0 % 2 == 0,
+            ))
+            .filter(Predicate::custom::<Score>(
+                "small",
+                0.5,
+                |world, entity| world.get::<Score>(entity).is_some_and(|s| s.0 < 25),
+            ))
+            .build();
+        // Mixed column + per-entity filters should NOT use scan_required.
+        assert!(plan.scan_required.is_none());
+        let result = plan.execute_collect(&mut world).unwrap().to_vec();
+        // Even scores from 0..25: 0, 2, 4, ..., 24 = 13 values
+        assert_eq!(result.len(), 13);
     }
 
     #[test]
