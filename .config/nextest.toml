@@ -1,0 +1,31 @@
+# Nextest configuration — https://nexte.st/docs/configuration/reference/
+
+# Miri profile: activated automatically when MIRI_SYSROOT is set.
+# Selects ~95 tests exercising unsafe code paths: raw pointer arithmetic,
+# type-erased column storage, arena allocation, entity lifecycle, pool/TCache.
+#
+# Selection criteria:
+#   Fully included: modules where ALL tests transit through unsafe storage
+#   Pattern-selected: specific test families in large mixed modules
+#
+# Excluded from Miri:
+#   - par_for_each (rayon thread pool unsupported by Miri, covered by TSan)
+#   - Concurrent pool tests (too slow under Miri, covered by TSan + Loom)
+#   - Mostly-safe modules: access, view, transaction, debounce, tick,
+#     lock_table, retention, planner (except execute_stream batch paths)
+[profile.default-miri]
+default-filter = """
+  test(/^storage::blob_vec::tests::/)
+  | test(/^storage::sparse::tests::/)
+  | test(/^storage::archetype::tests::/)
+  | test(/^query::fetch::tests::/)
+  | test(/^pool::tests::(slab_pool|tcache)/) - test(/concurrent|contention/)
+  | test(/^query::iter::tests::/) - test(/par_for_each/)
+  | test(/^world::tests::(spawn_and_get|get_mut$|get_mut_marks|get_batch_mut_basic|get_batch_mut_marks|despawn_and_is_alive|entity_recycling|insert_new_component|remove_component$|remove_last_component_swap|despawn_batch_multiple_arch)/)
+  | test(/^changeset::tests::(arena_|apply_does_not_double_drop|drop_runs_destructor|insert_raw|fast_lane)/)
+  | test(/^table::tests::(derive_table_register|query_table_yields|typed_query_table_mut$)/)
+  | test(/^bundle::tests::/)
+  | test(/^query::planner::tests::execute_stream_(batched_yields|join_chunk_yields|join_chunk_multi)/)
+  | test(/^reducer::tests::query_writer_fast_lane/)
+"""
+slow-timeout = { period = "60s", terminate-after = 2 }

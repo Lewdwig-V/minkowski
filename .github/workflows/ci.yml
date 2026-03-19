@@ -57,10 +57,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri, rust-src
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: nightly
-      - name: Miri subset (~92 tests targeting unsafe code)
+      - name: Miri subset (nextest, parallel)
         run: ci/run-miri-subset.sh
         env:
           MIRIFLAGS: "-Zmiri-tree-borrows"
