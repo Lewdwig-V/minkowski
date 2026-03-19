@@ -1,0 +1,32 @@
+name: Miri
+
+# Full Miri run (~860 tests) — too slow for per-PR CI.
+# Runs nightly on main and on release tags.
+on:
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC daily
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+
+jobs:
+  miri:
+    name: Miri (full suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly
+      - name: Miri full suite (nextest, parallel)
+        run: ci/run-miri-subset.sh
+        env:
+          MIRIFLAGS: "-Zmiri-tree-borrows"

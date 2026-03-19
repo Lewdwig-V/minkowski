@@ -1,0 +1,9 @@
+# Nextest configuration — https://nexte.st/docs/configuration/reference/
+
+# Miri profile: activated automatically when MIRI_SYSROOT is set.
+# Runs the full test suite minus Miri-incompatible tests:
+#   - par_for_each: rayon thread pool unsupported by Miri (covered by TSan)
+#   - concurrent/contention pool tests: too slow under Miri (covered by TSan + Loom)
+[profile.default-miri]
+default-filter = "all() - test(/par_for_each/) - test(/concurrent|contention/)"
+slow-timeout = { period = "60s", terminate-after = 2 }

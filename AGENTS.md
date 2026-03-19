@@ -38,8 +38,7 @@ cargo run -p minkowski-examples --example profile_changeset --release   # Profil
 cargo run -p minkowski-examples --example planner --release   # Compiled push-based query planner: cost-based plans, index selection, joins, execute/for_each/for_each_raw (1K entities, 2 archetypes)
 cargo run -p minkowski-examples --example materialized_view --release   # Materialized views: cached debounced subscription queries, change detection, invalidation (200 entities, 7 demos)
 
-MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
-MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri nextest run -p minkowski --lib  # UB check (full suite ~860 tests, parallel via nextest)
 
 RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p minkowski --lib --tests -Z build-std --target x86_64-unknown-linux-gnu -- --skip par_for_each  # TSan (data race detection)
 RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p minkowski --lib --tests -Z build-std --target x86_64-unknown-linux-gnu par_for_each  # TSan rayon tests
@@ -52,28 +51,93 @@ cargo +nightly fuzz run fuzz_snapshot_load -- -max_total_time=60 -max_len=65536 
 cargo +nightly fuzz run fuzz_wal_replay -- -max_total_time=60 -max_len=65536    # fuzz: WAL replay
 ```
 
-Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows; `-Zmiri-ignore-leaks` only for the two `par_for_each` tests because rayon's thread pool intentionally outlives main. All other tests run without leak suppression to catch real leaks.
+Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows. Runs the full test suite via nextest (parallel execution). Exclusions defined in `.config/nextest.toml` (`[profile.default-miri]`, auto-activated under Miri): `par_for_each` (rayon unsupported by Miri, covered by TSan), concurrent/contention pool tests (too slow, covered by TSan + Loom). To list selected tests: `cargo nextest list -p minkowski --lib --profile default-miri`.
 
 Pre-commit hooks run `cargo fmt` and `cargo clippy -D warnings` on commit, `cargo test` on push.
 
 ## CI
 
-GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every PR and push to main:
+### PR pipeline (`.github/workflows/ci.yml`)
 
-| Job | Toolchain | Command | `needs` |
-|---|---|---|---|
-| fmt | stable | `cargo fmt --all -- --check` | — |
-| clippy | stable | `cargo clippy --workspace --all-targets -- -D warnings` | — |
-| test | stable | `cargo test -p minkowski` | fmt, clippy |
-| miri | nightly | Full Miri run including rayon (push to main only) | test |
-| tsan | nightly | Two-step TSan run with `-Z build-std` (see Build & Test Commands) | test |
-| loom | stable | Exhaustive concurrency verification (see Build & Test Commands) | test |
+Runs on every PR and push to main:
 
-Format and clippy run in parallel. Test runs after both pass. TSan and Loom run in parallel after test on every PR. Miri runs only on push to main (full test suite including rayon). A `ci-pass` aggregator job (runs with `if: always()`) is the single required status check for branch protection — it verifies all required jobs succeeded and allows Miri to be skipped on PRs without failing the gate.
+| Job | Toolchain | Duration | Command | `needs` |
+|---|---|---|---|---|
+| fmt | stable | ~30s | `cargo fmt --all -- --check` | — |
+| clippy | stable | ~1min | `cargo clippy --workspace --all-targets -- -D warnings` | — |
+| test | stable | ~2min | `cargo test -p minkowski` | fmt, clippy |
+| tsan | nightly | ~2min | Two-step TSan run with `-Z build-std` (see Build & Test Commands) | test |
+| loom | stable | ~1min | Exhaustive concurrency verification (see Build & Test Commands) | test |
+
+Format and clippy run in parallel. Test runs after both pass. TSan and Loom run in parallel after test. A `ci-pass` aggregator job (runs with `if: always()`) is the single required status check for branch protection.
+
+**Total PR pipeline wall-clock: ~4 minutes** (fmt+clippy parallel ~1min → test ~2min → tsan/loom parallel ~2min).
+
+### Miri (`.github/workflows/miri.yml`)
+
+Full Miri suite (~860 tests) via nextest parallel execution. Runs nightly (04:00 UTC) and on release tags (`v*`). Can also be triggered manually via `workflow_dispatch`.
+
+**Flake guidance**: Miri and TSan use nightly toolchains that occasionally introduce regressions. If a nightly Miri run fails but the code hasn't changed, check the [Rust nightly changelog](https://releases.rs/) for recent Miri changes. Pin the nightly version in CI (`rust-toolchain.toml` or `dtolnay/rust-toolchain@<date>`) if a regression persists. Use `gh workflow run miri.yml` to re-run manually after a suspected nightly flake.
+
+Run the full CI pipeline locally (PR checks + Miri):
+```bash
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test -p minkowski && RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p minkowski --lib --tests -Z build-std --target x86_64-unknown-linux-gnu && RUSTFLAGS="--cfg loom" cargo test -p minkowski --lib --features loom -- loom_tests && MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri nextest run -p minkowski --lib
+```
 
 ## Architecture
 
 Minkowski is a **column-oriented archetype ECS**. Five crates: `minkowski` (core), `minkowski-derive` (`#[derive(Table)]` proc macro), `minkowski-persist` (WAL, snapshots, durable transactions), `minkowski-observe` (metrics capture and display), and `minkowski-examples` (examples as external API consumers).
+
+```
+                          ┌─────────────────────────────────────────────┐
+                          │              User / Framework               │
+                          └──────┬──────────────┬───────────────┬───────┘
+                                 │              │               │
+                    world.spawn()│  registry.call()    strategy.transact()
+                    world.query()│  registry.run()             │
+                                 │              │               │
+          ┌──────────────────────▼──────────────▼───────────────▼──────────────┐
+          │                            World                                   │
+          │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────────┐   │
+          │  │EntityAllocator│ │ComponentRegistry│ │  QueryCache (TypeId→  │   │
+          │  │ gen[] + free  │ │  id→layout+drop │ │  matched archetypes)  │   │
+          │  └──────┬───────┘ └───────┬──────┘  └──────────────────────────┘   │
+          │         │                 │                                         │
+          │  ┌──────▼─────────────────▼────────────────────────────────────┐   │
+          │  │                    Archetypes                                │   │
+          │  │  ┌─────────────────────────────────────────────────────┐    │   │
+          │  │  │ Archetype { component_ids: FixedBitSet }            │    │   │
+          │  │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐            │    │   │
+          │  │  │  │ BlobVec  │ │ BlobVec  │ │ BlobVec  │  ...cols   │    │   │
+          │  │  │  │ (Pos)    │ │ (Vel)    │ │ (Health) │            │    │   │
+          │  │  │  │ 64B-align│ │ 64B-align│ │ 64B-align│            │    │   │
+          │  │  │  └──────────┘ └──────────┘ └──────────┘            │    │   │
+          │  │  │  entities: [Entity] ── row↔entity mapping          │    │   │
+          │  │  └─────────────────────────────────────────────────────┘    │   │
+          │  │  entity_locations: [Option<(arch_id, row)>] ── O(1) lookup │   │
+          │  └─────────────────────────────────────────────────────────────┘   │
+          │  ┌───────────────────────┐  ┌──────────────────┐                   │
+          │  │ PagedSparseSet (opt-in│  │  SlabPool (mmap) │                   │
+          │  │  sparse components)   │  │  TCache (TLS)    │                   │
+          │  └───────────────────────┘  └──────────────────┘                   │
+          └────────────────────────────────────────────────────────────────────┘
+                     │                            │
+       ┌─────────────┘                            └──────────────┐
+       │ External composition (not inside World)                  │
+       │                                                          │
+  ┌────▼─────────┐  ┌───────────────┐  ┌──────────────────┐  ┌───▼──────────┐
+  │ReducerRegistry│ │ QueryPlanner  │  │ SpatialIndex     │  │ Transact     │
+  │ call()/run() │  │ cost-based    │  │ BTreeIndex       │  │ Sequential   │
+  │ Access bitsets│  │ plans, joins  │  │ HashIndex        │  │ Optimistic   │
+  │              │  │ aggregates    │  │ grids, quadtrees │  │ Pessimistic  │
+  └──────────────┘  └───────────────┘  └──────────────────┘  └──────────────┘
+                                                                    │
+                                                             ┌──────▼──────┐
+                                                             │ Durable<S>  │
+                                                             │ WAL+snapshot│
+                                                             │ (persist)   │
+                                                             └─────────────┘
+```
 
 ### Storage Model
 
@@ -219,6 +283,24 @@ Lock granularity is per-column `(ArchetypeId, ComponentId)`. `ColumnLockTable` i
 
 **Entity ID lifecycle invariant**: entity IDs allocated during a transaction (`tx.spawn`) are tracked. On successful commit they become placed entities. On abort (drop without commit or conflict), the IDs are pushed to a shared `OrphanQueue` owned by World. World drains this queue automatically at the top of every `&mut self` method — bumping generations and recycling indices. No entity ID ever leaks, regardless of how the transaction ends. No manual drain step required.
 
+### Choosing a Transaction Strategy
+
+| | Sequential | Optimistic | Pessimistic |
+|---|---|---|---|
+| **Throughput** | Highest (zero overhead) | High (retries rare if low contention) | Medium (lock acquire/release cost) |
+| **Contention handling** | N/A (single writer) | Retry on conflict (default 3×) | Block until lock acquired (default 64× spin+yield) |
+| **Failure mode** | None — commit always succeeds | `Err(Conflict)` if column written by another thread since begin | Deadlock-free (total column ordering) but can starve under extreme contention |
+| **Read path** | Direct `&mut World` | `query_raw(&World)` — shared ref, no cache/ticks | `query_raw(&World)` — shared ref, no cache/ticks |
+| **Write path** | Direct mutation | Buffered in `EnumChangeSet`, applied at commit | Buffered in `EnumChangeSet`, applied at commit |
+| **Best for** | Single-threaded game loops, batch setup, tooling | Multi-threaded with rare write overlap (e.g. spatial partitioned updates) | Multi-threaded with frequent write overlap (e.g. shared health pool, economy) |
+| **Durable?** | Yes (wrap with `Durable<Sequential>`) | Yes (wrap with `Durable<Optimistic>`) | Yes (wrap with `Durable<Pessimistic>`) |
+
+**Rules of thumb**:
+- Start with `Sequential` unless you have a measured concurrency need.
+- Use `Optimistic` when threads touch mostly disjoint component sets — retries are cheap but wasted work scales with conflict rate.
+- Use `Pessimistic` when threads frequently write the same columns — locks prevent wasted work but add baseline overhead even without contention.
+- All three compose with `Durable<S>` for WAL-backed crash safety.
+
 ### Reducer System
 
 Typed reducers narrow what a closure *can* touch so that conflict freedom is provable from the type signature. Three execution models:
@@ -287,17 +369,35 @@ The corollary is that forging an ID — constructing one from a raw integer with
 
 ## Dependencies
 
-| Crate | Purpose |
-|---|---|
-| `fixedbitset` | Archetype component bitmasks for query matching |
-| `parking_lot` | Mutex for `ColumnLockTable`, `OrphanQueue`, `Durable` WAL lock |
-| `rayon` | `par_for_each` parallel iteration |
-| `minkowski-derive` | `#[derive(Table)]` proc macro (syn/quote/proc-macro2) |
-| `minkowski-persist` | WAL, snapshots, codec registry, `Durable<S>` wrapper |
-| `minkowski-observe` | Observability companion: metrics capture, diff, display |
-| `rkyv` (persist) | Zero-copy serialization for WAL records and snapshots |
-| `memmap2` (persist) | Memory-mapped file I/O for zero-copy snapshot loading |
-| `thiserror` (persist) | Derive macros for `std::error::Error` impls |
-| `criterion` (dev) | Benchmark harness |
-| `tempfile` (dev, bench) | Temporary directories for serialize benchmarks |
-| `fastrand` (examples) | Example RNG |
+### Core (`minkowski`)
+
+| Crate | Version | Features | Why this crate / why this version |
+|---|---|---|---|
+| `fixedbitset` | 0.5 | — | Archetype component bitmasks for query matching. Compact, no-alloc subset checks via bitwise AND. |
+| `parking_lot` | 0.12 | — | Mutex for `ColumnLockTable`, `OrphanQueue`, `Durable` WAL lock. Smaller, faster than `std::sync::Mutex`, no poisoning. |
+| `rayon` | 1 | — | `par_for_each` parallel iteration. Work-stealing thread pool. |
+| `atomic` | 0.6 | — | `Atomic<T>` for generic atomics in pool side table. Needed for types wider than platform word. |
+| `libc` | 0.2 | — | `mmap`/`madvise` syscalls for pool slab allocation. |
+| `memmap2` | 0.9 | — | Memory-mapped file I/O for zero-copy snapshot loading. |
+| `loom` | 0.7 | optional | Exhaustive concurrency model checker. Behind `--features loom`. |
+| `minkowski-derive` | path | — | `#[derive(Table)]` proc macro (syn/quote/proc-macro2). |
+
+### Persistence (`minkowski-persist`)
+
+| Crate | Version | Features | Why |
+|---|---|---|---|
+| `rkyv` | 0.8 | `alloc`, `bytecheck` | Zero-copy serialization for WAL records and snapshots. `bytecheck` for validation on untrusted input; `alloc` for `ArchivedVec`. |
+| `memmap2` | 0.9 | — | Memory-mapped snapshot loading. |
+| `parking_lot` | 0.12 | — | WAL segment lock. |
+| `fixedbitset` | 0.5 | — | Archetype bitmask serialization in snapshots. |
+| `thiserror` | 2 | — | Derive macros for `std::error::Error` impls. v2 uses `core::error::Error` (edition 2024). |
+| `crc32fast` | 1 | — | CRC32 checksums for WAL frame integrity. |
+
+### Dev / Bench / Examples
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `criterion` | 0.5 | Benchmark harness |
+| `tempfile` | 3 | Temporary directories for persistence benchmarks |
+| `fastrand` | — | Example RNG (deterministic seeds) |
+| `cargo-nextest` | CI | Parallel test runner for Miri (installed via `taiki-e/install-action`) |

@@ -48,24 +48,6 @@ jobs:
           shared-key: stable
       - run: cargo test -p minkowski
 
-  miri:
-    name: Miri
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri, rust-src
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: nightly
-      - name: Miri subset (~85 tests targeting unsafe code)
-        run: ci/run-miri-subset.sh
-        env:
-          MIRIFLAGS: "-Zmiri-tree-borrows"
-
   tsan:
     name: ThreadSanitizer
     needs: test
@@ -103,11 +85,11 @@ jobs:
           RUSTFLAGS: "--cfg loom"
 
   # Aggregator job — the single required status check for branch protection.
-  # fmt and clippy run in parallel. test runs after both. TSan, Loom run on
-  # every PR. Miri runs only on push to main — "skipped" on PRs is expected.
+  # fmt and clippy run in parallel. test runs after both. TSan and Loom
+  # run after test. Miri runs separately (nightly schedule + release tags).
   ci-pass:
     name: CI
-    needs: [fmt, clippy, test, miri, tsan, loom]
+    needs: [fmt, clippy, test, tsan, loom]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -124,11 +106,5 @@ jobs:
             echo "  test:   ${{ needs.test.result }}"
             echo "  tsan:   ${{ needs.tsan.result }}"
             echo "  loom:   ${{ needs.loom.result }}"
-            exit 1
-          fi
-          # Miri only runs on push to main — "skipped" on PRs is expected.
-          if [[ "${{ needs.miri.result }}" != "success" &&
-                "${{ needs.miri.result }}" != "skipped" ]]; then
-            echo "miri failed: ${{ needs.miri.result }}"
             exit 1
           fi
