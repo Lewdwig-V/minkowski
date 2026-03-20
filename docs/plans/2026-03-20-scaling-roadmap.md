@@ -45,7 +45,7 @@ The log sits atop a column-oriented archetype ECS:
 - `QueryPlanner`: cost-based plans, joins, aggregates, index-driven lookups
 - `ReducerRegistry`: typed mutation handles with compile-time conflict detection
 - `EnumChangeSet`: ordered mutation log with arena allocation
-- `Transact`: Sequential, Optimistic (tick-based), Pessimistic (lock-based)
+- `Transact` trait: Optimistic (tick-based), Pessimistic (lock-based). `Sequential`: zero-cost non-transactional path with its own API
 
 ### Key properties carried forward
 
@@ -74,7 +74,7 @@ recovery only needs to replay the WAL tail from the last checkpoint.
 
 - `Snapshot`: full-world serialization via rkyv (v2 format with CRC32 envelope)
 - `CheckpointHandler` / `AutoCheckpoint`: snapshot trigger when WAL exceeds threshold
-- `Durable<S>` integration: checkpoint handler fires automatically on WAL rollover
+- `Durable<S>` integration: checkpoint handler fires automatically when accumulated WAL bytes exceed the configured threshold
 
 ### What makes this a good Stage 2
 
@@ -93,9 +93,9 @@ The WAL and snapshots are properly integrated, not bolted on separately:
 - **Incremental snapshots**: `Snapshot::save` serializes the entire world every
   time. Large worlds make this prohibitively expensive. Stage 3 replaces this
   with incremental (delta) snapshots via LSM compaction.
-- **Column-level change tracking**: `Changed<T>` is archetype-granular (a single
-  mutation marks the entire column as changed). Incremental snapshots need
-  row-level or page-level dirty tracking.
+- **Page-level change tracking**: `Changed<T>` is column-granular within each
+  archetype (a single row mutation marks that column's `changed_tick`).
+  Incremental snapshots need finer-grained page-level dirty tracking.
 
 ---
 
@@ -159,10 +159,14 @@ column-oriented access patterns and SIMD alignment.
 ### Key design decisions
 
 **Unit of flush: the dirty page, not the row.**
-BlobVec columns are already page-aligned (64-byte columns, mmap-backed via
-SlabPool). A "page" in the LSM is a contiguous range of rows within one
-archetype column. Dirty tracking is a bitset per page. Flush writes only dirty
-pages to L1.
+A "page" in the LSM is a contiguous range of rows within one archetype column.
+Dirty tracking is a bitset per page. Flush writes only dirty pages to L1.
+
+Note: BlobVec columns have 64-byte *alignment* (for SIMD), but are not
+page-aligned or mmap-backed by default — `WorldBuilder` falls back to
+`SystemAllocator` unless `memory_budget()` opts into `SlabPool`. Stage 3 will
+need new allocation/layout machinery to ensure columns are backed by
+page-aligned, mmap'd memory suitable for dirty-page tracking and O_DIRECT I/O.
 
 **WAL remains the source of truth for crash recovery.**
 The LSM is not a replacement for the WAL. The WAL captures the logical mutations
@@ -194,8 +198,8 @@ across levels. In Minkowski, the in-memory World IS the merged view.
 
 ### Dependencies on existing infrastructure
 
-- `SlabPool` page alignment → natural page boundary for dirty tracking
-- `BlobVec::changed_tick` → drives dirty detection (but needs page granularity)
+- `SlabPool` (when opted into via `WorldBuilder::memory_budget`) → mmap-backed, page-aligned
+- `BlobVec::changed_tick` (whole-column granularity) → drives dirty detection; needs page-level granularity for efficient flush
 - `CrcProof` → gates the zero-copy read path from mmap'd sorted runs
 - `CodecRegistry` → sorted runs use the same serialization as WAL/snapshots
 
@@ -281,10 +285,13 @@ world state. Instead of a monolithic snapshot (Stage 2), send the LSM L2/L3
 sorted runs + L1 delta + WAL tail. This is incremental — if the follower has
 a recent baseline, only the delta needs to transfer.
 
-**Reads can go to any replica.**
-`World::query_raw(&self)` (the shared-ref read path) requires no mutation. Any
-replica can serve reads. This is free linearizable reads for queries that don't
-need the absolute latest write — configurable staleness bound.
+**Follower reads with bounded staleness.**
+The internal `query_raw(&self)` method (used by the transaction system) requires
+no mutation — execution is side-effect-free. This means followers *can* serve
+reads, but without a read lease or leader round-trip to confirm the follower's
+commit index, they provide **bounded-staleness reads, not linearizable reads**.
+Linearizable reads require either routing to the leader or a read lease protocol.
+The staleness bound is configurable per query.
 
 ### New components
 
@@ -403,11 +410,20 @@ data across the network — only results travel.
 
 **Deterministic scheduling over 2PC.**
 Instead of two-phase commit for cross-shard transactions, use deterministic
-scheduling: all shards agree on the transaction order (via the consensus log),
-then each shard independently executes its portion. No coordination at execution
-time. Calvin/BOHM-style. This eliminates the serial coordination bottleneck of
-2PC at the cost of requiring all shards to process the full log (even entries
-they don't own, to maintain order). TigerBeetle uses this approach.
+scheduling: a **global sequencer** (shared log) assigns a total order to all
+cross-shard transactions. Each shard reads this shared log and independently
+executes its portion in the agreed order. No coordination at execution time.
+Calvin/BOHM-style.
+
+This is critical: per-shard consensus logs do NOT give a total order across
+shards. The global sequencer is the missing piece that makes deterministic
+cross-shard ordering possible. It can be implemented as a dedicated RSM group
+(a lightweight consensus group that only sequences transaction IDs, not data)
+or as a shared log service (e.g., Corfu/DELOS-style).
+
+This eliminates the serial coordination bottleneck of 2PC at the cost of
+requiring all shards to process the full log (even entries they don't own,
+to maintain order). TigerBeetle uses this approach.
 
 ### New components
 
@@ -417,7 +433,8 @@ they don't own, to maintain order). TigerBeetle uses this approach.
 | `ShardCoordinator` | Scatter-gather query execution across shards |
 | `CrossShardPlanner` | Extends `QueryPlanner` with shard-aware cost model |
 | `EntityMigrator` | Move entities between shards (spawn+despawn+route update) |
-| `DeterministicScheduler` | Order cross-shard transactions via shared log |
+| `GlobalSequencer` | Shared log assigning total order to cross-shard transactions |
+| `DeterministicScheduler` | Per-shard executor consuming the global sequence |
 
 ### Open questions
 
@@ -667,7 +684,9 @@ An ECS engine at Stage 7 has properties that a general-purpose database does not
    across entities. Sharding is structurally clean.
 
 3. **Query plans are push-down ready.** The existing `QueryPlanner` generates
-   execution plans that can be serialized and sent to remote shards.
+   structured execution plans (`PlanNode` tree) that could be made serializable
+   for remote shard dispatch. Plan serialization does not exist today — it is
+   a Stage 5 requirement.
 
 4. **Deterministic execution is already enforced.** The reducer determinism rule
    is a cultural and tooling convention, not a runtime check. RSM requires this
