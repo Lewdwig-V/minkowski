@@ -9,11 +9,12 @@
 
 1. [Stage 1: The Log](#stage-1-the-log) ✅
 2. [Stage 2: Snapshots](#stage-2-snapshots) ✅ (current)
-3. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage)
-4. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
-5. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
-6. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
-7. [Stage 7: Diagonal Scaling](#stage-7-diagonal-scaling)
+3. [Stage 2.5: SlabPool as the Only Allocator](#stage-25-slabpool-as-the-only-allocator)
+4. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage)
+5. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
+6. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
+7. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
+8. [Stage 7: Diagonal Scaling](#stage-7-diagonal-scaling)
 
 ---
 
@@ -99,9 +100,61 @@ The WAL and snapshots are properly integrated, not bolted on separately:
 
 ---
 
+## Stage 2.5: SlabPool as the Only Allocator
+
+**Status: Not started. Prerequisite for Stage 3.**
+
+**Goal**: Eliminate `SystemAllocator` — all BlobVec columns must be mmap-backed
+via `SlabPool`. This is a hard prerequisite for every subsequent stage.
+
+### Why this is necessary
+
+Every stage from 3 onwards assumes mmap-backed, page-aligned memory:
+
+| Stage | Assumption |
+|---|---|
+| 3 (LSM) | Dirty page tracking requires knowing page boundaries — `malloc`'d memory has no page structure |
+| 4 (RSM) | io_uring + O_DIRECT requires page-aligned buffers with `RLIMIT_MEMLOCK` |
+| 5 (Sharding) | Entity migration between shards copies page-aligned column slices |
+| 6 (Storage/Compute) | Demand-paged working set maps directly onto mmap pages |
+| 7 (Diagonal) | Object storage sorted runs are page-aligned for zero-copy load |
+
+Today, `WorldBuilder` defaults to `SystemAllocator` unless `memory_budget()` is
+called. This means most worlds in tests, examples, and user code use `malloc`'d
+memory. The `SlabPool` path is opt-in, not default.
+
+### What changes
+
+1. **Remove `SystemAllocator`** as a backing option for `BlobVec` columns.
+   All column storage goes through `SlabPool`.
+
+2. **`World::new()` allocates a default `SlabPool`** with a sensible default
+   budget (e.g., 256 MB). `WorldBuilder::memory_budget()` becomes a way to
+   tune the budget, not to opt into a different allocator.
+
+3. **Tests and examples** that currently use `World::new()` get `SlabPool`
+   automatically. Tests that need small worlds can use a small budget.
+
+4. **Remove the allocator abstraction** — one code path, one allocation model,
+   one set of invariants. This is a simplification, not a complication.
+
+### Migration risk
+
+- **Breaking change**: any user code that constructs `World::new()` will now
+  require `mmap` to succeed. Environments that restrict `mmap` (some containers,
+  WASM) need a plan. Options: (a) WASM gets a `malloc`-backed `SlabPool` shim,
+  (b) WASM is explicitly unsupported for persistent workloads.
+- **Default budget sizing**: too small and users hit `PoolExhausted` unexpectedly;
+  too large and the process reserves address space it never uses (virtual memory
+  is cheap, but `RLIMIT_MEMLOCK` is not).
+- **Miri compatibility**: Miri doesn't support `mmap` syscalls. The Miri test
+  suite (860 tests) will need a mock allocator or `cfg(miri)` fallback.
+
+---
+
 ## Stage 3: LSM Tree Storage
 
-**Status: Not started.**
+**Status: Not started. Prerequisites: Stage 2.5 (SlabPool-only allocation).**
 
 **Goal**: Incremental persistence. Only write what changed, not the entire world.
 
@@ -162,11 +215,8 @@ column-oriented access patterns and SIMD alignment.
 A "page" in the LSM is a contiguous range of rows within one archetype column.
 Dirty tracking is a bitset per page. Flush writes only dirty pages to L1.
 
-Note: BlobVec columns have 64-byte *alignment* (for SIMD), but are not
-page-aligned or mmap-backed by default — `WorldBuilder` falls back to
-`SystemAllocator` unless `memory_budget()` opts into `SlabPool`. Stage 3 will
-need new allocation/layout machinery to ensure columns are backed by
-page-aligned, mmap'd memory suitable for dirty-page tracking and O_DIRECT I/O.
+Stage 2.5 ensures all columns are mmap-backed via `SlabPool`, providing the
+page-aligned memory required for dirty-page tracking and O_DIRECT I/O.
 
 **WAL remains the source of truth for crash recovery.**
 The LSM is not a replacement for the WAL. The WAL captures the logical mutations
@@ -198,7 +248,7 @@ across levels. In Minkowski, the in-memory World IS the merged view.
 
 ### Dependencies on existing infrastructure
 
-- `SlabPool` (when opted into via `WorldBuilder::memory_budget`) → mmap-backed, page-aligned
+- `SlabPool` (mandatory after Stage 2.5) → mmap-backed, page-aligned
 - `BlobVec::changed_tick` (whole-column granularity) → drives dirty detection; needs page-level granularity for efficient flush
 - `CrcProof` → gates the zero-copy read path from mmap'd sorted runs
 - `CodecRegistry` → sorted runs use the same serialization as WAL/snapshots
@@ -749,25 +799,30 @@ An ECS engine at Stage 7 has properties that a general-purpose database does not
 ## Sequencing and Dependencies
 
 ```
- Stage 1 ──▶ Stage 2 ──▶ Stage 3 ──▶ Stage 4 ──▶ Stage 5 ──▶ Stage 6 ──▶ Stage 7
- The Log    Snapshots     LSM         RSM       Sharding    Storage/     Diagonal
-  (done)     (done)                                         Compute
-                           │                        │
-                           │            ┌───────────┘
-                           │            │
-                           ▼            ▼
-                     Stage 3 is    Stage 5 is
-                     prerequisite  prerequisite
-                     for Stage 4   for Stage 6
-                     (state        (sharding
-                     transfer)     creates the
-                                   need to
-                                   separate)
+ Stage 1 ──▶ Stage 2 ──▶ Stage 2.5 ──▶ Stage 3 ──▶ Stage 4 ──▶ Stage 5 ──▶ Stage 6 ──▶ Stage 7
+ The Log    Snapshots   SlabPool-     LSM         RSM       Sharding    Storage/     Diagonal
+  (done)     (done)      only                                           Compute
+                                       │                        │
+                                       │            ┌───────────┘
+                                       │            │
+                                       ▼            ▼
+                                 Stage 3 is    Stage 5 is
+                                 prerequisite  prerequisite
+                                 for Stage 4   for Stage 6
+                                 (state        (sharding
+                                 transfer)     creates the
+                                               need to
+                                               separate)
 ```
+
+**Stage 2.5 (SlabPool-only) is the immediate next step.** It's a prerequisite
+for Stage 3 — LSM dirty-page tracking requires mmap-backed, page-aligned
+columns. This is a breaking change that removes `SystemAllocator`, so do it
+first while the user base is small.
 
 **Stage 3 (LSM) is the critical path.** It blocks Stage 4 (efficient state
 transfer for new replicas) and is the foundation for Stage 6 (object storage
-as LSM backing store). Start here.
+as LSM backing store).
 
 **Stages 4 and 5 can partially overlap.** The consensus protocol (Stage 4) can
 be developed and tested with a single shard. Sharding (Stage 5) adds the
