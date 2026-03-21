@@ -293,15 +293,61 @@ commit index, they provide **bounded-staleness reads, not linearizable reads**.
 Linearizable reads require either routing to the leader or a read lease protocol.
 The staleness bound is configurable per query.
 
+**Unified I/O via io_uring (TigerBeetle pattern).**
+Following TigerBeetle's architecture, storage and network I/O should be
+unified into a single io_uring instance. A single `io_uring_enter` syscall
+can: write WAL frames to disk AND send replication packets to followers AND
+poll for client requests. This is not "use async I/O" — it's a fundamentally
+different architecture where storage writes and network sends are siblings in
+the same completion ring.
+
+Key properties:
+- **O_DIRECT + pre-allocated buffers**: bypass the kernel page cache, copy
+  data directly from network buffer → WAL file → state machine. `SlabPool`'s
+  mmap-backed allocation + `RLIMIT_MEMLOCK` prevents kernel swapping.
+- **Zero-copy pipeline**: `ReplicationBatch` bytes go from the network ring
+  buffer directly to the WAL segment file and then to `apply_batch` — no
+  intermediate deserialization/reserialization.
+- **Fixed-size, cache-aligned structures**: Minkowski already has this —
+  `BlobVec` is fixed-layout per component `Layout`, entity IDs are fixed
+  8 bytes, `SlabPool` pre-allocates all memory.
+
+**View changes do NOT drain the I/O ring.**
+This is a critical design constraint learned from TigerBeetle. When a view
+change (leader election) begins:
+
+1. The replica transitions state (e.g., `status=normal` → `status=view_change`)
+2. It **stops submitting new storage requests** for client transactions
+3. It **continues pumping the io_uring event loop** — processing completions
+   and submitting consensus protocol messages (StartViewChange, DoViewChange)
+4. Pending storage writes from the previous view remain in-flight within the
+   kernel/hardware
+
+When late completions arrive after the view change:
+- Check the completion's view ID against the current view
+- If the write is still valid in the new view, mark it as durable
+- If the view change truncated the log, safely discard the stale completion
+
+This pattern is analogous to Minkowski's generational entity IDs: a stale
+completion is like a stale entity handle — the generation (view ID) check
+catches it at O(1) cost without coordination.
+
+**Why this matters**: if view changes blocked on draining the ring, failover
+latency would be bounded by the slowest in-flight I/O. A "gray failure" — a
+disk that hasn't crashed but responds in 30 seconds — would hang the election
+for 30 seconds. By decoupling view changes from storage completions, failover
+is bounded by *network* latency (microseconds), not *storage* tail latency.
+
 ### New components
 
 | Component | Purpose |
 |---|---|
+| `IoRing` | Unified io_uring event loop for storage + network I/O (with kqueue/epoll fallback) |
 | `ReplicaGroup` | Manages the set of replicas, their states, and the consensus protocol |
-| `LogReplicator` | Sends `ReplicationBatch` entries from leader to followers |
+| `LogReplicator` | Sends `ReplicationBatch` entries from leader to followers via `IoRing` |
 | `ConsensusState` | VR protocol state: view number, op number, commit number, log |
 | `StateTransfer` | Sends LSM sorted runs to new/lagging replicas |
-| `LeaderElection` | VR view change protocol |
+| `LeaderElection` | VR view change protocol (non-blocking — does not drain I/O ring) |
 
 ### Dependencies on existing infrastructure
 
@@ -313,9 +359,10 @@ The staleness bound is configurable per query.
 
 ### Open questions
 
-1. **Network transport**: TCP, QUIC, or Unix domain sockets for local clusters?
-   TigerBeetle uses io_uring + custom protocol. Minkowski could start with TCP
-   and move to io_uring later.
+1. **io_uring bootstrapping**: io_uring requires Linux 5.6+. What's the
+   fallback for macOS/Windows development? Options: epoll fallback (TigerBeetle
+   uses kqueue on macOS), or require Linux for production with a simulated I/O
+   layer for dev/test.
 
 2. **Client interaction model**: do clients send mutation requests to the leader
    (command pattern) or send `ReplicationBatch` directly? The command pattern is
