@@ -353,11 +353,20 @@ the same completion ring.
 
 Key properties:
 - **O_DIRECT + pre-allocated buffers**: bypass the kernel page cache, copy
-  data directly from network buffer → WAL file → state machine. `SlabPool`'s
-  mmap-backed allocation + `RLIMIT_MEMLOCK` prevents kernel swapping.
-- **Zero-copy pipeline**: `ReplicationBatch` bytes go from the network ring
-  buffer directly to the WAL segment file and then to `apply_batch` — no
-  intermediate deserialization/reserialization.
+  data directly from network buffer → WAL file → state machine. Stage 2.5
+  ensures all columns are `SlabPool`/mmap-backed, but **pinning pages requires
+  `mlock`**, which is currently best-effort (`try_mlockall` falls back to
+  manual page-touch on failure). For io_uring O_DIRECT, pinned memory is
+  mandatory — Stage 4 must make `mlock` a hard requirement, not opt-in.
+  `RLIMIT_MEMLOCK` is only the kernel quota for how much can be locked; it
+  does not pin pages on its own.
+- **Zero-copy WAL write** (aspirational): today's `ReplicationBatch` is a
+  heap-backed `Vec<WalRecord>` that must be serialized via `to_bytes()` and
+  deserialized via `from_bytes()` — `apply_batch` accepts a parsed
+  `&ReplicationBatch`, not raw bytes. True zero-copy (network ring buffer →
+  WAL file → state machine with no decode step) requires a **new flat wire
+  format** where the on-wire representation IS the on-disk representation.
+  This is a Stage 4 deliverable, not an existing capability.
 - **Fixed-size, cache-aligned structures**: Minkowski already has this —
   `BlobVec` is fixed-layout per component `Layout`, entity IDs are fixed
   8 bytes, `SlabPool` pre-allocates all memory.
@@ -378,9 +387,22 @@ When late completions arrive after the view change:
 - If the write is still valid in the new view, mark it as durable
 - If the view change truncated the log, safely discard the stale completion
 
-This pattern is analogous to Minkowski's generational entity IDs: a stale
-completion is like a stale entity handle — the generation (view ID) check
-catches it at O(1) cost without coordination.
+**Critical caveat: fencing stale DMA writes.**
+"Discarding the stale completion" only discards the *acknowledgement* — the
+bytes may have already hit the disk via DMA before the CQE arrived. If the
+new leader reuses the same WAL offset for a new log entry, the old-view write
+races with the new-view write at the storage level. TigerBeetle solves this
+with **generation-isolated WAL slots**: each slot's header contains the view
+number, and the new leader explicitly overwrites stale slots before reusing
+them. Minkowski's WAL must adopt the same pattern — each WAL frame header
+needs a view field, and recovery must validate the view of every frame against
+the known view history to detect torn writes from view transitions.
+
+The analogy to generational entity IDs still holds: a stale WAL frame is like
+a stale entity handle — the generation (view number in the frame header)
+catches it. But unlike entity handles (which are checked at read time), WAL
+frames are checked at *recovery* time, so the cost of a missed check is
+silent data corruption, not a runtime error.
 
 **Why this matters**: if view changes blocked on draining the ring, failover
 latency would be bounded by the slowest in-flight I/O. A "gray failure" — a
