@@ -1895,6 +1895,44 @@ impl World {
         unsafe { arch.columns[col_idx].get_ptr(row) as *const u8 }
     }
 
+    /// Returns true if archetype `arch_idx` has any dirty pages in any column.
+    pub fn archetype_any_dirty(&self, arch_idx: usize) -> bool {
+        self.archetypes.archetypes[arch_idx].any_dirty()
+    }
+
+    /// Returns true if the column for `comp_id` in archetype `arch_idx` has any
+    /// dirty pages since the last flush.
+    pub fn column_any_dirty(&self, arch_idx: usize, comp_id: ComponentId) -> bool {
+        let arch = &self.archetypes.archetypes[arch_idx];
+        arch.column_index(comp_id)
+            .is_some_and(|col_idx| arch.columns[col_idx].dirty_pages.any_dirty())
+    }
+
+    /// Iterate dirty page indices for a specific column. Each page covers
+    /// [`PAGE_SIZE`](crate::storage::dirty_pages::PAGE_SIZE) rows.
+    pub fn column_dirty_pages(
+        &self,
+        arch_idx: usize,
+        comp_id: ComponentId,
+    ) -> Option<crate::storage::dirty_pages::DirtyPageIter<'_>> {
+        let arch = &self.archetypes.archetypes[arch_idx];
+        let col_idx = arch.column_index(comp_id)?;
+        Some(arch.columns[col_idx].dirty_pages.dirty_pages())
+    }
+
+    /// Clear all dirty page bits across every archetype and column.
+    /// Called after a successful persistence flush.
+    pub fn clear_all_dirty_pages(&mut self) {
+        for arch in &mut self.archetypes.archetypes {
+            arch.clear_dirty_pages();
+        }
+    }
+
+    /// Clear dirty page bits for a single archetype.
+    pub fn clear_archetype_dirty_pages(&mut self, arch_idx: usize) {
+        self.archetypes.archetypes[arch_idx].clear_dirty_pages();
+    }
+
     /// Component name (from `std::any::type_name`). Returns None if unregistered.
     pub fn component_name(&self, id: ComponentId) -> Option<&'static str> {
         if id < self.components.len() {
@@ -3822,6 +3860,108 @@ mod tests {
         for &e in &entities {
             assert!(seen.insert(e.index()), "duplicate entity index");
         }
+    }
+
+    // ── Dirty page tracking ────────────────────────────────────────
+
+    #[test]
+    fn spawn_marks_dirty_pages() {
+        let mut world = World::new();
+        let _e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let pos_id = world.component_id::<Pos>().unwrap();
+        assert!(world.archetype_any_dirty(0));
+        assert!(world.column_any_dirty(0, pos_id));
+
+        let pages: Vec<usize> = world.column_dirty_pages(0, pos_id).unwrap().collect();
+        assert_eq!(pages, vec![0]); // first row → page 0
+    }
+
+    #[test]
+    fn clear_dirty_pages_resets() {
+        let mut world = World::new();
+        let _e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let pos_id = world.component_id::<Pos>().unwrap();
+        assert!(world.archetype_any_dirty(0));
+
+        world.clear_all_dirty_pages();
+        assert!(!world.archetype_any_dirty(0));
+        assert!(!world.column_any_dirty(0, pos_id));
+    }
+
+    #[test]
+    fn get_mut_marks_dirty_page() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let pos_id = world.component_id::<Pos>().unwrap();
+        world.clear_all_dirty_pages();
+
+        let p = world.get_mut::<Pos>(e).unwrap();
+        p.x = 99.0;
+
+        assert!(world.column_any_dirty(0, pos_id));
+        let pages: Vec<usize> = world.column_dirty_pages(0, pos_id).unwrap().collect();
+        assert_eq!(pages, vec![0]);
+    }
+
+    #[test]
+    fn insert_overwrite_marks_dirty_page() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let pos_id = world.component_id::<Pos>().unwrap();
+        world.clear_all_dirty_pages();
+
+        world.insert(e, (Pos { x: 99.0, y: 0.0 },)).unwrap();
+        assert!(world.column_any_dirty(0, pos_id));
+    }
+
+    #[test]
+    fn despawn_marks_dirty_page_on_swap() {
+        let mut world = World::new();
+        let e0 = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let _e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let pos_id = world.component_id::<Pos>().unwrap();
+        world.clear_all_dirty_pages();
+
+        world.despawn(e0);
+        assert!(world.column_any_dirty(0, pos_id));
+    }
+
+    #[test]
+    fn clear_archetype_dirty_pages_is_targeted() {
+        let mut world = World::new();
+        let _e0 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let _e1 = world.spawn((Vel { dx: 1.0, dy: 2.0 },));
+
+        assert!(world.archetype_any_dirty(0));
+        assert!(world.archetype_any_dirty(1));
+
+        world.clear_archetype_dirty_pages(0);
+        assert!(!world.archetype_any_dirty(0));
+        assert!(world.archetype_any_dirty(1));
+    }
+
+    #[test]
+    fn changeset_apply_marks_dirty_pages() {
+        use crate::changeset::EnumChangeSet;
+
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.clear_all_dirty_pages();
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert::<Pos>(&mut world, e, Pos { x: 5.0, y: 5.0 });
+        cs.apply(&mut world).unwrap();
+
+        let pos_id = world.component_id::<Pos>().unwrap();
+        assert!(world.column_any_dirty(0, pos_id));
+    }
+
+    #[test]
+    fn column_dirty_pages_returns_none_for_missing_component() {
+        let mut world = World::new();
+        let _e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let vel_id = world.register_component::<Vel>();
+        assert!(world.column_dirty_pages(0, vel_id).is_none());
     }
 }
 

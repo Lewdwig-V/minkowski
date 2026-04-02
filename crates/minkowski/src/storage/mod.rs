@@ -2,4 +2,5 @@
 
 pub mod archetype;
 pub mod blob_vec;
+pub mod dirty_pages;
 pub mod sparse;

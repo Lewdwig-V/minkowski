@@ -94,6 +94,18 @@ impl Archetype {
             }
         }
     }
+
+    /// Returns true if any column in this archetype has dirty pages.
+    pub fn any_dirty(&self) -> bool {
+        self.columns.iter().any(|col| col.dirty_pages.any_dirty())
+    }
+
+    /// Clear dirty page bits for all columns. Called after a successful flush.
+    pub fn clear_dirty_pages(&mut self) {
+        for col in &mut self.columns {
+            col.dirty_pages.clear();
+        }
+    }
 }
 
 /// Collection of archetypes with lookup by component set.

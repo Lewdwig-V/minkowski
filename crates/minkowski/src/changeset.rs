@@ -804,6 +804,7 @@ impl EnumChangeSet {
                         }
                         std::ptr::copy_nonoverlapping(src, dst, size);
                     }
+                    col.mark_row_dirty(entry.row);
                 }
             }
         }
@@ -1033,6 +1034,7 @@ fn flush_insert_batch(
             }
             std::ptr::copy_nonoverlapping(src, dst, size);
         }
+        col.mark_row_dirty(row);
     }
     *batch = None;
 }

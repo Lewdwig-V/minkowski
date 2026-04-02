@@ -2,6 +2,7 @@ use std::alloc::Layout;
 use std::ptr::NonNull;
 
 use crate::pool::{PoolExhausted, SharedPool};
+use crate::storage::dirty_pages::DirtyPageTracker;
 use crate::tick::Tick;
 
 /// Type-erased growable array. Stores raw bytes with a known `Layout`.
@@ -13,6 +14,7 @@ pub(crate) struct BlobVec {
     len: usize,
     capacity: usize,
     pub(crate) changed_tick: Tick,
+    pub(crate) dirty_pages: DirtyPageTracker,
     pool: SharedPool,
 }
 
@@ -34,6 +36,16 @@ impl BlobVec {
     #[inline]
     pub(crate) fn mark_changed(&mut self, tick: Tick) {
         self.changed_tick = tick;
+    }
+
+    /// Mark the page containing `row` as dirty without advancing the column tick.
+    ///
+    /// Use this on write paths that call [`mark_changed`] once for a batch and
+    /// then write individual rows via [`get_ptr`]. The tick is already set for
+    /// the whole column; this records per-page granularity for incremental flush.
+    #[inline]
+    pub(crate) fn mark_row_dirty(&mut self, row: usize) {
+        self.dirty_pages.mark_row(row);
     }
 
     /// Creates a new `BlobVec` for items with the given layout and optional drop function.
@@ -65,6 +77,7 @@ impl BlobVec {
             len: 0,
             capacity,
             changed_tick: Tick::default(),
+            dirty_pages: DirtyPageTracker::new(),
             pool,
         }
     }
@@ -139,13 +152,15 @@ impl BlobVec {
         if self.len == self.capacity {
             self.grow();
         }
-        let dst = self.ptr_at(self.len);
+        let row = self.len;
+        let dst = self.ptr_at(row);
         let size = self.item_layout.size();
         if size > 0 {
             // SAFETY: caller guarantees ptr is valid for size bytes; dst is within allocated capacity
             unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
         }
         self.len += 1;
+        self.dirty_pages.mark_row(row);
     }
 
     /// Returns a raw pointer to the element at `row`.
@@ -180,6 +195,7 @@ impl BlobVec {
     pub unsafe fn get_ptr_mut(&mut self, row: usize, tick: Tick) -> *mut u8 {
         debug_assert!(row < self.len);
         self.changed_tick = tick;
+        self.dirty_pages.mark_row(row);
         self.ptr_at(row)
     }
 
@@ -201,6 +217,8 @@ impl BlobVec {
             let last_ptr = self.ptr_at(last);
             // SAFETY: last_ptr and row_ptr are non-overlapping valid pointers within allocation
             unsafe { std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size) };
+            // The destination page now contains different data.
+            self.dirty_pages.mark_row(row);
         } else if let Some(drop_fn) = self.drop_fn {
             // SAFETY: ptr_at returns valid pointer; drop_fn was set at construction for this type
             unsafe { drop_fn(self.ptr_at(row)) };
@@ -227,6 +245,7 @@ impl BlobVec {
                 let last_ptr = self.ptr_at(last);
                 // SAFETY: last_ptr and row_ptr are non-overlapping valid pointers
                 unsafe { std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size) };
+                self.dirty_pages.mark_row(row);
             }
         }
         self.len -= 1;
@@ -247,6 +266,7 @@ impl BlobVec {
             let last_ptr = self.ptr_at(last);
             // SAFETY: last_ptr and row_ptr are non-overlapping valid pointers within allocation
             unsafe { std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size) };
+            self.dirty_pages.mark_row(row);
         }
         self.len -= 1;
     }
@@ -282,6 +302,7 @@ impl BlobVec {
             let dst = self.ptr_at(dst_row);
             // SAFETY: src and dst are valid pointers within allocation; caller guarantees non-overlap semantics
             unsafe { std::ptr::copy_nonoverlapping(src, dst, size) };
+            self.dirty_pages.mark_row(dst_row);
         }
     }
 
@@ -368,13 +389,15 @@ impl BlobVec {
         if self.len == self.capacity {
             self.try_grow()?;
         }
-        let dst = self.ptr_at(self.len);
+        let row = self.len;
+        let dst = self.ptr_at(row);
         let size = self.item_layout.size();
         if size > 0 {
             // SAFETY: caller guarantees ptr is valid for size bytes; dst is within allocated capacity
             unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
         }
         self.len += 1;
+        self.dirty_pages.mark_row(row);
         Ok(())
     }
 
@@ -734,5 +757,105 @@ mod tests {
             bv.set_len(2);
         }
         // BlobVec::drop will now drop 2 remaining Tracked values
+    }
+
+    // ── Dirty page tracking ──────────────────────────────────────
+
+    #[test]
+    fn push_marks_page_dirty() {
+        let mut bv = bv_for::<u32>();
+        assert!(!bv.dirty_pages.any_dirty());
+        unsafe { push_val(&mut bv, 42u32) };
+        assert!(bv.dirty_pages.is_dirty(0));
+        assert_eq!(bv.dirty_pages.dirty_count(), 1);
+    }
+
+    #[test]
+    fn get_ptr_mut_marks_page_dirty() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 10u32);
+            push_val(&mut bv, 20u32);
+        }
+        bv.dirty_pages.clear();
+
+        unsafe { bv.get_ptr_mut(1, Tick::new(1)) };
+        assert!(bv.dirty_pages.is_dirty(0)); // row 1 → page 0
+    }
+
+    #[test]
+    fn swap_remove_marks_destination_page_dirty() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 10u32);
+            push_val(&mut bv, 20u32);
+            push_val(&mut bv, 30u32);
+        }
+        bv.dirty_pages.clear();
+
+        // Remove row 0 — row 2 swaps into row 0
+        unsafe { bv.swap_remove(0) };
+        assert!(bv.dirty_pages.is_dirty(0));
+    }
+
+    #[test]
+    fn swap_remove_last_does_not_mark_dirty() {
+        let mut bv = bv_for::<u32>();
+        unsafe { push_val(&mut bv, 10u32) };
+        bv.dirty_pages.clear();
+
+        // Remove the only element — no swap, just truncate
+        unsafe { bv.swap_remove(0) };
+        assert!(!bv.dirty_pages.any_dirty());
+    }
+
+    #[test]
+    fn swap_remove_no_drop_marks_dirty() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 10u32);
+            push_val(&mut bv, 20u32);
+        }
+        bv.dirty_pages.clear();
+
+        unsafe { bv.swap_remove_no_drop(0) };
+        assert!(bv.dirty_pages.is_dirty(0));
+    }
+
+    #[test]
+    fn copy_unchecked_marks_dst_dirty() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 10u32);
+            push_val(&mut bv, 20u32);
+        }
+        bv.dirty_pages.clear();
+
+        unsafe { bv.copy_unchecked(1, 0) };
+        assert!(bv.dirty_pages.is_dirty(0));
+    }
+
+    #[test]
+    fn mark_row_dirty_without_tick() {
+        let mut bv = bv_for::<u32>();
+        unsafe { push_val(&mut bv, 42u32) };
+        bv.dirty_pages.clear();
+
+        bv.mark_row_dirty(0);
+        assert!(bv.dirty_pages.is_dirty(0));
+        // Tick should not have changed
+        assert_eq!(bv.changed_tick, Tick::default());
+    }
+
+    #[test]
+    fn clear_dirty_pages_resets() {
+        let mut bv = bv_for::<u32>();
+        unsafe {
+            push_val(&mut bv, 10u32);
+            push_val(&mut bv, 20u32);
+        }
+        assert!(bv.dirty_pages.any_dirty());
+        bv.dirty_pages.clear();
+        assert!(!bv.dirty_pages.any_dirty());
     }
 }

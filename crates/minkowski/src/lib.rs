@@ -115,6 +115,7 @@ pub use reducer::{
     ReducerInfo, ReducerRegistry, Spawner, WritableRef, WriterQuery,
 };
 pub use retention::Expiry;
+pub use storage::dirty_pages::{DirtyPageIter, DirtyPageTracker, PAGE_SIZE};
 pub use tick::ChangeTick;
 pub use transaction::{
     Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, TransactError, Tx,
