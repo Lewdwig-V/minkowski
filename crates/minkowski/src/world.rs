@@ -438,7 +438,7 @@ impl World {
     ///
     /// # Panics
     ///
-    /// This method can still panic if the system allocator (used for internal
+    /// This method can still panic if the global allocator (used for internal
     /// metadata like entity location tables) runs out of memory. Only pool-backed
     /// storage (component columns) is covered by the `Result` return type.
     pub fn try_spawn<B: Bundle>(&mut self, bundle: B) -> Result<Entity, PoolExhausted> {
@@ -1852,7 +1852,7 @@ impl World {
     ///
     /// Call at the end of a level load or batch operation to release
     /// blocks and get an accurate `stats().pool_used` reading.
-    /// No-op for system-allocator worlds.
+    /// Call at the end of a level load or batch operation.
     pub fn flush_pool_caches(&mut self) {
         self.pool.flush_caches();
     }
@@ -1977,7 +1977,7 @@ use crate::pool::HugePages;
 ///
 /// let world = WorldBuilder::new().build().unwrap();
 /// let stats = world.stats();
-/// assert!(stats.pool_capacity.is_none()); // system allocator
+/// assert!(stats.pool_capacity.is_some()); // default 256 MiB SlabPool
 /// ```
 pub struct WorldBuilder {
     memory_budget: Option<usize>,
@@ -1994,8 +1994,11 @@ impl WorldBuilder {
         }
     }
 
-    /// Set a fixed memory budget in bytes. When set, the World will
-    /// allocate from a bounded [`SlabPool`] instead of the system allocator.
+    /// Set a fixed memory budget in bytes with pre-faulted pages.
+    ///
+    /// When set, the pool is sized to `bytes` and all pages are pre-faulted
+    /// into physical RAM at creation time. Without this, the default pool
+    /// (256 MiB, demand-paged) is used.
     pub fn memory_budget(mut self, bytes: usize) -> Self {
         self.memory_budget = Some(bytes);
         self
@@ -2034,7 +2037,7 @@ impl WorldBuilder {
         }
         let pool: SharedPool = match self.memory_budget {
             Some(bytes) => {
-                let slab = SlabPool::new(bytes, self.hugepages)?;
+                let slab = SlabPool::new(bytes, self.hugepages, true)?;
                 crate::pool::into_shared(slab)
             }
             None => default_pool(),
@@ -3544,19 +3547,19 @@ mod tests {
     // ── WorldBuilder tests ───────────────────────────────────────────
 
     #[test]
-    fn world_builder_default_is_system_allocator() {
+    fn world_builder_default_uses_slab_pool() {
         let world = World::builder().build().unwrap();
         let stats = world.stats();
-        assert!(stats.pool_capacity.is_none());
-        assert!(stats.pool_used.is_none());
+        assert_eq!(stats.pool_capacity, Some(crate::pool::DEFAULT_POOL_BUDGET));
+        assert_eq!(stats.pool_used, Some(0));
     }
 
     #[test]
-    fn world_new_still_works() {
+    fn world_new_uses_slab_pool() {
         let world = World::new();
         let stats = world.stats();
-        assert!(stats.pool_capacity.is_none());
-        assert!(stats.pool_used.is_none());
+        assert_eq!(stats.pool_capacity, Some(crate::pool::DEFAULT_POOL_BUDGET));
+        assert_eq!(stats.pool_used, Some(0));
     }
 
     #[test]
@@ -3609,7 +3612,7 @@ mod tests {
     // ── try_spawn / try_insert tests ────────────────────────────────
 
     #[test]
-    fn try_spawn_succeeds_with_system_allocator() {
+    fn try_spawn_succeeds_with_default_pool() {
         let mut world = World::new();
         let e = world.try_spawn((42u32,)).unwrap();
         assert_eq!(*world.get::<u32>(e).unwrap(), 42);
@@ -3635,7 +3638,7 @@ mod tests {
     }
 
     #[test]
-    fn try_insert_succeeds_with_system_allocator() {
+    fn try_insert_succeeds_with_default_pool() {
         let mut world = World::new();
         let e = world.spawn((42u32,));
         world.try_insert(e, (1.5f64,)).unwrap();

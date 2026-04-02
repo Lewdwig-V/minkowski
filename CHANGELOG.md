@@ -122,7 +122,7 @@
 
 - **TigerBeetle-style slab pool allocator** — `WorldBuilder` creates a World backed by a single mmap region with a fixed memory budget. Six size classes (64 B to 1 MB) with mutex-serialized free lists. Pre-fault fallback chain: `MAP_POPULATE` → `mlock` → manual page touch. Optional 2 MiB hugepage support via `HugePages::Try` / `HugePages::Require`.
 - **`try_spawn<B>()` / `try_insert<B>()`** — fallible spawn and insert that return `Err(PoolExhausted)` instead of crashing on pool exhaustion. Pre-check all column capacities before committing any state changes.
-- **`WorldBuilder`** — builder pattern for pool configuration: `memory_budget()`, `hugepages()`, `lock_all_memory()`. `World::new()` unchanged (system allocator, no budget).
+- **`WorldBuilder`** — builder pattern for pool configuration: `memory_budget()`, `hugepages()`, `lock_all_memory()`. `World::new()` uses a default 256 MiB demand-paged SlabPool.
 - **`try_mlockall()`** — opt-in `mlockall(MCL_CURRENT | MCL_FUTURE)` for dedicated database processes. Non-fatal on failure.
 - **Pool observability** — `WorldStats` gains `pool_capacity: Option<usize>` and `pool_used: Option<usize>`.
 - **Miri compatibility** — pool tests pass under Miri with Tree Borrows. Mmap region uses plain `MAP_PRIVATE|MAP_ANONYMOUS` under `cfg(miri)`, skipping unsupported syscalls (`MAP_POPULATE`, `mlock`).

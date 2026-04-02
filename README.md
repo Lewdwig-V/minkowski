@@ -180,7 +180,7 @@ durable.transact_with(&mut world, access, |scope| { /* TxScope: no world param n
 // Changeset written to WAL on successful commit
 ```
 
-**Persistence vs. the memory pool**: `Durable<S>` and `WorldBuilder`'s mmap pool solve different problems. The pool pre-allocates volatile RAM — anonymous `MAP_ANONYMOUS` pages that vanish when the process exits. It controls memory *layout and budget*, not durability. `Durable<S>` writes committed mutations to a WAL on *disk* before they're visible, giving crash safety. They compose naturally: a pooled World with `Durable<Optimistic>` gives crash-safe transactions within a fixed memory envelope. Use the pool alone for bounded in-memory workloads that don't need crash recovery. Use `Durable` alone for crash safety with the system allocator. Use both when you want both guarantees.
+**Persistence vs. the memory pool**: `Durable<S>` and `WorldBuilder`'s mmap pool solve different problems. The pool pre-allocates volatile RAM — anonymous `MAP_ANONYMOUS` pages that vanish when the process exits. It controls memory *layout and budget*, not durability. `Durable<S>` writes committed mutations to a WAL on *disk* before they're visible, giving crash safety. They compose naturally: a pooled World with `Durable<Optimistic>` gives crash-safe transactions within a fixed memory envelope. Use `memory_budget()` for bounded workloads with pre-faulted pages. Use `Durable` for crash safety. Use both when you want both guarantees.
 
 ## Schema & Mutation
 

@@ -71,13 +71,14 @@ fn main() {
         stats.pool_capacity.unwrap() as f64 / 1_048_576.0,
     );
 
-    // Show that the default builder (no budget) reports no pool stats
-    println!("\n--- Default World (system allocator, no pool) ---");
+    // Default World uses 256 MiB demand-paged SlabPool
+    println!("\n--- Default World (256 MiB SlabPool, demand-paged) ---");
     let default_world = World::new();
     let ds = default_world.stats();
     println!(
-        "pool_capacity: {:?}, pool_used: {:?}",
-        ds.pool_capacity, ds.pool_used
+        "Pool: {:.1} MB capacity, {:.1} KB used",
+        ds.pool_capacity.unwrap() as f64 / 1_048_576.0,
+        ds.pool_used.unwrap() as f64 / 1024.0,
     );
 
     println!("\nDone.");

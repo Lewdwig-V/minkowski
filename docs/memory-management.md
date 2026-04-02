@@ -22,7 +22,7 @@ match world.try_spawn((pos, vel)) {
 }
 ```
 
-The pool uses size-classed slab allocation (64 B to 1 MB) with a three-tier pre-fault chain: `MAP_POPULATE` → `mlock` → manual page touch. `World::new()` still works — it uses the system allocator with no budget limit.
+The pool uses size-classed slab allocation (64 B to 1 MB). All worlds use mmap-backed `SlabPool` — `World::new()` creates a 256 MiB demand-paged pool, while `WorldBuilder::memory_budget()` creates a pre-faulted pool with a specific budget and optional hugepage support.
 
 ## Blob Offloading
 

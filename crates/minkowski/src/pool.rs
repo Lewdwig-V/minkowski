@@ -1,9 +1,9 @@
-//! Memory pool allocator trait and implementations.
+//! Memory pool allocator trait and implementation.
 //!
 //! The pool allocator is the single backing allocator for all internal
 //! data structures (BlobVec, Arena, entity tables, sparse pages).
-//! Two implementations: `SystemAllocator` (current behavior, default)
-//! and `SlabPool` (TigerBeetle-style fixed budget with mmap).
+//! All allocations go through `SlabPool` — a TigerBeetle-style
+//! mmap-backed allocator with fixed budget and lock-free slab classes.
 
 use std::alloc::Layout;
 use std::fmt;
@@ -100,41 +100,13 @@ pub unsafe trait PoolAllocator: Send + Sync {
     /// but may still include blocks cached by other threads until they check
     /// in.
     ///
-    /// No-op for allocators without caching (e.g., `SystemAllocator`).
+    /// No-op for allocators without caching.
     fn flush_caches(&self) {}
 }
 
-/// Default allocator -- delegates to `std::alloc`. Unbounded, panics on OOM.
-/// This is the allocator used by `World::new()`.
-pub(crate) struct SystemAllocator;
-
-// SAFETY: SystemAllocator delegates to the global allocator which returns
-// properly aligned, non-overlapping memory regions. Zero-size allocations
-// return dangling aligned pointers (never passed to `std::alloc::dealloc`).
-unsafe impl PoolAllocator for SystemAllocator {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
-        if layout.size() == 0 {
-            // Zero-size: return dangling aligned pointer.
-            // `layout.align()` is guaranteed non-zero by Layout invariants.
-            return Ok(NonNull::new(layout.align() as *mut u8).expect("alignment is non-zero"));
-        }
-        // SAFETY: layout has non-zero size (checked above).
-        let ptr = unsafe { std::alloc::alloc(layout) };
-        NonNull::new(ptr).ok_or_else(|| {
-            // Preserve current behavior: panic on OOM for system allocator.
-            std::alloc::handle_alloc_error(layout)
-        })
-    }
-
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        if layout.size() == 0 {
-            return;
-        }
-        // SAFETY: caller guarantees `ptr` was returned by a prior `allocate`
-        // with the same layout, and `layout.size() > 0`.
-        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
-    }
-}
+/// Default pool budget: 256 MiB. Virtual address space is cheap on 64-bit;
+/// physical pages are demand-paged (no pre-faulting for the default pool).
+pub(crate) const DEFAULT_POOL_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Shared handle to a pool allocator. Cheaply cloneable.
 ///
@@ -148,10 +120,14 @@ pub(crate) type SharedPool = Arc<dyn PoolAllocator>;
 #[cfg(loom)]
 pub(crate) type SharedPool = Arc<Box<dyn PoolAllocator>>;
 
-/// Create the default (system) allocator as a shared pool.
+/// Create the default mmap-backed pool (256 MiB, demand-paged, no hugepages).
+///
+/// Panics if the mmap allocation fails (e.g., restricted container environment).
 #[allow(dead_code)]
 pub(crate) fn default_pool() -> SharedPool {
-    into_shared(SystemAllocator)
+    let pool = SlabPool::new(DEFAULT_POOL_BUDGET, HugePages::Off, false)
+        .expect("failed to allocate default 256 MiB memory pool via mmap");
+    into_shared(pool)
 }
 
 /// Wrap a concrete allocator into a `SharedPool`.
@@ -203,14 +179,19 @@ struct MmapRegion {
 }
 
 impl MmapRegion {
-    /// Create the mmap region with full pre-fault chain.
+    /// Create the mmap region.
+    ///
+    /// When `prefault` is true, pages are pre-faulted into physical RAM
+    /// via a three-step fallback chain (MAP_POPULATE → mlock → manual
+    /// touch). When false, pages are demand-paged by the OS — the first
+    /// access to each page triggers a soft fault.
     ///
     /// Miri only supports `mmap` with `MAP_PRIVATE|MAP_ANONYMOUS` — no
     /// `MAP_POPULATE`, `MAP_HUGETLB`, `mlock`, or `write_volatile` page
     /// touch. Under `cfg(miri)` we use plain `map_anon()` and skip
     /// pre-faulting entirely (there's no real VM subsystem to fault into).
     #[cfg(not(miri))]
-    fn new(size: usize, hugepages: HugePages) -> Result<Self, PoolExhausted> {
+    fn new(size: usize, hugepages: HugePages, prefault: bool) -> Result<Self, PoolExhausted> {
         use memmap2::MmapOptions;
         let layout = Layout::from_size_align(size, 1).expect("valid layout");
 
@@ -231,10 +212,20 @@ impl MmapRegion {
             }
         }
 
+        if !prefault {
+            // Lazy mode: demand-paged, no pre-faulting. The OS backs
+            // pages with physical RAM on first access (soft fault).
+            let mmap = MmapOptions::new()
+                .len(size)
+                .map_anon()
+                .map_err(|_| PoolExhausted { requested: layout })?;
+            return Ok(Self { mmap, huge: false });
+        }
+
         // Regular pages — pre-fault via fallback chain.
-        // Pre-faulting is NOT optional: we must know at startup whether
-        // the system can back the mapping with physical RAM. Three paths,
-        // tried in order of preference:
+        // Pre-faulting is NOT optional for bounded pools: we must know
+        // at startup whether the system can back the mapping with
+        // physical RAM. Three paths, tried in order of preference:
         //
         // 1. MAP_POPULATE — kernel pre-faults pages at mmap time.
         //    Fastest on native Linux, but can hang/fail on WSL2 or
@@ -270,7 +261,7 @@ impl MmapRegion {
 
     /// Miri-compatible path: plain `MAP_PRIVATE|MAP_ANONYMOUS` only.
     #[cfg(miri)]
-    fn new(size: usize, _hugepages: HugePages) -> Result<Self, PoolExhausted> {
+    fn new(size: usize, _hugepages: HugePages, _prefault: bool) -> Result<Self, PoolExhausted> {
         use memmap2::MmapOptions;
         let layout = Layout::from_size_align(size, 1).expect("valid layout");
         let mmap = MmapOptions::new()
@@ -482,8 +473,8 @@ unsafe impl Send for SlabPoolInner {}
 unsafe impl Sync for SlabPoolInner {}
 
 impl SlabPoolInner {
-    fn new(budget: usize, hugepages: HugePages) -> Result<Self, PoolExhausted> {
-        let mut region = MmapRegion::new(budget, hugepages)?;
+    fn new(budget: usize, hugepages: HugePages, prefault: bool) -> Result<Self, PoolExhausted> {
+        let mut region = MmapRegion::new(budget, hugepages, prefault)?;
 
         // Cache base pointer and length now. After this point we never
         // re-borrow the MmapMut — calling `as_ptr()` would create a
@@ -964,9 +955,16 @@ pub(crate) struct SlabPool {
 
 impl SlabPool {
     /// Create a new slab pool backed by an mmap region of `budget` bytes.
-    pub(crate) fn new(budget: usize, hugepages: HugePages) -> Result<Self, PoolExhausted> {
+    ///
+    /// When `prefault` is true, all pages are pre-faulted into physical
+    /// RAM at creation time. When false, pages are demand-paged by the OS.
+    pub(crate) fn new(
+        budget: usize,
+        hugepages: HugePages,
+        prefault: bool,
+    ) -> Result<Self, PoolExhausted> {
         Ok(Self {
-            inner: Arc::new(SlabPoolInner::new(budget, hugepages)?),
+            inner: Arc::new(SlabPoolInner::new(budget, hugepages, prefault)?),
         })
     }
 
@@ -1158,30 +1156,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_allocator_allocate_and_deallocate() {
-        let alloc = SystemAllocator;
-        let layout = Layout::from_size_align(256, 64).unwrap();
-        let ptr = alloc.allocate(layout).unwrap();
-        // SAFETY: ptr points to 256 bytes of allocated memory.
-        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0xAB, 256) };
-        // SAFETY: ptr was returned by `allocate` with this layout.
-        unsafe { alloc.deallocate(ptr, layout) };
-    }
-
-    #[test]
-    fn system_allocator_zero_size() {
-        let alloc = SystemAllocator;
-        let layout = Layout::from_size_align(0, 1).unwrap();
-        let ptr = alloc.allocate(layout).unwrap();
-        // SAFETY: ptr was returned by `allocate` with this layout (zero-size).
-        unsafe { alloc.deallocate(ptr, layout) };
-    }
-
-    #[test]
-    fn system_allocator_capacity_is_none() {
-        let alloc = SystemAllocator;
-        assert!(alloc.capacity().is_none());
-        assert!(alloc.used().is_none());
+    fn default_pool_is_slab_pool() {
+        let pool = default_pool();
+        assert_eq!(pool.capacity(), Some(DEFAULT_POOL_BUDGET));
+        assert_eq!(pool.used(), Some(0));
     }
 
     #[test]
@@ -1257,7 +1235,7 @@ mod tests {
 
     #[test]
     fn slab_pool_allocate_and_deallocate() {
-        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
         let layout = Layout::from_size_align(64, 64).unwrap();
         let ptr = pool.allocate(layout).unwrap();
         assert!(pool.used().unwrap() > 0);
@@ -1267,7 +1245,7 @@ mod tests {
 
     #[test]
     fn slab_pool_returns_error_on_exhaustion() {
-        let pool = SlabPool::new(64 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(64 * 1024, HugePages::Off, false).unwrap();
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         let mut ptrs = Vec::new();
@@ -1284,7 +1262,7 @@ mod tests {
 
     #[test]
     fn slab_pool_observability() {
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
         assert_eq!(pool.capacity(), Some(1024 * 1024));
         assert_eq!(pool.used(), Some(0));
 
@@ -1297,7 +1275,7 @@ mod tests {
 
     #[test]
     fn slab_pool_concurrent_allocate_no_duplicates() {
-        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off, false).unwrap());
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         let all_ptrs: Vec<Vec<usize>> = std::thread::scope(|s| {
@@ -1341,7 +1319,7 @@ mod tests {
 
     #[test]
     fn slab_pool_concurrent_alloc_dealloc_interleaved() {
-        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off, false).unwrap());
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         // Use std::thread::spawn (not scope) so threads fully exit and
@@ -1368,7 +1346,7 @@ mod tests {
 
     #[test]
     fn slab_pool_multiple_size_classes() {
-        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off, false).unwrap();
 
         let small = Layout::from_size_align(32, 8).unwrap();
         let medium = Layout::from_size_align(200, 8).unwrap();
@@ -1392,7 +1370,7 @@ mod tests {
 
     #[test]
     fn slab_pool_used_returns_to_zero_after_dealloc() {
-        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
         assert_eq!(pool.used(), Some(0));
 
         let layout = Layout::from_size_align(64, 64).unwrap();
@@ -1412,7 +1390,7 @@ mod tests {
 
     #[test]
     fn slab_pool_zero_size_allocation() {
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
         let layout = Layout::from_size_align(0, 1).unwrap();
         let ptr = pool.allocate(layout).unwrap();
         assert_eq!(pool.used(), Some(0), "ZST should not consume pool bytes");
@@ -1423,7 +1401,7 @@ mod tests {
 
     #[test]
     fn slab_pool_oversized_returns_error() {
-        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
         // 2 MB exceeds the largest size class (1 MB).
         let layout = Layout::from_size_align(2 * 1024 * 1024, 8).unwrap();
         assert!(pool.allocate(layout).is_err());
@@ -1434,7 +1412,7 @@ mod tests {
         // Verify that exhausting one size class DOES spill into the next
         // larger class (one step up). This replaced the old
         // no_cross_class_fallback test.
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
         // Exhaust class 0 (64B blocks) — overflow should kick in.
@@ -1462,7 +1440,7 @@ mod tests {
     #[test]
     fn slab_pool_overflow_to_next_class() {
         // Small pool so class 0 exhausts quickly.
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
         // Exhaust all classes by allocating until failure.
@@ -1495,7 +1473,7 @@ mod tests {
 
     #[test]
     fn slab_pool_overflow_dealloc_returns_to_correct_class() {
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
         // Exhaust class 0, forcing overflow to class 1.
@@ -1534,7 +1512,7 @@ mod tests {
     #[test]
     fn slab_pool_exhaust_both_target_and_overflow_class() {
         // Small pool: exhaust class 0 AND class 1, verify PoolExhausted.
-        let pool = SlabPool::new(512 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(512 * 1024, HugePages::Off, false).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap(); // class 0
         let layout_medium = Layout::from_size_align(200, 8).unwrap(); // class 1
 
@@ -1566,7 +1544,7 @@ mod tests {
     #[test]
     fn slab_pool_overflow_telemetry() {
         // Test overflow telemetry via global paths (bypassing TCache).
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
         // Exhaust class 0 to force overflow.
@@ -1599,7 +1577,7 @@ mod tests {
 
     #[test]
     fn slab_pool_largest_class_no_overflow() {
-        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off, false).unwrap();
         let layout_large = Layout::from_size_align(1_000_000, 8).unwrap(); // class 5
 
         // Exhaust class 5 (1MB blocks).
@@ -1623,7 +1601,7 @@ mod tests {
 
     #[test]
     fn slab_pool_concurrent_multi_class() {
-        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off, false).unwrap());
         let layout_small = Layout::from_size_align(64, 64).unwrap();
         let layout_large = Layout::from_size_align(4000, 8).unwrap();
 
@@ -1659,7 +1637,7 @@ mod tests {
     #[test]
     fn slab_pool_small_budget_empty_classes() {
         // 128KB budget — class 5 (1MB) gets zero blocks.
-        let pool = SlabPool::new(128 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(128 * 1024, HugePages::Off, false).unwrap();
         let layout_huge = Layout::from_size_align(1_000_000, 8).unwrap();
         assert!(pool.allocate(layout_huge).is_err());
 
@@ -1674,7 +1652,7 @@ mod tests {
     #[test]
     fn slab_pool_multi_class_used_bytes_tracking() {
         // Test exact used_bytes tracking via global paths (bypassing TCache).
-        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off, false).unwrap();
         assert_eq!(pool.used(), Some(0));
 
         let l0 = Layout::from_size_align(32, 8).unwrap(); // class 0 (64B)
@@ -1736,7 +1714,7 @@ mod tests {
 
     #[test]
     fn tcache_refill_and_hit() {
-        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         // First allocation triggers refill (16 blocks from global).
@@ -1767,7 +1745,7 @@ mod tests {
 
     #[test]
     fn tcache_spill_on_full() {
-        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         // Allocate enough blocks to fill the TCache bin on dealloc.
@@ -1797,7 +1775,7 @@ mod tests {
 
     #[test]
     fn tcache_epoch_flush() {
-        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         // Allocate 5 blocks (refill grabs 16 from global, returns 1, caches 15).
@@ -1833,7 +1811,7 @@ mod tests {
 
     #[test]
     fn tcache_cross_thread_dealloc() {
-        let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+        let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap());
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         // Thread A allocates.
@@ -1861,7 +1839,7 @@ mod tests {
 
     #[test]
     fn tcache_thread_exit_flushes() {
-        let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+        let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap());
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         let used_before = pool.used().unwrap();
@@ -1884,7 +1862,7 @@ mod tests {
 
     #[test]
     fn tcache_overflow_refill_correct_bin() {
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
         // Exhaust class 0 globally so refill overflows to class 1.
@@ -1914,7 +1892,7 @@ mod tests {
 
     #[test]
     fn tcache_concurrent_no_duplicates() {
-        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off, false).unwrap());
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         let all_ptrs: Vec<Vec<usize>> = std::thread::scope(|s| {
@@ -1983,7 +1961,7 @@ mod tests {
 
     #[test]
     fn tcache_rapid_fill_spill_cycles() {
-        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         // Repeated fill-spill cycles to stress the shift-down compaction.
@@ -2005,7 +1983,7 @@ mod tests {
 
     #[test]
     fn tcache_epoch_flush_dealloc_cached_blocks() {
-        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap();
+        let pool = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         // Allocate blocks then deallocate (blocks enter TCache via dealloc path).
@@ -2032,7 +2010,7 @@ mod tests {
 
     #[test]
     fn tcache_thread_exit_with_overflow_blocks() {
-        let pool = Arc::new(SlabPool::new(1024 * 1024, HugePages::Off).unwrap());
+        let pool = Arc::new(SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap());
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
         // Exhaust class 0 so refill overflows to class 1.
@@ -2064,7 +2042,7 @@ mod tests {
 
     #[test]
     fn tcache_epoch_flush_under_contention() {
-        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off, false).unwrap());
         let layout = Layout::from_size_align(64, 64).unwrap();
 
         std::thread::scope(|s| {
@@ -2099,7 +2077,7 @@ mod loom_tests {
     #[test]
     fn loom_concurrent_pop_no_duplicates() {
         loom::model(|| {
-            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap());
             let layout = Layout::from_size_align(64, 64).unwrap();
 
             let p1 = pool.clone();
@@ -2121,7 +2099,7 @@ mod loom_tests {
     #[test]
     fn loom_concurrent_push_no_lost_blocks() {
         loom::model(|| {
-            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap());
             let layout = Layout::from_size_align(64, 64).unwrap();
 
             // Allocate two blocks.
@@ -2149,7 +2127,7 @@ mod loom_tests {
     #[test]
     fn loom_push_pop_concurrent() {
         loom::model(|| {
-            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap());
             let layout = Layout::from_size_align(64, 64).unwrap();
 
             let ptr = pool.allocate(layout).unwrap();
