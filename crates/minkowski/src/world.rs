@@ -2028,7 +2028,7 @@ impl WorldBuilder {
     }
 
     /// Build the [`World`]. Returns `Err` if the memory pool cannot be
-    /// allocated (only possible with a bounded `memory_budget`).
+    /// allocated (mmap failure in the default pool or a bounded budget).
     pub fn build(self) -> Result<World, PoolExhausted> {
         if self.lock_all_memory {
             // mlockall failure is non-fatal — the pool's per-mapping
@@ -2040,7 +2040,7 @@ impl WorldBuilder {
                 let slab = SlabPool::new(bytes, self.hugepages, true)?;
                 crate::pool::into_shared(slab)
             }
-            None => default_pool(),
+            None => crate::pool::try_default_pool()?,
         };
         Ok(World::new_with_pool(pool))
     }
