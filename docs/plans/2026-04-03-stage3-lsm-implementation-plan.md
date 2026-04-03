@@ -277,7 +277,12 @@ pub struct BlockedBloomFilter {
 }
 ```
 
-- **Hash**: Kirsch-Mitzenmacher double-hashing via `splitmix64`
+- **Hash**: Enhanced double-hashing with per-word entropy via `splitmix64`.
+  `h1 = splitmix64(key ^ seed)` selects the block; `h2 = splitmix64(h1)` and
+  `h3 = splitmix64(h2)` generate per-word bit positions as
+  `bit_i = ((h2 >> (i*6)) ^ (h3 >> ((7-i)*6))) & 0x3F`. XOR-combining two
+  independent 6-bit slices at mirrored offsets gives each word full 0–63 range
+  and 12 bits of effective input entropy per position.
 - **Key**: `(ArchetypeId, page_index)` packed as `u64`
 - **Sizing**: 10 bits/key → ~0.84% FPR
 - **SIMD**: `#[repr(align(64))]` enables AVX2 `vpand`+`vpcmpeq` auto-vectorization

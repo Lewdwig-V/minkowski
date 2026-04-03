@@ -291,10 +291,19 @@ Bloom filter.
 0..63 within each word). SIMD-friendly: the compiler auto-vectorizes the 8-word
 AND+compare via AVX2/NEON with `target-cpu=native`.
 
-**Hash scheme** (Kirsch-Mitzenmacher double-hashing):
-- `h1 = splitmix64(key)` → block index (`h1 % num_blocks`)
-- `h2 = splitmix64(h1)` → 8 bit positions extracted as `(h2 >> (i*6)) & 0x3F`
-  for `i` in 0..8, one per word
+**Hash scheme** (enhanced double-hashing with per-word entropy):
+- `h1 = splitmix64(key ^ seed)` → block index (`h1 % num_blocks`)
+- `h2 = splitmix64(h1)` → bit positions for words 0–7
+- `h3 = splitmix64(h2)` → independent perturbation for per-word mixing
+- Bit position for word `i`: `bit_i = ((h2 >> (i*6)) ^ (h3 >> ((7-i)*6))) & 0x3F`
+
+Each word's bit position is derived from two independent 6-bit slices — one
+from `h2` at offset `i*6` and one from `h3` at the mirror offset `(7-i)*6`.
+XOR-combining them doubles the effective entropy per position (12 bits reduced
+to 6) and ensures every word can reach all 64 bit positions uniformly. This
+avoids the pitfall of standard enhanced double hashing (`g_i = h1 + i·h2 +
+i·(i+1)/2 mod m`) which, when applied mod 64 per word, collapses all entropy
+to `h2 % 64` and restricts reachable positions for words with even multipliers.
 
 **Sizing**: ~10 bits per expected key → ~1% false-positive rate. For *N* keys:
 `num_blocks = ceil(10 * N / 512)`. With 8 hashes in a 512-bit block and ~51
