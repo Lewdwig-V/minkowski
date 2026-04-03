@@ -12,7 +12,7 @@ cargo test -p minkowski -- entity      # Run tests matching a filter
 cargo clippy --workspace --all-targets -- -D warnings   # Lint (strict, warnings are errors)
 cargo fmt --all                                          # Format
 
-cargo bench -p minkowski-bench                      # All standardized benchmarks (simple_insert, simple_iter, fragmented_iter, heavy_compute, add_remove, schedule, serialize, reducer, planner)
+cargo bench -p minkowski-bench                      # All standardized benchmarks (simple_insert, simple_iter, fragmented_iter, heavy_compute, add_remove, schedule, serialize, reducer, planner, iter_micro)
 cargo bench -p minkowski-bench -- simple_iter       # Single scenario
 cargo bench -p minkowski-bench -- simple_iter/par   # Sub-benchmark filter
 cargo bench -p minkowski-persist       # Persistence benchmarks (snapshot save/load/zero-copy, WAL append)
@@ -174,7 +174,7 @@ Each unique set of component types gets an **Archetype** — a struct containing
 
 ### Column Alignment & Vectorization
 
-BlobVec columns are allocated with 64-byte alignment (cache line). `QueryIter::for_each_chunk` yields typed `&[T]` / `&mut [T]` slices per archetype — LLVM can auto-vectorize loops over these slices. Reducer handles (`QueryMut::for_each`, `QueryRef::for_each`, `DynamicCtx::for_each`) delegate to `for_each_chunk` internally.
+BlobVec columns are allocated with 64-byte alignment (cache line). `QueryIter::for_each_chunk` yields typed `&[T]` / `&mut [T]` slices per archetype — LLVM can auto-vectorize loops over these slices. `QueryIter::par_for_each_chunk` combines chunk-based slice access with rayon parallelism across archetypes — SIMD within each chunk, thread-level parallelism across chunks. Reducer handles (`QueryMut::for_each`, `QueryRef::for_each`, `DynamicCtx::for_each`) delegate to `for_each_chunk` internally.
 
 Component types that are 16-byte-aligned (e.g., `#[repr(align(16))]` or naturally `[f32; 4]`) vectorize better than odd-sized ones. The engine guarantees 64-byte column alignment; component layout determines whether LLVM can pack operations.
 

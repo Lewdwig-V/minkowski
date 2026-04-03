@@ -17,6 +17,9 @@ pub struct QueryIter<'w, Q: WorldQuery> {
     fetches: Vec<(Q::Fetch<'w>, usize)>, // (fetch_state, archetype_len)
     current_arch: usize,
     current_row: usize,
+    /// Cached total remaining items — decremented in `next()`, avoids
+    /// O(archetypes) recomputation in `size_hint()`.
+    remaining: usize,
     /// Whether we've already set the iterated flag (avoids repeated atomics).
     marked: bool,
     /// Shared flag set on first iteration. `None` for iterators created
@@ -28,10 +31,12 @@ pub struct QueryIter<'w, Q: WorldQuery> {
 impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
     /// Create an iterator without tick tracking (used by `query_raw`).
     pub(crate) fn new(fetches: Vec<(Q::Fetch<'w>, usize)>) -> Self {
+        let remaining = fetches.iter().map(|(_, len)| *len).sum();
         Self {
             fetches,
             current_arch: 0,
             current_row: 0,
+            remaining,
             iterated: None,
             marked: false,
             _marker: PhantomData,
@@ -43,10 +48,12 @@ impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
         fetches: Vec<(Q::Fetch<'w>, usize)>,
         iterated: Arc<AtomicBool>,
     ) -> Self {
+        let remaining = fetches.iter().map(|(_, len)| *len).sum();
         Self {
             fetches,
             current_arch: 0,
             current_row: 0,
+            remaining,
             iterated: Some(iterated),
             marked: false,
             _marker: PhantomData,
@@ -94,6 +101,24 @@ impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
             });
         }
     }
+
+    /// Iterate archetypes in parallel, yielding typed column slices per
+    /// archetype. Each invocation of `f` receives all matched rows in one
+    /// archetype as contiguous slices — combining SIMD auto-vectorization
+    /// (within a chunk) with rayon parallelism (across chunks).
+    pub fn par_for_each_chunk<F>(mut self, f: F)
+    where
+        F: Fn(Q::Slice<'_>) + Send + Sync,
+        for<'a> Q::Slice<'a>: Send,
+    {
+        self.mark_iterated();
+        self.fetches.par_iter().for_each(|(fetch, len)| {
+            if *len > 0 {
+                let slices = unsafe { Q::as_slice(fetch, *len) };
+                f(slices);
+            }
+        });
+    }
 }
 
 impl<'w, Q: WorldQuery> Iterator for QueryIter<'w, Q> {
@@ -108,6 +133,7 @@ impl<'w, Q: WorldQuery> Iterator for QueryIter<'w, Q> {
             if self.current_row < len {
                 let item = unsafe { Q::fetch(fetch, self.current_row) };
                 self.current_row += 1;
+                self.remaining -= 1;
                 self.mark_iterated();
                 return Some(item);
             }
@@ -117,12 +143,13 @@ impl<'w, Q: WorldQuery> Iterator for QueryIter<'w, Q> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining: usize = self.fetches[self.current_arch..]
-            .iter()
-            .map(|(_, len)| *len)
-            .sum::<usize>()
-            .saturating_sub(self.current_row);
-        (remaining, Some(remaining))
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<Q: WorldQuery> ExactSizeIterator for QueryIter<'_, Q> {
+    fn len(&self) -> usize {
+        self.remaining
     }
 }
 
@@ -307,6 +334,110 @@ mod tests {
             .query::<(&mut Pos, &Vel)>()
             .par_for_each(|(pos, vel)| {
                 pos.x += vel.dx;
+            });
+
+        let xs: Vec<f32> = world.query::<&Pos>().map(|p| p.x).collect();
+        for (i, x) in xs.iter().enumerate() {
+            assert_eq!(*x, i as f32 + 1.0);
+        }
+    }
+
+    #[test]
+    fn exact_size_iterator() {
+        let mut world = World::new();
+        for i in 0..50u32 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },));
+        }
+        let iter = world.query::<&Pos>();
+        assert_eq!(iter.len(), 50);
+        // size_hint and len agree
+        assert_eq!(iter.size_hint(), (50, Some(50)));
+    }
+
+    #[test]
+    fn exact_size_decrements() {
+        let mut world = World::new();
+        for i in 0..5u32 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },));
+        }
+        let mut iter = world.query::<&Pos>();
+        assert_eq!(iter.len(), 5);
+        iter.next();
+        assert_eq!(iter.len(), 4);
+        iter.next();
+        iter.next();
+        assert_eq!(iter.len(), 2);
+    }
+
+    #[test]
+    fn exact_size_multiple_archetypes() {
+        let mut world = World::new();
+        // Archetype 1: (Pos,)
+        for i in 0..3u32 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },));
+        }
+        // Archetype 2: (Pos, Vel)
+        for i in 0..7u32 {
+            world.spawn((
+                Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+                Vel { dx: 1.0, dy: 0.0 },
+            ));
+        }
+        let iter = world.query::<&Pos>();
+        assert_eq!(iter.len(), 10);
+    }
+
+    #[test]
+    fn par_for_each_chunk_sums_correctly() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let mut world = World::new();
+        for i in 0..1000u32 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },));
+        }
+
+        let sum = AtomicU32::new(0);
+        world.query::<&Pos>().par_for_each_chunk(|positions| {
+            let chunk_sum: f32 = positions.iter().map(|p| p.x).sum();
+            sum.fetch_add(chunk_sum as u32, Ordering::Relaxed);
+        });
+        assert_eq!(sum.load(Ordering::SeqCst), 499500);
+    }
+
+    #[test]
+    fn par_for_each_chunk_mutation() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((
+                Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+                Vel { dx: 1.0, dy: 0.0 },
+            ));
+        }
+
+        world
+            .query::<(&mut Pos, &Vel)>()
+            .par_for_each_chunk(|(positions, velocities)| {
+                for (pos, vel) in positions.iter_mut().zip(velocities.iter()) {
+                    pos.x += vel.dx;
+                }
             });
 
         let xs: Vec<f32> = world.query::<&Pos>().map(|p| p.x).collect();

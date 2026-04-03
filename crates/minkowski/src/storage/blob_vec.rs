@@ -13,6 +13,9 @@ pub(crate) struct BlobVec {
     data: NonNull<u8>,
     len: usize,
     capacity: usize,
+    /// Cached `item_layout.size() == 0` — avoids recalculating on every
+    /// `ptr_at` call in the hot path.
+    is_zst: bool,
     pub(crate) changed_tick: Tick,
     pub(crate) dirty_pages: DirtyPageTracker,
     pool: SharedPool,
@@ -71,6 +74,7 @@ impl BlobVec {
             (data, capacity)
         };
         Self {
+            is_zst: item_layout.size() == 0,
             item_layout,
             drop_fn,
             data,
@@ -319,7 +323,7 @@ impl BlobVec {
 
     #[inline]
     fn ptr_at(&self, index: usize) -> *mut u8 {
-        if self.item_layout.size() == 0 {
+        if self.is_zst {
             NonNull::dangling().as_ptr()
         } else {
             // <= because push() writes at index == len (within allocated capacity).

@@ -55,3 +55,7 @@ harness = false
 [[bench]]
 name = "planner"
 harness = false
+
+[[bench]]
+name = "iter_micro"
+harness = false
