@@ -8,11 +8,28 @@ use crate::schema::SchemaSection;
 /// A reference to a page within a sorted run.
 pub struct PageRef<'a> {
     /// Header describing the page metadata (owned copy, read from file).
-    pub header: PageHeader,
+    header: PageHeader,
     /// Raw page data bytes (full `PAGE_SIZE * item_size`, zero-padded).
-    pub data: &'a [u8],
+    data: &'a [u8],
     /// Absolute byte offset of this page's header within the file.
-    pub file_offset: u64,
+    file_offset: u64,
+}
+
+impl<'a> PageRef<'a> {
+    /// Header describing the page metadata.
+    pub fn header(&self) -> &PageHeader {
+        &self.header
+    }
+
+    /// Raw page data bytes (full `PAGE_SIZE * item_size`, zero-padded).
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Absolute byte offset of this page's header within the file.
+    pub fn file_offset(&self) -> u64 {
+        self.file_offset
+    }
 }
 
 // ── Internal mmap abstraction ───────────────────────────────────────────────
@@ -249,14 +266,14 @@ impl SortedRunReader {
     /// The CRC covers `row_count * item_size` bytes (the actual data, not
     /// zero-padding).
     pub fn validate_page_crc(&self, page: &PageRef<'_>) -> Result<(), LsmError> {
-        let item_size = self.item_size_for_slot(page.header.slot)?;
-        let actual_len = page.header.row_count as usize * item_size;
-        let computed = crc32fast::hash(&page.data[..actual_len]);
+        let item_size = self.item_size_for_slot(page.header().slot)?;
+        let actual_len = page.header().row_count as usize * item_size;
+        let computed = crc32fast::hash(&page.data()[..actual_len]);
 
-        if computed != page.header.page_crc32 {
+        if computed != page.header().page_crc32 {
             return Err(LsmError::Crc {
-                offset: page.file_offset,
-                expected: page.header.page_crc32,
+                offset: page.file_offset(),
+                expected: page.header().page_crc32,
                 actual: computed,
             });
         }
@@ -375,8 +392,8 @@ mod tests {
             .unwrap()
             .expect("page should exist");
 
-        assert!(page.header.row_count > 0);
-        assert!(!page.data.is_empty());
+        assert!(page.header().row_count > 0);
+        assert!(!page.data().is_empty());
     }
 
     #[test]

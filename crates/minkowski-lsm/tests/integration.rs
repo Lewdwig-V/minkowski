@@ -4,6 +4,7 @@ use minkowski::World;
 use minkowski_lsm::error::LsmError;
 use minkowski_lsm::format::{ENTITY_SLOT, PAGE_SIZE};
 use minkowski_lsm::reader::SortedRunReader;
+use minkowski_lsm::schema::SchemaEntry;
 use minkowski_lsm::writer::flush;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -61,25 +62,25 @@ fn round_trip_single_archetype() {
     // Check each component page.
     for entry in schema.entries() {
         let page = reader
-            .get_page(0, entry.slot, 0)
+            .get_page(0, entry.slot(), 0)
             .expect("get_page should not error")
             .expect("page must exist for slot");
-        assert_eq!(page.header.row_count, 5);
+        assert_eq!(page.header().row_count, 5);
 
         // Reconstruct expected bytes from world.
         let comp_id = world
             .archetype_component_ids(0)
             .iter()
-            .find(|&&cid| world.component_name(cid).unwrap() == entry.name)
+            .find(|&&cid| world.component_name(cid).unwrap() == entry.name())
             .copied()
             .expect("component must exist in archetype");
 
         let expected = world.column_page_bytes(0, comp_id, 0, 5).unwrap();
         assert_eq!(
-            &page.data[..expected.len()],
+            &page.data()[..expected.len()],
             expected,
             "data mismatch for component {}",
-            entry.name
+            entry.name()
         );
 
         reader.validate_page_crc(&page).unwrap();
@@ -90,12 +91,12 @@ fn round_trip_single_archetype() {
         .get_page(0, ENTITY_SLOT, 0)
         .expect("get_page should not error")
         .expect("entity page must exist");
-    assert_eq!(entity_page.header.row_count, 5);
+    assert_eq!(entity_page.header().row_count, 5);
 
     let entities = world.archetype_entities(0);
     for (i, &e) in entities.iter().enumerate() {
         let offset = i * 8;
-        let stored = u64::from_le_bytes(entity_page.data[offset..offset + 8].try_into().unwrap());
+        let stored = u64::from_le_bytes(entity_page.data()[offset..offset + 8].try_into().unwrap());
         assert_eq!(stored, e.to_bits(), "entity mismatch at index {i}");
     }
 }
@@ -121,7 +122,7 @@ fn round_trip_partial_page() {
         .expect("page must exist");
 
     // Verify row count.
-    assert_eq!(page.header.row_count, 100);
+    assert_eq!(page.header().row_count, 100);
 
     // Verify data bytes for valid rows match.
     let item_size = Layout::new::<Pos>().size();
@@ -129,12 +130,12 @@ fn round_trip_partial_page() {
     let expected = world
         .column_page_bytes(0, world.archetype_component_ids(0)[0], 0, 100)
         .unwrap();
-    assert_eq!(&page.data[..valid_len], expected);
+    assert_eq!(&page.data()[..valid_len], expected);
 
     // Verify padding beyond valid rows is zero.
     let full_len = PAGE_SIZE * item_size;
     assert!(
-        page.data[valid_len..full_len].iter().all(|&b| b == 0),
+        page.data()[valid_len..full_len].iter().all(|&b| b == 0),
         "padding bytes beyond row_count must be zero"
     );
 
@@ -249,34 +250,29 @@ fn crc_corruption_detected() {
     let dir = tempfile::tempdir().unwrap();
     let path = flush(&world, (0, 50), dir.path()).unwrap().unwrap();
 
-    // Read file, corrupt a byte in the middle of page data, write back.
-    let mut data = std::fs::read(&path).unwrap();
+    // Open the reader first to find a valid page's file_offset, then corrupt a
+    // byte well inside that page's data region.  We use offset 256, which is
+    // past the 64-byte file header, past any realistic schema section, and past
+    // the 16-byte page header — i.e. guaranteed to be inside page data for
+    // files with 10 entities.
+    let corrupt_offset: usize = 256;
 
-    // Page data starts after the file header (64 bytes) + schema section.
-    // Find the first page header — it's after the schema. The schema offset
-    // is at header byte 64, but we can just look for the first page by
-    // scanning past the schema. A simpler approach: corrupt a byte well into
-    // the file (past header + schema + page header = somewhere in page data).
-    // File is large enough that byte 200 is within page data.
-    let corrupt_offset = 200;
+    let mut data = std::fs::read(&path).unwrap();
     assert!(
         corrupt_offset < data.len(),
-        "file must be large enough to corrupt"
+        "file must be large enough to have page data at offset {corrupt_offset}"
     );
     data[corrupt_offset] ^= 0xFF; // flip all bits
     std::fs::write(&path, &data).unwrap();
 
-    // Open should succeed (header CRC may still be valid).
-    // But page CRC validation should fail.
-    // Note: if flipping byte 200 corrupted the header CRC region, open will
-    // fail with a CRC or Format error, which is also a valid corruption
-    // detection. We accept either page-level or header-level detection.
+    // Open may succeed (header CRC region ends at byte 40) or fail with a
+    // CRC/Format error if the corruption propagated to a covered region.
     match SortedRunReader::open(&path) {
         Ok(reader) => {
             // File opened — validate all page CRCs; at least one must fail.
             let mut found_corruption = false;
             for entry in reader.schema().entries() {
-                match reader.get_page(0, entry.slot, 0) {
+                match reader.get_page(0, entry.slot(), 0) {
                     Ok(Some(page)) if reader.validate_page_crc(&page).is_err() => {
                         found_corruption = true;
                     }
@@ -301,10 +297,68 @@ fn crc_corruption_detected() {
             );
         }
         Err(LsmError::Crc { .. } | LsmError::Format(_)) => {
-            // Header or format-level corruption detected — also acceptable.
+            // Header or total-file CRC corruption detected at open — acceptable.
         }
         Err(e) => panic!("unexpected error type: {e}"),
     }
+}
+
+#[test]
+fn header_crc_corruption_detected() {
+    let mut world = World::new();
+    for i in 0..5 {
+        world.spawn((Pos {
+            x: i as f32,
+            y: 0.0,
+        },));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = flush(&world, (0, 10), dir.path()).unwrap().unwrap();
+
+    // Corrupt byte 20, which falls in the `page_count` field of the file
+    // header (bytes 8-11: version, 12-15: schema_count, 16-23: page_count).
+    // This is within the 40-byte CRC-protected region but after the magic
+    // bytes (0-7), so the magic check passes but the header CRC fails.
+    let mut data = std::fs::read(&path).unwrap();
+    data[20] ^= 0xFF;
+    std::fs::write(&path, &data).unwrap();
+
+    let result = SortedRunReader::open(&path);
+    assert!(
+        matches!(result, Err(LsmError::Crc { .. })),
+        "expected CRC error for header byte corruption, got: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn empty_file_returns_format_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.run");
+    std::fs::write(&path, b"").unwrap();
+
+    let result = SortedRunReader::open(&path);
+    assert!(
+        matches!(result, Err(LsmError::Format(_))),
+        "expected Format error for empty file, got: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn truncated_file_returns_format_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short.run");
+    // 64 bytes — enough for a header but not the minimum 128 (header + footer).
+    std::fs::write(&path, [0u8; 64]).unwrap();
+
+    let result = SortedRunReader::open(&path);
+    assert!(
+        matches!(result, Err(LsmError::Format(_))),
+        "expected Format error for truncated file, got: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -320,7 +374,7 @@ fn schema_contains_correct_entries() {
     let pos_name = std::any::type_name::<Pos>();
     let vel_name = std::any::type_name::<Vel>();
 
-    let names: Vec<&str> = schema.entries().iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = schema.entries().iter().map(SchemaEntry::name).collect();
     assert!(names.contains(&pos_name), "schema must contain Pos name");
     assert!(names.contains(&vel_name), "schema must contain Vel name");
 
@@ -328,16 +382,16 @@ fn schema_contains_correct_entries() {
     let pos_entry = schema
         .entries()
         .iter()
-        .find(|e| e.name == pos_name)
+        .find(|e| e.name() == pos_name)
         .unwrap();
     let vel_entry = schema
         .entries()
         .iter()
-        .find(|e| e.name == vel_name)
+        .find(|e| e.name() == vel_name)
         .unwrap();
 
-    assert_eq!(pos_entry.item_size as usize, Layout::new::<Pos>().size());
-    assert_eq!(vel_entry.item_size as usize, Layout::new::<Vel>().size());
+    assert_eq!(pos_entry.item_size() as usize, Layout::new::<Pos>().size());
+    assert_eq!(vel_entry.item_size() as usize, Layout::new::<Vel>().size());
 }
 
 #[test]
@@ -376,7 +430,8 @@ fn sparse_index_finds_all_pages() {
             count - page_index * PAGE_SIZE
         };
         assert_eq!(
-            page.header.row_count, expected_rows as u16,
+            page.header().row_count,
+            expected_rows as u16,
             "page {page_index} row count mismatch"
         );
 
@@ -418,7 +473,7 @@ fn entity_pages_match_world() {
         .get_page(0, ENTITY_SLOT, 0)
         .expect("get_page should not error")
         .expect("entity page must exist");
-    assert_eq!(entity_page.header.row_count, 20);
+    assert_eq!(entity_page.header().row_count, 20);
 
     let entities = world.archetype_entities(0);
     assert_eq!(entities.len(), 20);
@@ -426,7 +481,7 @@ fn entity_pages_match_world() {
     for (i, &e) in entities.iter().enumerate() {
         let offset = i * 8;
         let stored_bits =
-            u64::from_le_bytes(entity_page.data[offset..offset + 8].try_into().unwrap());
+            u64::from_le_bytes(entity_page.data()[offset..offset + 8].try_into().unwrap());
         assert_eq!(
             stored_bits,
             e.to_bits(),
@@ -451,16 +506,20 @@ fn zst_component_round_trip() {
     // Schema should have one entry for the ZST component.
     assert_eq!(reader.schema().len(), 1);
     let entry = &reader.schema().entries()[0];
-    assert_eq!(entry.item_size, 0, "ZST component should have item_size 0");
+    assert_eq!(
+        entry.item_size(),
+        0,
+        "ZST component should have item_size 0"
+    );
 
     // ZST page should exist with row_count=5 but empty data region.
     let page = reader
-        .get_page(0, entry.slot, 0)
+        .get_page(0, entry.slot(), 0)
         .expect("get_page should not error")
         .expect("ZST page must exist");
-    assert_eq!(page.header.row_count, 5);
+    assert_eq!(page.header().row_count, 5);
     assert!(
-        page.data.is_empty(),
+        page.data().is_empty(),
         "ZST page data should be empty (0 * PAGE_SIZE = 0 bytes)"
     );
 
@@ -469,7 +528,7 @@ fn zst_component_round_trip() {
         .get_page(0, ENTITY_SLOT, 0)
         .expect("get_page should not error")
         .expect("entity page must exist");
-    assert_eq!(entity_page.header.row_count, 5);
+    assert_eq!(entity_page.header().row_count, 5);
 
     reader.validate_page_crc(&page).unwrap();
     reader.validate_page_crc(&entity_page).unwrap();

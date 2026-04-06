@@ -2,6 +2,7 @@ use std::io;
 
 /// Errors that can occur during LSM file operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LsmError {
     /// Underlying I/O error.
     Io(io::Error),

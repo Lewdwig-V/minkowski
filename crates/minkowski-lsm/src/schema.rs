@@ -8,10 +8,32 @@ use crate::format::ENTITY_SLOT;
 /// One entry in the schema section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaEntry {
-    pub slot: u16,
-    pub name: String,
-    pub item_size: u32,
-    pub item_align: u32,
+    pub(crate) slot: u16,
+    pub(crate) name: String,
+    pub(crate) item_size: u32,
+    pub(crate) item_align: u32,
+}
+
+impl SchemaEntry {
+    /// Component slot index within this sorted run.
+    pub fn slot(&self) -> u16 {
+        self.slot
+    }
+
+    /// Component type name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Size in bytes of each item.
+    pub fn item_size(&self) -> u32 {
+        self.item_size
+    }
+
+    /// Alignment in bytes of each item.
+    pub fn item_align(&self) -> u32 {
+        self.item_align
+    }
 }
 
 /// The complete schema section of a sorted run.
