@@ -241,7 +241,12 @@ pub fn flush(
         });
     }
 
-    // (e) Sparse index — entries are already sorted by construction.
+    // (e) Sparse index — sort by (arch_id, slot, page_index) so the reader
+    //     can binary-search.  Component pages are already sorted by their
+    //     write order, but entity pages (slot = ENTITY_SLOT) are appended
+    //     after all component pages, which breaks global sort order when
+    //     multiple archetypes are present.
+    index_entries.sort();
     let sparse_index_offset = w.stream_position()?;
     for entry in &index_entries {
         w.write_all(entry.as_bytes())?;
