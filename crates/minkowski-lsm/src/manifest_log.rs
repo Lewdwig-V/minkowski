@@ -25,7 +25,7 @@ const MAGIC_BYTES: [u8; 4] = *b"MKMF";
 const CURRENT_VERSION: u8 = 0x01;
 
 /// Total header size in bytes: 4 magic + 1 version + 3 reserved.
-#[expect(dead_code)]
+#[allow(dead_code)]
 const HEADER_SIZE: u64 = 8;
 
 /// Write the manifest log header at offset 0.
@@ -859,5 +859,8 @@ mod tests {
             .unwrap();
         let err = validate_header(&mut file).unwrap_err();
         assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("too short"), "got: {msg}");
+        }
     }
 }
