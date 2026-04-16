@@ -807,7 +807,7 @@ impl Wal {
 
     /// Number of segment files in the WAL directory.
     pub fn segment_count(&self) -> usize {
-        list_segments(&self.dir).map(|s| s.len()).unwrap_or(0)
+        list_segments(&self.dir).map_or(0, |s| s.len())
     }
 
     /// Start-seq of the oldest remaining segment, or `None` if no segments exist.

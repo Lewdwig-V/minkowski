@@ -300,6 +300,14 @@ impl SortedRunReader {
         self.index.len()
     }
 
+    /// Returns the sorted, deduplicated list of archetype IDs present in this sorted run.
+    pub fn archetype_ids(&self) -> Vec<u16> {
+        let mut ids: Vec<u16> = self.index.iter().map(|e| e.arch_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────────
 
     /// Item size in bytes for a given slot.
@@ -435,6 +443,26 @@ mod tests {
             matches!(result, Err(LsmError::Format(_))),
             "expected Format error for corrupted magic"
         );
+    }
+
+    #[test]
+    fn archetype_ids_returns_sorted_unique() {
+        let mut world = World::new();
+        // Create two archetypes
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.spawn((Vel { dx: 1.0, dy: 0.0 },));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = flush(&world, (0, 0), dir.path()).unwrap().unwrap();
+        let reader = SortedRunReader::open(&path).unwrap();
+
+        let ids = reader.archetype_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0] < ids[1]); // sorted
+        // No duplicates
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped);
     }
 
     #[test]
