@@ -640,7 +640,7 @@ impl World {
         // PERF: Non-vectorizable by design — drop_fn is opaque, memcpy is variable-size.
         // Batch wins via amortized archetype resolution, not SIMD.
         for (arch_idx, mut row_entities) in by_archetype {
-            row_entities.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            row_entities.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
             let archetype = &mut self.archetypes.archetypes[arch_idx];
 
             for &(row, _entity) in &row_entities {
