@@ -15,12 +15,12 @@ pub struct LsmManifest {
 /// Metadata for a single sorted run file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortedRunMeta {
-    pub(crate) path: PathBuf,
-    pub(crate) level: u8,
-    pub(crate) sequence_range: SeqRange,
-    pub(crate) archetype_coverage: Vec<u16>,
-    pub(crate) page_count: u64,
-    pub(crate) size_bytes: u64,
+    path: PathBuf,
+    pub(crate) level: u8, // stays pub(crate); promote_run mutates it directly — Task 5 removes it
+    sequence_range: SeqRange,
+    archetype_coverage: Vec<u16>,
+    page_count: u64,
+    size_bytes: u64,
 }
 
 impl SortedRunMeta {

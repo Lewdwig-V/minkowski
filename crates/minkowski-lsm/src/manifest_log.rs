@@ -179,12 +179,12 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
         ManifestEntry::AddRun { level, meta } => {
             buf.push(TAG_ADD_RUN);
             buf.push(*level);
-            encode_path(&mut buf, &meta.path)?;
-            buf.extend_from_slice(&meta.sequence_range.lo.0.to_le_bytes());
-            buf.extend_from_slice(&meta.sequence_range.hi.0.to_le_bytes());
-            encode_coverage(&mut buf, &meta.archetype_coverage)?;
-            buf.extend_from_slice(&meta.page_count.to_le_bytes());
-            buf.extend_from_slice(&meta.size_bytes.to_le_bytes());
+            encode_path(&mut buf, meta.path())?;
+            buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
+            encode_coverage(&mut buf, meta.archetype_coverage())?;
+            buf.extend_from_slice(&meta.page_count().to_le_bytes());
+            buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
         }
         ManifestEntry::RemoveRun { level, path } => {
             buf.push(TAG_REMOVE_RUN);
@@ -212,12 +212,12 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
         } => {
             buf.push(TAG_ADD_RUN_AND_SEQUENCE);
             buf.push(*level);
-            encode_path(&mut buf, &meta.path)?;
-            buf.extend_from_slice(&meta.sequence_range.lo.0.to_le_bytes());
-            buf.extend_from_slice(&meta.sequence_range.hi.0.to_le_bytes());
-            encode_coverage(&mut buf, &meta.archetype_coverage)?;
-            buf.extend_from_slice(&meta.page_count.to_le_bytes());
-            buf.extend_from_slice(&meta.size_bytes.to_le_bytes());
+            encode_path(&mut buf, meta.path())?;
+            buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
+            encode_coverage(&mut buf, meta.archetype_coverage())?;
+            buf.extend_from_slice(&meta.page_count().to_le_bytes());
+            buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
             buf.extend_from_slice(&next_sequence.to_le_bytes());
         }
     }
@@ -653,7 +653,7 @@ mod tests {
         .unwrap();
         log.append(&ManifestEntry::RemoveRun {
             level: 0,
-            path: meta.path,
+            path: meta.path().to_path_buf(),
         })
         .unwrap();
 
