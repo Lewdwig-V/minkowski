@@ -254,7 +254,6 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
 
             let meta = SortedRunMeta::new(
                 path,
-                level,
                 SeqRange::new(SeqNo(seq_lo), SeqNo(seq_hi))?,
                 coverage,
                 page_count,
@@ -313,7 +312,6 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
 
             let meta = SortedRunMeta::new(
                 path,
-                level,
                 SeqRange::new(SeqNo(seq_lo), SeqNo(seq_hi))?,
                 coverage,
                 page_count,
@@ -473,7 +471,6 @@ mod tests {
     fn test_meta(name: &str) -> SortedRunMeta {
         SortedRunMeta::new(
             PathBuf::from(name),
-            0,
             SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
             vec![0, 3, 7],
             42,
@@ -484,8 +481,7 @@ mod tests {
 
     #[test]
     fn encode_decode_add_run() {
-        let mut meta = test_meta("10-20.run");
-        meta.level = 1;
+        let meta = test_meta("10-20.run");
         let entry = ManifestEntry::AddRun { level: 1, meta };
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();
@@ -527,8 +523,7 @@ mod tests {
 
     #[test]
     fn encode_decode_add_run_and_sequence() {
-        let mut meta = test_meta("atomic.run");
-        meta.level = 0;
+        let meta = test_meta("atomic.run");
         let entry = ManifestEntry::AddRunAndSequence {
             level: 0,
             meta,

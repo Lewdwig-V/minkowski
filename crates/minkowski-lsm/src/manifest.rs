@@ -16,7 +16,6 @@ pub struct LsmManifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortedRunMeta {
     path: PathBuf,
-    pub(crate) level: u8, // stays pub(crate); promote_run mutates it directly — Task 5 removes it
     sequence_range: SeqRange,
     archetype_coverage: Vec<u16>,
     page_count: u64,
@@ -26,10 +25,6 @@ pub struct SortedRunMeta {
 impl SortedRunMeta {
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    pub fn level(&self) -> u8 {
-        self.level
     }
 
     pub fn sequence_range(&self) -> SeqRange {
@@ -59,7 +54,6 @@ impl SortedRunMeta {
     /// has a non-empty header).
     pub fn new(
         path: PathBuf,
-        level: u8,
         sequence_range: SeqRange,
         archetype_coverage: Vec<u16>,
         page_count: u64,
@@ -75,7 +69,6 @@ impl SortedRunMeta {
         }
         Ok(Self {
             path,
-            level,
             sequence_range,
             archetype_coverage,
             page_count,
@@ -114,14 +107,13 @@ impl LsmManifest {
         to_level: u8,
         path: &Path,
     ) -> Result<(), LsmError> {
-        let mut meta = self.remove_run(from_level, path).ok_or_else(|| {
+        let meta = self.remove_run(from_level, path).ok_or_else(|| {
             LsmError::Format(format!(
                 "run {} not found at level {}",
                 path.display(),
                 from_level
             ))
         })?;
-        meta.level = to_level;
         self.add_run(to_level, meta);
         Ok(())
     }
@@ -162,10 +154,9 @@ mod tests {
     use super::*;
     use crate::types::{SeqNo, SeqRange};
 
-    fn test_meta(name: &str, level: u8) -> SortedRunMeta {
+    fn test_meta(name: &str) -> SortedRunMeta {
         SortedRunMeta::new(
             PathBuf::from(name),
-            level,
             SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
             vec![0],
             1,
@@ -187,7 +178,7 @@ mod tests {
     #[test]
     fn add_run_places_at_correct_level() {
         let mut m = LsmManifest::new();
-        let meta = test_meta("run_l1.sst", 1);
+        let meta = test_meta("run_l1.sst");
         m.add_run(1, meta.clone());
         assert_eq!(m.runs_at_level(1), &[meta]);
         assert!(m.runs_at_level(0).is_empty());
@@ -196,7 +187,7 @@ mod tests {
     #[test]
     fn remove_run_by_path() {
         let mut m = LsmManifest::new();
-        let meta = test_meta("run_a.sst", 0);
+        let meta = test_meta("run_a.sst");
         m.add_run(0, meta.clone());
         let removed = m.remove_run(0, Path::new("run_a.sst"));
         assert_eq!(removed, Some(meta));
@@ -212,13 +203,12 @@ mod tests {
     #[test]
     fn promote_run_moves_between_levels() {
         let mut m = LsmManifest::new();
-        let meta = test_meta("run_x.sst", 0);
+        let meta = test_meta("run_x.sst");
         m.add_run(0, meta);
         m.promote_run(0, 1, Path::new("run_x.sst")).unwrap();
         assert!(m.runs_at_level(0).is_empty());
-        let promoted = &m.runs_at_level(1)[0];
-        assert_eq!(promoted.path(), Path::new("run_x.sst"));
-        assert_eq!(promoted.level(), 1);
+        assert_eq!(m.runs_at_level(1).len(), 1);
+        assert_eq!(m.runs_at_level(1)[0].path(), Path::new("run_x.sst"));
     }
 
     #[test]
@@ -231,8 +221,8 @@ mod tests {
     #[test]
     fn all_run_paths_collects_all_levels() {
         let mut m = LsmManifest::new();
-        m.add_run(0, test_meta("l0.sst", 0));
-        m.add_run(2, test_meta("l2.sst", 2));
+        m.add_run(0, test_meta("l0.sst"));
+        m.add_run(2, test_meta("l2.sst"));
         let paths = m.all_run_paths();
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&Path::new("l0.sst")));
@@ -242,9 +232,9 @@ mod tests {
     #[test]
     fn total_runs_counts_correctly() {
         let mut m = LsmManifest::new();
-        m.add_run(0, test_meta("a.sst", 0));
-        m.add_run(0, test_meta("b.sst", 0));
-        m.add_run(2, test_meta("c.sst", 2));
+        m.add_run(0, test_meta("a.sst"));
+        m.add_run(0, test_meta("b.sst"));
+        m.add_run(2, test_meta("c.sst"));
         assert_eq!(m.total_runs(), 3);
     }
 
@@ -259,7 +249,6 @@ mod tests {
     fn sorted_run_meta_new_accepts_valid_input() {
         let meta = SortedRunMeta::new(
             PathBuf::from("0-10.run"),
-            0,
             SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
             vec![0, 3, 7],
             1,
@@ -274,7 +263,6 @@ mod tests {
     fn sorted_run_meta_new_rejects_unsorted_coverage() {
         let result = SortedRunMeta::new(
             PathBuf::from("x.run"),
-            0,
             SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
             vec![3, 1, 2],
             1,
@@ -287,7 +275,6 @@ mod tests {
     fn sorted_run_meta_new_rejects_duplicated_coverage() {
         let result = SortedRunMeta::new(
             PathBuf::from("x.run"),
-            0,
             SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
             vec![1, 2, 2, 3],
             1,
@@ -300,7 +287,6 @@ mod tests {
     fn sorted_run_meta_new_accepts_empty_coverage() {
         let meta = SortedRunMeta::new(
             PathBuf::from("x.run"),
-            0,
             SeqRange::new(SeqNo(0), SeqNo(0)).unwrap(),
             vec![],
             1,
@@ -314,7 +300,6 @@ mod tests {
     fn sorted_run_meta_new_rejects_zero_page_count() {
         let result = SortedRunMeta::new(
             PathBuf::from("x.run"),
-            0,
             SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
             vec![0],
             0,

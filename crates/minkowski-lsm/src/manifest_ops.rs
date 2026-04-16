@@ -33,7 +33,6 @@ pub fn flush_and_record(
 
     let meta = SortedRunMeta::new(
         path.clone(),
-        0,
         reader.sequence_range(),
         archetype_coverage,
         reader.page_count(),
@@ -162,7 +161,6 @@ mod tests {
             0,
             SortedRunMeta::new(
                 dir.path().join("0-10.run"),
-                0,
                 SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
                 vec![0],
                 1,
