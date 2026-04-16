@@ -37,8 +37,8 @@ impl fmt::Display for SeqNo {
 /// range (syntactically allowed, not currently produced by any code path).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct SeqRange {
-    pub lo: SeqNo,
-    pub hi: SeqNo,
+    pub(crate) lo: SeqNo,
+    pub(crate) hi: SeqNo,
 }
 
 impl SeqRange {
@@ -117,8 +117,8 @@ mod tests {
     #[test]
     fn seqrange_accepts_lo_less_than_hi() {
         let r = SeqRange::new(SeqNo(0), SeqNo(10)).unwrap();
-        assert_eq!(r.lo.0, 0);
-        assert_eq!(r.hi.0, 10);
+        assert_eq!(r.lo, SeqNo(0));
+        assert_eq!(r.hi, SeqNo(10));
     }
 
     #[test]

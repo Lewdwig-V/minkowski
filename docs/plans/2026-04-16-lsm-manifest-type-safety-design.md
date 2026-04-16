@@ -51,7 +51,7 @@ impl fmt::Display for SeqNo { /* ... */ }
 /// `lo <= hi`. `hi == lo` represents an empty range (not currently
 /// produced by any code path but syntactically allowed).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct SeqRange { pub lo: SeqNo, pub hi: SeqNo }
+pub struct SeqRange { pub(crate) lo: SeqNo, pub(crate) hi: SeqNo }
 
 impl SeqRange {
     pub fn new(lo: SeqNo, hi: SeqNo) -> Result<Self, LsmError> {
@@ -86,7 +86,7 @@ impl Level {
 
 Design notes:
 
-- `SeqNo` is transparent (pub field) because the type's only job is nominal distinction. `Level` keeps its `u8` private because the bounds invariant is the whole point.
+- `SeqNo` is transparent (pub field) because the type's only job is nominal distinction. `SeqRange` fields are `pub(crate)` — the invariant (`lo <= hi`) must flow through `SeqRange::new`; downstream code still reads via field syntax within the crate. `Level` keeps its `u8` private because the bounds invariant is the whole point.
 - No arithmetic impls on `SeqNo` — seq numbers aren't scalar quantities. Callers that need "next seq" explicitly go through `SeqNo(x.0 + 1)` or via `SeqRange.hi`.
 - `Level` has associated consts `L0..L3` for code that knows the level at compile time, avoiding an `.unwrap()` on `Level::new(0)`.
 - `NUM_LEVELS` stays a constant. Bumping to 5 or 6 in the future is a one-line change; no `match Level` to update.
