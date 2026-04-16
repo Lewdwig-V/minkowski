@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::error::LsmError;
 use crate::format::*;
 use crate::schema::SchemaSection;
+use crate::types::{SeqNo, SeqRange};
 
 /// A reference to a page within a sorted run.
 pub struct PageRef<'a> {
@@ -57,7 +58,7 @@ pub struct SortedRunReader {
     data: MappedData,
     schema: SchemaSection,
     index: Vec<IndexEntry>,
-    sequence_range: (u64, u64),
+    sequence_range: SeqRange,
     page_count: u64,
 }
 
@@ -68,7 +69,7 @@ const MIN_FILE_SIZE: usize = 128;
 struct ParsedMetadata {
     schema: SchemaSection,
     index: Vec<IndexEntry>,
-    sequence_range: (u64, u64),
+    sequence_range: SeqRange,
     page_count: u64,
 }
 
@@ -112,7 +113,13 @@ fn validate_and_parse(buf: &[u8]) -> Result<ParsedMetadata, LsmError> {
     }
 
     let schema_count = header.schema_count;
-    let sequence_range = (header.sequence_lo, header.sequence_hi);
+    let sequence_range = SeqRange::new(SeqNo(header.sequence_lo), SeqNo(header.sequence_hi))
+        .map_err(|_| {
+            LsmError::Format(format!(
+                "header sequence range invalid: lo={} > hi={}",
+                header.sequence_lo, header.sequence_hi
+            ))
+        })?;
     let page_count = header.page_count;
 
     // 5. Read footer (last 64 bytes).
@@ -286,7 +293,7 @@ impl SortedRunReader {
     }
 
     /// WAL sequence range covered by this sorted run.
-    pub fn sequence_range(&self) -> (u64, u64) {
+    pub fn sequence_range(&self) -> SeqRange {
         self.sequence_range
     }
 
@@ -381,7 +388,10 @@ mod tests {
         let (_dir, path, _world) = flush_world_with_pos(5);
         let reader = SortedRunReader::open(&path).unwrap();
 
-        assert_eq!(reader.sequence_range(), (10, 20));
+        assert_eq!(
+            reader.sequence_range(),
+            SeqRange::new(SeqNo(10), SeqNo(20)).unwrap()
+        );
         assert_eq!(reader.schema().len(), 1); // Pos only
         assert!(reader.page_count() > 0);
         assert!(reader.index_len() > 0);

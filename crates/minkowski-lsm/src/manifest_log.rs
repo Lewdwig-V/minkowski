@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
+use crate::types::{SeqNo, SeqRange};
 
 // ── Entry type ──────────────────────────────────────────────────────────────
 
@@ -179,8 +180,8 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.push(TAG_ADD_RUN);
             buf.push(*level);
             encode_path(&mut buf, &meta.path)?;
-            buf.extend_from_slice(&meta.sequence_range.0.to_le_bytes());
-            buf.extend_from_slice(&meta.sequence_range.1.to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range.lo.0.to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range.hi.0.to_le_bytes());
             encode_coverage(&mut buf, &meta.archetype_coverage)?;
             buf.extend_from_slice(&meta.page_count.to_le_bytes());
             buf.extend_from_slice(&meta.size_bytes.to_le_bytes());
@@ -212,8 +213,8 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.push(TAG_ADD_RUN_AND_SEQUENCE);
             buf.push(*level);
             encode_path(&mut buf, &meta.path)?;
-            buf.extend_from_slice(&meta.sequence_range.0.to_le_bytes());
-            buf.extend_from_slice(&meta.sequence_range.1.to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range.lo.0.to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range.hi.0.to_le_bytes());
             encode_coverage(&mut buf, &meta.archetype_coverage)?;
             buf.extend_from_slice(&meta.page_count.to_le_bytes());
             buf.extend_from_slice(&meta.size_bytes.to_le_bytes());
@@ -251,17 +252,15 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             let page_count = read_u64_le(data, &mut offset)?;
             let size_bytes = read_u64_le(data, &mut offset)?;
 
-            Ok(ManifestEntry::AddRun {
+            let meta = SortedRunMeta::new(
+                path,
                 level,
-                meta: SortedRunMeta {
-                    path,
-                    level,
-                    sequence_range: (seq_lo, seq_hi),
-                    archetype_coverage: coverage,
-                    page_count,
-                    size_bytes,
-                },
-            })
+                SeqRange::new(SeqNo(seq_lo), SeqNo(seq_hi))?,
+                coverage,
+                page_count,
+                size_bytes,
+            )?;
+            Ok(ManifestEntry::AddRun { level, meta })
         }
         TAG_REMOVE_RUN => {
             if offset >= data.len() {
@@ -312,16 +311,17 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             let size_bytes = read_u64_le(data, &mut offset)?;
             let next_sequence = read_u64_le(data, &mut offset)?;
 
+            let meta = SortedRunMeta::new(
+                path,
+                level,
+                SeqRange::new(SeqNo(seq_lo), SeqNo(seq_hi))?,
+                coverage,
+                page_count,
+                size_bytes,
+            )?;
             Ok(ManifestEntry::AddRunAndSequence {
                 level,
-                meta: SortedRunMeta {
-                    path,
-                    level,
-                    sequence_range: (seq_lo, seq_hi),
-                    archetype_coverage: coverage,
-                    page_count,
-                    size_bytes,
-                },
+                meta,
                 next_sequence,
             })
         }
@@ -471,14 +471,15 @@ mod tests {
     use super::*;
 
     fn test_meta(name: &str) -> SortedRunMeta {
-        SortedRunMeta {
-            path: PathBuf::from(name),
-            level: 0,
-            sequence_range: (10, 20),
-            archetype_coverage: vec![0, 3, 7],
-            page_count: 42,
-            size_bytes: 8192,
-        }
+        SortedRunMeta::new(
+            PathBuf::from(name),
+            0,
+            SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+            vec![0, 3, 7],
+            42,
+            8192,
+        )
+        .unwrap()
     }
 
     #[test]

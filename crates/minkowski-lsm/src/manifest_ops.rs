@@ -31,14 +31,14 @@ pub fn flush_and_record(
     let file_size = fs::metadata(&path)?.len();
     let archetype_coverage = reader.archetype_ids();
 
-    let meta = SortedRunMeta {
-        path: path.clone(),
-        level: 0,
-        sequence_range: reader.sequence_range(),
+    let meta = SortedRunMeta::new(
+        path.clone(),
+        0,
+        reader.sequence_range(),
         archetype_coverage,
-        page_count: reader.page_count(),
-        size_bytes: file_size,
-    };
+        reader.page_count(),
+        file_size,
+    )?;
 
     // Persist to log first, then update in-memory state.
     // A single atomic entry ensures a crash can never leave the manifest with
@@ -98,6 +98,7 @@ pub fn cleanup_orphans(dir: &Path, manifest: &LsmManifest) -> Result<usize, LsmE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{SeqNo, SeqRange};
 
     #[derive(Clone, Copy)]
     #[expect(dead_code)]
@@ -159,14 +160,15 @@ mod tests {
         let mut manifest = LsmManifest::new();
         manifest.add_run(
             0,
-            SortedRunMeta {
-                path: dir.path().join("0-10.run"),
-                level: 0,
-                sequence_range: (0, 10),
-                archetype_coverage: vec![0],
-                page_count: 1,
-                size_bytes: 4,
-            },
+            SortedRunMeta::new(
+                dir.path().join("0-10.run"),
+                0,
+                SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+                vec![0],
+                1,
+                4,
+            )
+            .unwrap(),
         );
 
         let deleted = cleanup_orphans(dir.path(), &manifest).unwrap();
