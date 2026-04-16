@@ -12,6 +12,69 @@ use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
 use crate::types::{Level, SeqNo, SeqRange};
 
+// ── File header ─────────────────────────────────────────────────────────────
+
+/// 4-byte magic: "M", "K", "M", "F" — Minkowski Manifest.
+// cfg_attr: used by recover() in Task 2; suppressed only in lib builds where
+// the test module is not compiled in.
+#[cfg_attr(not(test), allow(dead_code))]
+const MAGIC_BYTES: [u8; 4] = *b"MKMF";
+
+/// Current manifest log format version.
+#[cfg_attr(not(test), allow(dead_code))]
+const CURRENT_VERSION: u8 = 0x01;
+
+/// Total header size in bytes: 4 magic + 1 version + 3 reserved.
+#[expect(dead_code)]
+const HEADER_SIZE: u64 = 8;
+
+/// Write the manifest log header at offset 0.
+///
+/// Layout: `[magic: 4][version: 1][reserved: 3]`. Reserved bytes are
+/// written as zero; they are ignored on read but reserved for future
+/// flags/hints.
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_header(file: &mut File) -> Result<(), LsmError> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&MAGIC_BYTES)?;
+    file.write_all(&[CURRENT_VERSION])?;
+    file.write_all(&[0u8; 3])?;
+    Ok(())
+}
+
+/// Read and validate the manifest log header.
+///
+/// Returns `LsmError::Format` with a descriptive message on:
+/// - File shorter than 8 bytes
+/// - Magic bytes don't match `MKMF`
+/// - Version byte doesn't match `CURRENT_VERSION`
+///
+/// Reserved bytes are not validated (forward-compat for future flags).
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_header(file: &mut File) -> Result<(), LsmError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; 8];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(LsmError::Format(
+                "not a manifest log: file too short for header".to_owned(),
+            ));
+        }
+        Err(e) => return Err(LsmError::Io(e)),
+    }
+    if header[0..4] != MAGIC_BYTES {
+        return Err(LsmError::Format("not a manifest log: bad magic".to_owned()));
+    }
+    let version = header[4];
+    if version != CURRENT_VERSION {
+        return Err(LsmError::Format(format!(
+            "unsupported manifest version {version}"
+        )));
+    }
+    Ok(())
+}
+
 // ── Entry type ──────────────────────────────────────────────────────────────
 
 /// A log entry that mutates manifest state.
@@ -718,5 +781,83 @@ mod tests {
 
         let manifest2 = ManifestLog::replay(&path).unwrap();
         assert_eq!(manifest2.total_runs(), 3);
+    }
+
+    #[test]
+    fn write_header_emits_expected_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        let mut file = File::create(&path).unwrap();
+        write_header(&mut file).unwrap();
+        drop(file);
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(&bytes[0..4], b"MKMF");
+        assert_eq!(bytes[4], 0x01);
+        assert_eq!(&bytes[5..8], &[0u8; 3]);
+    }
+
+    #[test]
+    fn validate_header_accepts_valid_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        write_header(&mut file).unwrap();
+        validate_header(&mut file).unwrap();
+    }
+
+    #[test]
+    fn validate_header_rejects_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        fs::write(&path, b"XXXX\x01\x00\x00\x00").unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let err = validate_header(&mut file).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("bad magic"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_header_rejects_unsupported_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        fs::write(&path, b"MKMF\xFF\x00\x00\x00").unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let err = validate_header(&mut file).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("unsupported manifest version"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_header_rejects_file_too_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        fs::write(&path, b"MKMF").unwrap(); // only 4 bytes
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let err = validate_header(&mut file).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
     }
 }
