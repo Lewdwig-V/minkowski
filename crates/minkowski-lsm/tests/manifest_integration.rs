@@ -264,8 +264,8 @@ fn cleanup_removes_orphans_and_tmp() {
 
 /// Regression: a frame whose decoded SortedRunMeta fails validation
 /// (unsorted archetype_coverage) must be treated as tail garbage, not
-/// propagated as a fatal error. Wires the new SortedRunMeta::new
-/// validation into the existing torn-tail recovery path.
+/// propagated as a fatal error. Wires the SortedRunMeta::new invariant
+/// check into the existing torn-tail recovery path.
 #[test]
 fn replay_truncates_log_on_unsorted_coverage() {
     let dir = tempfile::tempdir().unwrap();
@@ -284,7 +284,8 @@ fn replay_truncates_log_on_unsorted_coverage() {
     // Bypass SortedRunMeta::new (can't call it — would error) by encoding
     // the bytes directly. Wire layout per manifest_log.rs::encode_entry.
     let mut payload = Vec::new();
-    payload.push(0x01); // TAG_ADD_RUN
+    // TAG_ADD_RUN = 0x01 (see manifest_log.rs::encode_entry AddRun branch)
+    payload.push(0x01);
     payload.push(0); // level
     // path: "x.run"
     let path_bytes = b"x.run";
@@ -344,7 +345,8 @@ fn replay_truncates_log_on_invalid_level_byte() {
     // Craft a REMOVE_RUN frame with level=255 (invalid; NUM_LEVELS is 4).
     // REMOVE_RUN is the simplest level-bearing entry to fabricate.
     let mut payload = Vec::new();
-    payload.push(0x02); // TAG_REMOVE_RUN
+    // TAG_REMOVE_RUN = 0x02 (see manifest_log.rs::encode_entry RemoveRun branch)
+    payload.push(0x02);
     payload.push(255); // invalid level byte
     let path_bytes = b"ghost.run";
     payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
