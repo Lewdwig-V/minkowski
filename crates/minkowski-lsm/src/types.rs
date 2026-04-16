@@ -48,6 +48,16 @@ impl SeqRange {
         }
         Ok(Self { lo, hi })
     }
+
+    /// Lower bound of the range (inclusive).
+    pub fn lo(self) -> SeqNo {
+        self.lo
+    }
+
+    /// Upper bound of the range (exclusive).
+    pub fn hi(self) -> SeqNo {
+        self.hi
+    }
 }
 
 /// An LSM level index. Construction enforces `< NUM_LEVELS`.

@@ -266,7 +266,7 @@ mod tests {
             1024,
         )
         .unwrap();
-        assert_eq!(meta.sequence_range().lo, SeqNo(0));
+        assert_eq!(meta.sequence_range().lo(), SeqNo(0));
         assert_eq!(meta.page_count(), 1);
     }
 
@@ -305,8 +305,9 @@ mod tests {
             vec![],
             1,
             1024,
-        );
-        assert!(meta.is_ok());
+        )
+        .unwrap();
+        assert_eq!(meta.archetype_coverage().len(), 0);
     }
 
     #[test]
