@@ -41,11 +41,11 @@ pub fn flush_and_record(
     };
 
     // Persist to log first, then update in-memory state.
-    log.append(&ManifestEntry::AddRun {
+    // A single atomic entry ensures a crash can never leave the manifest with
+    // a new run recorded but the sequence pointer still at its old value.
+    log.append(&ManifestEntry::AddRunAndSequence {
         level: 0,
         meta: meta.clone(),
-    })?;
-    log.append(&ManifestEntry::SetSequence {
         next_sequence: sequence_range.1,
     })?;
 

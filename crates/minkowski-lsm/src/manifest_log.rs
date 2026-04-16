@@ -32,6 +32,15 @@ pub enum ManifestEntry {
     SetSequence {
         next_sequence: u64,
     },
+    /// Atomic combination of `AddRun` + `SetSequence`.
+    ///
+    /// A single frame ensures that a crash can never leave the manifest with a
+    /// new run recorded but the sequence pointer still at its old value.
+    AddRunAndSequence {
+        level: u8,
+        meta: SortedRunMeta,
+        next_sequence: u64,
+    },
 }
 
 // ── Frame codec ─────────────────────────────────────────────────────────────
@@ -92,6 +101,7 @@ const TAG_ADD_RUN: u8 = 0x01;
 const TAG_REMOVE_RUN: u8 = 0x02;
 const TAG_PROMOTE_RUN: u8 = 0x03;
 const TAG_SET_SEQUENCE: u8 = 0x04;
+const TAG_ADD_RUN_AND_SEQUENCE: u8 = 0x05;
 
 fn encode_path(buf: &mut Vec<u8>, path: &Path) -> Result<(), LsmError> {
     let s = path
@@ -172,6 +182,25 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.push(TAG_SET_SEQUENCE);
             buf.extend_from_slice(&next_sequence.to_le_bytes());
         }
+        ManifestEntry::AddRunAndSequence {
+            level,
+            meta,
+            next_sequence,
+        } => {
+            buf.push(TAG_ADD_RUN_AND_SEQUENCE);
+            buf.push(*level);
+            encode_path(&mut buf, &meta.path)?;
+            buf.extend_from_slice(&meta.sequence_range.0.to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range.1.to_le_bytes());
+            let count = meta.archetype_coverage.len() as u16;
+            buf.extend_from_slice(&count.to_le_bytes());
+            for &arch_id in &meta.archetype_coverage {
+                buf.extend_from_slice(&arch_id.to_le_bytes());
+            }
+            buf.extend_from_slice(&meta.page_count.to_le_bytes());
+            buf.extend_from_slice(&meta.size_bytes.to_le_bytes());
+            buf.extend_from_slice(&next_sequence.to_le_bytes());
+        }
     }
     Ok(buf)
 }
@@ -244,6 +273,40 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             let next_sequence = read_u64_le(data, &mut offset)?;
             Ok(ManifestEntry::SetSequence { next_sequence })
         }
+        TAG_ADD_RUN_AND_SEQUENCE => {
+            if offset >= data.len() {
+                return Err(LsmError::Format("truncated AddRunAndSequence".to_owned()));
+            }
+            let level = data[offset];
+            offset += 1;
+            let path = decode_path(data, &mut offset)?;
+            let seq_lo = read_u64_le(data, &mut offset)?;
+            let seq_hi = read_u64_le(data, &mut offset)?;
+            let count = read_u16_le(data, &mut offset)? as usize;
+            if offset + count * 2 > data.len() {
+                return Err(LsmError::Format("truncated coverage data".to_owned()));
+            }
+            let mut coverage = Vec::with_capacity(count);
+            for _ in 0..count {
+                coverage.push(read_u16_le(data, &mut offset)?);
+            }
+            let page_count = read_u64_le(data, &mut offset)?;
+            let size_bytes = read_u64_le(data, &mut offset)?;
+            let next_sequence = read_u64_le(data, &mut offset)?;
+
+            Ok(ManifestEntry::AddRunAndSequence {
+                level,
+                meta: SortedRunMeta {
+                    path,
+                    level,
+                    sequence_range: (seq_lo, seq_hi),
+                    archetype_coverage: coverage,
+                    page_count,
+                    size_bytes,
+                },
+                next_sequence,
+            })
+        }
         _ => Err(LsmError::Format(format!("unknown entry tag: {tag:#04x}"))),
     }
 }
@@ -264,6 +327,14 @@ fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) {
             let _ = manifest.promote_run(*from_level, *to_level, path);
         }
         ManifestEntry::SetSequence { next_sequence } => {
+            manifest.set_next_sequence(*next_sequence);
+        }
+        ManifestEntry::AddRunAndSequence {
+            level,
+            meta,
+            next_sequence,
+        } => {
+            manifest.add_run(*level, meta.clone());
             manifest.set_next_sequence(*next_sequence);
         }
     }
@@ -425,6 +496,39 @@ mod tests {
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();
         assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn encode_decode_add_run_and_sequence() {
+        let mut meta = test_meta("atomic.run");
+        meta.level = 0;
+        let entry = ManifestEntry::AddRunAndSequence {
+            level: 0,
+            meta,
+            next_sequence: 99,
+        };
+        let payload = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&payload).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn replay_add_run_and_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.log");
+
+        let mut log = ManifestLog::create(&path).unwrap();
+        log.append(&ManifestEntry::AddRunAndSequence {
+            level: 0,
+            meta: test_meta("atomic.run"),
+            next_sequence: 42,
+        })
+        .unwrap();
+
+        let manifest = ManifestLog::replay(&path).unwrap();
+        assert_eq!(manifest.total_runs(), 1);
+        assert_eq!(manifest.next_sequence(), 42);
+        assert_eq!(manifest.runs_at_level(0)[0].path(), Path::new("atomic.run"));
     }
 
     #[test]

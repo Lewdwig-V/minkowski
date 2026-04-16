@@ -112,7 +112,7 @@ fn corrupt_tail_partial_recovery() {
         f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x42]).unwrap();
     }
 
-    // Replay should recover the 2 good entries (each flush writes AddRun + SetSequence = 4 log entries).
+    // Replay should recover the 2 good entries (each flush writes one atomic AddRunAndSequence entry).
     let recovered = ManifestLog::replay(&log_path).unwrap();
     assert_eq!(recovered.total_runs(), 2);
     assert_eq!(recovered.next_sequence(), 20);

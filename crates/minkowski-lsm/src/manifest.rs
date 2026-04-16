@@ -78,13 +78,14 @@ impl LsmManifest {
         to_level: u8,
         path: &Path,
     ) -> Result<(), LsmError> {
-        let meta = self.remove_run(from_level, path).ok_or_else(|| {
+        let mut meta = self.remove_run(from_level, path).ok_or_else(|| {
             LsmError::Format(format!(
                 "run {} not found at level {}",
                 path.display(),
                 from_level
             ))
         })?;
+        meta.level = to_level;
         self.add_run(to_level, meta);
         Ok(())
     }
@@ -174,10 +175,12 @@ mod tests {
     fn promote_run_moves_between_levels() {
         let mut m = LsmManifest::new();
         let meta = test_meta("run_x.sst", 0);
-        m.add_run(0, meta.clone());
+        m.add_run(0, meta);
         m.promote_run(0, 1, Path::new("run_x.sst")).unwrap();
         assert!(m.runs_at_level(0).is_empty());
-        assert_eq!(m.runs_at_level(1), &[meta]);
+        let promoted = &m.runs_at_level(1)[0];
+        assert_eq!(promoted.path(), Path::new("run_x.sst"));
+        assert_eq!(promoted.level(), 1);
     }
 
     #[test]
