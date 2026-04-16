@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::LsmError;
-use crate::types::SeqRange;
+use crate::types::{Level, SeqNo, SeqRange};
 
 /// Number of LSM levels (L0 through L3).
 pub const NUM_LEVELS: usize = 4;
@@ -87,24 +87,23 @@ impl LsmManifest {
     }
 
     /// Add a sorted run to a level.
-    pub fn add_run(&mut self, level: u8, meta: SortedRunMeta) {
-        assert!((level as usize) < NUM_LEVELS, "level out of range");
-        self.levels[level as usize].push(meta);
+    pub fn add_run(&mut self, level: Level, meta: SortedRunMeta) {
+        self.levels[level.as_index()].push(meta);
     }
 
     /// Remove a sorted run by path from a level. Returns the removed entry.
-    pub fn remove_run(&mut self, level: u8, path: &Path) -> Option<SortedRunMeta> {
-        let runs = &mut self.levels[level as usize];
+    pub fn remove_run(&mut self, level: Level, path: &Path) -> Option<SortedRunMeta> {
+        let runs = &mut self.levels[level.as_index()];
         runs.iter()
-            .position(|r| r.path == path)
+            .position(|r| r.path() == path)
             .map(|pos| runs.remove(pos))
     }
 
     /// Move a run from one level to another.
     pub fn promote_run(
         &mut self,
-        from_level: u8,
-        to_level: u8,
+        from_level: Level,
+        to_level: Level,
         path: &Path,
     ) -> Result<(), LsmError> {
         let meta = self.remove_run(from_level, path).ok_or_else(|| {
@@ -118,23 +117,23 @@ impl LsmManifest {
         Ok(())
     }
 
-    pub fn set_next_sequence(&mut self, seq: u64) {
-        self.next_sequence = seq;
+    pub fn set_next_sequence(&mut self, seq: SeqNo) {
+        self.next_sequence = seq.0;
     }
 
-    pub fn next_sequence(&self) -> u64 {
-        self.next_sequence
+    pub fn next_sequence(&self) -> SeqNo {
+        SeqNo(self.next_sequence)
     }
 
-    pub fn runs_at_level(&self, level: u8) -> &[SortedRunMeta] {
-        &self.levels[level as usize]
+    pub fn runs_at_level(&self, level: Level) -> &[SortedRunMeta] {
+        &self.levels[level.as_index()]
     }
 
     /// All tracked run file paths across all levels.
     pub fn all_run_paths(&self) -> Vec<&Path> {
         self.levels
             .iter()
-            .flat_map(|runs| runs.iter().map(|r| r.path.as_path()))
+            .flat_map(|runs| runs.iter().map(SortedRunMeta::path))
             .collect()
     }
 
@@ -152,7 +151,7 @@ impl Default for LsmManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{SeqNo, SeqRange};
+    use crate::types::{Level, SeqNo, SeqRange};
 
     fn test_meta(name: &str) -> SortedRunMeta {
         SortedRunMeta::new(
@@ -168,10 +167,10 @@ mod tests {
     #[test]
     fn new_manifest_is_empty() {
         let m = LsmManifest::new();
-        for lvl in 0..NUM_LEVELS as u8 {
-            assert!(m.runs_at_level(lvl).is_empty());
+        for lvl in 0..NUM_LEVELS {
+            assert!(m.runs_at_level(Level::new(lvl as u8).unwrap()).is_empty());
         }
-        assert_eq!(m.next_sequence(), 0);
+        assert_eq!(m.next_sequence(), SeqNo(0));
         assert_eq!(m.total_runs(), 0);
     }
 
@@ -179,50 +178,54 @@ mod tests {
     fn add_run_places_at_correct_level() {
         let mut m = LsmManifest::new();
         let meta = test_meta("run_l1.sst");
-        m.add_run(1, meta.clone());
-        assert_eq!(m.runs_at_level(1), &[meta]);
-        assert!(m.runs_at_level(0).is_empty());
+        m.add_run(Level::L1, meta.clone());
+        assert_eq!(m.runs_at_level(Level::L1), &[meta]);
+        assert!(m.runs_at_level(Level::L0).is_empty());
     }
 
     #[test]
     fn remove_run_by_path() {
         let mut m = LsmManifest::new();
         let meta = test_meta("run_a.sst");
-        m.add_run(0, meta.clone());
-        let removed = m.remove_run(0, Path::new("run_a.sst"));
+        m.add_run(Level::L0, meta.clone());
+        let removed = m.remove_run(Level::L0, Path::new("run_a.sst"));
         assert_eq!(removed, Some(meta));
-        assert!(m.runs_at_level(0).is_empty());
+        assert!(m.runs_at_level(Level::L0).is_empty());
     }
 
     #[test]
     fn remove_run_missing_returns_none() {
         let mut m = LsmManifest::new();
-        assert!(m.remove_run(0, Path::new("nonexistent.sst")).is_none());
+        assert!(
+            m.remove_run(Level::L0, Path::new("nonexistent.sst"))
+                .is_none()
+        );
     }
 
     #[test]
     fn promote_run_moves_between_levels() {
         let mut m = LsmManifest::new();
         let meta = test_meta("run_x.sst");
-        m.add_run(0, meta);
-        m.promote_run(0, 1, Path::new("run_x.sst")).unwrap();
-        assert!(m.runs_at_level(0).is_empty());
-        assert_eq!(m.runs_at_level(1).len(), 1);
-        assert_eq!(m.runs_at_level(1)[0].path(), Path::new("run_x.sst"));
+        m.add_run(Level::L0, meta);
+        m.promote_run(Level::L0, Level::L1, Path::new("run_x.sst"))
+            .unwrap();
+        assert!(m.runs_at_level(Level::L0).is_empty());
+        assert_eq!(m.runs_at_level(Level::L1).len(), 1);
+        assert_eq!(m.runs_at_level(Level::L1)[0].path(), Path::new("run_x.sst"));
     }
 
     #[test]
     fn promote_run_missing_returns_error() {
         let mut m = LsmManifest::new();
-        let result = m.promote_run(0, 1, Path::new("missing.sst"));
+        let result = m.promote_run(Level::L0, Level::L1, Path::new("missing.sst"));
         assert!(matches!(result, Err(LsmError::Format(_))));
     }
 
     #[test]
     fn all_run_paths_collects_all_levels() {
         let mut m = LsmManifest::new();
-        m.add_run(0, test_meta("l0.sst"));
-        m.add_run(2, test_meta("l2.sst"));
+        m.add_run(Level::L0, test_meta("l0.sst"));
+        m.add_run(Level::L2, test_meta("l2.sst"));
         let paths = m.all_run_paths();
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&Path::new("l0.sst")));
@@ -232,17 +235,17 @@ mod tests {
     #[test]
     fn total_runs_counts_correctly() {
         let mut m = LsmManifest::new();
-        m.add_run(0, test_meta("a.sst"));
-        m.add_run(0, test_meta("b.sst"));
-        m.add_run(2, test_meta("c.sst"));
+        m.add_run(Level::L0, test_meta("a.sst"));
+        m.add_run(Level::L0, test_meta("b.sst"));
+        m.add_run(Level::L2, test_meta("c.sst"));
         assert_eq!(m.total_runs(), 3);
     }
 
     #[test]
     fn set_and_get_next_sequence() {
         let mut m = LsmManifest::new();
-        m.set_next_sequence(42);
-        assert_eq!(m.next_sequence(), 42);
+        m.set_next_sequence(SeqNo(42));
+        assert_eq!(m.next_sequence(), SeqNo(42));
     }
 
     #[test]

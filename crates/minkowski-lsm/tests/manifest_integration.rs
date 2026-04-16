@@ -8,6 +8,7 @@ use minkowski::World;
 use minkowski_lsm::manifest::LsmManifest;
 use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
+use minkowski_lsm::types::{Level, SeqNo};
 
 #[derive(Clone, Copy)]
 #[expect(dead_code)]
@@ -65,7 +66,7 @@ fn three_flushes_then_replay() {
         .unwrap();
 
     assert_eq!(manifest.total_runs(), 3);
-    assert_eq!(manifest.next_sequence(), 30);
+    assert_eq!(manifest.next_sequence(), SeqNo(30));
     assert!(p1.exists());
     assert!(p2.exists());
     assert!(p3.exists());
@@ -73,14 +74,14 @@ fn three_flushes_then_replay() {
     // Replay the log from scratch — should reconstruct identical state.
     let replayed = ManifestLog::replay(&log_path).unwrap();
     assert_eq!(replayed.total_runs(), 3);
-    assert_eq!(replayed.next_sequence(), 30);
-    assert_eq!(replayed.runs_at_level(0).len(), 3);
+    assert_eq!(replayed.next_sequence(), SeqNo(30));
+    assert_eq!(replayed.runs_at_level(Level::L0).len(), 3);
 
     // Verify run metadata matches.
     for (original, recovered) in manifest
-        .runs_at_level(0)
+        .runs_at_level(Level::L0)
         .iter()
-        .zip(replayed.runs_at_level(0).iter())
+        .zip(replayed.runs_at_level(Level::L0).iter())
     {
         assert_eq!(original.path(), recovered.path());
         assert_eq!(original.sequence_range(), recovered.sequence_range());
@@ -116,7 +117,7 @@ fn corrupt_tail_partial_recovery() {
     // Replay should recover the 2 good entries (each flush writes one atomic AddRunAndSequence entry).
     let recovered = ManifestLog::replay(&log_path).unwrap();
     assert_eq!(recovered.total_runs(), 2);
-    assert_eq!(recovered.next_sequence(), 20);
+    assert_eq!(recovered.next_sequence(), SeqNo(20));
 }
 
 /// Truncate the log to every byte prefix 0..=file_len and replay each time.
@@ -149,7 +150,7 @@ fn replay_converges_at_every_truncation_prefix() {
     assert!(!full_bytes.is_empty(), "log must have content");
 
     let mut prev_total_runs = 0usize;
-    let mut prev_next_seq = 0u64;
+    let mut prev_next_seq = SeqNo(0);
 
     for truncate_len in 0..=full_bytes.len() {
         let truncated_path = dir.path().join(format!("truncated_{truncate_len:05}.log"));
@@ -180,7 +181,11 @@ fn replay_converges_at_every_truncation_prefix() {
     }
 
     assert_eq!(prev_total_runs, 3, "full replay must recover all 3 runs");
-    assert_eq!(prev_next_seq, 30, "full replay must recover final sequence");
+    assert_eq!(
+        prev_next_seq,
+        SeqNo(30),
+        "full replay must recover final sequence"
+    );
 }
 
 /// Replay must truncate the log when `apply_entry` fails, not silently skip
@@ -201,14 +206,16 @@ fn replay_truncates_log_on_promote_of_missing_run() {
     // Inject a PromoteRun that references a path the manifest doesn't know.
     // Models a corrupted log or an out-of-order mutation.
     log.append(&ManifestEntry::PromoteRun {
-        from_level: 0,
-        to_level: 1,
+        from_level: Level::L0,
+        to_level: Level::L1,
         path: PathBuf::from("ghost.run"),
     })
     .unwrap();
     // Anything after the bad entry must be discarded on replay.
-    log.append(&ManifestEntry::SetSequence { next_sequence: 999 })
-        .unwrap();
+    log.append(&ManifestEntry::SetSequence {
+        next_sequence: SeqNo(999),
+    })
+    .unwrap();
     drop(log);
 
     let recovered = ManifestLog::replay(&log_path).unwrap();
@@ -218,11 +225,11 @@ fn replay_truncates_log_on_promote_of_missing_run() {
         "only the first flush should survive replay"
     );
     assert!(
-        recovered.next_sequence() < 999,
+        recovered.next_sequence() < SeqNo(999),
         "SetSequence past the bad PromoteRun must not apply"
     );
     // The surviving AddRunAndSequence set next_sequence to 10.
-    assert_eq!(recovered.next_sequence(), 10);
+    assert_eq!(recovered.next_sequence(), SeqNo(10));
 }
 
 // ── Cleanup ─────────────────────────────────────────────────────────────────
@@ -249,7 +256,7 @@ fn cleanup_removes_orphans_and_tmp() {
 
     // The real run file should still exist.
     assert_eq!(manifest.total_runs(), 1);
-    let run_path = manifest.runs_at_level(0)[0].path();
+    let run_path = manifest.runs_at_level(Level::L0)[0].path();
     assert!(run_path.exists());
 }
 
@@ -269,7 +276,7 @@ fn flush_and_record_clean_world_no_change() {
     let result = flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
     assert!(result.is_none());
     assert_eq!(manifest.total_runs(), 0);
-    assert_eq!(manifest.next_sequence(), 0);
+    assert_eq!(manifest.next_sequence(), SeqNo(0));
 
     // Log should be empty — replay produces empty manifest.
     let replayed = ManifestLog::replay(&log_path).unwrap();

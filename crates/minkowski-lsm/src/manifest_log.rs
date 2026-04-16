@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
-use crate::types::{SeqNo, SeqRange};
+use crate::types::{Level, SeqNo, SeqRange};
 
 // ── Entry type ──────────────────────────────────────────────────────────────
 
@@ -18,29 +18,29 @@ use crate::types::{SeqNo, SeqRange};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestEntry {
     AddRun {
-        level: u8,
+        level: Level,
         meta: SortedRunMeta,
     },
     RemoveRun {
-        level: u8,
+        level: Level,
         path: PathBuf,
     },
     PromoteRun {
-        from_level: u8,
-        to_level: u8,
+        from_level: Level,
+        to_level: Level,
         path: PathBuf,
     },
     SetSequence {
-        next_sequence: u64,
+        next_sequence: SeqNo,
     },
     /// Atomic combination of `AddRun` + `SetSequence`.
     ///
     /// A single frame ensures that a crash can never leave the manifest with a
     /// new run recorded but the sequence pointer still at its old value.
     AddRunAndSequence {
-        level: u8,
+        level: Level,
         meta: SortedRunMeta,
-        next_sequence: u64,
+        next_sequence: SeqNo,
     },
 }
 
@@ -178,7 +178,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
     match entry {
         ManifestEntry::AddRun { level, meta } => {
             buf.push(TAG_ADD_RUN);
-            buf.push(*level);
+            buf.push(level.as_u8());
             encode_path(&mut buf, meta.path())?;
             buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
             buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
@@ -188,7 +188,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
         }
         ManifestEntry::RemoveRun { level, path } => {
             buf.push(TAG_REMOVE_RUN);
-            buf.push(*level);
+            buf.push(level.as_u8());
             encode_path(&mut buf, path)?;
         }
         ManifestEntry::PromoteRun {
@@ -197,13 +197,13 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             path,
         } => {
             buf.push(TAG_PROMOTE_RUN);
-            buf.push(*from_level);
-            buf.push(*to_level);
+            buf.push(from_level.as_u8());
+            buf.push(to_level.as_u8());
             encode_path(&mut buf, path)?;
         }
         ManifestEntry::SetSequence { next_sequence } => {
             buf.push(TAG_SET_SEQUENCE);
-            buf.extend_from_slice(&next_sequence.to_le_bytes());
+            buf.extend_from_slice(&next_sequence.0.to_le_bytes());
         }
         ManifestEntry::AddRunAndSequence {
             level,
@@ -211,14 +211,14 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             next_sequence,
         } => {
             buf.push(TAG_ADD_RUN_AND_SEQUENCE);
-            buf.push(*level);
+            buf.push(level.as_u8());
             encode_path(&mut buf, meta.path())?;
             buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
             buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
             encode_coverage(&mut buf, meta.archetype_coverage())?;
             buf.extend_from_slice(&meta.page_count().to_le_bytes());
             buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
-            buf.extend_from_slice(&next_sequence.to_le_bytes());
+            buf.extend_from_slice(&next_sequence.0.to_le_bytes());
         }
     }
     Ok(buf)
@@ -236,8 +236,10 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             if offset >= data.len() {
                 return Err(LsmError::Format("truncated AddRun".to_owned()));
             }
-            let level = data[offset];
+            let level_byte = data[offset];
             offset += 1;
+            let level = Level::new(level_byte)
+                .ok_or_else(|| LsmError::Format(format!("invalid level {level_byte}")))?;
             let path = decode_path(data, &mut offset)?;
             let seq_lo = read_u64_le(data, &mut offset)?;
             let seq_hi = read_u64_le(data, &mut offset)?;
@@ -265,8 +267,10 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             if offset >= data.len() {
                 return Err(LsmError::Format("truncated RemoveRun".to_owned()));
             }
-            let level = data[offset];
+            let level_byte = data[offset];
             offset += 1;
+            let level = Level::new(level_byte)
+                .ok_or_else(|| LsmError::Format(format!("invalid level {level_byte}")))?;
             let path = decode_path(data, &mut offset)?;
             Ok(ManifestEntry::RemoveRun { level, path })
         }
@@ -274,10 +278,14 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             if offset + 2 > data.len() {
                 return Err(LsmError::Format("truncated PromoteRun".to_owned()));
             }
-            let from_level = data[offset];
+            let from_byte = data[offset];
             offset += 1;
-            let to_level = data[offset];
+            let to_byte = data[offset];
             offset += 1;
+            let from_level = Level::new(from_byte)
+                .ok_or_else(|| LsmError::Format(format!("invalid level {from_byte}")))?;
+            let to_level = Level::new(to_byte)
+                .ok_or_else(|| LsmError::Format(format!("invalid level {to_byte}")))?;
             let path = decode_path(data, &mut offset)?;
             Ok(ManifestEntry::PromoteRun {
                 from_level,
@@ -286,15 +294,17 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             })
         }
         TAG_SET_SEQUENCE => {
-            let next_sequence = read_u64_le(data, &mut offset)?;
+            let next_sequence = SeqNo(read_u64_le(data, &mut offset)?);
             Ok(ManifestEntry::SetSequence { next_sequence })
         }
         TAG_ADD_RUN_AND_SEQUENCE => {
             if offset >= data.len() {
                 return Err(LsmError::Format("truncated AddRunAndSequence".to_owned()));
             }
-            let level = data[offset];
+            let level_byte = data[offset];
             offset += 1;
+            let level = Level::new(level_byte)
+                .ok_or_else(|| LsmError::Format(format!("invalid level {level_byte}")))?;
             let path = decode_path(data, &mut offset)?;
             let seq_lo = read_u64_le(data, &mut offset)?;
             let seq_hi = read_u64_le(data, &mut offset)?;
@@ -308,7 +318,7 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             }
             let page_count = read_u64_le(data, &mut offset)?;
             let size_bytes = read_u64_le(data, &mut offset)?;
-            let next_sequence = read_u64_le(data, &mut offset)?;
+            let next_sequence = SeqNo(read_u64_le(data, &mut offset)?);
 
             let meta = SortedRunMeta::new(
                 path,
@@ -467,6 +477,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::types::Level;
 
     fn test_meta(name: &str) -> SortedRunMeta {
         SortedRunMeta::new(
@@ -482,7 +493,10 @@ mod tests {
     #[test]
     fn encode_decode_add_run() {
         let meta = test_meta("10-20.run");
-        let entry = ManifestEntry::AddRun { level: 1, meta };
+        let entry = ManifestEntry::AddRun {
+            level: Level::L1,
+            meta,
+        };
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();
         assert_eq!(entry, decoded);
@@ -491,7 +505,7 @@ mod tests {
     #[test]
     fn encode_decode_remove_run() {
         let entry = ManifestEntry::RemoveRun {
-            level: 2,
+            level: Level::L2,
             path: PathBuf::from("old.run"),
         };
         let payload = encode_entry(&entry).unwrap();
@@ -502,8 +516,8 @@ mod tests {
     #[test]
     fn encode_decode_promote_run() {
         let entry = ManifestEntry::PromoteRun {
-            from_level: 0,
-            to_level: 1,
+            from_level: Level::L0,
+            to_level: Level::L1,
             path: PathBuf::from("promoted.run"),
         };
         let payload = encode_entry(&entry).unwrap();
@@ -514,7 +528,7 @@ mod tests {
     #[test]
     fn encode_decode_set_sequence() {
         let entry = ManifestEntry::SetSequence {
-            next_sequence: 12345,
+            next_sequence: SeqNo(12345),
         };
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();
@@ -525,9 +539,9 @@ mod tests {
     fn encode_decode_add_run_and_sequence() {
         let meta = test_meta("atomic.run");
         let entry = ManifestEntry::AddRunAndSequence {
-            level: 0,
+            level: Level::L0,
             meta,
-            next_sequence: 99,
+            next_sequence: SeqNo(99),
         };
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();
@@ -541,16 +555,19 @@ mod tests {
 
         let mut log = ManifestLog::create(&path).unwrap();
         log.append(&ManifestEntry::AddRunAndSequence {
-            level: 0,
+            level: Level::L0,
             meta: test_meta("atomic.run"),
-            next_sequence: 42,
+            next_sequence: SeqNo(42),
         })
         .unwrap();
 
         let manifest = ManifestLog::replay(&path).unwrap();
         assert_eq!(manifest.total_runs(), 1);
-        assert_eq!(manifest.next_sequence(), 42);
-        assert_eq!(manifest.runs_at_level(0)[0].path(), Path::new("atomic.run"));
+        assert_eq!(manifest.next_sequence(), SeqNo(42));
+        assert_eq!(
+            manifest.runs_at_level(Level::L0)[0].path(),
+            Path::new("atomic.run")
+        );
     }
 
     #[test]
@@ -614,7 +631,7 @@ mod tests {
         // File doesn't exist → empty manifest.
         let manifest = ManifestLog::replay(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
-        assert_eq!(manifest.next_sequence(), 0);
+        assert_eq!(manifest.next_sequence(), SeqNo(0));
     }
 
     #[test]
@@ -625,13 +642,16 @@ mod tests {
         let mut log = ManifestLog::create(&path).unwrap();
         for i in 0..3 {
             let meta = test_meta(&format!("{i}.run"));
-            log.append(&ManifestEntry::AddRun { level: 0, meta })
-                .unwrap();
+            log.append(&ManifestEntry::AddRun {
+                level: Level::L0,
+                meta,
+            })
+            .unwrap();
         }
 
         let manifest = ManifestLog::replay(&path).unwrap();
         assert_eq!(manifest.total_runs(), 3);
-        assert_eq!(manifest.runs_at_level(0).len(), 3);
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), 3);
     }
 
     #[test]
@@ -642,12 +662,12 @@ mod tests {
         let mut log = ManifestLog::create(&path).unwrap();
         let meta = test_meta("ephemeral.run");
         log.append(&ManifestEntry::AddRun {
-            level: 0,
+            level: Level::L0,
             meta: meta.clone(),
         })
         .unwrap();
         log.append(&ManifestEntry::RemoveRun {
-            level: 0,
+            level: Level::L0,
             path: meta.path().to_path_buf(),
         })
         .unwrap();
@@ -664,12 +684,12 @@ mod tests {
         // Write 2 good entries.
         let mut log = ManifestLog::create(&path).unwrap();
         log.append(&ManifestEntry::AddRun {
-            level: 0,
+            level: Level::L0,
             meta: test_meta("a.run"),
         })
         .unwrap();
         log.append(&ManifestEntry::AddRun {
-            level: 0,
+            level: Level::L0,
             meta: test_meta("b.run"),
         })
         .unwrap();
@@ -691,7 +711,7 @@ mod tests {
 
         // Should be able to append after recovery.
         log2.append(&ManifestEntry::AddRun {
-            level: 1,
+            level: Level::L1,
             meta: test_meta("c.run"),
         })
         .unwrap();
