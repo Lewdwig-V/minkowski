@@ -69,7 +69,7 @@ impl MetricsDiff {
                 entity_count: a.entity_count,
             })
             .collect();
-        sorted.sort_by(|a, b| b.entity_count.cmp(&a.entity_count));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.entity_count));
         sorted.truncate(5);
 
         let pool_used_delta = match (before.world.pool_used, after.world.pool_used) {
