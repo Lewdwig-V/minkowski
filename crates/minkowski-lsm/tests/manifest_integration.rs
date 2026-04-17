@@ -487,7 +487,8 @@ fn replay_truncates_log_on_remove_of_missing_run() {
 // ── recover() lifecycle and rejection regressions ───────────────────────────
 
 /// A recover -> flush -> recover round trip reconstructs identical state.
-/// Exercises the full lifecycle through the new unified entry point.
+/// Exercises the full lifecycle: open, write frames, close, reopen,
+/// verify per-run metadata matches.
 #[test]
 fn recover_then_flush_then_recover_roundtrips_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -522,17 +523,16 @@ fn recover_then_flush_then_recover_roundtrips_state() {
     }
 }
 
-/// Opening a file that wasn't produced by PR-B1-or-later code (no 8-byte
-/// header at offset 0) must fail fast with a Format error. Explicitly
-/// documents the strict-reject compatibility decision.
+/// A file without the 8-byte magic+version header must be rejected
+/// with a Format error. Documents the strict-reject compatibility
+/// policy for legacy headerless logs.
 #[test]
 fn recover_rejects_file_without_header() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("legacy.log");
 
-    // Write raw bytes starting with what looks like a frame length prefix
-    // (not a header). This is what a pre-PR-B1 manifest log would look
-    // like byte-for-byte.
+    // Write raw bytes that look like a frame length prefix (not a
+    // header) — what a legacy headerless log would look like byte-for-byte.
     fs::write(&log_path, [0x20, 0x00, 0x00, 0x00, 0xAB, 0xCD, 0xEF, 0x12]).unwrap();
 
     let err = ManifestLog::recover(&log_path).err().unwrap();

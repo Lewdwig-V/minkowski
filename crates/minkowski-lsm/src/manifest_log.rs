@@ -1,8 +1,11 @@
 //! Persistent append-only log of manifest mutations.
 //!
-//! Each entry is framed as `[len: u32 LE][crc32: u32 LE][payload]` — the same
-//! 8-byte header format used by the WAL, reimplemented here to avoid a
-//! dependency on `minkowski-persist`.
+//! File layout:
+//! - Bytes 0..8: file header `[magic: b"MKMF"; 4][version: u8; 1][reserved: 0u8; 3]`.
+//! - Bytes 8..: zero or more frames, each `[len: u32 LE][crc32: u32 LE][payload]`.
+//!
+//! The frame format matches the WAL's (reimplemented here to avoid a
+//! dependency on `minkowski-persist`). The file header is manifest-specific.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -17,7 +20,6 @@ use crate::types::{Level, SeqNo, SeqRange};
 /// 4-byte magic: "M", "K", "M", "F" — Minkowski Manifest.
 const MAGIC_BYTES: [u8; 4] = *b"MKMF";
 
-/// Current manifest log format version.
 const CURRENT_VERSION: u8 = 0x01;
 
 /// Total header size in bytes: 4 magic + 1 version + 3 reserved.
@@ -26,8 +28,7 @@ const HEADER_SIZE: u64 = 8;
 /// Write the manifest log header at offset 0.
 ///
 /// Layout: `[magic: 4][version: 1][reserved: 3]`. Reserved bytes are
-/// written as zero; they are ignored on read but reserved for future
-/// flags/hints.
+/// written as zero and ignored on read.
 fn write_header(file: &mut File) -> Result<(), LsmError> {
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&MAGIC_BYTES)?;
@@ -43,7 +44,7 @@ fn write_header(file: &mut File) -> Result<(), LsmError> {
 /// - Magic bytes don't match `MKMF`
 /// - Version byte doesn't match `CURRENT_VERSION`
 ///
-/// Reserved bytes are not validated (forward-compat for future flags).
+/// Reserved bytes are not validated (forward-compat).
 fn validate_header(file: &mut File) -> Result<(), LsmError> {
     file.seek(SeekFrom::Start(0))?;
     let mut header = [0u8; 8];
@@ -57,7 +58,9 @@ fn validate_header(file: &mut File) -> Result<(), LsmError> {
         Err(e) => return Err(LsmError::Io(e)),
     }
     if header[0..4] != MAGIC_BYTES {
-        return Err(LsmError::Format("not a manifest log: bad magic".to_owned()));
+        return Err(LsmError::Format(
+            "not a manifest log: bad magic (delete manifest.log to rebuild from WAL)".to_owned(),
+        ));
     }
     let version = header[4];
     if version != CURRENT_VERSION {
