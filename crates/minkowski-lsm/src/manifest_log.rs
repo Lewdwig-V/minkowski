@@ -462,7 +462,7 @@ fn replay_frames(file: &File, path: &Path, start: u64) -> Result<(LsmManifest, u
 /// Persistent append-only log of manifest mutations.
 ///
 /// Each entry is framed with a CRC32 checksum for integrity. On crash
-/// recovery, [`replay`](Self::replay) reconstructs the manifest from the log,
+/// recovery, [`recover`](Self::recover) reconstructs the manifest from the log,
 /// tolerating a corrupt tail frame (torn write).
 pub struct ManifestLog {
     file: File,
@@ -470,30 +470,6 @@ pub struct ManifestLog {
 }
 
 impl ManifestLog {
-    /// Create a new empty manifest log, truncating any existing file.
-    pub fn create(path: &Path) -> Result<Self, LsmError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .truncate(true)
-            .open(path)?;
-        Ok(Self { file, write_pos: 0 })
-    }
-
-    /// Open an existing manifest log, positioning at the end for appending.
-    /// Creates the file if it doesn't exist.
-    pub fn open_or_create(path: &Path) -> Result<Self, LsmError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .read(true)
-            .open(path)?;
-        let write_pos = file.metadata()?.len();
-        Ok(Self { file, write_pos })
-    }
-
     /// Append an entry to the log, fsyncing for durability.
     pub fn append(&mut self, entry: &ManifestEntry) -> Result<(), LsmError> {
         let payload = encode_entry(entry)?;
@@ -501,23 +477,6 @@ impl ManifestLog {
         self.file.sync_all()?;
         self.write_pos += written;
         Ok(())
-    }
-
-    /// Replay the log to reconstruct a manifest.
-    ///
-    /// Tolerates corrupt tail frames. Returns an empty manifest if the
-    /// file doesn't exist.
-    ///
-    /// Note: this entry point assumes the file has no header (pre-PR-B1
-    /// format). New code should use `recover()` which handles the
-    /// v1-header format.
-    pub fn replay(path: &Path) -> Result<LsmManifest, LsmError> {
-        if !path.exists() {
-            return Ok(LsmManifest::new());
-        }
-        let file = File::open(path)?;
-        let (manifest, _) = replay_frames(&file, path, 0)?;
-        Ok(manifest)
     }
 
     /// Load an existing manifest log or initialize a new empty one.
@@ -653,15 +612,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
 
-        let mut log = ManifestLog::create(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover(&path).unwrap();
         log.append(&ManifestEntry::AddRunAndSequence {
             level: Level::L0,
             meta: test_meta("atomic.run"),
             next_sequence: SeqNo(42),
         })
         .unwrap();
+        drop(log);
 
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 1);
         assert_eq!(manifest.next_sequence(), SeqNo(42));
         assert_eq!(
@@ -729,7 +689,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
         // File doesn't exist → empty manifest.
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
         assert_eq!(manifest.next_sequence(), SeqNo(0));
     }
@@ -739,7 +699,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
 
-        let mut log = ManifestLog::create(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover(&path).unwrap();
         for i in 0..3 {
             let meta = test_meta(&format!("{i}.run"));
             log.append(&ManifestEntry::AddRun {
@@ -748,8 +708,9 @@ mod tests {
             })
             .unwrap();
         }
+        drop(log);
 
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 3);
         assert_eq!(manifest.runs_at_level(Level::L0).len(), 3);
     }
@@ -759,7 +720,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
 
-        let mut log = ManifestLog::create(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover(&path).unwrap();
         let meta = test_meta("ephemeral.run");
         log.append(&ManifestEntry::AddRun {
             level: Level::L0,
@@ -771,8 +732,9 @@ mod tests {
             path: meta.path().to_path_buf(),
         })
         .unwrap();
+        drop(log);
 
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
     }
 
@@ -782,7 +744,7 @@ mod tests {
         let path = dir.path().join("manifest.log");
 
         // Write 2 good entries.
-        let mut log = ManifestLog::create(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover(&path).unwrap();
         log.append(&ManifestEntry::AddRun {
             level: Level::L0,
             meta: test_meta("a.run"),
@@ -793,6 +755,7 @@ mod tests {
             meta: test_meta("b.run"),
         })
         .unwrap();
+        drop(log);
 
         // Append garbage (simulates torn write).
         {
@@ -801,12 +764,11 @@ mod tests {
         }
 
         // Replay should recover the 2 good entries.
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, mut log2) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 2);
 
-        // File should be truncated to remove garbage.
+        // File should be truncated to remove garbage; write_pos should be at end of valid data.
         let file_len = fs::metadata(&path).unwrap().len();
-        let mut log2 = ManifestLog::open_or_create(&path).unwrap();
         assert_eq!(log2.write_pos, file_len);
 
         // Should be able to append after recovery.
@@ -815,8 +777,9 @@ mod tests {
             meta: test_meta("c.run"),
         })
         .unwrap();
+        drop(log2);
 
-        let manifest2 = ManifestLog::replay(&path).unwrap();
+        let (manifest2, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest2.total_runs(), 3);
     }
 

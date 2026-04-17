@@ -118,8 +118,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("manifest.log");
-        let mut manifest = LsmManifest::new();
-        let mut log = ManifestLog::create(&log_path).unwrap();
+        let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
         let result =
             flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
@@ -137,8 +136,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("manifest.log");
-        let mut manifest = LsmManifest::new();
-        let mut log = ManifestLog::create(&log_path).unwrap();
+        let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
         let result =
             flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
