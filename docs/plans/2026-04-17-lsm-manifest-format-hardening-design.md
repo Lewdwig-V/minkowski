@@ -73,16 +73,17 @@ impl ManifestLog {
     /// Explicit fsync.
     pub fn sync(&mut self) -> Result<(), LsmError>;
 
-    /// Test-only: create a fresh log, truncating any existing file and
-    /// writing a valid header. Used by tests that specifically need
-    /// "wipe the slate" semantics.
-    pub(crate) fn create(path: &Path) -> Result<Self, LsmError>;
+    // Note: an earlier draft of this design retained `pub(crate) fn create`
+    // as a test-only "wipe and start fresh" helper. During implementation
+    // (Task 3) it was found to have zero callers — every existing test that
+    // used create() did so on a freshly-created tempdir where recover()'s
+    // missing-path branch produces identical behavior. Removed entirely
+    // instead of kept as dead code. Tests that need truncation semantics
+    // can use fs::remove_file(path).ok(); recover(path).
 }
 ```
 
-**Removed:**
-- `pub fn open_or_create(path: &Path) -> Result<Self>` — the footgun that permitted appending on a torn tail. No `pub(crate)` fallback; the path is gone entirely. Callers must use `recover()` or the test-only `create()`.
-- `pub fn replay(path: &Path) -> Result<LsmManifest>` — the externally-callable replay. Becomes a private helper inside `recover()`.
+**Removed entirely:** `open_or_create()` (the footgun — removed, not even `pub(crate)`) and `replay(path)` (folded into `recover()`'s existing-file branch via the `replay_frames` private helper). Also removed: `create()` — all tests migrated to `recover(path)` on non-existing paths.
 
 ### 3. `recover()` implementation sketch
 

@@ -164,6 +164,9 @@ fn replay_converges_at_every_truncation_prefix() {
             continue;
         }
 
+        // truncate_len == 8: valid header, no frames — first Ok case,
+        // returns empty manifest. Subsequent iterations accumulate runs
+        // as frame boundaries are crossed.
         let (replayed, _) = ManifestLog::recover(&truncated_path)
             .unwrap_or_else(|e| panic!("recover failed at truncate_len={truncate_len}: {e:?}"));
 
