@@ -446,6 +446,56 @@ fn replay_truncates_log_on_invalid_level_byte() {
     );
 }
 
+/// Regression: a frame with a valid CRC but an unknown tag byte must be
+/// treated as tail garbage. `ManifestTag::try_from` surfaces
+/// `LsmError::Format` for bytes outside the enum's defined range, and the
+/// replay loop must truncate at the bad frame rather than fail recovery.
+#[test]
+fn replay_truncates_log_on_unknown_tag_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
+
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
+
+    let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
+
+    // Craft a frame whose payload starts with 0x06 — the first byte past
+    // the last defined `ManifestTag` discriminant (0x05).
+    let payload = vec![0x06u8, 0x00, 0x00];
+
+    let mut f = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+    let len = payload.len() as u32;
+    let crc = crc32fast::hash(&payload);
+    f.write_all(&len.to_le_bytes()).unwrap();
+    f.write_all(&crc.to_le_bytes()).unwrap();
+    f.write_all(&payload).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(
+        recovered.total_runs(),
+        1,
+        "only the valid first flush survives"
+    );
+
+    let len_after_replay = fs::metadata(&log_path).unwrap().len();
+    assert_eq!(
+        len_after_replay, len_after_first_frame,
+        "replay truncated the unknown-tag frame"
+    );
+}
+
 /// Regression: a frame whose `SeqRange::new` call fails (seq_lo > seq_hi)
 /// must be treated as tail garbage, not propagated as a fatal error.
 /// Completes the three-error regression symmetry alongside
