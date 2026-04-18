@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::LsmError;
-use crate::types::{Level, PageCount, SeqNo, SeqRange};
+use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 
 /// Number of LSM levels (L0 through L3).
 pub const NUM_LEVELS: usize = 4;
@@ -19,7 +19,7 @@ pub struct SortedRunMeta {
     sequence_range: SeqRange,
     archetype_coverage: Box<[u16]>,
     page_count: PageCount,
-    size_bytes: u64,
+    size_bytes: SizeBytes,
 }
 
 impl SortedRunMeta {
@@ -39,7 +39,7 @@ impl SortedRunMeta {
         self.page_count
     }
 
-    pub fn size_bytes(&self) -> u64 {
+    pub fn size_bytes(&self) -> SizeBytes {
         self.size_bytes
     }
 
@@ -47,25 +47,22 @@ impl SortedRunMeta {
     ///
     /// Validates:
     /// - `archetype_coverage` is strictly sorted ascending (sorted + deduped).
-    /// - `page_count` is non-zero.
     ///
-    /// `sequence_range` is already validated by `SeqRange::new`. `size_bytes` is
-    /// not validated (redundant with `page_count`; a valid run file always
-    /// has a non-empty header).
+    /// `page_count` is already non-zero (enforced by `PageCount::new` at the
+    /// call site). `sequence_range` is already validated by `SeqRange::new`.
+    /// `size_bytes` is not validated (zero is permitted for this newtype).
     pub fn new(
         path: PathBuf,
         sequence_range: SeqRange,
         archetype_coverage: Vec<u16>,
-        page_count: u64,
-        size_bytes: u64,
+        page_count: PageCount,
+        size_bytes: SizeBytes,
     ) -> Result<Self, LsmError> {
         if archetype_coverage.windows(2).any(|w| w[0] >= w[1]) {
             return Err(LsmError::Format(
                 "archetype_coverage is not strictly sorted".to_owned(),
             ));
         }
-        let page_count = PageCount::new(page_count)
-            .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
         Ok(Self {
             path,
             sequence_range,
@@ -153,15 +150,15 @@ impl Default for LsmManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Level, SeqNo, SeqRange};
+    use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 
     fn test_meta(name: &str) -> SortedRunMeta {
         SortedRunMeta::new(
             PathBuf::from(name),
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             vec![0],
-            1,
-            1024,
+            PageCount::new(1).unwrap(),
+            SizeBytes::new(1024),
         )
         .unwrap()
     }
@@ -256,8 +253,8 @@ mod tests {
             PathBuf::from("0-10.run"),
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             vec![0, 3, 7],
-            1,
-            1024,
+            PageCount::new(1).unwrap(),
+            SizeBytes::new(1024),
         )
         .unwrap();
         assert_eq!(meta.sequence_range().lo(), SeqNo::from(0u64));
@@ -270,8 +267,8 @@ mod tests {
             PathBuf::from("x.run"),
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             vec![3, 1, 2],
-            1,
-            1024,
+            PageCount::new(1).unwrap(),
+            SizeBytes::new(1024),
         );
         assert!(matches!(result, Err(LsmError::Format(_))));
     }
@@ -282,8 +279,8 @@ mod tests {
             PathBuf::from("x.run"),
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             vec![1, 2, 2, 3],
-            1,
-            1024,
+            PageCount::new(1).unwrap(),
+            SizeBytes::new(1024),
         );
         assert!(matches!(result, Err(LsmError::Format(_))));
     }
@@ -294,22 +291,10 @@ mod tests {
             PathBuf::from("x.run"),
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             vec![],
-            1,
-            1024,
+            PageCount::new(1).unwrap(),
+            SizeBytes::new(1024),
         )
         .unwrap();
         assert_eq!(meta.archetype_coverage().len(), 0);
-    }
-
-    #[test]
-    fn sorted_run_meta_new_rejects_zero_page_count() {
-        let result = SortedRunMeta::new(
-            PathBuf::from("x.run"),
-            SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
-            vec![0],
-            0,
-            1024,
-        );
-        assert!(matches!(result, Err(LsmError::Format(_))));
     }
 }

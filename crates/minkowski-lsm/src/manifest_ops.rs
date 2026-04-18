@@ -10,7 +10,7 @@ use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
 use crate::manifest_log::{ManifestEntry, ManifestLog};
 use crate::reader::SortedRunReader;
-use crate::types::{Level, SeqRange};
+use crate::types::{Level, PageCount, SeqRange, SizeBytes};
 use crate::writer::flush;
 
 /// Flush dirty pages and record the new sorted run in the manifest.
@@ -32,12 +32,14 @@ pub fn flush_and_record(
     let file_size = fs::metadata(&path)?.len();
     let archetype_coverage = reader.archetype_ids();
 
+    let page_count = PageCount::new(reader.page_count())
+        .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
     let meta = SortedRunMeta::new(
         path.clone(),
         reader.sequence_range(),
         archetype_coverage,
-        reader.page_count(),
-        file_size,
+        page_count,
+        SizeBytes::new(file_size),
     )?;
 
     // Persist to log first, then update in-memory state.
@@ -98,7 +100,7 @@ pub fn cleanup_orphans(dir: &Path, manifest: &LsmManifest) -> Result<usize, LsmE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Level, SeqNo, SeqRange};
+    use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 
     #[derive(Clone, Copy)]
     #[expect(dead_code)]
@@ -174,8 +176,8 @@ mod tests {
                 dir.path().join("0-10.run"),
                 SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
                 vec![0],
-                1,
-                4,
+                PageCount::new(1).unwrap(),
+                SizeBytes::new(4),
             )
             .unwrap(),
         );

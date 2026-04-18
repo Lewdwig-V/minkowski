@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
-use crate::types::{Level, SeqNo, SeqRange};
+use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 
 // ── File header ─────────────────────────────────────────────────────────────
 
@@ -243,7 +243,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.extend_from_slice(&meta.sequence_range().hi().get().to_le_bytes());
             encode_coverage(&mut buf, meta.archetype_coverage())?;
             buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
-            buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
+            buf.extend_from_slice(&meta.size_bytes().get().to_le_bytes());
         }
         ManifestEntry::RemoveRun { level, path } => {
             buf.push(TAG_REMOVE_RUN);
@@ -276,7 +276,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.extend_from_slice(&meta.sequence_range().hi().get().to_le_bytes());
             encode_coverage(&mut buf, meta.archetype_coverage())?;
             buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
-            buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
+            buf.extend_from_slice(&meta.size_bytes().get().to_le_bytes());
             buf.extend_from_slice(&next_sequence.get().to_le_bytes());
         }
     }
@@ -312,13 +312,14 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             }
             let page_count = read_u64_le(data, &mut offset)?;
             let size_bytes = read_u64_le(data, &mut offset)?;
-
+            let page_count = PageCount::new(page_count)
+                .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
             let meta = SortedRunMeta::new(
                 path,
                 SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi))?,
                 coverage,
                 page_count,
-                size_bytes,
+                SizeBytes::new(size_bytes),
             )?;
             Ok(ManifestEntry::AddRun { level, meta })
         }
@@ -378,13 +379,14 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             let page_count = read_u64_le(data, &mut offset)?;
             let size_bytes = read_u64_le(data, &mut offset)?;
             let next_sequence = SeqNo::from(read_u64_le(data, &mut offset)?);
-
+            let page_count = PageCount::new(page_count)
+                .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
             let meta = SortedRunMeta::new(
                 path,
                 SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi))?,
                 coverage,
                 page_count,
-                size_bytes,
+                SizeBytes::new(size_bytes),
             )?;
             Ok(ManifestEntry::AddRunAndSequence {
                 level,
@@ -549,15 +551,15 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::types::Level;
+    use crate::types::{Level, PageCount, SizeBytes};
 
     fn test_meta(name: &str) -> SortedRunMeta {
         SortedRunMeta::new(
             PathBuf::from(name),
             SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             vec![0, 3, 7],
-            42,
-            8192,
+            PageCount::new(42).unwrap(),
+            SizeBytes::new(8192),
         )
         .unwrap()
     }
