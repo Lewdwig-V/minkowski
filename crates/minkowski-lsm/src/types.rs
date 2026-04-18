@@ -139,6 +139,31 @@ impl fmt::Display for PageCount {
     }
 }
 
+/// Size in bytes of an on-disk artifact.
+///
+/// Infallible newtype — zero is permitted (matches the semantics of
+/// `fs::metadata(...).len()`, which returns `0` for empty files).
+/// Type-level distinction from `PageCount` prevents arg-swap bugs at
+/// `SortedRunMeta::new`.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct SizeBytes(u64);
+
+impl SizeBytes {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for SizeBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +180,10 @@ mod tests {
     // - Option<PageCount> is 8 bytes via NonZeroU64's niche.
     assert_eq_size!(PageCount, u64);
     assert_eq_size!(Option<PageCount>, u64);
+
+    // SizeBytes is a plain u64 wrapper — no niche, so only the direct size holds.
+    // Option<SizeBytes> is 16 bytes, not 8.
+    assert_eq_size!(SizeBytes, u64);
 
     #[test]
     fn seqno_get_returns_inner_u64() {
@@ -258,5 +287,22 @@ mod tests {
         let raw: u64 = pc.get();
         let restored = PageCount::new(raw).unwrap();
         assert_eq!(pc, restored);
+    }
+
+    #[test]
+    fn sizebytes_get_returns_inner_u64() {
+        let s = SizeBytes::new(1024);
+        assert_eq!(s.get(), 1024);
+    }
+
+    #[test]
+    fn sizebytes_allows_zero() {
+        let s = SizeBytes::new(0);
+        assert_eq!(s.get(), 0);
+    }
+
+    #[test]
+    fn sizebytes_display() {
+        assert_eq!(SizeBytes::new(42).to_string(), "42");
     }
 }
