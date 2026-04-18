@@ -122,7 +122,7 @@ mod tests {
 
         let result = flush_and_record(
             &world,
-            SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             &mut manifest,
             &mut log,
             dir.path(),
@@ -130,7 +130,7 @@ mod tests {
         .unwrap();
         assert!(result.is_some());
         assert_eq!(manifest.total_runs(), 1);
-        assert_eq!(manifest.next_sequence(), SeqNo(10));
+        assert_eq!(manifest.next_sequence(), SeqNo::from(10u64));
         assert_eq!(manifest.runs_at_level(Level::L0).len(), 1);
     }
 
@@ -146,7 +146,7 @@ mod tests {
 
         let result = flush_and_record(
             &world,
-            SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             &mut manifest,
             &mut log,
             dir.path(),
@@ -172,7 +172,7 @@ mod tests {
             Level::L0,
             SortedRunMeta::new(
                 dir.path().join("0-10.run"),
-                SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+                SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
                 vec![0],
                 1,
                 4,

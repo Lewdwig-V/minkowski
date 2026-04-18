@@ -10,9 +10,24 @@ use crate::manifest::NUM_LEVELS;
 ///
 /// Raw `u64` arithmetic on sequence numbers is disallowed by the type
 /// (no `Add`/`Sub` impls) because sequences are identities, not sizes.
-/// Callers that need "next seq" do so explicitly: `SeqNo(x.0 + 1)`.
+/// Use `.next()` for "advance by one"; use `.get()` to extract the raw value.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
-pub struct SeqNo(pub u64);
+pub struct SeqNo(u64);
+
+impl SeqNo {
+    /// Extract the underlying `u64`.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The next sequence number. Panics on `u64::MAX + 1` — an internal
+    /// invariant violation, since the WAL is the only `SeqNo` producer
+    /// and a 64-bit sequence space exhausts long after any realistic
+    /// process lifetime.
+    pub fn next(self) -> Self {
+        Self(self.0.checked_add(1).expect("SeqNo overflow"))
+    }
+}
 
 impl From<u64> for SeqNo {
     fn from(v: u64) -> Self {
@@ -140,6 +155,26 @@ mod tests {
     // - Option<PageCount> is 8 bytes via NonZeroU64's niche.
     assert_eq_size!(PageCount, u64);
     assert_eq_size!(Option<PageCount>, u64);
+
+    #[test]
+    fn seqno_get_returns_inner_u64() {
+        let s = SeqNo::from(42u64);
+        assert_eq!(s.get(), 42);
+    }
+
+    #[test]
+    fn seqno_next_advances_by_one() {
+        let s = SeqNo::from(5u64);
+        let n = s.next();
+        assert_eq!(n.get(), 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "SeqNo overflow")]
+    fn seqno_next_panics_on_overflow() {
+        let s = SeqNo::from(u64::MAX);
+        let _ = s.next();
+    }
 
     #[test]
     fn seqno_display_matches_inner_u64() {

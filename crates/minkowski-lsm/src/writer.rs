@@ -84,8 +84,8 @@ pub fn flush(
         .collect();
 
     // ── 4. Write to temp file ───────────────────────────────────────────────
-    let seq_lo = sequence_range.lo().0;
-    let seq_hi = sequence_range.hi().0;
+    let seq_lo = sequence_range.lo().get();
+    let seq_hi = sequence_range.hi().get();
     let tmp_name = format!("{seq_lo}-{seq_hi}.run.tmp");
     let final_name = format!("{seq_lo}-{seq_hi}.run");
     let tmp_path = output_dir.join(&tmp_name);
@@ -407,7 +407,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = flush(
             &world,
-            SeqRange::new(SeqNo(0), SeqNo(0)).unwrap(),
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
         )
         .unwrap();
@@ -422,7 +422,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = flush(
             &world,
-            SeqRange::new(SeqNo(1), SeqNo(5)).unwrap(),
+            SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
             dir.path(),
         )
         .unwrap();
@@ -439,7 +439,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = flush(
             &world,
-            SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+            SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             dir.path(),
         )
         .unwrap();
@@ -456,7 +456,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = flush(
             &world,
-            SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             dir.path(),
         )
         .unwrap();
@@ -481,7 +481,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = flush(
             &world,
-            SeqRange::new(SeqNo(0), SeqNo(1)).unwrap(),
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
             dir.path(),
         )
         .unwrap()

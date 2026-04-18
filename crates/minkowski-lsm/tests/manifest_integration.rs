@@ -43,7 +43,7 @@ fn three_flushes_then_replay() {
     }
     let p1 = flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -61,7 +61,7 @@ fn three_flushes_then_replay() {
     }
     let p2 = flush_and_record(
         &world,
-        SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+        SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -74,7 +74,7 @@ fn three_flushes_then_replay() {
     world.spawn((Vel { dx: 1.0, dy: 2.0 },));
     let p3 = flush_and_record(
         &world,
-        SeqRange::new(SeqNo(20), SeqNo(30)).unwrap(),
+        SeqRange::new(SeqNo::from(20u64), SeqNo::from(30u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -83,7 +83,7 @@ fn three_flushes_then_replay() {
     .unwrap();
 
     assert_eq!(manifest.total_runs(), 3);
-    assert_eq!(manifest.next_sequence(), SeqNo(30));
+    assert_eq!(manifest.next_sequence(), SeqNo::from(30u64));
     assert!(p1.exists());
     assert!(p2.exists());
     assert!(p3.exists());
@@ -91,7 +91,7 @@ fn three_flushes_then_replay() {
     // Replay the log from scratch — should reconstruct identical state.
     let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(recovered.total_runs(), 3);
-    assert_eq!(recovered.next_sequence(), SeqNo(30));
+    assert_eq!(recovered.next_sequence(), SeqNo::from(30u64));
     assert_eq!(recovered.runs_at_level(Level::L0).len(), 3);
 
     // Verify run metadata matches.
@@ -120,7 +120,7 @@ fn corrupt_tail_partial_recovery() {
     // Two good flushes.
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -131,7 +131,7 @@ fn corrupt_tail_partial_recovery() {
     world.spawn((Pos { x: 3.0, y: 4.0 },));
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+        SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -147,7 +147,7 @@ fn corrupt_tail_partial_recovery() {
     // Replay should recover the 2 good entries (each flush writes one atomic AddRunAndSequence entry).
     let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(recovered.total_runs(), 2);
-    assert_eq!(recovered.next_sequence(), SeqNo(20));
+    assert_eq!(recovered.next_sequence(), SeqNo::from(20u64));
 }
 
 /// Truncate the log to every byte prefix 0..=file_len and replay each time.
@@ -173,7 +173,7 @@ fn replay_converges_at_every_truncation_prefix() {
         let hi = lo + 10;
         flush_and_record(
             &world,
-            SeqRange::new(SeqNo(lo), SeqNo(hi)).unwrap(),
+            SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap(),
             &mut manifest,
             &mut log,
             dir.path(),
@@ -186,7 +186,7 @@ fn replay_converges_at_every_truncation_prefix() {
     assert!(!full_bytes.is_empty(), "log must have content");
 
     let mut prev_total_runs = 0usize;
-    let mut prev_next_seq = SeqNo(0);
+    let mut prev_next_seq = SeqNo::from(0u64);
 
     for truncate_len in 0..=full_bytes.len() {
         let truncated_path = dir.path().join(format!("truncated_{truncate_len:05}.log"));
@@ -233,7 +233,7 @@ fn replay_converges_at_every_truncation_prefix() {
     assert_eq!(prev_total_runs, 3, "full replay must recover all 3 runs");
     assert_eq!(
         prev_next_seq,
-        SeqNo(30),
+        SeqNo::from(30u64),
         "full replay must recover final sequence"
     );
 }
@@ -251,7 +251,7 @@ fn replay_truncates_log_on_promote_of_missing_run() {
     // Real flush: produces a genuine AddRunAndSequence entry.
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -268,7 +268,7 @@ fn replay_truncates_log_on_promote_of_missing_run() {
     .unwrap();
     // Anything after the bad entry must be discarded on replay.
     log.append(&ManifestEntry::SetSequence {
-        next_sequence: SeqNo(999),
+        next_sequence: SeqNo::from(999u64),
     })
     .unwrap();
     drop(log);
@@ -280,11 +280,11 @@ fn replay_truncates_log_on_promote_of_missing_run() {
         "only the first flush should survive replay"
     );
     assert!(
-        recovered.next_sequence() < SeqNo(999),
+        recovered.next_sequence() < SeqNo::from(999u64),
         "SetSequence past the bad PromoteRun must not apply"
     );
     // The surviving AddRunAndSequence set next_sequence to 10.
-    assert_eq!(recovered.next_sequence(), SeqNo(10));
+    assert_eq!(recovered.next_sequence(), SeqNo::from(10u64));
 }
 
 // ── Cleanup ─────────────────────────────────────────────────────────────────
@@ -301,7 +301,7 @@ fn cleanup_removes_orphans_and_tmp() {
     // One real flush.
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -338,7 +338,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
     // One real flush, produces a valid AddRunAndSequence frame.
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -405,7 +405,7 @@ fn replay_truncates_log_on_invalid_level_byte() {
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -462,7 +462,7 @@ fn replay_truncates_log_on_inverted_seq_range() {
     // One real flush, produces a valid AddRunAndSequence frame.
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -528,7 +528,7 @@ fn replay_truncates_log_on_remove_of_missing_run() {
     // One real flush — produces a valid AddRunAndSequence entry.
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -543,7 +543,7 @@ fn replay_truncates_log_on_remove_of_missing_run() {
     .unwrap();
     // Anything after the bad entry must be discarded on replay.
     log.append(&ManifestEntry::SetSequence {
-        next_sequence: SeqNo(999),
+        next_sequence: SeqNo::from(999u64),
     })
     .unwrap();
     drop(log);
@@ -556,10 +556,10 @@ fn replay_truncates_log_on_remove_of_missing_run() {
     );
     // The trailing SetSequence must not have been applied.
     assert!(
-        recovered.next_sequence() < SeqNo(999),
+        recovered.next_sequence() < SeqNo::from(999u64),
         "SetSequence past the bad RemoveRun must not apply"
     );
-    assert_eq!(recovered.next_sequence(), SeqNo(10));
+    assert_eq!(recovered.next_sequence(), SeqNo::from(10u64));
 }
 
 // ── recover() lifecycle and rejection regressions ───────────────────────────
@@ -581,7 +581,7 @@ fn recover_then_flush_then_recover_roundtrips_state() {
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -591,7 +591,7 @@ fn recover_then_flush_then_recover_roundtrips_state() {
     world.spawn((Pos { x: 2.0, y: 0.0 },));
     flush_and_record(
         &world,
-        SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+        SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -602,7 +602,7 @@ fn recover_then_flush_then_recover_roundtrips_state() {
     // Second recover replays both entries.
     let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(recovered.total_runs(), 2);
-    assert_eq!(recovered.next_sequence(), SeqNo(20));
+    assert_eq!(recovered.next_sequence(), SeqNo::from(20u64));
 
     // Metadata round-trips faithfully.
     for (orig, rec) in manifest
@@ -668,7 +668,7 @@ fn recover_ignores_nonzero_reserved_bytes() {
     // Recover should succeed on an otherwise-empty log.
     let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(recovered.total_runs(), 0);
-    assert_eq!(recovered.next_sequence(), SeqNo(0));
+    assert_eq!(recovered.next_sequence(), SeqNo::from(0u64));
 }
 
 /// Calling recover() twice on the same path with no intervening writes
@@ -708,7 +708,7 @@ fn flush_and_record_clean_world_no_change() {
 
     let result = flush_and_record(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
@@ -716,7 +716,7 @@ fn flush_and_record_clean_world_no_change() {
     .unwrap();
     assert!(result.is_none());
     assert_eq!(manifest.total_runs(), 0);
-    assert_eq!(manifest.next_sequence(), SeqNo(0));
+    assert_eq!(manifest.next_sequence(), SeqNo::from(0u64));
 
     // Log should be empty — recover produces empty manifest.
     let (replayed, _) = ManifestLog::recover(&log_path).unwrap();
