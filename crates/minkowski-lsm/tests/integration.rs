@@ -31,7 +31,7 @@ fn flush_and_open(world: &World) -> (tempfile::TempDir, SortedRunReader) {
     let dir = tempfile::tempdir().unwrap();
     let path = flush(
         world,
-        SeqRange::new(SeqNo(0), SeqNo(100)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
         dir.path(),
     )
     .unwrap()
@@ -225,7 +225,7 @@ fn no_dirty_pages_no_file() {
     let dir = tempfile::tempdir().unwrap();
     let result = flush(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(0)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
         dir.path(),
     )
     .unwrap();
@@ -260,7 +260,7 @@ fn crc_corruption_detected() {
     let dir = tempfile::tempdir().unwrap();
     let path = flush(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(50)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(50u64)).unwrap(),
         dir.path(),
     )
     .unwrap()
@@ -332,7 +332,7 @@ fn header_crc_corruption_detected() {
     let dir = tempfile::tempdir().unwrap();
     let path = flush(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         dir.path(),
     )
     .unwrap()
@@ -524,7 +524,7 @@ fn zst_component_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = flush(
         &world,
-        SeqRange::new(SeqNo(0), SeqNo(0)).unwrap(),
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
         dir.path(),
     )
     .unwrap()

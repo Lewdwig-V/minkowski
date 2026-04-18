@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
-use crate::types::{Level, SeqNo, SeqRange};
+use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 
 // ── File header ─────────────────────────────────────────────────────────────
 
@@ -239,11 +239,11 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.push(TAG_ADD_RUN);
             buf.push(level.as_u8());
             encode_path(&mut buf, meta.path())?;
-            buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
-            buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range().lo().get().to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range().hi().get().to_le_bytes());
             encode_coverage(&mut buf, meta.archetype_coverage())?;
             buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
-            buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
+            buf.extend_from_slice(&meta.size_bytes().get().to_le_bytes());
         }
         ManifestEntry::RemoveRun { level, path } => {
             buf.push(TAG_REMOVE_RUN);
@@ -262,7 +262,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
         }
         ManifestEntry::SetSequence { next_sequence } => {
             buf.push(TAG_SET_SEQUENCE);
-            buf.extend_from_slice(&next_sequence.0.to_le_bytes());
+            buf.extend_from_slice(&next_sequence.get().to_le_bytes());
         }
         ManifestEntry::AddRunAndSequence {
             level,
@@ -272,12 +272,12 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.push(TAG_ADD_RUN_AND_SEQUENCE);
             buf.push(level.as_u8());
             encode_path(&mut buf, meta.path())?;
-            buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
-            buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range().lo().get().to_le_bytes());
+            buf.extend_from_slice(&meta.sequence_range().hi().get().to_le_bytes());
             encode_coverage(&mut buf, meta.archetype_coverage())?;
             buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
-            buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
-            buf.extend_from_slice(&next_sequence.0.to_le_bytes());
+            buf.extend_from_slice(&meta.size_bytes().get().to_le_bytes());
+            buf.extend_from_slice(&next_sequence.get().to_le_bytes());
         }
     }
     Ok(buf)
@@ -312,13 +312,14 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             }
             let page_count = read_u64_le(data, &mut offset)?;
             let size_bytes = read_u64_le(data, &mut offset)?;
-
+            let page_count = PageCount::new(page_count)
+                .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
             let meta = SortedRunMeta::new(
                 path,
-                SeqRange::new(SeqNo(seq_lo), SeqNo(seq_hi))?,
+                SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi))?,
                 coverage,
                 page_count,
-                size_bytes,
+                SizeBytes::new(size_bytes),
             )?;
             Ok(ManifestEntry::AddRun { level, meta })
         }
@@ -353,7 +354,7 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             })
         }
         TAG_SET_SEQUENCE => {
-            let next_sequence = SeqNo(read_u64_le(data, &mut offset)?);
+            let next_sequence = SeqNo::from(read_u64_le(data, &mut offset)?);
             Ok(ManifestEntry::SetSequence { next_sequence })
         }
         TAG_ADD_RUN_AND_SEQUENCE => {
@@ -377,14 +378,15 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             }
             let page_count = read_u64_le(data, &mut offset)?;
             let size_bytes = read_u64_le(data, &mut offset)?;
-            let next_sequence = SeqNo(read_u64_le(data, &mut offset)?);
-
+            let next_sequence = SeqNo::from(read_u64_le(data, &mut offset)?);
+            let page_count = PageCount::new(page_count)
+                .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
             let meta = SortedRunMeta::new(
                 path,
-                SeqRange::new(SeqNo(seq_lo), SeqNo(seq_hi))?,
+                SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi))?,
                 coverage,
                 page_count,
-                size_bytes,
+                SizeBytes::new(size_bytes),
             )?;
             Ok(ManifestEntry::AddRunAndSequence {
                 level,
@@ -549,15 +551,15 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::types::Level;
+    use crate::types::{Level, PageCount, SizeBytes};
 
     fn test_meta(name: &str) -> SortedRunMeta {
         SortedRunMeta::new(
             PathBuf::from(name),
-            SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+            SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             vec![0, 3, 7],
-            42,
-            8192,
+            PageCount::new(42).unwrap(),
+            SizeBytes::new(8192),
         )
         .unwrap()
     }
@@ -612,7 +614,7 @@ mod tests {
     #[test]
     fn encode_decode_set_sequence() {
         let entry = ManifestEntry::SetSequence {
-            next_sequence: SeqNo(12345),
+            next_sequence: SeqNo::from(12345u64),
         };
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();
@@ -625,7 +627,7 @@ mod tests {
         let entry = ManifestEntry::AddRunAndSequence {
             level: Level::L0,
             meta,
-            next_sequence: SeqNo(99),
+            next_sequence: SeqNo::from(99u64),
         };
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();
@@ -638,7 +640,7 @@ mod tests {
         let entry = ManifestEntry::AddRunAndSequence {
             level: Level::L3,
             meta,
-            next_sequence: SeqNo(42),
+            next_sequence: SeqNo::from(42u64),
         };
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();
@@ -654,14 +656,14 @@ mod tests {
         log.append(&ManifestEntry::AddRunAndSequence {
             level: Level::L0,
             meta: test_meta("atomic.run"),
-            next_sequence: SeqNo(42),
+            next_sequence: SeqNo::from(42u64),
         })
         .unwrap();
         drop(log);
 
         let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 1);
-        assert_eq!(manifest.next_sequence(), SeqNo(42));
+        assert_eq!(manifest.next_sequence(), SeqNo::from(42u64));
         assert_eq!(
             manifest.runs_at_level(Level::L0)[0].path(),
             Path::new("atomic.run")
@@ -729,7 +731,7 @@ mod tests {
         // File doesn't exist → empty manifest.
         let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
-        assert_eq!(manifest.next_sequence(), SeqNo(0));
+        assert_eq!(manifest.next_sequence(), SeqNo::from(0u64));
     }
 
     #[test]
@@ -910,7 +912,7 @@ mod tests {
 
         let (manifest, _log) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
-        assert_eq!(manifest.next_sequence(), SeqNo(0));
+        assert_eq!(manifest.next_sequence(), SeqNo::from(0u64));
 
         assert!(path.exists());
         let bytes = fs::read(&path).unwrap();
@@ -967,12 +969,12 @@ mod tests {
         // Reopen via recover, append an entry, reopen again.
         let (_, mut log) = ManifestLog::recover(&path).unwrap();
         log.append(&ManifestEntry::SetSequence {
-            next_sequence: SeqNo(42),
+            next_sequence: SeqNo::from(42u64),
         })
         .unwrap();
         drop(log);
 
         let (manifest, _log) = ManifestLog::recover(&path).unwrap();
-        assert_eq!(manifest.next_sequence(), SeqNo(42));
+        assert_eq!(manifest.next_sequence(), SeqNo::from(42u64));
     }
 }

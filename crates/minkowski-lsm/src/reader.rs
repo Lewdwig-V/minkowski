@@ -113,13 +113,16 @@ fn validate_and_parse(buf: &[u8]) -> Result<ParsedMetadata, LsmError> {
     }
 
     let schema_count = header.schema_count;
-    let sequence_range = SeqRange::new(SeqNo(header.sequence_lo), SeqNo(header.sequence_hi))
-        .map_err(|_| {
-            LsmError::Format(format!(
-                "header sequence range invalid: lo={} > hi={}",
-                header.sequence_lo, header.sequence_hi
-            ))
-        })?;
+    let sequence_range = SeqRange::new(
+        SeqNo::from(header.sequence_lo),
+        SeqNo::from(header.sequence_hi),
+    )
+    .map_err(|_| {
+        LsmError::Format(format!(
+            "header sequence range invalid: lo={} > hi={}",
+            header.sequence_lo, header.sequence_hi
+        ))
+    })?;
     let page_count = header.page_count;
 
     // 5. Read footer (last 64 bytes).
@@ -381,7 +384,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = flush(
             &world,
-            SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+            SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             dir.path(),
         )
         .unwrap()
@@ -396,7 +399,7 @@ mod tests {
 
         assert_eq!(
             reader.sequence_range(),
-            SeqRange::new(SeqNo(10), SeqNo(20)).unwrap()
+            SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap()
         );
         assert_eq!(reader.schema().len(), 1); // Pos only
         assert!(reader.page_count() > 0);
@@ -471,7 +474,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = flush(
             &world,
-            SeqRange::new(SeqNo(0), SeqNo(0)).unwrap(),
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
         )
         .unwrap()
@@ -552,7 +555,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = flush(
             &world,
-            SeqRange::new(SeqNo(0), SeqNo(100)).unwrap(),
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
             dir.path(),
         )
         .unwrap()

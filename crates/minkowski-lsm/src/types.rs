@@ -1,3 +1,10 @@
+//! Newtype primitives for the LSM manifest subsystem.
+//!
+//! Construction idiom reflects the validity story:
+//! - `From<u64>` — total, interchangeable with `u64` (e.g., `SeqNo`).
+//! - `new(u64) -> Option<Self>` — fallible with a precondition (e.g., `PageCount::new` rejects zero, `Level::new` rejects out-of-range).
+//! - `new(u64) -> Self` without `From<u64>` — infallible but nominally distinct; `From` is deliberately omitted to block silent `.into()` conversions at adjacent-arg call sites (e.g., `SizeBytes`).
+//!
 //! Invariant-carrying newtype primitives shared across the manifest.
 
 use std::fmt;
@@ -10,9 +17,24 @@ use crate::manifest::NUM_LEVELS;
 ///
 /// Raw `u64` arithmetic on sequence numbers is disallowed by the type
 /// (no `Add`/`Sub` impls) because sequences are identities, not sizes.
-/// Callers that need "next seq" do so explicitly: `SeqNo(x.0 + 1)`.
+/// Use `.next()` for "advance by one"; use `.get()` to extract the raw value.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
-pub struct SeqNo(pub u64);
+pub struct SeqNo(u64);
+
+impl SeqNo {
+    /// Extract the underlying `u64`.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The next sequence number. Panics on `u64::MAX + 1` — an internal
+    /// invariant violation, since the WAL is the only `SeqNo` producer
+    /// and a 64-bit sequence space exhausts long after any realistic
+    /// process lifetime.
+    pub fn next(self) -> Self {
+        Self(self.0.checked_add(1).expect("SeqNo overflow"))
+    }
+}
 
 impl From<u64> for SeqNo {
     fn from(v: u64) -> Self {
@@ -124,22 +146,74 @@ impl fmt::Display for PageCount {
     }
 }
 
+/// Size in bytes of an on-disk artifact.
+///
+/// Infallible newtype — zero is permitted (matches the semantics of
+/// `fs::metadata(...).len()`, which returns `0` for empty files).
+/// Type-level distinction from `PageCount` prevents arg-swap bugs at
+/// any call site taking both.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct SizeBytes(u64);
+
+impl SizeBytes {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for SizeBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Tombstone tests: SeqNo must NOT implement Add/Sub/AddAssign/SubAssign.
+    // Tombstones: sequences are identities, not sizes — arithmetic must
+    // stay unimplemented so `seq + 1` or `seq - other` fails to compile.
+    // See the SeqNo type doc comment above for the rationale.
     use static_assertions::{assert_eq_size, assert_not_impl_all};
-    use std::ops::{Add, AddAssign, Sub, SubAssign};
+    use std::ops::{Add, AddAssign, Div, Mul, Neg, Rem, Sub, SubAssign};
 
     assert_not_impl_all!(SeqNo: Add<SeqNo>, Sub<SeqNo>, AddAssign<SeqNo>, SubAssign<SeqNo>);
     assert_not_impl_all!(SeqNo: Add<u64>, Sub<u64>, AddAssign<u64>, SubAssign<u64>);
+    assert_not_impl_all!(SeqNo: Mul<u64>, Div<u64>, Rem<u64>, Neg);
 
     // Pin the PageCount layout claims documented on the type:
     // - PageCount itself is 8 bytes (same as u64).
     // - Option<PageCount> is 8 bytes via NonZeroU64's niche.
     assert_eq_size!(PageCount, u64);
     assert_eq_size!(Option<PageCount>, u64);
+
+    // SizeBytes is a plain u64 wrapper — no niche, so only the direct size holds.
+    // Option<SizeBytes> is 16 bytes, not 8.
+    assert_eq_size!(SizeBytes, u64);
+
+    #[test]
+    fn seqno_get_returns_inner_u64() {
+        let s = SeqNo::from(42u64);
+        assert_eq!(s.get(), 42);
+    }
+
+    #[test]
+    fn seqno_next_advances_by_one() {
+        let s = SeqNo::from(5u64);
+        let n = s.next();
+        assert_eq!(n.get(), 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "SeqNo overflow")]
+    fn seqno_next_panics_on_overflow() {
+        let s = SeqNo::from(u64::MAX);
+        let _ = s.next();
+    }
 
     #[test]
     fn seqno_display_matches_inner_u64() {
@@ -223,5 +297,22 @@ mod tests {
         let raw: u64 = pc.get();
         let restored = PageCount::new(raw).unwrap();
         assert_eq!(pc, restored);
+    }
+
+    #[test]
+    fn sizebytes_get_returns_inner_u64() {
+        let s = SizeBytes::new(1024);
+        assert_eq!(s.get(), 1024);
+    }
+
+    #[test]
+    fn sizebytes_allows_zero() {
+        let s = SizeBytes::new(0);
+        assert_eq!(s.get(), 0);
+    }
+
+    #[test]
+    fn sizebytes_display() {
+        assert_eq!(SizeBytes::new(42).to_string(), "42");
     }
 }
