@@ -16,10 +16,10 @@ use crate::writer::flush;
 /// Flush dirty pages and record the new sorted run in the manifest.
 ///
 /// Returns `Ok(Some(path))` if a run was written, `Ok(None)` if no dirty pages.
-pub fn flush_and_record(
+pub fn flush_and_record<const N: usize>(
     world: &World,
     sequence_range: SeqRange,
-    manifest: &mut LsmManifest,
+    manifest: &mut LsmManifest<N>,
     log: &mut ManifestLog,
     output_dir: &Path,
 ) -> Result<Option<PathBuf>, LsmError> {
@@ -51,7 +51,7 @@ pub fn flush_and_record(
         next_sequence: sequence_range.hi(),
     })?;
 
-    manifest.add_run(Level::L0, meta);
+    manifest.add_run(Level::L0, meta)?;
     manifest.set_next_sequence(sequence_range.hi());
 
     Ok(Some(path))
@@ -61,7 +61,10 @@ pub fn flush_and_record(
 ///
 /// Also removes any `.run.tmp` files (incomplete flushes).
 /// Returns the number of files deleted.
-pub fn cleanup_orphans(dir: &Path, manifest: &LsmManifest) -> Result<usize, LsmError> {
+pub fn cleanup_orphans<const N: usize>(
+    dir: &Path,
+    manifest: &LsmManifest<N>,
+) -> Result<usize, LsmError> {
     let known: HashSet<PathBuf> = manifest
         .all_run_paths()
         .into_iter()
@@ -120,7 +123,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("manifest.log");
-        let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
         let result = flush_and_record(
             &world,
@@ -144,7 +147,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("manifest.log");
-        let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
         let result = flush_and_record(
             &world,
@@ -169,18 +172,20 @@ mod tests {
         fs::write(dir.path().join("notes.txt"), b"not a run").unwrap();
 
         // Manifest only knows about 0-10.run.
-        let mut manifest = LsmManifest::new();
-        manifest.add_run(
-            Level::L0,
-            SortedRunMeta::new(
-                dir.path().join("0-10.run"),
-                SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
-                vec![0],
-                PageCount::new(1).unwrap(),
-                SizeBytes::new(4),
+        let mut manifest: crate::manifest::DefaultManifest = LsmManifest::new();
+        manifest
+            .add_run(
+                Level::L0,
+                SortedRunMeta::new(
+                    dir.path().join("0-10.run"),
+                    SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
+                    vec![0],
+                    PageCount::new(1).unwrap(),
+                    SizeBytes::new(4),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
+            .unwrap();
 
         let deleted = cleanup_orphans(dir.path(), &manifest).unwrap();
         assert_eq!(deleted, 2); // 10-20.run + crash.run.tmp

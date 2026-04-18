@@ -423,9 +423,12 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
 
 // ── ManifestLog ─────────────────────────────────────────────────────────────
 
-fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) -> Result<(), LsmError> {
+fn apply_entry<const N: usize>(
+    manifest: &mut LsmManifest<N>,
+    entry: &ManifestEntry,
+) -> Result<(), LsmError> {
     match entry {
-        ManifestEntry::AddRun { level, meta } => manifest.add_run(*level, meta.clone()),
+        ManifestEntry::AddRun { level, meta } => manifest.add_run(*level, meta.clone())?,
         ManifestEntry::RemoveRun { level, path } => {
             // A RemoveRun for a path the manifest doesn't know means log
             // corruption — the corresponding AddRun was lost, or entries
@@ -457,7 +460,7 @@ fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) -> Result<(), 
             meta,
             next_sequence,
         } => {
-            manifest.add_run(*level, meta.clone());
+            manifest.add_run(*level, meta.clone())?;
             manifest.set_next_sequence(*next_sequence);
         }
     }
@@ -468,7 +471,11 @@ fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) -> Result<(), 
 /// Truncates on torn-tail / decode / apply errors, as the existing
 /// recovery contract requires. Returns the recovered manifest and the
 /// post-truncation position (end of the valid frame region).
-fn replay_frames(file: &File, path: &Path, start: u64) -> Result<(LsmManifest, u64), LsmError> {
+fn replay_frames<const N: usize>(
+    file: &File,
+    path: &Path,
+    start: u64,
+) -> Result<(LsmManifest<N>, u64), LsmError> {
     let mut manifest = LsmManifest::new();
     let mut pos: u64 = start;
 
@@ -527,7 +534,7 @@ impl ManifestLog {
     /// replays frames from offset 8 onward (truncating torn tails), and
     /// returns `(recovered_manifest, log_handle)` with `write_pos` at
     /// end of valid data.
-    pub fn recover(path: &Path) -> Result<(LsmManifest, Self), LsmError> {
+    pub fn recover<const N: usize>(path: &Path) -> Result<(LsmManifest<N>, Self), LsmError> {
         if !path.exists() {
             let mut file = OpenOptions::new()
                 .create(true)
@@ -713,7 +720,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
 
-        let (_, mut log) = ManifestLog::recover(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover::<4>(&path).unwrap();
         log.append(&ManifestEntry::AddRunAndSequence {
             level: Level::L0,
             meta: test_meta("atomic.run"),
@@ -722,7 +729,7 @@ mod tests {
         .unwrap();
         drop(log);
 
-        let (manifest, _) = ManifestLog::recover(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover::<4>(&path).unwrap();
         assert_eq!(manifest.total_runs(), 1);
         assert_eq!(manifest.next_sequence(), SeqNo::from(42u64));
         assert_eq!(
@@ -790,7 +797,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
         // File doesn't exist → empty manifest.
-        let (manifest, _) = ManifestLog::recover(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover::<4>(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
         assert_eq!(manifest.next_sequence(), SeqNo::from(0u64));
     }
@@ -800,7 +807,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
 
-        let (_, mut log) = ManifestLog::recover(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover::<4>(&path).unwrap();
         for i in 0..3 {
             let meta = test_meta(&format!("{i}.run"));
             log.append(&ManifestEntry::AddRun {
@@ -811,7 +818,7 @@ mod tests {
         }
         drop(log);
 
-        let (manifest, _) = ManifestLog::recover(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover::<4>(&path).unwrap();
         assert_eq!(manifest.total_runs(), 3);
         assert_eq!(manifest.runs_at_level(Level::L0).len(), 3);
     }
@@ -821,7 +828,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
 
-        let (_, mut log) = ManifestLog::recover(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover::<4>(&path).unwrap();
         let meta = test_meta("ephemeral.run");
         log.append(&ManifestEntry::AddRun {
             level: Level::L0,
@@ -835,7 +842,7 @@ mod tests {
         .unwrap();
         drop(log);
 
-        let (manifest, _) = ManifestLog::recover(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover::<4>(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
     }
 
@@ -845,7 +852,7 @@ mod tests {
         let path = dir.path().join("manifest.log");
 
         // Write 2 good entries.
-        let (_, mut log) = ManifestLog::recover(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover::<4>(&path).unwrap();
         log.append(&ManifestEntry::AddRun {
             level: Level::L0,
             meta: test_meta("a.run"),
@@ -865,7 +872,7 @@ mod tests {
         }
 
         // Replay should recover the 2 good entries.
-        let (manifest, mut log2) = ManifestLog::recover(&path).unwrap();
+        let (manifest, mut log2) = ManifestLog::recover::<4>(&path).unwrap();
         assert_eq!(manifest.total_runs(), 2);
 
         // File should be truncated to remove garbage; write_pos should be at end of valid data.
@@ -880,7 +887,7 @@ mod tests {
         .unwrap();
         drop(log2);
 
-        let (manifest2, _) = ManifestLog::recover(&path).unwrap();
+        let (manifest2, _) = ManifestLog::recover::<4>(&path).unwrap();
         assert_eq!(manifest2.total_runs(), 3);
     }
 
@@ -971,7 +978,7 @@ mod tests {
         let path = dir.path().join("new.log");
         assert!(!path.exists());
 
-        let (manifest, _log) = ManifestLog::recover(&path).unwrap();
+        let (manifest, _log) = ManifestLog::recover::<4>(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
         assert_eq!(manifest.next_sequence(), SeqNo::from(0u64));
 
@@ -992,7 +999,7 @@ mod tests {
             write_header(&mut file).unwrap();
             file.sync_all().unwrap();
         }
-        let (manifest, log) = ManifestLog::recover(&path).unwrap();
+        let (manifest, log) = ManifestLog::recover::<4>(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
         assert_eq!(log.write_pos, 8);
     }
@@ -1002,7 +1009,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.log");
         fs::write(&path, b"XXXXv1\x00\x00\x00").unwrap();
-        let err = ManifestLog::recover(&path).err().unwrap();
+        let err = ManifestLog::recover::<4>(&path).err().unwrap();
         assert!(matches!(err, LsmError::Format(_)));
     }
 
@@ -1011,7 +1018,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v99.log");
         fs::write(&path, b"MKMF\x63\x00\x00\x00").unwrap();
-        let err = ManifestLog::recover(&path).err().unwrap();
+        let err = ManifestLog::recover::<4>(&path).err().unwrap();
         assert!(matches!(err, LsmError::Format(_)));
     }
 
@@ -1028,14 +1035,14 @@ mod tests {
         }
 
         // Reopen via recover, append an entry, reopen again.
-        let (_, mut log) = ManifestLog::recover(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover::<4>(&path).unwrap();
         log.append(&ManifestEntry::SetSequence {
             next_sequence: SeqNo::from(42u64),
         })
         .unwrap();
         drop(log);
 
-        let (manifest, _log) = ManifestLog::recover(&path).unwrap();
+        let (manifest, _log) = ManifestLog::recover::<4>(&path).unwrap();
         assert_eq!(manifest.next_sequence(), SeqNo::from(42u64));
     }
 }
