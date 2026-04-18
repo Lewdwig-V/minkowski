@@ -145,12 +145,25 @@ pub enum ManifestEntry {
 [tag: u8 = 0x06]
 [output_level: u8]
 [output: SortedRunMeta encoded as in AddRun]
-[input_count: u16 LE]
+[input_count: u32 LE]
 input_count × {
     [level: u8]
     [path_len: u16 LE][path: bytes]
 }
 ```
+
+`input_count` is `u32` rather than `u16`. The expected value is <100 even under pathological conditions (bounded by per-level count trigger), but the asymmetry of change cost favors the wider field: u16→u32 later requires a manifest-log format-version bump and dual-decode, while u32→u16 later is trivial. A logical bound check sits at the apply site:
+
+```rust
+const MAX_COMPACTION_INPUTS: usize = 1024;  // orders of magnitude past expected
+
+debug_assert!(
+    inputs.len() <= MAX_COMPACTION_INPUTS,
+    "CompactionCommit with {} inputs — check compaction granularity",
+    inputs.len()
+);
+```
+That preserves the "bounded everything" property at the semantic layer without baking it into the wire format.
 
 **Apply semantics**: on replay, `apply_entry` atomically adds the output to the manifest and removes all listed inputs. Partial application is impossible — the frame is a single CRC-validated unit; it either applies entirely or gets truncated as tail garbage.
 
