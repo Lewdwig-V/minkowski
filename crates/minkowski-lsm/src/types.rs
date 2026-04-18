@@ -168,12 +168,13 @@ impl fmt::Display for SizeBytes {
 mod tests {
     use super::*;
 
-    // Tombstone tests: SeqNo must NOT implement Add/Sub/AddAssign/SubAssign.
+    // Tombstone tests: SeqNo must NOT implement any arithmetic.
     use static_assertions::{assert_eq_size, assert_not_impl_all};
-    use std::ops::{Add, AddAssign, Sub, SubAssign};
+    use std::ops::{Add, AddAssign, Div, Mul, Neg, Rem, Sub, SubAssign};
 
     assert_not_impl_all!(SeqNo: Add<SeqNo>, Sub<SeqNo>, AddAssign<SeqNo>, SubAssign<SeqNo>);
     assert_not_impl_all!(SeqNo: Add<u64>, Sub<u64>, AddAssign<u64>, SubAssign<u64>);
+    assert_not_impl_all!(SeqNo: Mul<u64>, Div<u64>, Rem<u64>, Neg);
 
     // Pin the PageCount layout claims documented on the type:
     // - PageCount itself is 8 bytes (same as u64).

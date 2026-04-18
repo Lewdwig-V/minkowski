@@ -671,6 +671,41 @@ fn recover_ignores_nonzero_reserved_bytes() {
     assert_eq!(recovered.next_sequence(), SeqNo::from(0u64));
 }
 
+/// Reserved bytes must survive an append round trip. Guards against a
+/// future refactor that "normalizes" the header on every recover — which
+/// would silently drop forward-compat flags a future version wrote there.
+#[test]
+fn recover_preserves_reserved_bytes_through_append_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("reserved_append.log");
+
+    // Start with a valid header whose reserved bytes carry a non-zero
+    // "flag" pattern.
+    fs::write(&log_path, b"MKMF\x01\xFF\xAA\x55").unwrap();
+
+    // Open, append one entry, close.
+    let (_, mut log) = ManifestLog::recover(&log_path).unwrap();
+    log.append(&ManifestEntry::SetSequence {
+        next_sequence: SeqNo::from(42),
+    })
+    .unwrap();
+    drop(log);
+
+    // Reserved bytes at offsets 5..8 must still be intact.
+    let bytes = fs::read(&log_path).unwrap();
+    assert_eq!(&bytes[0..4], b"MKMF", "magic preserved");
+    assert_eq!(bytes[4], 0x01, "version preserved");
+    assert_eq!(
+        &bytes[5..8],
+        &[0xFF, 0xAA, 0x55],
+        "reserved bytes preserved"
+    );
+
+    // And the entry must replay.
+    let (m, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(m.next_sequence(), SeqNo::from(42));
+}
+
 /// Calling recover() twice on the same path with no intervening writes
 /// must produce identical state. Guards against a bug where re-opening
 /// mutates the header or resets write_pos.

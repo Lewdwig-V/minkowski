@@ -259,6 +259,7 @@ mod tests {
         .unwrap();
         assert_eq!(meta.sequence_range().lo(), SeqNo::from(0u64));
         assert_eq!(meta.page_count().get(), 1);
+        assert_eq!(meta.size_bytes().get(), 1024);
     }
 
     #[test]
