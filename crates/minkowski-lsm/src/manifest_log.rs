@@ -42,9 +42,11 @@ const HEADER_SIZE: u64 = 8;
 /// manifests written for a different level count. Reserved bytes are
 /// written as zero and ignored on read.
 fn write_header<const N: usize>(file: &mut File) -> Result<(), LsmError> {
-    let max_level = u8::try_from(N).unwrap_or_else(|_| {
-        panic!("N={N} does not fit in max_level byte; MAX_LEVELS must be <= 255")
-    });
+    let max_level = u8::try_from(N).map_err(|_| {
+        LsmError::Format(format!(
+            "N={N} does not fit in max_level byte (must be <= 255)"
+        ))
+    })?;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&MAGIC_BYTES)?;
     file.write_all(&[CURRENT_VERSION])?;
@@ -388,15 +390,29 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             output,
             inputs,
         } => {
-            buf.push(ManifestTag::CompactionCommit as u8);
-            buf.push(output_level.as_u8());
-            encode_meta(&mut buf, output)?;
+            // Reject at encode time what decode would reject at replay.
+            // Without this, a caller could successfully append a frame
+            // that the same codebase cannot replay — on restart, recovery
+            // would classify it as tail corruption and truncate the log,
+            // silently dropping this commit AND every subsequent entry.
+            if inputs.len() > MAX_COMPACTION_INPUTS {
+                return Err(LsmError::Format(format!(
+                    "CompactionCommit input_count {} exceeds MAX_COMPACTION_INPUTS ({MAX_COMPACTION_INPUTS})",
+                    inputs.len()
+                )));
+            }
+            // Redundant after the check above — inputs.len() fits u32 given
+            // MAX_COMPACTION_INPUTS = 1024 — but kept as defense-in-depth
+            // in case MAX_COMPACTION_INPUTS ever grows past u32::MAX.
             let input_count = u32::try_from(inputs.len()).map_err(|_| {
                 LsmError::Format(format!(
                     "CompactionCommit input_count {} exceeds u32",
                     inputs.len()
                 ))
             })?;
+            buf.push(ManifestTag::CompactionCommit as u8);
+            buf.push(output_level.as_u8());
+            encode_meta(&mut buf, output)?;
             buf.extend_from_slice(&input_count.to_le_bytes());
             for (level, path) in inputs {
                 buf.push(level.as_u8());
@@ -954,6 +970,52 @@ mod tests {
     }
 
     #[test]
+    fn encode_compaction_commit_rejects_oversized_input_list() {
+        // Symmetry with the decode-side check: encode must also reject
+        // oversized input lists so a caller can't successfully append a
+        // frame the same codebase refuses to replay.
+        let output = test_meta("out.run");
+        let inputs: Vec<(Level, PathBuf)> = (0..=MAX_COMPACTION_INPUTS)
+            .map(|i| (Level::L0, PathBuf::from(format!("in{i}.run"))))
+            .collect();
+        assert_eq!(inputs.len(), MAX_COMPACTION_INPUTS + 1);
+        let entry = ManifestEntry::CompactionCommit {
+            output_level: Level::L1,
+            output,
+            inputs,
+        };
+        let err = encode_entry(&entry).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("exceeds MAX_COMPACTION_INPUTS"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn encode_compaction_commit_accepts_max_input_count() {
+        // Boundary check: exactly MAX_COMPACTION_INPUTS must encode cleanly.
+        let output = test_meta("out.run");
+        let inputs: Vec<(Level, PathBuf)> = (0..MAX_COMPACTION_INPUTS)
+            .map(|i| (Level::L0, PathBuf::from(format!("in{i}.run"))))
+            .collect();
+        let entry = ManifestEntry::CompactionCommit {
+            output_level: Level::L1,
+            output,
+            inputs,
+        };
+        let payload = encode_entry(&entry).unwrap();
+        // Round-trip through decode to confirm the accepted boundary is
+        // also readable.
+        let decoded = decode_entry(&payload).unwrap();
+        match decoded {
+            ManifestEntry::CompactionCommit { inputs, .. } => {
+                assert_eq!(inputs.len(), MAX_COMPACTION_INPUTS);
+            }
+            _ => panic!("expected CompactionCommit"),
+        }
+    }
+
+    #[test]
     fn apply_compaction_commit_atomic_roundtrip() {
         // Seed a manifest with 4 L0 runs, then apply a CompactionCommit
         // that consolidates them into one L1 run.
@@ -1285,6 +1347,22 @@ mod tests {
 
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes[5], 7, "max_level reflects N=7");
+    }
+
+    #[test]
+    fn write_header_returns_error_on_n_overflow_u8() {
+        // N > 255 cannot fit in the max_level byte. write_header must
+        // return LsmError::Format rather than panic, matching the rest of
+        // the ManifestLog API's fallible contract.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.log");
+        let mut file = File::create(&path).unwrap();
+        let err = write_header::<256>(&mut file).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("max_level byte"), "got: {msg}");
+            assert!(msg.contains("N=256"), "got: {msg}");
+        }
     }
 
     #[test]
