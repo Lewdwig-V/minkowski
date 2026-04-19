@@ -127,7 +127,24 @@ pub enum ManifestEntry {
         meta: SortedRunMeta,
         next_sequence: SeqNo,
     },
+    /// Atomic compaction commit: install the output run, remove all input runs.
+    ///
+    /// A single CRC-protected frame ensures recovery cannot see a partial
+    /// compaction state (output + some remaining inputs at old levels). Either
+    /// the frame applies entirely or it is tail-truncated, leaving the
+    /// pre-compaction state intact.
+    CompactionCommit {
+        output_level: Level,
+        output: SortedRunMeta,
+        inputs: Vec<(Level, PathBuf)>,
+    },
 }
+
+/// Sanity bound on the number of inputs per `CompactionCommit` frame. Well
+/// above the expected value (~K=4 per compaction job). Wire format carries
+/// `u32` so the limit is logical, not structural — raise only if
+/// compaction granularity intentionally produces jobs past this count.
+pub(crate) const MAX_COMPACTION_INPUTS: usize = 1024;
 
 // ── Frame codec ─────────────────────────────────────────────────────────────
 
@@ -205,6 +222,7 @@ pub enum ManifestTag {
     PromoteRun = 0x03,
     SetSequence = 0x04,
     AddRunAndSequence = 0x05,
+    CompactionCommit = 0x06,
 }
 
 impl TryFrom<u8> for ManifestTag {
@@ -217,6 +235,7 @@ impl TryFrom<u8> for ManifestTag {
             0x03 => Ok(Self::PromoteRun),
             0x04 => Ok(Self::SetSequence),
             0x05 => Ok(Self::AddRunAndSequence),
+            0x06 => Ok(Self::CompactionCommit),
             other => Err(LsmError::Format(format!("unknown entry tag: {other:#04x}"))),
         }
     }
@@ -282,18 +301,60 @@ fn read_u16_le(data: &[u8], offset: &mut usize) -> Result<u16, LsmError> {
     Ok(val)
 }
 
+fn read_u32_le(data: &[u8], offset: &mut usize) -> Result<u32, LsmError> {
+    if *offset + 4 > data.len() {
+        return Err(LsmError::Format("truncated u32".to_owned()));
+    }
+    let val = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
+    *offset += 4;
+    Ok(val)
+}
+
+/// Encode a `SortedRunMeta` payload (path, seq range, coverage, page count,
+/// size bytes). Shared by `AddRun`, `AddRunAndSequence`, `CompactionCommit`.
+fn encode_meta(buf: &mut Vec<u8>, meta: &SortedRunMeta) -> Result<(), LsmError> {
+    encode_path(buf, meta.path())?;
+    buf.extend_from_slice(&meta.sequence_range().lo().get().to_le_bytes());
+    buf.extend_from_slice(&meta.sequence_range().hi().get().to_le_bytes());
+    encode_coverage(buf, meta.archetype_coverage())?;
+    buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
+    buf.extend_from_slice(&meta.size_bytes().get().to_le_bytes());
+    Ok(())
+}
+
+/// Decode a `SortedRunMeta` payload. Mirror of [`encode_meta`].
+fn decode_meta(data: &[u8], offset: &mut usize) -> Result<SortedRunMeta, LsmError> {
+    let path = decode_path(data, offset)?;
+    let seq_lo = read_u64_le(data, offset)?;
+    let seq_hi = read_u64_le(data, offset)?;
+    let count = read_u16_le(data, offset)? as usize;
+    if *offset + count * 2 > data.len() {
+        return Err(LsmError::Format("truncated coverage data".to_owned()));
+    }
+    let mut coverage = Vec::with_capacity(count);
+    for _ in 0..count {
+        coverage.push(read_u16_le(data, offset)?);
+    }
+    let page_count = read_u64_le(data, offset)?;
+    let size_bytes = read_u64_le(data, offset)?;
+    let page_count = PageCount::new(page_count)
+        .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
+    SortedRunMeta::new(
+        path,
+        SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi))?,
+        coverage,
+        page_count,
+        SizeBytes::new(size_bytes),
+    )
+}
+
 fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
     let mut buf = Vec::new();
     match entry {
         ManifestEntry::AddRun { level, meta } => {
             buf.push(ManifestTag::AddRun as u8);
             buf.push(level.as_u8());
-            encode_path(&mut buf, meta.path())?;
-            buf.extend_from_slice(&meta.sequence_range().lo().get().to_le_bytes());
-            buf.extend_from_slice(&meta.sequence_range().hi().get().to_le_bytes());
-            encode_coverage(&mut buf, meta.archetype_coverage())?;
-            buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
-            buf.extend_from_slice(&meta.size_bytes().get().to_le_bytes());
+            encode_meta(&mut buf, meta)?;
         }
         ManifestEntry::RemoveRun { level, path } => {
             buf.push(ManifestTag::RemoveRun as u8);
@@ -321,13 +382,28 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
         } => {
             buf.push(ManifestTag::AddRunAndSequence as u8);
             buf.push(level.as_u8());
-            encode_path(&mut buf, meta.path())?;
-            buf.extend_from_slice(&meta.sequence_range().lo().get().to_le_bytes());
-            buf.extend_from_slice(&meta.sequence_range().hi().get().to_le_bytes());
-            encode_coverage(&mut buf, meta.archetype_coverage())?;
-            buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
-            buf.extend_from_slice(&meta.size_bytes().get().to_le_bytes());
+            encode_meta(&mut buf, meta)?;
             buf.extend_from_slice(&next_sequence.get().to_le_bytes());
+        }
+        ManifestEntry::CompactionCommit {
+            output_level,
+            output,
+            inputs,
+        } => {
+            buf.push(ManifestTag::CompactionCommit as u8);
+            buf.push(output_level.as_u8());
+            encode_meta(&mut buf, output)?;
+            let input_count = u32::try_from(inputs.len()).map_err(|_| {
+                LsmError::Format(format!(
+                    "CompactionCommit input_count {} exceeds u32",
+                    inputs.len()
+                ))
+            })?;
+            buf.extend_from_slice(&input_count.to_le_bytes());
+            for (level, path) in inputs {
+                buf.push(level.as_u8());
+                encode_path(&mut buf, path)?;
+            }
         }
     }
     Ok(buf)
@@ -349,28 +425,7 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             offset += 1;
             let level = Level::new(level_byte)
                 .ok_or_else(|| LsmError::Format(format!("invalid level {level_byte}")))?;
-            let path = decode_path(data, &mut offset)?;
-            let seq_lo = read_u64_le(data, &mut offset)?;
-            let seq_hi = read_u64_le(data, &mut offset)?;
-            let count = read_u16_le(data, &mut offset)? as usize;
-            if offset + count * 2 > data.len() {
-                return Err(LsmError::Format("truncated coverage data".to_owned()));
-            }
-            let mut coverage = Vec::with_capacity(count);
-            for _ in 0..count {
-                coverage.push(read_u16_le(data, &mut offset)?);
-            }
-            let page_count = read_u64_le(data, &mut offset)?;
-            let size_bytes = read_u64_le(data, &mut offset)?;
-            let page_count = PageCount::new(page_count)
-                .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
-            let meta = SortedRunMeta::new(
-                path,
-                SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi))?,
-                coverage,
-                page_count,
-                SizeBytes::new(size_bytes),
-            )?;
+            let meta = decode_meta(data, &mut offset)?;
             Ok(ManifestEntry::AddRun { level, meta })
         }
         ManifestTag::RemoveRun => {
@@ -415,33 +470,50 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             offset += 1;
             let level = Level::new(level_byte)
                 .ok_or_else(|| LsmError::Format(format!("invalid level {level_byte}")))?;
-            let path = decode_path(data, &mut offset)?;
-            let seq_lo = read_u64_le(data, &mut offset)?;
-            let seq_hi = read_u64_le(data, &mut offset)?;
-            let count = read_u16_le(data, &mut offset)? as usize;
-            if offset + count * 2 > data.len() {
-                return Err(LsmError::Format("truncated coverage data".to_owned()));
-            }
-            let mut coverage = Vec::with_capacity(count);
-            for _ in 0..count {
-                coverage.push(read_u16_le(data, &mut offset)?);
-            }
-            let page_count = read_u64_le(data, &mut offset)?;
-            let size_bytes = read_u64_le(data, &mut offset)?;
+            let meta = decode_meta(data, &mut offset)?;
             let next_sequence = SeqNo::from(read_u64_le(data, &mut offset)?);
-            let page_count = PageCount::new(page_count)
-                .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
-            let meta = SortedRunMeta::new(
-                path,
-                SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi))?,
-                coverage,
-                page_count,
-                SizeBytes::new(size_bytes),
-            )?;
             Ok(ManifestEntry::AddRunAndSequence {
                 level,
                 meta,
                 next_sequence,
+            })
+        }
+        ManifestTag::CompactionCommit => {
+            if offset >= data.len() {
+                return Err(LsmError::Format(
+                    "truncated CompactionCommit output_level".to_owned(),
+                ));
+            }
+            let output_level_byte = data[offset];
+            offset += 1;
+            let output_level = Level::new(output_level_byte).ok_or_else(|| {
+                LsmError::Format(format!("invalid output_level {output_level_byte}"))
+            })?;
+            let output = decode_meta(data, &mut offset)?;
+            let input_count = read_u32_le(data, &mut offset)? as usize;
+            if input_count > MAX_COMPACTION_INPUTS {
+                return Err(LsmError::Format(format!(
+                    "CompactionCommit input_count {input_count} exceeds MAX_COMPACTION_INPUTS ({MAX_COMPACTION_INPUTS})"
+                )));
+            }
+            let mut inputs = Vec::with_capacity(input_count);
+            for _ in 0..input_count {
+                if offset >= data.len() {
+                    return Err(LsmError::Format(
+                        "truncated CompactionCommit input level byte".to_owned(),
+                    ));
+                }
+                let level_byte = data[offset];
+                offset += 1;
+                let level = Level::new(level_byte)
+                    .ok_or_else(|| LsmError::Format(format!("invalid input level {level_byte}")))?;
+                let path = decode_path(data, &mut offset)?;
+                inputs.push((level, path));
+            }
+            Ok(ManifestEntry::CompactionCommit {
+                output_level,
+                output,
+                inputs,
             })
         }
     }
@@ -488,6 +560,44 @@ fn apply_entry<const N: usize>(
         } => {
             manifest.add_run(*level, meta.clone())?;
             manifest.set_next_sequence(*next_sequence);
+        }
+        ManifestEntry::CompactionCommit {
+            output_level,
+            output,
+            inputs,
+        } => {
+            debug_assert!(
+                inputs.len() <= MAX_COMPACTION_INPUTS,
+                "CompactionCommit with {} inputs — check compaction granularity",
+                inputs.len()
+            );
+            // Pre-validate all inputs exist before mutating. Preserves
+            // apply_entry's all-or-nothing contract: either every listed
+            // input is found and removed + the output added, or no
+            // mutations happen and the frame is treated as corruption by
+            // the replay loop's tail-truncate policy.
+            for (level, path) in inputs {
+                let exists = manifest
+                    .runs_at_level(*level)
+                    .iter()
+                    .any(|m| m.path() == path.as_path());
+                if !exists {
+                    return Err(LsmError::Format(format!(
+                        "CompactionCommit: input run {} not found at level {}",
+                        path.display(),
+                        level
+                    )));
+                }
+            }
+            manifest.add_run(*output_level, output.clone())?;
+            for (level, path) in inputs {
+                let removed = manifest.remove_run(*level, path);
+                debug_assert!(
+                    removed.is_some(),
+                    "pre-validated CompactionCommit input vanished: {}",
+                    path.display()
+                );
+            }
         }
     }
     Ok(())
@@ -636,11 +746,15 @@ mod tests {
             ManifestTag::try_from(0x05).unwrap(),
             ManifestTag::AddRunAndSequence
         );
+        assert_eq!(
+            ManifestTag::try_from(0x06).unwrap(),
+            ManifestTag::CompactionCommit
+        );
     }
 
     #[test]
     fn manifest_tag_try_from_u8_rejects_unknown_values() {
-        for byte in [0x00u8, 0x06, 0x7F, 0xFF] {
+        for byte in [0x00u8, 0x07, 0x7F, 0xFF] {
             let err = ManifestTag::try_from(byte).unwrap_err();
             assert!(matches!(err, LsmError::Format(_)));
             if let LsmError::Format(msg) = err {
@@ -656,6 +770,7 @@ mod tests {
         assert_eq!(ManifestTag::PromoteRun as u8, 0x03);
         assert_eq!(ManifestTag::SetSequence as u8, 0x04);
         assert_eq!(ManifestTag::AddRunAndSequence as u8, 0x05);
+        assert_eq!(ManifestTag::CompactionCommit as u8, 0x06);
     }
 
     #[test]
@@ -761,6 +876,162 @@ mod tests {
         assert_eq!(
             manifest.runs_at_level(Level::L0)[0].path(),
             Path::new("atomic.run")
+        );
+    }
+
+    #[test]
+    fn encode_decode_compaction_commit() {
+        let entry = ManifestEntry::CompactionCommit {
+            output_level: Level::L1,
+            output: test_meta("compacted.run"),
+            inputs: vec![
+                (Level::L0, PathBuf::from("in1.run")),
+                (Level::L0, PathBuf::from("in2.run")),
+                (Level::L0, PathBuf::from("in3.run")),
+                (Level::L0, PathBuf::from("in4.run")),
+            ],
+        };
+        let payload = encode_entry(&entry).unwrap();
+        assert_eq!(
+            payload[0],
+            ManifestTag::CompactionCommit as u8,
+            "tag byte is 0x06"
+        );
+        let decoded = decode_entry(&payload).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn encode_decode_compaction_commit_zero_inputs() {
+        // Not a useful commit (you'd never compact 0 runs) but the wire
+        // format must round-trip cleanly.
+        let entry = ManifestEntry::CompactionCommit {
+            output_level: Level::L2,
+            output: test_meta("empty_inputs.run"),
+            inputs: vec![],
+        };
+        let payload = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&payload).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn decode_compaction_commit_rejects_oversized_input_count() {
+        // Hand-craft a header declaring input_count > MAX_COMPACTION_INPUTS.
+        let meta = test_meta("victim.run");
+        let mut buf = Vec::new();
+        buf.push(ManifestTag::CompactionCommit as u8);
+        buf.push(Level::L1.as_u8());
+        encode_meta(&mut buf, &meta).unwrap();
+        buf.extend_from_slice(&((MAX_COMPACTION_INPUTS as u32) + 1).to_le_bytes());
+        // No actual inputs — we expect the count-check to fail before we
+        // try to decode any.
+        let err = decode_entry(&buf).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("exceeds MAX_COMPACTION_INPUTS"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn apply_compaction_commit_atomic_roundtrip() {
+        // Seed a manifest with 4 L0 runs, then apply a CompactionCommit
+        // that consolidates them into one L1 run.
+        let mut m: LsmManifest<4> = LsmManifest::new();
+        for i in 1..=4 {
+            m.add_run(Level::L0, test_meta(&format!("in{i}.run")))
+                .unwrap();
+        }
+        assert_eq!(m.runs_at_level(Level::L0).len(), 4);
+
+        let commit = ManifestEntry::CompactionCommit {
+            output_level: Level::L1,
+            output: test_meta("out.run"),
+            inputs: (1..=4)
+                .map(|i| (Level::L0, PathBuf::from(format!("in{i}.run"))))
+                .collect(),
+        };
+        apply_entry(&mut m, &commit).unwrap();
+
+        assert!(
+            m.runs_at_level(Level::L0).is_empty(),
+            "all inputs removed from L0"
+        );
+        assert_eq!(m.runs_at_level(Level::L1).len(), 1);
+        assert_eq!(m.runs_at_level(Level::L1)[0].path(), Path::new("out.run"));
+    }
+
+    #[test]
+    fn apply_compaction_commit_missing_input_is_all_or_nothing() {
+        // Seed L0 with 2 runs, but list 3 inputs in the commit — the third
+        // doesn't exist. apply_entry must NOT mutate (no output installed,
+        // no inputs removed) before it errors out.
+        let mut m: LsmManifest<4> = LsmManifest::new();
+        m.add_run(Level::L0, test_meta("real1.run")).unwrap();
+        m.add_run(Level::L0, test_meta("real2.run")).unwrap();
+
+        let commit = ManifestEntry::CompactionCommit {
+            output_level: Level::L1,
+            output: test_meta("out.run"),
+            inputs: vec![
+                (Level::L0, PathBuf::from("real1.run")),
+                (Level::L0, PathBuf::from("real2.run")),
+                (Level::L0, PathBuf::from("GHOST.run")),
+            ],
+        };
+        let err = apply_entry(&mut m, &commit).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("GHOST.run"), "got: {msg}");
+        }
+
+        // Pre-apply state must be intact: no output installed, no inputs
+        // removed.
+        assert!(
+            m.runs_at_level(Level::L1).is_empty(),
+            "output must not be installed on failure"
+        );
+        assert_eq!(
+            m.runs_at_level(Level::L0).len(),
+            2,
+            "real inputs must not be removed on failure"
+        );
+    }
+
+    #[test]
+    fn replay_compaction_commit_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.log");
+        let (mut m, mut log) = ManifestLog::recover::<4>(&path).unwrap();
+
+        // Seed with some L0 runs via the log (so they replay alongside
+        // the commit).
+        for i in 1..=3 {
+            let name = format!("in{i}.run");
+            log.append(&ManifestEntry::AddRun {
+                level: Level::L0,
+                meta: test_meta(&name),
+            })
+            .unwrap();
+            m.add_run(Level::L0, test_meta(&name)).unwrap();
+        }
+        // Now record the compaction.
+        log.append(&ManifestEntry::CompactionCommit {
+            output_level: Level::L1,
+            output: test_meta("out.run"),
+            inputs: (1..=3)
+                .map(|i| (Level::L0, PathBuf::from(format!("in{i}.run"))))
+                .collect(),
+        })
+        .unwrap();
+        drop(log);
+
+        let (replayed, _) = ManifestLog::recover::<4>(&path).unwrap();
+        assert!(replayed.runs_at_level(Level::L0).is_empty());
+        assert_eq!(replayed.runs_at_level(Level::L1).len(), 1);
+        assert_eq!(
+            replayed.runs_at_level(Level::L1)[0].path(),
+            Path::new("out.run")
         );
     }
 
