@@ -413,6 +413,7 @@ Pure feature addition. Estimated ~800–1200 lines. Depends on PR 1, independent
 - Tombstone elision at bottom level only
 - `FlushWriter::set_entry_observer` hook (no-op observer for Phase 3; Phase 4 installs a real one)
 - `MAX_COMPACTION_INPUTS = 1024` debug_assert at apply site
+- **Manifest-log header `max_level` byte** (repurpose one of PR #164's 3 reserved bytes at offset 5–7): write `N as u8` on create; on `recover::<N>()`, reject mismatches as fatal `LsmError::Format` rather than letting per-frame OOR checks silently truncate valid frames. Closes the cross-`N` portability hazard flagged on PR #168 (Codex review + internal type-design review). Since PR 3 already bumps the on-disk format with `CompactionCommit`, the header byte rides along naturally.
 
 PR 2 and PR 3 can land in either order (or in parallel worktrees). PR 1 is the strict prerequisite for both.
 
