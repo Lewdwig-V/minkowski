@@ -471,9 +471,11 @@ fn replay_truncates_log_on_unknown_tag_byte() {
 
     let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
 
-    // Craft a frame whose payload starts with 0x06 — the first byte past
-    // the last defined `ManifestTag` discriminant (0x05).
-    let payload = vec![0x06u8, 0x00, 0x00];
+    // Craft a frame whose payload starts with 0x07 — the first byte past
+    // the last defined `ManifestTag` discriminant (currently `CompactionCommit
+    // = 0x06`). If a new variant is ever added at 0x07, bump this to the
+    // next free byte.
+    let payload = vec![0x07u8, 0x00, 0x00];
 
     let mut f = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
     let len = payload.len() as u32;
@@ -636,6 +638,79 @@ fn replay_truncates_log_on_zero_page_count() {
     );
 }
 
+/// Regression: a CompactionCommit frame with a garbled input list (valid
+/// CRC at the frame layer but invalid level byte inside the inputs loop)
+/// must be treated as tail garbage. Sibling to the AddRun body-corruption
+/// tests above.
+#[test]
+fn replay_truncates_log_on_invalid_compaction_input_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    // One real flush so there's something to survive the replay truncation.
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
+
+    let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
+
+    // Handcraft a CompactionCommit frame whose single input carries
+    // level = 255 (valid byte, but >= MAX_LEVELS = 32 so Level::new rejects).
+    // Wire layout:
+    //   [tag=0x06][output_level: u8][output: SortedRunMeta]
+    //   [input_count: u32 LE]
+    //   input_count × {[level: u8][path_len: u16 LE][path bytes]}
+    let mut payload = Vec::new();
+    payload.push(ManifestTag::CompactionCommit as u8);
+    payload.push(1); // output_level = L1
+    // output SortedRunMeta
+    let out_path = b"fake_out.run";
+    payload.extend_from_slice(&(out_path.len() as u16).to_le_bytes());
+    payload.extend_from_slice(out_path);
+    payload.extend_from_slice(&0u64.to_le_bytes()); // seq_lo
+    payload.extend_from_slice(&10u64.to_le_bytes()); // seq_hi
+    payload.extend_from_slice(&0u16.to_le_bytes()); // coverage_count
+    payload.extend_from_slice(&1u64.to_le_bytes()); // page_count
+    payload.extend_from_slice(&1024u64.to_le_bytes()); // size_bytes
+    // input_count = 1
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    // malformed input: level byte = 255
+    payload.push(255);
+    let in_path = b"fake_in.run";
+    payload.extend_from_slice(&(in_path.len() as u16).to_le_bytes());
+    payload.extend_from_slice(in_path);
+
+    let len = payload.len() as u32;
+    let crc = crc32fast::hash(&payload);
+    let mut f = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+    f.write_all(&len.to_le_bytes()).unwrap();
+    f.write_all(&crc.to_le_bytes()).unwrap();
+    f.write_all(&payload).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    // Replay must truncate at the bad frame.
+    let (recovered, _) = ManifestLog::recover::<4>(&log_path).unwrap();
+    assert_eq!(
+        recovered.total_runs(),
+        1,
+        "only the valid first flush survives"
+    );
+    let len_after_replay = fs::metadata(&log_path).unwrap().len();
+    assert_eq!(
+        len_after_replay, len_after_first_frame,
+        "replay truncated the invalid-input-level CompactionCommit frame"
+    );
+}
+
 /// Regression: a RemoveRun frame referencing a path the manifest doesn't
 /// know is log corruption. apply_entry must propagate the error so replay
 /// treats the rest of the log as tail garbage — same policy as PromoteRun.
@@ -776,16 +851,16 @@ fn recover_rejects_file_with_unsupported_version() {
 // ── Forward-compat and idempotency ──────────────────────────────────────────
 
 /// Reserved bytes in the header are documented as "ignored on read" for
-/// forward-compat with future flags. Pin that behavior: a header with
-/// non-zero reserved bytes followed by a valid frame must successfully
+/// forward-compat with future flags. Pin that behavior: a v2 header with
+/// valid max_level and non-zero reserved bytes (6..8) must successfully
 /// recover.
 #[test]
 fn recover_ignores_nonzero_reserved_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("reserved.log");
 
-    // Write a v1 header with non-zero reserved bytes (bytes 5-7).
-    fs::write(&log_path, b"MKMF\x01\xFF\xAA\x55").unwrap();
+    // v2 header: magic, version=0x02, max_level=4, reserved 0xAA 0x55.
+    fs::write(&log_path, b"MKMF\x02\x04\xAA\x55").unwrap();
 
     // Recover should succeed on an otherwise-empty log.
     let (recovered, _) = ManifestLog::recover::<4>(&log_path).unwrap();
@@ -801,11 +876,9 @@ fn recover_preserves_reserved_bytes_through_append_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("reserved_append.log");
 
-    // Start with a valid header whose reserved bytes carry a non-zero
-    // "flag" pattern.
-    // Layout: bytes 0..4 = magic ("MKMF"), byte 4 = version (0x01),
-    // bytes 5..8 = reserved (here 0xFF, 0xAA, 0x55).
-    fs::write(&log_path, b"MKMF\x01\xFF\xAA\x55").unwrap();
+    // v2 layout: magic + version (0x02) + max_level (0x04) + 2 reserved
+    // bytes carrying a non-zero "flag" pattern (0xAA, 0x55).
+    fs::write(&log_path, b"MKMF\x02\x04\xAA\x55").unwrap();
 
     // Open, append one entry, close.
     let (_, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
@@ -815,15 +888,12 @@ fn recover_preserves_reserved_bytes_through_append_cycle() {
     .unwrap();
     drop(log);
 
-    // Reserved bytes at offsets 5..8 must still be intact.
+    // Header bytes must still be intact after the append cycle.
     let bytes = fs::read(&log_path).unwrap();
     assert_eq!(&bytes[0..4], b"MKMF", "magic preserved");
-    assert_eq!(bytes[4], 0x01, "version preserved");
-    assert_eq!(
-        &bytes[5..8],
-        &[0xFF, 0xAA, 0x55],
-        "reserved bytes preserved"
-    );
+    assert_eq!(bytes[4], 0x02, "version preserved");
+    assert_eq!(bytes[5], 0x04, "max_level preserved");
+    assert_eq!(&bytes[6..8], &[0xAA, 0x55], "reserved bytes preserved");
 
     // And the entry must replay.
     let (m, _) = ManifestLog::recover::<4>(&log_path).unwrap();
