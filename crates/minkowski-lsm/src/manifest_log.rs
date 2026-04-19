@@ -9,11 +9,11 @@
 //!
 //! ## Version history
 //!
-//! - v1 (PR #164): magic + version + 3 reserved bytes.
-//! - v2 (PR 3, this version): magic + version + `max_level` byte + 2 reserved
-//!   bytes. `max_level` is `N as u8` for an `LsmManifest<N>`; mismatches on
-//!   recover surface as fatal `LsmError::Format`, preventing the silent
-//!   cross-N tail truncation that v1 allowed.
+//! - v1: magic + version + 3 reserved bytes.
+//! - v2 (current): magic + version + `max_level` byte + 2 reserved bytes.
+//!   `max_level` is `N as u8` for an `LsmManifest<N>`; mismatches on recover
+//!   surface as fatal `LsmError::Format`, preventing the silent cross-N tail
+//!   truncation that v1 allowed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -28,10 +28,8 @@ use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 /// 4-byte magic: "M", "K", "M", "F" — Minkowski Manifest.
 const MAGIC_BYTES: [u8; 4] = *b"MKMF";
 
-/// Current on-disk format version. Bumped from 0x01 → 0x02 when the
-/// `max_level` byte was added at offset 5 (PR 3). v1 logs are rejected
-/// with an "unsupported manifest version" error — delete to rebuild
-/// from WAL.
+/// Current on-disk format version. v1 logs are rejected with an
+/// "unsupported manifest version" error — delete to rebuild from WAL.
 const CURRENT_VERSION: u8 = 0x02;
 
 /// Total header size in bytes: 4 magic + 1 version + 1 max_level + 2 reserved.
@@ -140,10 +138,10 @@ pub enum ManifestEntry {
     },
 }
 
-/// Sanity bound on the number of inputs per `CompactionCommit` frame. Well
-/// above the expected value (~K=4 per compaction job). Wire format carries
-/// `u32` so the limit is logical, not structural — raise only if
-/// compaction granularity intentionally produces jobs past this count.
+/// Sanity bound on the number of inputs per `CompactionCommit` frame.
+/// Wire format carries `u32` so the limit is logical, not structural —
+/// raise only if compaction granularity intentionally produces jobs
+/// past this count.
 pub(crate) const MAX_COMPACTION_INPUTS: usize = 1024;
 
 // ── Frame codec ─────────────────────────────────────────────────────────────
@@ -311,7 +309,7 @@ fn read_u32_le(data: &[u8], offset: &mut usize) -> Result<u32, LsmError> {
 }
 
 /// Encode a `SortedRunMeta` payload (path, seq range, coverage, page count,
-/// size bytes). Shared by `AddRun`, `AddRunAndSequence`, `CompactionCommit`.
+/// size bytes). Counterpart of [`decode_meta`].
 fn encode_meta(buf: &mut Vec<u8>, meta: &SortedRunMeta) -> Result<(), LsmError> {
     encode_path(buf, meta.path())?;
     buf.extend_from_slice(&meta.sequence_range().lo().get().to_le_bytes());
@@ -571,12 +569,28 @@ fn apply_entry<const N: usize>(
                 "CompactionCommit with {} inputs — check compaction granularity",
                 inputs.len()
             );
-            // Pre-validate all inputs exist before mutating. Preserves
-            // apply_entry's all-or-nothing contract: either every listed
-            // input is found and removed + the output added, or no
-            // mutations happen and the frame is treated as corruption by
-            // the replay loop's tail-truncate policy.
+            // Pre-validate: every input exists, no duplicates, output_level
+            // is in-range for this manifest. Keeps apply_entry's
+            // all-or-nothing contract independent of mutation ordering:
+            // after this loop passes, every subsequent step must succeed.
+            //
+            // output_level in-range: a cross-N log is caught by the
+            // header max_level gate, but a hand-forged frame could still
+            // carry a level byte in [N, MAX_LEVELS). Explicit check here.
+            if output_level.as_index() >= N {
+                return Err(LsmError::Format(format!(
+                    "CompactionCommit: output_level {output_level} out of range for {N}-level manifest"
+                )));
+            }
+            let mut seen = std::collections::HashSet::with_capacity(inputs.len());
             for (level, path) in inputs {
+                if !seen.insert((*level, path.as_path())) {
+                    return Err(LsmError::Format(format!(
+                        "CompactionCommit: duplicate input {} at level {}",
+                        path.display(),
+                        level
+                    )));
+                }
                 let exists = manifest
                     .runs_at_level(*level)
                     .iter()
@@ -589,14 +603,20 @@ fn apply_entry<const N: usize>(
                     )));
                 }
             }
-            manifest.add_run(*output_level, output.clone())?;
+            // All checks passed; mutations cannot fail. Use expect() rather
+            // than debug_assert so release builds still panic loudly if an
+            // invariant breaks.
+            manifest
+                .add_run(*output_level, output.clone())
+                .expect("output_level pre-validated < N");
             for (level, path) in inputs {
-                let removed = manifest.remove_run(*level, path);
-                debug_assert!(
-                    removed.is_some(),
-                    "pre-validated CompactionCommit input vanished: {}",
-                    path.display()
-                );
+                manifest.remove_run(*level, path).unwrap_or_else(|| {
+                    panic!(
+                        "pre-validated CompactionCommit input vanished: {} at level {}",
+                        path.display(),
+                        level
+                    )
+                });
             }
         }
     }
@@ -959,6 +979,57 @@ mod tests {
         );
         assert_eq!(m.runs_at_level(Level::L1).len(), 1);
         assert_eq!(m.runs_at_level(Level::L1)[0].path(), Path::new("out.run"));
+    }
+
+    #[test]
+    fn apply_compaction_commit_rejects_duplicate_inputs() {
+        // Two identical (level, path) entries must error. Without this
+        // check a buggy compactor could remove the real input + silently
+        // succeed on the duplicate, masking the bug.
+        let mut m: LsmManifest<4> = LsmManifest::new();
+        m.add_run(Level::L0, test_meta("same.run")).unwrap();
+
+        let commit = ManifestEntry::CompactionCommit {
+            output_level: Level::L1,
+            output: test_meta("out.run"),
+            inputs: vec![
+                (Level::L0, PathBuf::from("same.run")),
+                (Level::L0, PathBuf::from("same.run")),
+            ],
+        };
+        let err = apply_entry(&mut m, &commit).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("duplicate input"), "got: {msg}");
+        }
+        // Pre-apply state intact.
+        assert_eq!(m.runs_at_level(Level::L0).len(), 1);
+        assert!(m.runs_at_level(Level::L1).is_empty());
+    }
+
+    #[test]
+    fn apply_compaction_commit_rejects_oor_output_level() {
+        // Hand-forge a frame carrying output_level in [N, MAX_LEVELS) —
+        // decode accepts this (Level::new enforces MAX_LEVELS), but
+        // apply_entry must catch it as OOR for the target manifest before
+        // mutating anything.
+        let mut m: LsmManifest<4> = LsmManifest::new();
+        m.add_run(Level::L0, test_meta("in.run")).unwrap();
+
+        let oor_level = Level::new(5).unwrap(); // valid Level, OOR for N=4
+        let commit = ManifestEntry::CompactionCommit {
+            output_level: oor_level,
+            output: test_meta("out.run"),
+            inputs: vec![(Level::L0, PathBuf::from("in.run"))],
+        };
+        let err = apply_entry(&mut m, &commit).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("output_level"), "got: {msg}");
+            assert!(msg.contains("out of range"), "got: {msg}");
+        }
+        // Pre-apply state intact.
+        assert_eq!(m.runs_at_level(Level::L0).len(), 1);
     }
 
     #[test]
