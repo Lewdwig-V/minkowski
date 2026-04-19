@@ -10,6 +10,25 @@ use crate::format::*;
 use crate::schema::SchemaSection;
 use crate::types::SeqRange;
 
+/// The value passed to an [`EntryObserver`] for each entity written to an
+/// entity-slot page.
+///
+/// Currently just the raw entity bits (`Entity::to_bits()`). If Phase 4
+/// needs archetype context it can be extended — the observer API is not a
+/// stability boundary yet.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct EntityKey(pub u64);
+
+/// Per-entry observer invoked by [`flush_observed`] once for each entity
+/// written to an entity-slot page. Phase 4 bloom filter uses this to build
+/// a per-run filter without re-plumbing the writer. Phase 3 leaves the hook
+/// in place with a no-op observer.
+///
+/// Not `Send`-bounded — [`flush`] / [`flush_observed`] are synchronous and
+/// single-threaded; callers that need cross-thread sharing can wrap their
+/// own `Arc<Mutex<_>>` before installing.
+pub type EntryObserver = Box<dyn FnMut(EntityKey)>;
+
 /// Convert a `usize` to `u16`, returning `LsmError::Format` on overflow.
 fn to_u16(value: usize, label: &str) -> Result<u16, LsmError> {
     u16::try_from(value).map_err(|_| LsmError::Format(format!("{label} {value} exceeds u16")))
@@ -26,6 +45,21 @@ pub fn flush(
     world: &World,
     sequence_range: SeqRange,
     output_dir: &Path,
+) -> Result<Option<PathBuf>, LsmError> {
+    flush_observed(world, sequence_range, output_dir, None)
+}
+
+/// Like [`flush`], but invokes `observer` once per entity ID written to an
+/// entity-slot page. Pass `None` for no observation (identical to [`flush`]).
+///
+/// The observer fires *after* the entity bytes are successfully written to
+/// the buffer, so it will not fire for pages that are skipped due to zero
+/// `row_count`. It fires exactly once per entity per call.
+pub fn flush_observed(
+    world: &World,
+    sequence_range: SeqRange,
+    output_dir: &Path,
+    mut observer: Option<&mut dyn FnMut(EntityKey)>,
 ) -> Result<Option<PathBuf>, LsmError> {
     // ── 1. Collect dirty page set ───────────────────────────────────────────
     // Key: (arch_idx, comp_id, page_index)
@@ -268,6 +302,13 @@ pub fn flush(
         w.write_all(ph.as_bytes())?;
         w.write_all(&entity_bytes)?;
 
+        // Notify the observer once per successfully-written entity.
+        if let Some(ref mut obs) = observer {
+            for &e in page_entities {
+                obs(EntityKey(e.to_bits()));
+            }
+        }
+
         // Zero-pad partial pages.
         let full_page_bytes = PAGE_SIZE * entity_item_size;
         if entity_bytes.len() < full_page_bytes {
@@ -491,5 +532,38 @@ mod tests {
         let stored_crc = u32::from_le_bytes(data[40..44].try_into().unwrap());
         let computed_crc = crc32fast::hash(&data[..40]);
         assert_eq!(stored_crc, computed_crc);
+    }
+
+    #[test]
+    fn entry_observer_fires_once_per_entity_id() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let e2 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e3 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        let observed: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        let observed_clone = Rc::clone(&observed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = flush_observed(
+            &world,
+            SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
+            dir.path(),
+            Some(&mut |key: EntityKey| {
+                observed_clone.borrow_mut().push(key.0);
+            }),
+        )
+        .unwrap();
+
+        assert!(result.is_some(), "expected a run to be written");
+
+        let seen = observed.borrow();
+        assert_eq!(seen.len(), 3, "observer must fire exactly once per entity");
+        assert!(seen.contains(&e1.to_bits()), "e1 not observed");
+        assert!(seen.contains(&e2.to_bits()), "e2 not observed");
+        assert!(seen.contains(&e3.to_bits()), "e3 not observed");
     }
 }

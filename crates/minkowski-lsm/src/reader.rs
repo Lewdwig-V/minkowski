@@ -317,6 +317,27 @@ impl SortedRunReader {
         ids
     }
 
+    /// Returns the sorted, deduplicated list of component slot indices used by
+    /// `arch_id` in this sorted run, excluding the entity pseudo-slot
+    /// (`ENTITY_SLOT = 0xFFFF`).
+    ///
+    /// Returns an empty `Vec` if the archetype is not present in the index.
+    // Used by `schema_match` (Task 2) and will be used directly by the
+    // compactor (Task 3). The dead_code lint fires on the lib target because
+    // the only current callers are in cfg(test); allow it until Task 3 lands.
+    #[allow(dead_code)]
+    pub(crate) fn component_slots_for_arch(&self, arch_id: u16) -> Vec<u16> {
+        let mut slots: Vec<u16> = self
+            .index
+            .iter()
+            .filter(|e| e.arch_id == arch_id && e.slot != ENTITY_SLOT)
+            .map(|e| e.slot)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────────
 
     /// Item size in bytes for a given slot.

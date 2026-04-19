@@ -15,19 +15,6 @@
 //! history), construct [`LsmManifest<7>`] instead. Merge logic is
 //! level-count-agnostic; only bounds checks and manifest serialization
 //! care about `N`.
-//!
-//! ## Cross-N log portability (known limitation)
-//!
-//! The manifest-log wire format does not yet carry an `N` field. A log
-//! written by an `LsmManifest<7>` replayed by an `LsmManifest<4>` will
-//! silently truncate every frame referencing level 4..=6 as tail
-//! garbage (those bytes fail the `level.as_index() < N` bounds check
-//! in `apply_entry`, which the replay loop treats as torn-tail).
-//!
-//! Practical rule: **do not move a manifest log between builds that use
-//! different `N` values.** A fix (manifest-header `max_level` byte with
-//! fatal mismatch on recover) is in scope for the Phase 3 compactor PR,
-//! where on-disk format changes are already expected.
 
 use std::path::{Path, PathBuf};
 
@@ -197,6 +184,18 @@ impl<const N: usize> LsmManifest<N> {
 
     pub fn total_runs(&self) -> usize {
         self.levels.iter().map(Vec::len).sum()
+    }
+
+    /// Returns `true` if any `(level, archetype)` pair has at least
+    /// [`COMPACTION_TRIGGER`] runs at a non-bottom level — i.e., there is
+    /// work the compactor would pick up.
+    ///
+    /// Delegates to [`compactor::find_compaction_candidate`] so there is one
+    /// source of truth for the trigger policy.
+    ///
+    /// [`COMPACTION_TRIGGER`]: crate::compactor::COMPACTION_TRIGGER
+    pub fn needs_compaction(&self) -> bool {
+        crate::compactor::find_compaction_candidate(self).is_ok_and(|opt| opt.is_some())
     }
 }
 
