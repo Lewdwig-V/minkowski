@@ -46,7 +46,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: stable
-      - run: cargo test -p minkowski
+      # Whole workspace, not just -p minkowski: minkowski-persist,
+      # minkowski-lsm, and minkowski-observe each have substantial test
+      # suites that previously never ran in CI and silently rotted.
+      # minkowski-py is excluded — its tests link against libpython and
+      # need a maturin/Python toolchain this job doesn't set up.
+      - run: cargo test --workspace --exclude minkowski-py
 
   tsan:
     name: ThreadSanitizer
