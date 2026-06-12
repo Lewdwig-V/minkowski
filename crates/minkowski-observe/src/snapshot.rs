@@ -217,8 +217,12 @@ mod tests {
 
     #[test]
     fn snapshot_without_pool_omits_pool_line() {
+        // Every World carries a default SlabPool, so drive the omit-branch
+        // directly: when pool stats are absent, the pool line is omitted.
         let world = World::new();
-        let snap = MetricsSnapshot::capture(&world, None);
+        let mut snap = MetricsSnapshot::capture(&world, None);
+        snap.world.pool_capacity = None;
+        snap.world.pool_used = None;
         let output = format!("{snap}");
         assert!(!output.contains("pool:"));
     }

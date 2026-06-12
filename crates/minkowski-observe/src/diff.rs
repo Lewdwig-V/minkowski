@@ -240,10 +240,15 @@ mod tests {
 
     #[test]
     fn diff_no_pool_omits_delta() {
+        // Every World carries a default SlabPool, so null out pool stats to
+        // exercise the no-pool diff branch: with either side lacking pool_used,
+        // the delta is absent and the line is omitted.
         let mut world = World::new();
-        let before = MetricsSnapshot::capture(&world, None);
+        let mut before = MetricsSnapshot::capture(&world, None);
         world.spawn((Pos { x: 1.0, y: 2.0 },));
-        let after = MetricsSnapshot::capture(&world, None);
+        let mut after = MetricsSnapshot::capture(&world, None);
+        before.world.pool_used = None;
+        after.world.pool_used = None;
 
         let diff = MetricsDiff::compute(&before, &after);
         assert!(diff.pool_used_delta.is_none());

@@ -230,10 +230,13 @@ mod tests {
     fn new_renders_default_zeros() {
         let exporter = PrometheusExporter::new();
         let output = exporter.render();
+        // Unlabeled gauges always render, even at zero.
         assert!(output.contains("minkowski_entity_count"));
         assert!(output.contains("minkowski_tick"));
         assert!(output.contains("minkowski_wal_seq"));
-        assert!(output.contains("minkowski_archetype_entity_count"));
+        // Labeled families (e.g. minkowski_archetype_entity_count) only emit
+        // once they have at least one series — covered by
+        // `update_sets_archetype_labels`, not here.
     }
 
     #[test]
