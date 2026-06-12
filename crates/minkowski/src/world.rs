@@ -31,10 +31,14 @@ impl fmt::Display for DeadEntity {
 impl std::error::Error for DeadEntity {}
 
 /// Error returned by [`World::try_insert`].
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum InsertError {
     /// The entity is not alive.
     DeadEntity(DeadEntity),
+    /// The entity is alive but not placed in any archetype — e.g. one
+    /// obtained from [`World::alloc_entity`] without a subsequent spawn.
+    Unplaced(Entity),
     /// The memory pool is exhausted.
     PoolExhausted(PoolExhausted),
 }
@@ -43,6 +47,9 @@ impl fmt::Display for InsertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InsertError::DeadEntity(e) => write!(f, "{e}"),
+            InsertError::Unplaced(e) => {
+                write!(f, "entity {e:?} is alive but not placed in an archetype")
+            }
             InsertError::PoolExhausted(e) => write!(f, "{e}"),
         }
     }
@@ -53,6 +60,7 @@ impl std::error::Error for InsertError {
         match self {
             InsertError::DeadEntity(e) => Some(e),
             InsertError::PoolExhausted(e) => Some(e),
+            InsertError::Unplaced(_) => None,
         }
     }
 }
@@ -1178,13 +1186,28 @@ impl World {
         }
     }
 
+    /// Insert a bundle's components into an existing, placed entity.
+    ///
+    /// Returns `Err(DeadEntity)` if the entity is not alive, or if it is
+    /// alive but not yet placed in an archetype (e.g. from
+    /// [`alloc_entity`](Self::alloc_entity) without a subsequent spawn) —
+    /// this method's error type does not distinguish the two. Use
+    /// [`try_insert`](Self::try_insert) (which reports
+    /// [`InsertError::Unplaced`]) when the distinction matters.
+    ///
+    /// Panics if the memory pool is exhausted; use
+    /// [`try_insert`](Self::try_insert) to handle that as an error instead.
     pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) -> Result<(), DeadEntity> {
         self.drain_orphans();
         if !self.is_alive(entity) {
             return Err(DeadEntity { entity });
         }
         let index = entity.index() as usize;
-        let location = self.entity_locations[index].unwrap();
+        // Alive but unplaced (alloc_entity without spawn) surfaces as
+        // DeadEntity here — see the doc note above.
+        let Some(location) = self.entity_locations.get(index).copied().flatten() else {
+            return Err(DeadEntity { entity });
+        };
         debug_assert!(
             location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
             "stale EntityLocation: row {} >= archetype len {}",
@@ -1324,7 +1347,9 @@ impl World {
     /// Like [`insert`](Self::insert) but additionally handles pool exhaustion
     /// as an error instead of panicking. Returns
     /// `Err(InsertError::PoolExhausted(_))` when the slab pool cannot allocate,
-    /// and `Err(InsertError::DeadEntity(_))` when the entity is not alive.
+    /// `Err(InsertError::DeadEntity(_))` when the entity is not alive, and
+    /// `Err(InsertError::Unplaced(_))` when the entity is alive but not placed
+    /// in an archetype.
     ///
     /// If this method returns `Err`, the world state is unchanged — no partial
     /// migration occurs and the entity remains in its original archetype.
@@ -1334,7 +1359,9 @@ impl World {
             return Err(DeadEntity { entity }.into());
         }
         let index = entity.index() as usize;
-        let location = self.entity_locations[index].unwrap();
+        let Some(location) = self.entity_locations.get(index).copied().flatten() else {
+            return Err(InsertError::Unplaced(entity));
+        };
         debug_assert!(
             location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
             "stale EntityLocation: row {} >= archetype len {}",
@@ -2578,6 +2605,31 @@ mod tests {
         // Allocated but not yet placed in any archetype
         assert!(world.is_alive(e)); // allocator considers it alive
         assert!(!world.is_placed(e)); // but no archetype row yet
+    }
+
+    #[test]
+    fn insert_on_unplaced_entity_returns_err_not_panic() {
+        // Regression: insert on an alive-but-unplaced entity (alloc_entity
+        // without spawn) must return Err, not panic on a None location.
+        let mut world = World::new();
+        let unplaced = world.alloc_entity();
+        let result = world.insert(unplaced, (Pos { x: 1.0, y: 2.0 },));
+        assert_eq!(result, Err(DeadEntity { entity: unplaced }));
+        // The unplaced entity is untouched.
+        assert!(!world.is_placed(unplaced));
+    }
+
+    #[test]
+    fn try_insert_on_unplaced_entity_returns_unplaced() {
+        // Regression: try_insert on an alive-but-unplaced entity must return
+        // the distinct InsertError::Unplaced, not panic and not DeadEntity.
+        let mut world = World::new();
+        let unplaced = world.alloc_entity();
+        match world.try_insert(unplaced, (Pos { x: 1.0, y: 2.0 },)) {
+            Err(InsertError::Unplaced(e)) => assert_eq!(e, unplaced),
+            other => panic!("expected InsertError::Unplaced, got {other:?}"),
+        }
+        assert!(!world.is_placed(unplaced));
     }
 
     #[test]
