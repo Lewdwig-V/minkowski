@@ -10,25 +10,66 @@ use crate::world::{EntityLocation, World, get_pair_mut};
 
 /// Error returned by [`EnumChangeSet::apply`] when a mutation targets
 /// an invalid entity.
+///
+/// **Important:** `apply` is not atomic. When any error is returned, the
+/// World may be in a partially-mutated state and must be discarded. The
+/// [`PartialApply`](ApplyError::PartialApply) variant marks the cases
+/// where mutations were already committed before the failure; see
+/// [`EnumChangeSet::apply`] for the full contract.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplyError {
     /// Mutation targeted an entity that is no longer alive.
     DeadEntity(Entity),
+    /// Mutation targeted an entity that is alive but not placed in any
+    /// archetype — e.g. one obtained from [`World::alloc_entity`] without
+    /// a subsequent spawn.
+    ///
+    /// [`World::alloc_entity`]: crate::world::World::alloc_entity
+    Unplaced(Entity),
     /// Spawn targeted an entity already placed in an archetype.
     AlreadyPlaced(Entity),
+    /// A mutation failed after one or more earlier mutations had already
+    /// been committed to the World. The World is partially mutated and
+    /// must be discarded.
+    ///
+    /// The variant is `#[non_exhaustive]` so it can only be constructed by
+    /// the engine, which guarantees `source` is never itself a
+    /// `PartialApply`.
+    #[non_exhaustive]
+    PartialApply {
+        /// Position of the failing mutation in the changeset's sequential
+        /// mutation log.
+        failed_index: usize,
+        /// The leaf error that caused the failure (never `PartialApply`).
+        source: Box<ApplyError>,
+    },
 }
 
 impl std::fmt::Display for ApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DeadEntity(e) => write!(f, "entity {:?} is not alive", e),
-            Self::AlreadyPlaced(e) => write!(f, "entity {:?} is already placed", e),
+            Self::DeadEntity(e) => write!(f, "entity {e:?} is not alive"),
+            Self::Unplaced(e) => write!(f, "entity {e:?} is alive but not placed in an archetype"),
+            Self::AlreadyPlaced(e) => write!(f, "entity {e:?} is already placed"),
+            Self::PartialApply {
+                failed_index,
+                source,
+            } => {
+                write!(f, "partial apply at mutation {failed_index}: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for ApplyError {}
+impl std::error::Error for ApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PartialApply { source, .. } => Some(&**source),
+            Self::DeadEntity(_) | Self::Unplaced(_) | Self::AlreadyPlaced(_) => None,
+        }
+    }
+}
 
 const ARENA_ALIGN: usize = 16;
 
@@ -740,6 +781,21 @@ impl EnumChangeSet {
     ///
     /// Returns `Ok(())` on success or `Err(ApplyError)` if a mutation targets
     /// an invalid entity. A single tick is allocated for the entire batch.
+    ///
+    /// # Partial application
+    ///
+    /// `apply` is **not atomic**. Mutations are committed incrementally and
+    /// there is no rollback: a mutation that succeeds stays applied even if a
+    /// later one fails. (Internally, "fast-lane" overwrites are also flushed
+    /// ahead of the per-mutation pass, so committed writes can precede the
+    /// first reported mutation index.)
+    ///
+    /// When a failure leaves committed writes behind, the error is
+    /// [`ApplyError::PartialApply`], carrying the index of the failing
+    /// mutation. The only error that guarantees an untouched World is a
+    /// non-`PartialApply` variant. Either way, callers must **discard** the
+    /// World on error — there is no way to determine exactly which writes
+    /// took effect.
     pub fn apply(mut self, world: &mut World) -> Result<(), ApplyError> {
         let tick = world.next_tick();
 
@@ -760,7 +816,26 @@ impl EnumChangeSet {
                 self.drop_entries.retain(|entry| {
                     entry.mutation_idx >= failed_idx && entry.mutation_idx != usize::MAX
                 });
-                Err(err)
+                // The World is partially mutated whenever something committed
+                // before the failure: either fast-lane batches (applied ahead
+                // of the sequential loop) or any earlier sequential mutation
+                // (indices 0..failed_idx). Only a first-mutation failure with no
+                // fast-lane batches leaves the World untouched.
+                let partially_applied = !self.archetype_batches.is_empty() || failed_idx > 0;
+                if partially_applied {
+                    // `err` originates from a per-mutation failure and is always a
+                    // leaf variant — apply_mutations never produces PartialApply.
+                    debug_assert!(
+                        !matches!(err, ApplyError::PartialApply { .. }),
+                        "PartialApply must wrap a leaf error, never another PartialApply"
+                    );
+                    Err(ApplyError::PartialApply {
+                        failed_index: failed_idx,
+                        source: Box::new(err),
+                    })
+                } else {
+                    Err(err)
+                }
             }
         }
     }
@@ -840,9 +915,9 @@ impl EnumChangeSet {
                 // this (archetype, component), skip contains + column_index +
                 // info lookup — all invariant within a batch run.
                 let Some(location) = location else {
-                    // Alive but unplaced (from alloc_entity) — treat as dead.
+                    // Alive but unplaced (from alloc_entity without spawn).
                     flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
-                    return Err(map_err(ApplyError::DeadEntity(*entity)));
+                    return Err(map_err(ApplyError::Unplaced(*entity)));
                 };
                 let key_matches = batch.as_ref().is_some_and(|b| {
                     b.arch_idx == location.archetype_id.0 && b.comp_id == *component_id
@@ -1083,7 +1158,10 @@ fn changeset_insert_raw(
         return Err(ApplyError::DeadEntity(entity));
     }
     let index = entity.index() as usize;
-    let location = world.entity_locations[index].unwrap();
+    let Some(location) = world.entity_locations.get(index).copied().flatten() else {
+        // Alive but unplaced (alloc_entity without spawn).
+        return Err(ApplyError::Unplaced(entity));
+    };
 
     let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
 
@@ -1182,7 +1260,10 @@ fn changeset_remove_raw(
         return Err(ApplyError::DeadEntity(entity));
     }
     let index = entity.index() as usize;
-    let location = world.entity_locations[index].unwrap();
+    let Some(location) = world.entity_locations.get(index).copied().flatten() else {
+        // Alive but unplaced (alloc_entity without spawn).
+        return Err(ApplyError::Unplaced(entity));
+    };
     let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
 
     if !src_arch.component_ids.contains(comp_id) {
@@ -2160,7 +2241,10 @@ mod tests {
 
     #[test]
     fn batch_apply_dead_entity_returns_error() {
-        // A dead entity mid-batch should flush the batch and return an error.
+        // A dead entity mid-batch flushes the pending batch (committing the
+        // earlier mutation) and then fails. Because an earlier mutation was
+        // already committed, the failure is reported as PartialApply wrapping
+        // the DeadEntity leaf — the World is partially mutated.
         let mut world = World::new();
         let alive = world.spawn((Pos { x: 1.0, y: 1.0 },));
         let dead = world.spawn((Pos { x: 2.0, y: 2.0 },));
@@ -2170,11 +2254,16 @@ mod tests {
         cs.insert::<Pos>(&mut world, alive, Pos { x: 99.0, y: 99.0 });
         cs.insert::<Pos>(&mut world, dead, Pos { x: 0.0, y: 0.0 });
 
-        let result = cs.apply(&mut world);
-        assert!(
-            matches!(result, Err(ApplyError::DeadEntity(_))),
-            "should return DeadEntity error"
-        );
+        match cs.apply(&mut world) {
+            Err(ApplyError::PartialApply {
+                failed_index,
+                source,
+            }) => {
+                assert_eq!(failed_index, 1);
+                assert_eq!(*source, ApplyError::DeadEntity(dead));
+            }
+            other => panic!("expected PartialApply wrapping DeadEntity, got {other:?}"),
+        }
 
         // The first mutation (on alive entity) should have been flushed
         // and applied before the error.
@@ -2548,7 +2637,26 @@ mod tests {
         });
 
         let result = cs.apply(&mut world);
-        assert!(result.is_err());
+
+        // Fast-lane batches were committed before the failure, so the error
+        // is wrapped in PartialApply marking the partially-mutated World.
+        // The failing mutation is index 0 and its leaf cause is DeadEntity.
+        let err = result.expect_err("dead entity must fail the apply");
+        // The error chain must surface the leaf via `source()`.
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "PartialApply must expose its source"
+        );
+        match err {
+            ApplyError::PartialApply {
+                failed_index,
+                source,
+            } => {
+                assert_eq!(failed_index, 0);
+                assert_eq!(*source, ApplyError::DeadEntity(dead));
+            }
+            other => panic!("expected PartialApply, got {other:?}"),
+        }
 
         // Fast-lane Pos was applied (it runs before the regular mutations).
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 99.0, y: 99.0 }));
@@ -2559,6 +2667,52 @@ mod tests {
             1,
             "failed mutation's value must be dropped once"
         );
+    }
+
+    #[test]
+    fn clean_failure_first_mutation_not_wrapped_in_partial_apply() {
+        // No fast-lane batches and the first mutation fails: nothing was
+        // committed, so the error must be a bare leaf variant, not
+        // PartialApply.
+        let mut world = World::new();
+        let dead = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        world.despawn(dead);
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert::<Pos>(&mut world, dead, Pos { x: 9.0, y: 9.0 });
+
+        match cs.apply(&mut world) {
+            Err(ApplyError::DeadEntity(e)) => assert_eq!(e, dead),
+            other => panic!("expected bare DeadEntity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn changeset_insert_on_unplaced_entity_returns_unplaced() {
+        // Alive-but-unplaced entity (alloc_entity without spawn). Inserting a
+        // component triggers the migration path (changeset_insert_raw), which
+        // must report Unplaced — not DeadEntity, not a panic.
+        let mut world = World::new();
+        let unplaced = world.alloc_entity();
+        assert!(world.is_alive(unplaced));
+        assert!(!world.is_placed(unplaced));
+
+        let mut cs = EnumChangeSet::new();
+        cs.insert::<Pos>(&mut world, unplaced, Pos { x: 1.0, y: 2.0 });
+
+        assert_eq!(cs.apply(&mut world), Err(ApplyError::Unplaced(unplaced)));
+    }
+
+    #[test]
+    fn changeset_remove_on_unplaced_entity_returns_unplaced() {
+        // Alive-but-unplaced entity routed through changeset_remove_raw.
+        let mut world = World::new();
+        let unplaced = world.alloc_entity();
+
+        let mut cs = EnumChangeSet::new();
+        cs.remove::<Pos>(&mut world, unplaced);
+
+        assert_eq!(cs.apply(&mut world), Err(ApplyError::Unplaced(unplaced)));
     }
 
     #[test]
