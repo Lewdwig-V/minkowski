@@ -705,6 +705,11 @@ impl Wal {
         // appear twice in one segment — silent corruption that causes
         // WalCursor to skip records.  A gap (missing seq) is detectable on
         // replay and therefore the lesser evil.
+        //
+        // This ordering only matters for callers that continue after a sync
+        // error: `Durable` treats a WAL error as fatal and never retries on
+        // the same handle, and a restart reconstructs `next_seq` from the
+        // durable segment bytes — so the in-memory gap heals naturally.
         self.active_bytes += frame_bytes;
         self.bytes_since_checkpoint += frame_bytes;
         self.next_seq += 1;
