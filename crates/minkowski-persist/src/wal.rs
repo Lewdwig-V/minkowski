@@ -697,9 +697,27 @@ impl Wal {
             let mut writer = BufWriter::new(&self.active_file);
             write_frame(&mut writer, &payload)?
         };
+
+        // Advance in-memory state *before* fsync.  Once bytes have been
+        // handed to the kernel via write(2), they may survive a crash even
+        // if fsync reports failure (POSIX allows this).  If we kept the old
+        // counters and the caller retried, the same sequence number would
+        // appear twice in one segment — silent corruption that causes
+        // WalCursor to skip records.  A gap (missing seq) is detectable on
+        // replay and therefore the lesser evil.
+        //
+        // This ordering only matters for callers that continue after a sync
+        // error: `Durable` treats a WAL error as fatal and never retries on
+        // the same handle, and a restart reconstructs `next_seq` from the
+        // durable segment bytes — so the in-memory gap heals naturally.
         self.active_bytes += frame_bytes;
         self.bytes_since_checkpoint += frame_bytes;
         self.next_seq += 1;
+
+        // Durability: flush kernel buffers to stable storage so that a
+        // process crash or power loss cannot lose the frame we just wrote.
+        // Without this, BufWriter::flush only pushes to the page cache.
+        self.active_file.sync_all()?;
 
         // Roll to new segment if threshold exceeded. Failure is non-fatal:
         // the mutation is already persisted and the oversized segment is
