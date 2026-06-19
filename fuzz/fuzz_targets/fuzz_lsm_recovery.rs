@@ -62,11 +62,27 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let (result, _, _) = match LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs) {
+    // Capture the source set (bit patterns: exact + NaN-safe) before recovery.
+    let mut expected: Vec<u32> = world
+        .query::<(&FuzzPos,)>()
+        .map(|(p,)| p.x.to_bits())
+        .collect();
+    expected.sort_unstable();
+
+    let (mut result, _, _) = match LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs) {
         Ok(v) => v,
         Err(_) => return,
     };
 
     assert_eq!(result.flush_seq, seq_hi);
-    assert!(result.world.query::<(&FuzzPos,)>().count() <= count);
+
+    // Recovery must reproduce the source world exactly — no dropped entities,
+    // no corrupted column bytes.
+    let mut got: Vec<u32> = result
+        .world
+        .query::<(&FuzzPos,)>()
+        .map(|(p,)| p.x.to_bits())
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, expected, "recovered FuzzPos set must equal source");
 });

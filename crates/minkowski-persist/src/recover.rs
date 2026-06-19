@@ -37,7 +37,13 @@ pub fn recover_world(
         wal.replay_from(result.flush_seq, &mut world, codecs)?;
         Ok(world)
     } else {
+        // No LSM baseline yet (crash before first flush). Register components
+        // before replaying — otherwise spawn replay records ComponentIds into an
+        // empty registry and EnumChangeSet::apply panics resolving their layouts.
         let mut world = World::new();
+        for id in codecs.registered_ids() {
+            codecs.register_one(id, &mut world);
+        }
         wal.replay_from(0, &mut world, codecs)?;
         Ok(world)
     }

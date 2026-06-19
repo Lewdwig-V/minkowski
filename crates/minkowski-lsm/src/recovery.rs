@@ -141,7 +141,12 @@ impl LsmRecovery {
             0
         };
 
-        debug_assert!(pages.is_empty() || !component_layouts.is_empty());
+        // Release-mode invariant: if we recovered any pages we must have resolved
+        // their component layouts, or materialize_world produces a corrupt world.
+        assert!(
+            pages.is_empty() || !component_layouts.is_empty(),
+            "recovery: pages present but no component layouts were resolved"
+        );
         let world = materialize_world(pages, allocator.as_ref(), &component_layouts, codecs)?;
         Ok((RecoveryResult { world, flush_seq }, manifest, log))
     }

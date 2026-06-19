@@ -36,6 +36,21 @@ fn to_u16(value: usize, label: &str) -> Result<u16, LsmError> {
     u16::try_from(value).map_err(|_| LsmError::Format(format!("{label} {value} exceeds u16")))
 }
 
+/// Convert an archetype index to its on-disk `arch_id`, rejecting the reserved
+/// sentinel range. `META_ARCH_ID` (0xFFFF) keys metadata pages; a real archetype
+/// landing on it would be silently dropped by the reader's `META_ARCH_ID` filter
+/// on recovery, so we refuse to write it rather than lose data.
+fn arch_id_to_u16(value: usize) -> Result<u16, LsmError> {
+    let id = to_u16(value, "arch_idx")?;
+    // META_ARCH_ID is u16::MAX, so it is the only reserved arch_id value.
+    if id == META_ARCH_ID {
+        return Err(LsmError::Format(format!(
+            "arch_idx {value} collides with reserved META_ARCH_ID"
+        )));
+    }
+    Ok(id)
+}
+
 /// Flush dirty pages from the World to a new sorted run file.
 ///
 /// Returns `Ok(Some(path))` if dirty pages were written, `Ok(None)` if there
@@ -198,13 +213,13 @@ pub fn flush_observed(
     }
     // Validate all indices fit in u16 before sorting.
     for job in &component_jobs {
-        to_u16(job.arch_idx, "arch_idx")?;
+        arch_id_to_u16(job.arch_idx)?;
         to_u16(job.page_index, "page_index")?;
     }
     component_jobs.sort_by_key(|j| (j.arch_idx as u16, j.slot, j.page_index as u16));
 
     for job in &component_jobs {
-        let arch_id = to_u16(job.arch_idx, "arch_idx")?;
+        let arch_id = arch_id_to_u16(job.arch_idx)?;
         let page_idx = to_u16(job.page_index, "page_index")?;
 
         let arch_len = world.archetype_len(job.arch_idx);
@@ -265,13 +280,13 @@ pub fn flush_observed(
     }
     // Validate all entity job indices fit in u16 before sorting.
     for &(arch_idx, page_index) in &entity_jobs {
-        to_u16(arch_idx, "arch_idx")?;
+        arch_id_to_u16(arch_idx)?;
         to_u16(page_index, "page_index")?;
     }
     entity_jobs.sort_by_key(|&(arch_idx, page_index)| (arch_idx as u16, page_index as u16));
 
     for &(arch_idx, page_index) in &entity_jobs {
-        let arch_id = to_u16(arch_idx, "arch_idx")?;
+        let arch_id = arch_id_to_u16(arch_idx)?;
         let page_idx = to_u16(page_index, "page_index")?;
 
         let entities = world.archetype_entities(arch_idx);
