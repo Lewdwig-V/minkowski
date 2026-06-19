@@ -255,11 +255,15 @@ impl SortedRunReader {
 
         // Compute and bounds-check data.
         let item_size = self.item_size_for_slot(slot)?;
-        let data_len = PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
-            LsmError::Format(format!(
-                "page ({arch_id}, {slot}, {page_index}): data length overflow"
-            ))
-        })?;
+        let data_len = if slot == crate::format::ALLOCATOR_SLOT {
+            header.row_count as usize
+        } else {
+            PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
+                LsmError::Format(format!(
+                    "page ({arch_id}, {slot}, {page_index}): data length overflow"
+                ))
+            })?
+        };
         let data_start = offset.checked_add(header_size).ok_or_else(|| {
             LsmError::Format(format!(
                 "page ({arch_id}, {slot}, {page_index}): data start overflow"
@@ -327,71 +331,86 @@ impl SortedRunReader {
         &self,
         arch_id: u16,
     ) -> impl Iterator<Item = Result<(u16, PageRef<'_>), LsmError>> + '_ {
-        let key = (arch_id, ENTITY_SLOT, 0u16);
+        self.slot_pages(arch_id, ENTITY_SLOT)
+    }
+
+    /// Iterate all pages for `(arch_id, slot)` from the sparse index.
+    pub fn slot_pages(
+        &self,
+        arch_id: u16,
+        slot: u16,
+    ) -> impl Iterator<Item = Result<(u16, PageRef<'_>), LsmError>> + '_ {
+        let key = (arch_id, slot, 0u16);
         let start = self
             .index
             .partition_point(|e| (e.arch_id, e.slot, e.page_index) < key);
 
         self.index[start..]
             .iter()
-            .take_while(move |e| e.arch_id == arch_id && e.slot == ENTITY_SLOT)
+            .take_while(move |e| e.arch_id == arch_id && e.slot == slot)
             .map(move |entry| {
                 let page_index = entry.page_index;
-                let buf = self.data.as_slice();
-                let offset = entry.file_offset as usize;
-                let header_size = std::mem::size_of::<PageHeader>();
-
-                let header_end = offset.checked_add(header_size).ok_or_else(|| {
-                    LsmError::Format(format!(
-                        "page ({arch_id}, {}, {page_index}): header offset overflow",
-                        ENTITY_SLOT
-                    ))
-                })?;
-                if header_end > buf.len() {
-                    return Err(LsmError::Format(format!(
-                        "page ({arch_id}, {}, {page_index}): header at offset {offset} extends beyond file",
-                        ENTITY_SLOT
-                    )));
-                }
-                let header_bytes: &[u8; 16] = buf[offset..header_end].try_into().expect("16 bytes");
-                let header = PageHeader::from_bytes(header_bytes);
-
-                let item_size = self.item_size_for_slot(ENTITY_SLOT)?;
-                let data_len = PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
-                    LsmError::Format(format!(
-                        "page ({arch_id}, {}, {page_index}): data length overflow",
-                        ENTITY_SLOT
-                    ))
-                })?;
-                let data_start = offset.checked_add(header_size).ok_or_else(|| {
-                    LsmError::Format(format!(
-                        "page ({arch_id}, {}, {page_index}): data start overflow",
-                        ENTITY_SLOT
-                    ))
-                })?;
-                let data_end = data_start.checked_add(data_len).ok_or_else(|| {
-                    LsmError::Format(format!(
-                        "page ({arch_id}, {}, {page_index}): data end overflow",
-                        ENTITY_SLOT
-                    ))
-                })?;
-                if data_end > buf.len() {
-                    return Err(LsmError::Format(format!(
-                        "page ({arch_id}, {}, {page_index}): data region [{data_start}..{data_end}] extends beyond file",
-                        ENTITY_SLOT
-                    )));
-                }
-                let data = &buf[data_start..data_end];
-
-                Ok((
-                    page_index,
-                    PageRef {
-                        header,
-                        data,
-                        file_offset: entry.file_offset,
-                    },
-                ))
+                self.page_ref_at(entry.file_offset, arch_id, slot, page_index)
+                    .map(|page| (page_index, page))
             })
+    }
+
+    fn page_ref_at(
+        &self,
+        file_offset: u64,
+        arch_id: u16,
+        slot: u16,
+        page_index: u16,
+    ) -> Result<PageRef<'_>, LsmError> {
+        let buf = self.data.as_slice();
+        let offset = file_offset as usize;
+        let header_size = std::mem::size_of::<PageHeader>();
+
+        let header_end = offset.checked_add(header_size).ok_or_else(|| {
+            LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): header offset overflow"
+            ))
+        })?;
+        if header_end > buf.len() {
+            return Err(LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): header at offset {offset} extends beyond file"
+            )));
+        }
+        let header_bytes: &[u8; 16] = buf[offset..header_end].try_into().expect("16 bytes");
+        let header = PageHeader::from_bytes(header_bytes);
+
+        let item_size = self.item_size_for_slot(slot)?;
+        let data_len = if slot == crate::format::ALLOCATOR_SLOT {
+            header.row_count as usize
+        } else {
+            PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
+                LsmError::Format(format!(
+                    "page ({arch_id}, {slot}, {page_index}): data length overflow"
+                ))
+            })?
+        };
+        let data_start = offset.checked_add(header_size).ok_or_else(|| {
+            LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): data start overflow"
+            ))
+        })?;
+        let data_end = data_start.checked_add(data_len).ok_or_else(|| {
+            LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): data end overflow"
+            ))
+        })?;
+        if data_end > buf.len() {
+            return Err(LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): data region [{data_start}..{data_end}] extends beyond file"
+            )));
+        }
+        let data = &buf[data_start..data_end];
+
+        Ok(PageRef {
+            header,
+            data,
+            file_offset,
+        })
     }
 
     /// Number of entries in the sparse index.
@@ -415,8 +434,15 @@ impl SortedRunReader {
     }
 
     /// Returns the sorted, deduplicated list of archetype IDs present in this sorted run.
+    ///
+    /// Excludes [`META_ARCH_ID`] metadata pages (e.g. allocator state).
     pub fn archetype_ids(&self) -> Vec<u16> {
-        let mut ids: Vec<u16> = self.index.iter().map(|e| e.arch_id).collect();
+        let mut ids: Vec<u16> = self
+            .index
+            .iter()
+            .map(|e| e.arch_id)
+            .filter(|&id| id != crate::format::META_ARCH_ID)
+            .collect();
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -447,7 +473,9 @@ impl SortedRunReader {
 
     /// Item size in bytes for a given slot.
     fn item_size_for_slot(&self, slot: u16) -> Result<usize, LsmError> {
-        if slot == ENTITY_SLOT {
+        if slot == crate::format::ALLOCATOR_SLOT {
+            Ok(1)
+        } else if slot == ENTITY_SLOT {
             Ok(std::mem::size_of::<u64>())
         } else {
             self.schema

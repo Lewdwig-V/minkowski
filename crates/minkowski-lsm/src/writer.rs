@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use minkowski::World;
 
+use crate::allocator_meta;
 use crate::bloom;
 use crate::error::LsmError;
 use crate::format::*;
@@ -153,7 +154,7 @@ pub fn flush_observed(
     let mut w = BufWriter::new(file);
 
     // (a) Header — write with crc32 = 0, patch later.
-    let page_count = dirty.len() + entity_dirty.values().map(BTreeSet::len).sum::<usize>();
+    let page_count = dirty.len() + entity_dirty.values().map(BTreeSet::len).sum::<usize>() + 1;
     let header = Header {
         magic: MAGIC,
         version: VERSION,
@@ -321,6 +322,37 @@ pub fn flush_observed(
             arch_id,
             slot: ENTITY_SLOT,
             page_index: page_idx,
+            _pad: 0,
+            file_offset,
+        });
+    }
+
+    // (d2) Allocator metadata page — always written when flushing dirty pages.
+    {
+        let (generations, free_list) = world.entity_allocator_state();
+        let meta_bytes = allocator_meta::encode(generations, free_list);
+        let meta_len = meta_bytes.len();
+        if meta_len > u16::MAX as usize {
+            return Err(LsmError::Format(format!(
+                "allocator metadata {meta_len} bytes exceeds u16::MAX"
+            )));
+        }
+        let page_crc = crc32fast::hash(&meta_bytes);
+        let file_offset = w.stream_position()?;
+        let ph = PageHeader {
+            arch_id: META_ARCH_ID,
+            slot: ALLOCATOR_SLOT,
+            page_index: 0,
+            row_count: meta_len as u16,
+            page_crc32: page_crc,
+            _padding: 0,
+        };
+        w.write_all(ph.as_bytes())?;
+        w.write_all(&meta_bytes)?;
+        index_entries.push(IndexEntry {
+            arch_id: META_ARCH_ID,
+            slot: ALLOCATOR_SLOT,
+            page_index: 0,
             _pad: 0,
             file_offset,
         });

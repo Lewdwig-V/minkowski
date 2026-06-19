@@ -8,6 +8,12 @@ pub const VERSION: u32 = 1;
 /// entity-ID pages (as opposed to component-data pages).
 pub const ENTITY_SLOT: u16 = 0xFFFF;
 
+/// Special `arch_id` for global metadata pages (not tied to an archetype).
+pub const META_ARCH_ID: u16 = 0xFFFF;
+
+/// Special `slot` for entity-allocator state pages (`generations` + `free_list`).
+pub const ALLOCATOR_SLOT: u16 = 0xFFFE;
+
 /// Number of rows per page — re-exported from the minkowski crate for
 /// convenience so callers do not need to depend on both crates.
 pub const PAGE_SIZE: usize = minkowski::PAGE_SIZE;

@@ -45,45 +45,6 @@ pub struct WalRecord {
     pub mutations: Vec<SerializedMutation>,
 }
 
-/// Serializable entity allocator state.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct AllocatorState {
-    pub generations: Vec<u32>,
-    pub free_list: Vec<u32>,
-}
-
-/// Per-archetype data in a snapshot.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct ArchetypeData {
-    pub component_ids: Vec<ComponentId>,
-    pub entities: Vec<u64>,
-    pub columns: Vec<ColumnData>,
-}
-
-/// Per-column data: one serialized blob per row.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct ColumnData {
-    pub component_id: ComponentId,
-    pub values: Vec<Vec<u8>>,
-}
-
-/// Sparse component data (outside archetype columns).
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct SparseComponentData {
-    pub component_id: ComponentId,
-    pub entries: Vec<(u64, Vec<u8>)>,
-}
-
-/// Full snapshot payload.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct SnapshotData {
-    pub wal_seq: u64,
-    pub schema: Vec<ComponentSchema>,
-    pub allocator: AllocatorState,
-    pub archetypes: Vec<ArchetypeData>,
-    pub sparse: Vec<SparseComponentData>,
-}
-
 /// Schema preamble: maps sender-local IDs to stable names.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 pub struct WalSchema {
@@ -95,7 +56,7 @@ pub struct WalSchema {
 pub enum WalEntry {
     Schema(WalSchema),
     Mutations(WalRecord),
-    Checkpoint { snapshot_seq: u64 },
+    Checkpoint { flush_seq: u64 },
 }
 
 /// Self-describing replication payload. Every batch carries its own schema
@@ -110,14 +71,6 @@ pub enum WalEntry {
 pub struct ReplicationBatch {
     pub schema: WalSchema,
     pub records: Vec<WalRecord>,
-}
-
-/// Returned after a successful snapshot save.
-#[derive(Debug, Clone)]
-pub struct SnapshotHeader {
-    pub wal_seq: u64,
-    pub archetype_count: usize,
-    pub entity_count: usize,
 }
 
 #[cfg(test)]
@@ -139,11 +92,8 @@ mod tests {
 
     #[test]
     fn wal_entry_checkpoint_variant() {
-        let checkpoint = WalEntry::Checkpoint { snapshot_seq: 42 };
-        assert!(matches!(
-            checkpoint,
-            WalEntry::Checkpoint { snapshot_seq: 42 }
-        ));
+        let checkpoint = WalEntry::Checkpoint { flush_seq: 42 };
+        assert!(matches!(checkpoint, WalEntry::Checkpoint { flush_seq: 42 }));
     }
 
     #[test]

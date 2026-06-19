@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 minkowski = { path = "../minkowski" }
 minkowski-persist = { path = "../minkowski-persist" }
+minkowski-lsm = { path = "../minkowski-lsm" }
 rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 
 [dev-dependencies]

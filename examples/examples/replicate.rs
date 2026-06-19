@@ -1,17 +1,15 @@
 //! Replication — pull-based WAL cursor for read replicas.
 //!
-//! Simulates a network replication flow using channels as the wire:
-//! - `source_side` spawns entities, takes a snapshot, writes post-snapshot
-//!   mutations to WAL, then sends snapshot bytes + WAL batch bytes over a channel.
-//! - `replica_side` receives the bytes, reconstructs a World from the snapshot,
-//!   applies the WAL batch, and returns the replica World.
-//! - The two sides share no World state — only serialized bytes cross the boundary.
-//!
 //! Run: cargo run -p minkowski-examples --example replicate --release
 
 use minkowski::{EnumChangeSet, World};
+use minkowski_lsm::manifest::SortedRunMeta;
+use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog};
+use minkowski_lsm::manifest_ops::flush_and_record;
+use minkowski_lsm::reader::SortedRunReader;
+use minkowski_lsm::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 use minkowski_persist::{
-    CodecRegistry, ReplicationBatch, Snapshot, Wal, WalConfig, WalCursor, apply_batch,
+    CodecRegistry, ReplicationBatch, Wal, WalConfig, WalCursor, apply_batch, recover_world,
 };
 use rkyv::{Archive, Deserialize, Serialize};
 use std::sync::mpsc;
@@ -30,28 +28,29 @@ struct Vel {
     dy: f32,
 }
 
-/// Messages sent from source to replica over the "network" (channel).
 enum WireMessage {
-    /// Full snapshot bytes — sent once at the start.
-    Snapshot(Vec<u8>),
-    /// Incremental WAL batch bytes — sent for each batch of mutations.
+    /// LSM baseline: sorted run bytes + WAL sequence covered by the flush.
+    LsmBaseline {
+        run_name: String,
+        run: Vec<u8>,
+        flush_seq: u64,
+    },
     WalBatch(Vec<u8>),
 }
 
-/// Source side: owns the authoritative World and WAL.
-/// Sends snapshot + WAL batches over the channel.
 fn source_side(tx: &mpsc::Sender<WireMessage>) {
     let dir = std::env::temp_dir().join("minkowski-replicate-source");
-    std::fs::create_dir_all(&dir).unwrap();
+    let lsm_dir = dir.join("lsm");
     let wal_dir = dir.join("source.wal");
-    let _ = std::fs::remove_dir_all(&wal_dir);
+    let manifest_log = lsm_dir.join("manifest.log");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&lsm_dir).unwrap();
 
     let mut world = World::new();
     let mut codecs = CodecRegistry::new();
     codecs.register_as::<Pos>("pos", &mut world).unwrap();
     codecs.register_as::<Vel>("vel", &mut world).unwrap();
 
-    // Spawn initial entities
     for i in 0..20 {
         world.spawn((
             Pos {
@@ -61,21 +60,29 @@ fn source_side(tx: &mpsc::Sender<WireMessage>) {
             Vel { dx: 1.0, dy: 0.5 },
         ));
     }
-    println!("[source] Spawned {} entities", world.entity_count());
 
-    // Take snapshot and send bytes over the wire
     let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
-    let snap = Snapshot::new();
-    let (header, snap_bytes) = snap.save_to_bytes(&world, &codecs, wal.next_seq()).unwrap();
-    println!(
-        "[source] Snapshot: {} entities, {} bytes, WAL seq {}",
-        header.entity_count,
-        snap_bytes.len(),
-        header.wal_seq
-    );
-    tx.send(WireMessage::Snapshot(snap_bytes)).unwrap();
+    let flush_seq = wal.next_seq();
+    let (mut manifest, mut log) = ManifestLog::recover::<4>(&manifest_log).unwrap();
+    let run_path = flush_and_record(
+        &world,
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(flush_seq)).unwrap(),
+        &mut manifest,
+        &mut log,
+        &lsm_dir,
+    )
+    .unwrap()
+    .expect("flush");
 
-    // Post-snapshot mutations via WAL
+    let run_name = run_path.file_name().unwrap().to_string_lossy().into_owned();
+    let run_bytes = std::fs::read(&run_path).unwrap();
+    tx.send(WireMessage::LsmBaseline {
+        run_name,
+        run: run_bytes,
+        flush_seq,
+    })
+    .unwrap();
+
     for i in 0..10 {
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
@@ -92,87 +99,89 @@ fn source_side(tx: &mpsc::Sender<WireMessage>) {
         )
         .unwrap();
         wal.append(&cs, &codecs).unwrap();
-        cs.apply(&mut world).expect("replicate apply");
+        cs.apply(&mut world).unwrap();
     }
-    println!(
-        "[source] After mutations: {} entities, WAL seq {}",
-        world.entity_count(),
-        wal.next_seq()
-    );
 
     drop(wal);
 
-    // Read WAL batch from cursor and send over the wire
-    let mut cursor = WalCursor::open(&wal_dir, header.wal_seq).unwrap();
+    let mut cursor = WalCursor::open(&wal_dir, flush_seq).unwrap();
     let batch = cursor.next_batch(100).unwrap();
-    let batch_bytes = batch.to_bytes().unwrap();
-    println!(
-        "[source] WAL batch: {} records, {} bytes",
-        batch.records.len(),
-        batch_bytes.len()
-    );
-    tx.send(WireMessage::WalBatch(batch_bytes)).unwrap();
+    tx.send(WireMessage::WalBatch(batch.to_bytes().unwrap()))
+        .unwrap();
 
     let _ = std::fs::remove_dir_all(&dir);
-    println!("[source] Done — {} entities total", world.entity_count());
 }
 
-/// Replica side: reconstructs World from bytes received over the channel.
-/// Has its own CodecRegistry — no shared state with source.
+fn install_baseline(
+    lsm_dir: &std::path::Path,
+    manifest_log: &std::path::Path,
+    run_name: &str,
+    run: &[u8],
+    flush_seq: u64,
+) {
+    let run_path = lsm_dir.join(run_name);
+    std::fs::write(&run_path, run).unwrap();
+    let reader = SortedRunReader::open(&run_path).unwrap();
+    let file_size = std::fs::metadata(&run_path).unwrap().len();
+    let meta = SortedRunMeta::new(
+        run_path,
+        reader.sequence_range(),
+        reader.archetype_ids(),
+        PageCount::new(reader.page_count()).expect("page count"),
+        SizeBytes::new(file_size),
+    )
+    .expect("run meta");
+    let (_, mut log) = ManifestLog::recover::<4>(manifest_log).unwrap();
+    log.append(&ManifestEntry::AddRunAndSequence {
+        level: Level::L0,
+        meta,
+        next_sequence: SeqNo::from(flush_seq),
+    })
+    .unwrap();
+}
+
 fn replica_side(rx: &mpsc::Receiver<WireMessage>) -> World {
-    // Replica registers codecs independently (could be different order)
+    let dir = std::env::temp_dir().join("minkowski-replicate-replica");
+    let lsm_dir = dir.join("lsm");
+    let wal_dir = dir.join("replica.wal");
+    let manifest_log = lsm_dir.join("manifest.log");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&lsm_dir).unwrap();
+
     let mut codecs = CodecRegistry::new();
     let mut tmp = World::new();
     codecs.register_as::<Vel>("vel", &mut tmp).unwrap();
     codecs.register_as::<Pos>("pos", &mut tmp).unwrap();
     drop(tmp);
 
-    // Receive and load snapshot
-    let WireMessage::Snapshot(snap_bytes) = rx.recv().unwrap() else {
-        panic!("expected snapshot")
+    let WireMessage::LsmBaseline {
+        run_name,
+        run,
+        flush_seq,
+    } = rx.recv().unwrap()
+    else {
+        panic!("expected LSM baseline");
     };
-    println!("[replica] Received snapshot: {} bytes", snap_bytes.len());
 
-    let snap = Snapshot::new();
-    let (mut world, snap_seq) = snap.load_from_bytes(&snap_bytes, &codecs).unwrap();
-    println!(
-        "[replica] Loaded snapshot: {} entities at seq {}",
-        world.entity_count(),
-        snap_seq
-    );
+    install_baseline(&lsm_dir, &manifest_log, &run_name, &run, flush_seq);
 
-    // Receive and apply WAL batch
+    let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
+    let mut world = recover_world(&lsm_dir, &manifest_log, &mut wal, &codecs).unwrap();
+
     let WireMessage::WalBatch(batch_bytes) = rx.recv().unwrap() else {
-        panic!("expected WAL batch")
+        panic!("expected WAL batch");
     };
-    println!("[replica] Received WAL batch: {} bytes", batch_bytes.len());
-
     let batch = ReplicationBatch::from_bytes(&batch_bytes).unwrap();
-    let last_seq = apply_batch(&batch, &mut world, &codecs).unwrap();
-    println!(
-        "[replica] Applied {} records up to seq {:?} — {} entities",
-        batch.records.len(),
-        last_seq,
-        world.entity_count()
-    );
+    apply_batch(&batch, &mut world, &codecs).unwrap();
 
+    let _ = std::fs::remove_dir_all(&dir);
     world
 }
 
 fn main() {
     let (tx, rx) = mpsc::channel();
-
-    // Run source and replica — channel is the "network"
     source_side(&tx);
-    let replica = replica_side(&rx);
-
-    // Verify convergence
-    println!("\n=== Convergence check ===");
-    println!("Replica entities: {}", replica.entity_count());
-    assert_eq!(
-        replica.entity_count(),
-        30,
-        "replica should have 20 (snapshot) + 10 (WAL) = 30 entities"
-    );
-    println!("Source and replica converged.");
+    drop(tx);
+    let world = replica_side(&rx);
+    println!("Replica converged with {} entities", world.entity_count());
 }

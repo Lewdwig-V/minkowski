@@ -2,18 +2,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use minkowski::World;
+use minkowski_lsm::compactor::{COMPACTION_TRIGGER, compact_one};
+use minkowski_lsm::manifest::DefaultManifest;
+use minkowski_lsm::manifest_log::ManifestLog;
+use minkowski_lsm::manifest_ops::flush_and_record;
+use minkowski_lsm::types::{SeqNo, SeqRange};
 use parking_lot::Mutex;
 
 use crate::index::PersistentIndex;
-use crate::snapshot::Snapshot;
 use crate::wal::Wal;
 use minkowski_lsm::codec::CodecRegistry;
 
 /// Callback invoked when the WAL has accumulated more mutation bytes than
 /// the configured `max_bytes_between_checkpoints` threshold without a
-/// snapshot acknowledgment. The default consumer is [`Durable`](crate::Durable).
+/// flush acknowledgment. The default consumer is [`Durable`](crate::Durable).
 ///
-/// Implementations should call [`Wal::acknowledge_snapshot`] on success to
+/// Implementations should call [`Wal::acknowledge_flush`] on success to
 /// reset the byte counter. If they do not, `checkpoint_needed()` will
 /// remain true and the handler will fire again on the next commit.
 ///
@@ -29,18 +33,24 @@ pub trait CheckpointHandler: Send {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
-/// Default checkpoint handler: saves a snapshot and acknowledges it.
-///
-/// Snapshots are written to `snap_dir/checkpoint-{seq:06}.snap`.
+/// Default checkpoint handler: LSM flush of dirty pages + optional compaction.
 pub struct AutoCheckpoint {
-    snap_dir: PathBuf,
+    lsm_dir: PathBuf,
+    manifest: Mutex<DefaultManifest>,
+    manifest_log: Mutex<ManifestLog>,
     indexes: Vec<(PathBuf, Arc<Mutex<dyn PersistentIndex>>)>,
 }
 
 impl AutoCheckpoint {
-    pub fn new(snap_dir: &Path) -> Self {
+    pub fn new(lsm_dir: &Path) -> Self {
+        std::fs::create_dir_all(lsm_dir).expect("create LSM directory");
+        let manifest_log_path = lsm_dir.join("manifest.log");
+        let (manifest, log) =
+            ManifestLog::recover::<4>(&manifest_log_path).expect("recover manifest log");
         Self {
-            snap_dir: snap_dir.to_path_buf(),
+            lsm_dir: lsm_dir.to_path_buf(),
+            manifest: Mutex::new(manifest),
+            manifest_log: Mutex::new(log),
             indexes: Vec::new(),
         }
     }
@@ -48,7 +58,7 @@ impl AutoCheckpoint {
     /// Register a persistent index to be saved on each checkpoint.
     ///
     /// Index save failures are non-fatal — they are logged to stderr
-    /// but do not fail the checkpoint. The snapshot and WAL are the
+    /// but do not fail the checkpoint. The LSM baseline and WAL are the
     /// source of truth; indexes are a performance optimization that
     /// can always be rebuilt.
     pub fn register_index(&mut self, path: PathBuf, index: Arc<Mutex<dyn PersistentIndex>>) {
@@ -61,16 +71,28 @@ impl CheckpointHandler for AutoCheckpoint {
         &mut self,
         world: &mut World,
         wal: &mut Wal,
-        codecs: &CodecRegistry,
+        _codecs: &CodecRegistry,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let seq = wal.next_seq();
-        let path = self.snap_dir.join(format!("checkpoint-{seq:06}.snap"));
-        let snap = Snapshot::new();
-        snap.save(&path, world, codecs, seq)?;
+        let flush_seq = wal.next_seq();
+        let lo = wal.last_checkpoint_seq().unwrap_or(0);
+        let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(flush_seq))
+            .map_err(|e| format!("invalid flush sequence range: {e}"))?;
 
-        // Sync and save registered indexes (non-fatal on failure).
-        // update() ensures the index reflects all mutations up to this
-        // checkpoint — without it, the saved index could be stale.
+        let mut manifest = self.manifest.lock();
+        let mut log = self.manifest_log.lock();
+        flush_and_record(world, seq_range, &mut manifest, &mut log, &self.lsm_dir)?;
+
+        // Best-effort compaction when L0 is over threshold.
+        while manifest
+            .runs_at_level(minkowski_lsm::types::Level::L0)
+            .len()
+            >= COMPACTION_TRIGGER
+        {
+            if compact_one(&mut manifest, &mut log, &self.lsm_dir)?.is_none() {
+                break;
+            }
+        }
+
         for (idx_path, index) in &self.indexes {
             let mut guard = index.lock();
             guard.update(world);
@@ -79,7 +101,7 @@ impl CheckpointHandler for AutoCheckpoint {
             }
         }
 
-        wal.acknowledge_snapshot(seq)?;
+        wal.acknowledge_flush(flush_seq)?;
         Ok(())
     }
 }
@@ -100,11 +122,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_checkpoint_creates_snapshot() {
+    fn auto_checkpoint_creates_lsm_run() {
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("test.wal");
-        let snap_dir = dir.path().join("snaps");
-        std::fs::create_dir_all(&snap_dir).unwrap();
+        let lsm_dir = dir.path().join("lsm");
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
@@ -134,7 +155,7 @@ mod tests {
 
         assert!(wal.checkpoint_needed());
 
-        let mut handler = AutoCheckpoint::new(&snap_dir);
+        let mut handler = AutoCheckpoint::new(&lsm_dir);
         handler
             .on_checkpoint_needed(&mut world, &mut wal, &codecs)
             .unwrap();
@@ -142,13 +163,12 @@ mod tests {
         assert!(!wal.checkpoint_needed());
         assert!(wal.last_checkpoint_seq().is_some());
 
-        // Verify snapshot file was created
-        let snaps: Vec<_> = std::fs::read_dir(&snap_dir)
+        let runs: Vec<_> = std::fs::read_dir(&lsm_dir)
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "snap"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "run"))
             .collect();
-        assert_eq!(snaps.len(), 1);
+        assert_eq!(runs.len(), 1);
     }
 
     #[test]
@@ -176,9 +196,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("idx_ckpt.wal");
-        let snap_dir = dir.path().join("snaps");
+        let lsm_dir = dir.path().join("lsm");
         let idx_path = dir.path().join("score.idx");
-        std::fs::create_dir_all(&snap_dir).unwrap();
 
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
@@ -191,7 +210,6 @@ mod tests {
         };
         let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
 
-        // Spawn entities with Pos (for WAL) and Score (for index)
         for i in 0..10 {
             let e = world.alloc_entity();
             let mut cs = minkowski::EnumChangeSet::new();
@@ -208,18 +226,16 @@ mod tests {
             cs.apply(&mut world).unwrap();
         }
 
-        // Also spawn some Score entities (not in WAL, just in world)
         world.spawn((Score(100),));
         world.spawn((Score(200),));
 
-        // Build and register index
         let idx = {
             let mut idx = BTreeIndex::<Score>::new();
             idx.rebuild(&mut world);
             Arc::new(Mutex::new(idx))
         };
 
-        let mut handler = AutoCheckpoint::new(&snap_dir);
+        let mut handler = AutoCheckpoint::new(&lsm_dir);
         handler.register_index(idx_path.clone(), idx.clone());
 
         assert!(wal.checkpoint_needed());
@@ -227,7 +243,6 @@ mod tests {
             .on_checkpoint_needed(&mut world, &mut wal, &codecs)
             .unwrap();
 
-        // Verify index file was created and is loadable
         assert!(idx_path.exists());
         let loaded = load_btree_index::<Score>(&idx_path, world.change_tick()).unwrap();
         assert_eq!(loaded.get(&Score(100)).len(), 1);

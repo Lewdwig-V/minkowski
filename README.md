@@ -169,15 +169,18 @@ All strategies handle entity ID cleanup automatically — no IDs leak on abort, 
 
 ## Persistence
 
-The `minkowski-persist` crate adds crash-safe durability. `Durable<S>` wraps any transaction strategy — every committed mutation is [WAL][wal]-logged before the caller sees the result. Recovery loads the latest snapshot and replays subsequent WAL entries.
+The `minkowski-persist` crate adds crash-safe durability. `Durable<S>` wraps any transaction strategy — every committed mutation is [WAL][wal]-logged before the caller sees the result. Recovery loads the latest LSM flush baseline and replays the WAL tail via [`recover_world`](crates/minkowski-persist/src/recover.rs).
 
-Snapshots serialize the full world state via [rkyv][rkyv] and can be saved to disk or transferred as bytes (`save_to_bytes` / `load_from_bytes`). `ReplicationBatch` is the transport-agnostic wire format for incremental replication — serialize it, send it over any medium (network, channels, shared memory), and `apply_batch` on the receiving end. `WalCursor` reads batches from local WAL files for same-server scenarios.
+LSM sorted runs hold incremental page images; `ReplicationBatch` is the transport-agnostic wire format for incremental replication — serialize it, send it over any medium (network, channels, shared memory), and `apply_batch` on the receiving end. `WalCursor` reads batches from local WAL files for same-server scenarios.
 
 ```rust
-// Durable wraps any strategy — Optimistic, Pessimistic, or Sequential
-let durable = Durable::new(strategy, wal, codecs);  // S = Optimistic here
-durable.transact_with(&mut world, access, |scope| { /* TxScope: no world param needed */ });
-// Changeset written to WAL on successful commit
+use minkowski_persist::{recover_world, AutoCheckpoint, Durable};
+
+// Recovery: LSM baseline + WAL tail
+let mut world = recover_world(&lsm_dir, &manifest_log, &mut wal, &codecs)?;
+
+// Automatic LSM flush checkpoints during durable commits
+let durable = Durable::with_checkpoint(strategy, wal, codecs, AutoCheckpoint::new(&lsm_dir));
 ```
 
 **Persistence vs. the memory pool**: `Durable<S>` and `WorldBuilder`'s mmap pool solve different problems. The pool pre-allocates volatile RAM — anonymous `MAP_ANONYMOUS` pages that vanish when the process exits. It controls memory *layout and budget*, not durability. `Durable<S>` writes committed mutations to a WAL on *disk* before they're visible, giving crash safety. They compose naturally: a pooled World with `Durable<Optimistic>` gives crash-safe transactions within a fixed memory envelope. Use `memory_budget()` for bounded workloads with pre-faulted pages. Use `Durable` for crash safety. Use both when you want both guarantees.

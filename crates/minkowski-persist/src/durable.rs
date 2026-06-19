@@ -211,7 +211,7 @@ mod tests {
             _codecs: &CodecRegistry,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            wal.acknowledge_snapshot(wal.next_seq())?;
+            wal.acknowledge_flush(wal.next_seq())?;
             Ok(())
         }
     }

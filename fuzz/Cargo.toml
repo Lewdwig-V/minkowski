@@ -26,8 +26,8 @@ path = "fuzz_targets/fuzz_reducers.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_snapshot_load"
-path = "fuzz_targets/fuzz_snapshot_load.rs"
+name = "fuzz_lsm_recovery"
+path = "fuzz_targets/fuzz_lsm_recovery.rs"
 doc = false
 
 [[bin]]

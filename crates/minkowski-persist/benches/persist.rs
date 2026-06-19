@@ -1,6 +1,10 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use minkowski::World;
-use minkowski_persist::{CodecRegistry, Snapshot, Wal, WalConfig};
+use minkowski_lsm::manifest_log::ManifestLog;
+use minkowski_lsm::manifest_ops::flush_and_record;
+use minkowski_lsm::recovery::LsmRecovery;
+use minkowski_lsm::types::{SeqNo, SeqRange};
+use minkowski_persist::{CodecRegistry, Wal, WalConfig};
 use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
@@ -34,48 +38,61 @@ fn setup() -> (World, CodecRegistry) {
     (world, codecs)
 }
 
-fn bench_snapshot_save(c: &mut Criterion) {
-    let (world, codecs) = setup();
+fn bench_lsm_flush(c: &mut Criterion) {
+    let (world, _codecs) = setup();
     let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
 
-    c.bench_function("persist/snapshot_save_1k", |b| {
-        let path = dir.path().join("bench.snap");
+    c.bench_function("persist/lsm_flush_1k", |b| {
         b.iter(|| {
-            let snap = Snapshot::new();
-            snap.save(&path, &world, &codecs, 0).unwrap();
+            let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+            flush_and_record(
+                &world,
+                SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
+                &mut manifest,
+                &mut log,
+                dir.path(),
+            )
+            .unwrap();
         });
     });
 }
 
-fn bench_snapshot_load(c: &mut Criterion) {
+fn bench_lsm_recover(c: &mut Criterion) {
     let (world, codecs) = setup();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bench.snap");
-    let snap = Snapshot::new();
-    snap.save(&path, &world, &codecs, 0).unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap()
+    .expect("flush");
 
-    c.bench_function("persist/snapshot_load_1k", |b| {
+    c.bench_function("persist/lsm_recover_1k", |b| {
         b.iter(|| {
-            let snap = Snapshot::new();
-            let (_world, _seq) = snap.load(&path, &codecs).unwrap();
+            let (mut result, _, _) =
+                LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
+            assert_eq!(result.world.query::<(&Pos,)>().count(), 1_000);
         });
     });
 }
 
 fn bench_wal_append(c: &mut Criterion) {
-    let (mut world, codecs) = setup();
     let dir = tempfile::tempdir().unwrap();
     let wal_dir = dir.path().join("bench.wal");
-    let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
-
-    // Single-mutation changeset — WAL append cost scales with changeset size,
-    // not world size, so this isolates serialization + I/O overhead.
-    let entity = world.spawn((Pos { x: 99.0, y: 99.0 }, Vel { dx: 0.0, dy: 0.0 }));
-    let mut cs = minkowski::EnumChangeSet::new();
-    cs.insert::<Pos>(&mut world, entity, Pos { x: 100.0, y: 100.0 });
+    let mut world = World::new();
+    let mut codecs = CodecRegistry::new();
+    codecs.register::<Pos>(&mut world).unwrap();
 
     c.bench_function("persist/wal_append", |b| {
+        let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
         b.iter(|| {
+            let cs = minkowski::EnumChangeSet::new();
             wal.append(&cs, &codecs).unwrap();
         });
     });
@@ -83,8 +100,8 @@ fn bench_wal_append(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_snapshot_save,
-    bench_snapshot_load,
-    bench_wal_append,
+    bench_lsm_flush,
+    bench_lsm_recover,
+    bench_wal_append
 );
 criterion_main!(benches);

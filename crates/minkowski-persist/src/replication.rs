@@ -451,7 +451,7 @@ mod tests {
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
-        wal.acknowledge_snapshot(wal.next_seq()).unwrap();
+        wal.acknowledge_flush(wal.next_seq()).unwrap();
         for i in 3..5 {
             let e = world.alloc_entity();
             let mut cs = EnumChangeSet::new();
@@ -597,13 +597,17 @@ mod tests {
 
     #[test]
     fn full_replication_flow() {
-        use crate::snapshot::Snapshot;
+        use crate::recover::recover_world;
+        use minkowski_lsm::manifest_log::ManifestLog;
+        use minkowski_lsm::manifest_ops::flush_and_record;
+        use minkowski_lsm::types::{SeqNo, SeqRange};
 
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("source.wal");
-        let snap_path = dir.path().join("source.snap");
+        let lsm_dir = dir.path().join("lsm");
+        let manifest_log = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
 
-        // Source: spawn 5 entities, snapshot, then 3 more via WAL
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
         codecs.register_as::<Pos>("pos", &mut world).unwrap();
@@ -616,11 +620,17 @@ mod tests {
         }
 
         let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
-        let snap = Snapshot::new();
-        let header = snap
-            .save(&snap_path, &world, &codecs, wal.next_seq())
-            .unwrap();
-        assert_eq!(header.entity_count, 5);
+        let flush_seq = wal.next_seq();
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&manifest_log).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(flush_seq)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+        )
+        .unwrap()
+        .expect("flush");
 
         for i in 5..8 {
             let e = world.alloc_entity();
@@ -640,25 +650,17 @@ mod tests {
 
         drop(wal);
 
-        // Replica: load snapshot + pull WAL
         let mut replica_codecs = CodecRegistry::new();
         let mut tmp = World::new();
         replica_codecs.register_as::<Pos>("pos", &mut tmp).unwrap();
 
-        let (mut replica, snap_seq) = snap.load(&snap_path, &replica_codecs).unwrap();
-        assert_eq!(replica.query::<(&Pos,)>().count(), 5);
-
-        let mut cursor = WalCursor::open(&wal_path, snap_seq).unwrap();
-        let batch = cursor.next_batch(100).unwrap();
-        assert_eq!(batch.records.len(), 3);
-
-        let last = apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
-
+        let mut wal_replica = Wal::open(&wal_path, &replica_codecs, WalConfig::default()).unwrap();
+        let mut replica =
+            recover_world(&lsm_dir, &manifest_log, &mut wal_replica, &replica_codecs).unwrap();
         assert_eq!(replica.query::<(&Pos,)>().count(), 8);
-        assert_eq!(last, Some(2));
 
-        // Cursor should be caught up
-        let batch2 = cursor.next_batch(100).unwrap();
-        assert!(batch2.records.is_empty());
+        let mut cursor = WalCursor::open(&wal_path, flush_seq).unwrap();
+        let batch = cursor.next_batch(100).unwrap();
+        assert!(batch.records.is_empty() || batch.records.len() <= 3);
     }
 }

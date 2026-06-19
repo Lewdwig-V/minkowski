@@ -1,40 +1,63 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use minkowski::EnumChangeSet;
 use minkowski_bench::{Position, register_codecs, spawn_world};
-use minkowski_persist::{CodecRegistry, Snapshot, Wal, WalConfig};
+use minkowski_lsm::manifest_log::ManifestLog;
+use minkowski_lsm::manifest_ops::flush_and_record;
+use minkowski_lsm::types::{SeqNo, SeqRange};
+use minkowski_persist::{CodecRegistry, Wal, WalConfig, recover_world};
 
 fn serialize(c: &mut Criterion) {
     let mut group = c.benchmark_group("serialize");
 
-    // -- snapshot_save --
-    group.bench_function("snapshot_save", |b| {
+    group.bench_function("lsm_flush", |b| {
         let world = spawn_world(1_000);
         let mut codecs = CodecRegistry::new();
         let mut w = world;
         register_codecs(&mut codecs, &mut w);
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bench.snap");
+        let lsm_dir = dir.path().join("lsm");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+        let log_path = lsm_dir.join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
         b.iter(|| {
-            Snapshot::new().save(&path, &w, &codecs, 0).unwrap();
+            flush_and_record(
+                &w,
+                SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+                &mut manifest,
+                &mut log,
+                &lsm_dir,
+            )
+            .unwrap();
         });
     });
 
-    // -- snapshot_load --
-    group.bench_function("snapshot_load", |b| {
+    group.bench_function("lsm_recover", |b| {
         let mut world = spawn_world(1_000);
         let mut codecs = CodecRegistry::new();
         register_codecs(&mut codecs, &mut world);
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bench.snap");
-        Snapshot::new().save(&path, &world, &codecs, 0).unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+        let log_path = lsm_dir.join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+        )
+        .unwrap()
+        .expect("flush");
 
         b.iter(|| {
-            let (_w, _seq) = Snapshot::new().load(&path, &codecs).unwrap();
+            let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
+            let _w = recover_world(&lsm_dir, &log_path, &mut wal, &codecs).unwrap();
         });
     });
 
-    // -- wal_append --
     group.bench_function("wal_append", |b| {
         let mut world = spawn_world(1_000);
         let mut codecs = CodecRegistry::new();
@@ -42,7 +65,6 @@ fn serialize(c: &mut Criterion) {
         let dir = tempfile::tempdir().unwrap();
         let mut wal = Wal::create(dir.path(), &codecs, WalConfig::default()).unwrap();
 
-        // Grab the first entity for insert mutations
         let entity = world.query::<minkowski::Entity>().next().unwrap();
 
         b.iter(|| {
@@ -60,21 +82,27 @@ fn serialize(c: &mut Criterion) {
         });
     });
 
-    // -- wal_replay --
     group.bench_function("wal_replay", |b| {
-        // One-time setup: create world, save snapshot, populate WAL with 1K mutations
         let mut world = spawn_world(1_000);
         let mut codecs = CodecRegistry::new();
         register_codecs(&mut codecs, &mut world);
 
         let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("bench.snap");
-        Snapshot::new()
-            .save(&snap_path, &world, &codecs, 0)
-            .unwrap();
-
-        // Create WAL and write 1K insert mutations
+        let lsm_dir = dir.path().join("lsm");
         let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+        let log_path = lsm_dir.join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+        )
+        .unwrap()
+        .expect("flush");
+
         let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
         let entities: Vec<_> = world.query::<minkowski::Entity>().collect();
         for &entity in &entities {
@@ -94,9 +122,8 @@ fn serialize(c: &mut Criterion) {
 
         b.iter_batched(
             || {
-                // Setup: load snapshot to get fresh world, open WAL
-                let (w, _seq) = Snapshot::new().load(&snap_path, &codecs).unwrap();
-                let wal = Wal::open(&wal_dir, &codecs, WalConfig::default()).unwrap();
+                let mut wal = Wal::open(&wal_dir, &codecs, WalConfig::default()).unwrap();
+                let w = recover_world(&lsm_dir, &log_path, &mut wal, &codecs).unwrap();
                 (w, wal)
             },
             |(mut w, mut wal)| {
