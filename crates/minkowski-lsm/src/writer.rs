@@ -51,6 +51,11 @@ fn arch_id_to_u16(value: usize) -> Result<u16, LsmError> {
     Ok(id)
 }
 
+/// Maximum bytes of allocator metadata per page, bounded by `PageHeader.row_count`
+/// (a `u16`). Blobs larger than this are split across `page_index` 0..N and
+/// concatenated back in order during recovery.
+const ALLOCATOR_PAGE_MAX_BYTES: usize = u16::MAX as usize;
+
 /// Flush dirty pages from the World to a new sorted run file.
 ///
 /// Returns `Ok(Some(path))` if dirty pages were written, `Ok(None)` if there
@@ -168,8 +173,19 @@ pub fn flush_observed(
 
     let mut w = BufWriter::new(file);
 
+    // Allocator metadata blob — encoded once, up front, so its page count is
+    // known before the header is written. encode() always returns at least a
+    // 16-byte length prefix, so there is always ≥ 1 allocator page.
+    let (generations, free_list) = world.entity_allocator_state();
+    let allocator_meta_bytes = allocator_meta::encode(generations, free_list);
+    let allocator_page_count = allocator_meta_bytes
+        .len()
+        .div_ceil(ALLOCATOR_PAGE_MAX_BYTES);
+
     // (a) Header — write with crc32 = 0, patch later.
-    let page_count = dirty.len() + entity_dirty.values().map(BTreeSet::len).sum::<usize>() + 1;
+    let page_count = dirty.len()
+        + entity_dirty.values().map(BTreeSet::len).sum::<usize>()
+        + allocator_page_count;
     let header = Header {
         magic: MAGIC,
         version: VERSION,
@@ -342,32 +358,31 @@ pub fn flush_observed(
         });
     }
 
-    // (d2) Allocator metadata page — always written when flushing dirty pages.
+    // (d2) Allocator metadata pages — always written when flushing dirty pages.
+    //      Chunked at u16::MAX bytes/page (the row_count limit) and keyed by
+    //      page_index; recovery concatenates them back in order before decode.
+    for (page_index, chunk) in allocator_meta_bytes
+        .chunks(ALLOCATOR_PAGE_MAX_BYTES)
+        .enumerate()
     {
-        let (generations, free_list) = world.entity_allocator_state();
-        let meta_bytes = allocator_meta::encode(generations, free_list);
-        let meta_len = meta_bytes.len();
-        if meta_len > u16::MAX as usize {
-            return Err(LsmError::Format(format!(
-                "allocator metadata {meta_len} bytes exceeds u16::MAX"
-            )));
-        }
-        let page_crc = crc32fast::hash(&meta_bytes);
+        let page_index = to_u16(page_index, "allocator page_index")?;
+        let page_crc = crc32fast::hash(chunk);
         let file_offset = w.stream_position()?;
         let ph = PageHeader {
             arch_id: META_ARCH_ID,
             slot: ALLOCATOR_SLOT,
-            page_index: 0,
-            row_count: meta_len as u16,
+            page_index,
+            // chunk.len() <= ALLOCATOR_PAGE_MAX_BYTES == u16::MAX, so this fits.
+            row_count: chunk.len() as u16,
             page_crc32: page_crc,
             _padding: 0,
         };
         w.write_all(ph.as_bytes())?;
-        w.write_all(&meta_bytes)?;
+        w.write_all(chunk)?;
         index_entries.push(IndexEntry {
             arch_id: META_ARCH_ID,
             slot: ALLOCATOR_SLOT,
-            page_index: 0,
+            page_index,
             _pad: 0,
             file_offset,
         });

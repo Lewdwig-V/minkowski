@@ -79,11 +79,22 @@ impl LsmRecovery {
                     .or_insert((entry.item_size() as usize, entry.item_align() as usize));
             }
 
-            if let Some(page) = reader.get_page(META_ARCH_ID, ALLOCATOR_SLOT, 0)? {
-                reader.validate_page_crc(&page)?;
-                let payload_len = page.header().row_count as usize;
-                let (generations, free_list) = allocator_meta::decode(&page.data()[..payload_len])?;
-                if allocator.as_ref().is_none_or(|a| seq_hi >= a.seq_hi) {
+            // Allocator metadata may span multiple pages (large free lists);
+            // the run with the highest seq_hi wins. Only the winner is read and
+            // decoded. slot_pages yields in page_index order, so concatenation
+            // reconstructs the original blob.
+            if allocator.as_ref().is_none_or(|a| seq_hi >= a.seq_hi) {
+                let mut alloc_blob: Vec<u8> = Vec::new();
+                let mut saw_allocator = false;
+                for result in reader.slot_pages(META_ARCH_ID, ALLOCATOR_SLOT) {
+                    let (_page_index, page) = result?;
+                    reader.validate_page_crc(&page)?;
+                    let payload_len = page.header().row_count as usize;
+                    alloc_blob.extend_from_slice(&page.data()[..payload_len]);
+                    saw_allocator = true;
+                }
+                if saw_allocator {
+                    let (generations, free_list) = allocator_meta::decode(&alloc_blob)?;
                     allocator = Some(StoredAllocator {
                         seq_hi,
                         generations,
@@ -353,6 +364,7 @@ fn reconcile_allocator(world: &mut World, stored: Option<&StoredAllocator>) {
 mod tests {
     use super::*;
     use crate::codec::CodecRegistry;
+    use crate::compactor::compact_one;
     use crate::manifest_log::ManifestLog;
     use crate::manifest_ops::flush_and_record;
     use crate::types::{SeqNo, SeqRange};
@@ -458,5 +470,167 @@ mod tests {
         let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
         assert_eq!(result.flush_seq, 0);
         assert_eq!(result.world.query::<(&Pos,)>().count(), 0);
+    }
+
+    /// A despawn-heavy world: the free list and bumped generations must survive
+    /// a flush+recover round-trip, or recycled indices collide with stale handles.
+    #[test]
+    fn recover_allocator_free_list_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+
+        let entities: Vec<_> = (0..10)
+            .map(|i| {
+                world.spawn((Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },))
+            })
+            .collect();
+        // Despawn a few — populates the free list and bumps generations.
+        world.despawn(entities[2]);
+        world.despawn(entities[5]);
+        world.despawn(entities[7]);
+
+        let (gen_before, free_before) = {
+            let (g, f) = world.entity_allocator_state();
+            (g.to_vec(), f.to_vec())
+        };
+        assert!(
+            !free_before.is_empty(),
+            "despawns must populate the free list"
+        );
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10);
+
+        let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
+
+        assert_eq!(result.world.query::<(&Pos,)>().count(), 7);
+        let (gen_after, free_after) = result.world.entity_allocator_state();
+        assert_eq!(
+            free_after,
+            free_before.as_slice(),
+            "free list must survive recovery"
+        );
+        assert_eq!(
+            gen_after,
+            gen_before.as_slice(),
+            "generations must survive recovery"
+        );
+    }
+
+    /// More than ~16K entity slots makes the allocator blob exceed `u16::MAX`
+    /// bytes, forcing multi-page allocator metadata. Before the fix this failed
+    /// to flush entirely.
+    #[test]
+    fn recover_large_world_allocator_multipage() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+
+        let n = 20_000usize;
+        for i in 0..n {
+            world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },));
+        }
+
+        let gen_len = {
+            let (g, f) = world.entity_allocator_state();
+            assert!(
+                allocator_meta::encode(g, f).len() > u16::MAX as usize,
+                "test must exceed a single allocator page"
+            );
+            g.len()
+        };
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10);
+
+        let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
+        assert_eq!(result.world.query::<(&Pos,)>().count(), n);
+        let (gen_after, _) = result.world.entity_allocator_state();
+        assert_eq!(
+            gen_after.len(),
+            gen_len,
+            "allocator generations must round-trip"
+        );
+    }
+
+    /// Compaction has no live World, so it must carry the allocator page forward
+    /// from the newest input run. Without that, recovery after compaction loses
+    /// the free list (rebuilds generations from live entities only). Regression
+    /// test for the C1 finding.
+    #[test]
+    fn recover_allocator_survives_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+
+        let entities: Vec<_> = (0..20)
+            .map(|i| {
+                world.spawn((Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },))
+            })
+            .collect();
+        world.despawn(entities[3]);
+        world.despawn(entities[11]);
+        world.despawn(entities[16]);
+
+        let (gen_before, free_before) = {
+            let (g, f) = world.entity_allocator_state();
+            (g.to_vec(), f.to_vec())
+        };
+        assert!(!free_before.is_empty());
+
+        // Accumulate COMPACTION_TRIGGER (4) L0 runs. Mutate between flushes so
+        // each has dirty pages; the allocator state stays constant post-despawn.
+        for seq in 0..4u64 {
+            for (p,) in world.query::<(&mut Pos,)>() {
+                p.y += seq as f32 + 1.0;
+            }
+            flush_world(
+                &world,
+                &mut manifest,
+                &mut log,
+                dir.path(),
+                seq * 10,
+                seq * 10 + 9,
+            );
+        }
+
+        // Compact the L0 runs away — the allocator-bearing inputs are removed.
+        let report = compact_one(&mut manifest, &mut log, dir.path()).unwrap();
+        assert!(report.is_some(), "4 L0 runs must trigger compaction");
+
+        let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
+        assert_eq!(result.world.query::<(&Pos,)>().count(), 17);
+
+        let (gen_after, free_after) = result.world.entity_allocator_state();
+        assert_eq!(
+            free_after,
+            free_before.as_slice(),
+            "free list must survive compaction"
+        );
+        assert_eq!(
+            gen_after,
+            gen_before.as_slice(),
+            "generations must survive compaction"
+        );
     }
 }

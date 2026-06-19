@@ -31,7 +31,8 @@ use std::path::{Path, PathBuf};
 use crate::bloom;
 use crate::error::LsmError;
 use crate::format::{
-    ENTITY_SLOT, Footer, Header, IndexEntry, MAGIC, PAGE_SIZE, PageHeader, VERSION,
+    ALLOCATOR_SLOT, ENTITY_SLOT, Footer, Header, IndexEntry, MAGIC, META_ARCH_ID, PAGE_SIZE,
+    PageHeader, VERSION,
 };
 use crate::manifest::SortedRunMeta;
 use crate::reader::SortedRunReader;
@@ -286,6 +287,26 @@ impl<'a> CompactionWriter<'a> {
             return Err(LsmError::Format("cannot compact: zero pages".to_owned()));
         }
 
+        // Allocator metadata: carry forward from the input run with the highest
+        // seq_hi. Compaction has no live World, so without this the free list and
+        // generations are lost once every flush that wrote them is compacted away
+        // (recovery would then rebuild generations from live entities only).
+        let allocator_pages: Vec<Vec<u8>> =
+            match self.inputs.iter().max_by_key(|r| r.sequence_range().hi()) {
+                Some(newest) => {
+                    let mut pages = Vec::new();
+                    for result in newest.slot_pages(META_ARCH_ID, ALLOCATOR_SLOT) {
+                        let (_page_index, page) = result?;
+                        newest.validate_page_crc(&page)?;
+                        let len = page.header().row_count as usize;
+                        pages.push(page.data()[..len].to_vec());
+                    }
+                    pages
+                }
+                None => Vec::new(),
+            };
+        total_pages += allocator_pages.len();
+
         // ── 5. Open temp file ─────────────────────────────────────────────────
         let seq_lo = self.output_seq_range.lo().get();
         let seq_hi = self.output_seq_range.hi().get();
@@ -502,6 +523,32 @@ impl<'a> CompactionWriter<'a> {
                     file_offset,
                 });
             }
+        }
+
+        // ── 8b. Carry forward allocator metadata pages ───────────────────────
+        for (page_index, payload) in allocator_pages.iter().enumerate() {
+            let page_index = u16::try_from(page_index)
+                .map_err(|_| LsmError::Format("allocator page_index exceeds u16".to_owned()))?;
+            let page_crc = crc32fast::hash(payload);
+            let file_offset = w.stream_position()?;
+            let ph = PageHeader {
+                arch_id: META_ARCH_ID,
+                slot: ALLOCATOR_SLOT,
+                page_index,
+                // payload came from a validated page whose row_count is u16.
+                row_count: payload.len() as u16,
+                page_crc32: page_crc,
+                _padding: 0,
+            };
+            w.write_all(ph.as_bytes())?;
+            w.write_all(payload)?;
+            index_entries.push(IndexEntry {
+                arch_id: META_ARCH_ID,
+                slot: ALLOCATOR_SLOT,
+                page_index,
+                _pad: 0,
+                file_offset,
+            });
         }
 
         // ── 9. Write sparse index (sorted) ──────────────────────────────────
