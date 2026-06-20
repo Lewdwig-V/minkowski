@@ -9,11 +9,12 @@ use minkowski::{ComponentId, Entity, EnumChangeSet, World};
 use crate::allocator_meta;
 use crate::codec::CodecRegistry;
 use crate::error::LsmError;
-use crate::format::{ALLOCATOR_SLOT, ENTITY_SLOT, META_ARCH_ID, PAGE_SIZE};
+use crate::format::{ALLOCATOR_SLOT, ENTITY_SLOT, META_ARCH_ID, PAGE_SIZE, SPARSE_ARCH_ID};
 use crate::manifest::{LsmManifest, SortedRunMeta};
 use crate::manifest_log::ManifestLog;
 use crate::manifest_ops::cleanup_orphans;
 use crate::reader::SortedRunReader;
+use crate::sparse_page;
 use crate::types::Level;
 
 /// Result of an LSM recovery operation.
@@ -29,6 +30,8 @@ pub struct LsmRecovery;
 
 type ArchetypeSig = Vec<String>;
 type PageKey = (ArchetypeSig, u16, u16);
+/// Raw sparse entries for one component: `(entity_bits, rkyv_value_bytes)`.
+type SparseEntries = Vec<(u64, Vec<u8>)>;
 
 #[derive(Clone)]
 struct StoredPage {
@@ -42,6 +45,12 @@ struct StoredAllocator {
     seq_hi: u64,
     generations: Vec<u32>,
     free_list: Vec<u32>,
+}
+
+struct StoredSparse {
+    seq_hi: u64,
+    /// (component stable name, entries) resolved against the winning run's schema.
+    components: Vec<(String, SparseEntries)>,
 }
 
 impl LsmRecovery {
@@ -65,6 +74,7 @@ impl LsmRecovery {
 
         let mut pages: BTreeMap<PageKey, StoredPage> = BTreeMap::new();
         let mut allocator: Option<StoredAllocator> = None;
+        let mut sparse: Option<StoredSparse> = None;
         let mut component_layouts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         let mut max_seq_hi = 0u64;
 
@@ -103,8 +113,38 @@ impl LsmRecovery {
                 }
             }
 
+            // Sparse baseline: newest run wins wholesale (same rule as allocator).
+            if sparse.as_ref().is_none_or(|s| seq_hi >= s.seq_hi) {
+                let mut components: Vec<(String, SparseEntries)> = Vec::new();
+                for slot in reader.component_slots_for_arch(SPARSE_ARCH_ID) {
+                    let mut blob: Vec<u8> = Vec::new();
+                    for result in reader.slot_pages(SPARSE_ARCH_ID, slot) {
+                        let (_page_index, page) = result?;
+                        reader.validate_page_crc(&page)?;
+                        let len = page.header().row_count as usize;
+                        blob.extend_from_slice(&page.data()[..len]);
+                    }
+                    if blob.is_empty() {
+                        continue;
+                    }
+                    let entries = sparse_page::decode(&blob)?;
+                    let name = reader
+                        .schema()
+                        .entry_for_slot(slot)
+                        .ok_or_else(|| {
+                            LsmError::Format(format!("sparse slot {slot} missing from schema"))
+                        })?
+                        .name()
+                        .to_owned();
+                    components.push((name, entries));
+                }
+                if !components.is_empty() {
+                    sparse = Some(StoredSparse { seq_hi, components });
+                }
+            }
+
             for arch_id in reader.archetype_ids() {
-                if arch_id == META_ARCH_ID {
+                if arch_id == META_ARCH_ID || arch_id == SPARSE_ARCH_ID {
                     continue;
                 }
                 let sig = archetype_signature(&reader, arch_id)?;
@@ -158,7 +198,8 @@ impl LsmRecovery {
             pages.is_empty() || !component_layouts.is_empty(),
             "recovery: pages present but no component layouts were resolved"
         );
-        let world = materialize_world(pages, allocator.as_ref(), &component_layouts, codecs)?;
+        let mut world = materialize_world(pages, allocator.as_ref(), &component_layouts, codecs)?;
+        apply_sparse(&mut world, sparse.as_ref(), codecs)?;
         Ok((RecoveryResult { world, flush_seq }, manifest, log))
     }
 }
@@ -337,6 +378,32 @@ fn materialize_world(
     Ok(world)
 }
 
+/// Re-inserts the baseline sparse state captured from the newest run. Runs
+/// after `materialize_world` so entity generations are already restored. Uses
+/// the codec sparse seam, which sets the correct drop function for each set.
+fn apply_sparse(
+    world: &mut World,
+    stored: Option<&StoredSparse>,
+    codecs: &CodecRegistry,
+) -> Result<(), LsmError> {
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    for (name, entries) in &stored.components {
+        let comp_id = resolve_schema_component(codecs, world, name).ok_or_else(|| {
+            LsmError::Format(format!(
+                "sparse component {name} not registered on recovery"
+            ))
+        })?;
+        for (entity_bits, value) in entries {
+            codecs
+                .insert_sparse_raw(comp_id, world, Entity::from_bits(*entity_bits), value)
+                .map_err(|e| LsmError::Format(format!("sparse restore failed for {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_allocator(world: &mut World, stored: Option<&StoredAllocator>) {
     let mut max_index = 0u32;
     for arch_idx in 0..world.archetype_count() {
@@ -369,6 +436,55 @@ mod tests {
     use crate::manifest_ops::flush_and_record;
     use crate::types::{SeqNo, SeqRange};
     use rkyv::{Archive, Deserialize, Serialize};
+
+    #[test]
+    fn recover_restores_sparse_components() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct SparsePos {
+            x: f32,
+            y: f32,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<SparsePos>("sparse_pos", &mut world)
+            .unwrap();
+        codecs.register_as::<Tag>("tag", &mut world).unwrap();
+
+        let e1 = world.spawn((SparsePos { x: 1.0, y: 2.0 },));
+        let e2 = world.spawn((SparsePos { x: 3.0, y: 4.0 },));
+        world.insert_sparse::<Tag>(e1, Tag(111));
+        world.insert_sparse::<Tag>(e2, Tag(222));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        assert_eq!(recovered.get::<Tag>(e1).copied(), Some(Tag(111)));
+        assert_eq!(recovered.get::<Tag>(e2).copied(), Some(Tag(222)));
+    }
 
     #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
     struct Pos {
