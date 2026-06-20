@@ -221,8 +221,15 @@ pub fn flush_observed(
             let layout = world
                 .component_layout(comp_id)
                 .expect("dirty component must have a layout");
-            // Task 5 derives this from the codec; for now every column is RawCopy.
-            (name.to_owned(), layout, crate::schema::StorageKind::RawCopy)
+            // The on-disk storage kind is the codec's classification for this
+            // component's TYPE (never its per-world ComponentId). The dense codec
+            // gate above guarantees every dirty dense component's type has a codec,
+            // so `storage_kind_for_type` is always `Some` here.
+            let kind = world
+                .component_type_id(comp_id)
+                .and_then(|ty| codecs.storage_kind_for_type(ty))
+                .expect("dense codec gate guarantees a codec for this type");
+            (name.to_owned(), layout, kind)
         })
         .collect();
 
@@ -349,16 +356,65 @@ pub fn flush_observed(
         }
         let row_count_u16 = to_u16(row_count, "row_count")?;
 
-        let item_size = schema
-            .entry_for_slot(job.slot)
-            .expect("slot must exist")
-            .item_size as usize;
+        let entry = schema.entry_for_slot(job.slot).expect("slot must exist");
+        let item_size = entry.item_size as usize;
+        let kind = entry.storage_kind();
 
-        let bytes = world
-            .column_page_bytes(job.arch_idx, job.comp_id, start_row, row_count)
-            .expect("dirty page must be readable");
+        // Build the page body per its storage kind:
+        //   RawCopy    → native column bytes, zero-padded to the full PAGE_SIZE
+        //                stride (`PAGE_SIZE * item_size`). Byte-identical to the
+        //                pre-Serialized fast path; recovery memcpy's them back.
+        //   Serialized → each row rkyv-serialized by TYPE and packed into one
+        //                `serialized_page` body (offset table + values). The body
+        //                is exact-length (no padding): its length is `pad_to`.
+        let (page_body, pad_to): (Vec<u8>, usize) = match kind {
+            crate::schema::StorageKind::RawCopy => {
+                let bytes = world
+                    .column_page_bytes(job.arch_idx, job.comp_id, start_row, row_count)
+                    .expect("dirty page must be readable")
+                    .to_vec();
+                (bytes, PAGE_SIZE * item_size)
+            }
+            crate::schema::StorageKind::Serialized => {
+                // Resolve the codec by the flushed world's component TYPE, never by
+                // its per-world ComponentId. The dense codec gate guarantees a
+                // codec for this type.
+                let type_id = world
+                    .component_type_id(job.comp_id)
+                    .expect("serialized column has a registered type");
+                let mut rows: Vec<Vec<u8>> = Vec::with_capacity(row_count);
+                for row in start_row..start_row + row_count {
+                    // SAFETY: `row` is in `start_row..start_row + row_count`, and
+                    // `row_count == PAGE_SIZE.min(arch_len - start_row)`, so
+                    // `row < arch_len`. `archetype_column_ptr` yields the live
+                    // native value for this arch/component, valid for reads of the
+                    // type's size during this read-only flush (no structural
+                    // mutation occurs while we hold `&World`).
+                    let ptr = unsafe { world.archetype_column_ptr(job.arch_idx, job.comp_id, row) };
+                    let mut buf = Vec::new();
+                    // SAFETY: `ptr` is a valid, aligned instance of the type
+                    // identified by `type_id` (this column's component type), as
+                    // established above.
+                    unsafe {
+                        codecs
+                            .serialize_by_type(type_id, ptr, &mut buf)
+                            .expect("dense codec gate guarantees a codec for this type")
+                            .map_err(|e| {
+                                LsmError::Format(format!(
+                                    "serialize failed for column {:?} row {row}: {e}",
+                                    entry.name()
+                                ))
+                            })?;
+                    }
+                    rows.push(buf);
+                }
+                let body = crate::serialized_page::encode(&rows);
+                let len = body.len();
+                (body, len)
+            }
+        };
 
-        let page_crc = crc32fast::hash(bytes);
+        let page_crc = crc32fast::hash(&page_body);
 
         let file_offset = w.stream_position()?;
 
@@ -371,12 +427,12 @@ pub fn flush_observed(
             _padding: 0,
         };
         w.write_all(ph.as_bytes())?;
-        w.write_all(bytes)?;
+        w.write_all(&page_body)?;
 
-        // Zero-pad partial pages.
-        let full_page_bytes = PAGE_SIZE * item_size;
-        if bytes.len() < full_page_bytes {
-            let pad = full_page_bytes - bytes.len();
+        // Zero-pad partial RawCopy pages to the full stride. For Serialized pages
+        // `pad_to == page_body.len()`, so this guard is false and no padding runs.
+        if page_body.len() < pad_to {
+            let pad = pad_to - page_body.len();
             write_zeros(&mut w, pad)?;
         }
 
@@ -892,6 +948,115 @@ mod tests {
         let mut want = vec![e1.to_bits(), e2.to_bits()];
         want.sort_unstable();
         assert_eq!(tags, want);
+    }
+
+    /// Heap dense column persistence: a registered component whose `Archived`
+    /// type differs in size from the native type (e.g. `String`) is classified
+    /// `Serialized` by its codec. The flush writer must (a) record that kind in
+    /// the schema and (b) write the page body as a per-row rkyv `serialized_page`
+    /// (offset table + values), NOT raw native String pointer-bytes.
+    ///
+    /// The reader cannot yet size a `Serialized` page (Task 6 teaches it to use
+    /// `serialized_page::encoded_len` instead of `PAGE_SIZE * item_size`), so the
+    /// full round-trip through `slot_pages`/`validate_page_crc` is deferred. This
+    /// test asserts what the WRITER controls: the schema kind is `Serialized`, and
+    /// the on-disk page body decodes to the two rkyv rows. It locates the page by
+    /// scanning the raw file for the `PageHeader` of the `Name` slot, then decodes
+    /// the body with `serialized_page::decode` — independent of the reader's
+    /// (Task-6-pending) page sizing.
+    #[test]
+    fn flush_writes_serialized_page_for_heap_component() {
+        use crate::reader::SortedRunReader;
+        use crate::schema::StorageKind;
+
+        #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        struct Name {
+            text: String,
+        }
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("Name", &mut world).unwrap();
+
+        world.spawn((Name {
+            text: "alice".to_owned(),
+        },));
+        world.spawn((Name {
+            text: "bob".to_owned(),
+        },));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            dir.path(),
+            &codecs,
+        )
+        .unwrap()
+        .unwrap();
+
+        // (a) Writer recorded the codec-derived kind in the schema. The schema
+        //     keys dense columns by `World::component_name` (the Rust type_name),
+        //     not the codec stable name — recovery resolves them that way — so
+        //     find the single dense column rather than hard-coding the name.
+        let reader = SortedRunReader::open(&path).unwrap();
+        let entry = reader
+            .schema()
+            .entries()
+            .iter()
+            .find(|e| e.name().ends_with("Name"))
+            .expect("Name column must be in the schema");
+        let slot = entry.slot();
+        assert_eq!(
+            entry.storage_kind(),
+            StorageKind::Serialized,
+            "heap dense column must be classified Serialized in the schema"
+        );
+
+        // (b) The on-disk page body for the `Name` slot decodes to two rkyv rows.
+        //     Scan the raw file for the matching PageHeader (arch_id 0, slot), then
+        //     decode the variable-length body via serialized_page (the reader's own
+        //     page-sizing is RawCopy-only until Task 6).
+        let data = std::fs::read(&path).unwrap();
+        let header_size = std::mem::size_of::<PageHeader>();
+        let mut found: Option<&[u8]> = None;
+        // Use the sparse index to get the page's file offset without depending on
+        // the reader's (Task-6-pending) page sizing: re-read the footer for it.
+        let footer_start = data.len() - 64;
+        let footer = crate::format::Footer::from_bytes(
+            data[footer_start..footer_start + 64].try_into().unwrap(),
+        );
+        let idx_start = footer.sparse_index_offset as usize;
+        let idx_count = footer.sparse_index_count as usize;
+        let entry_size = std::mem::size_of::<IndexEntry>();
+        for i in 0..idx_count {
+            let e_off = idx_start + i * entry_size;
+            let entry = IndexEntry::from_bytes(data[e_off..e_off + entry_size].try_into().unwrap());
+            if entry.arch_id == 0 && entry.slot == slot {
+                let page_off = entry.file_offset as usize;
+                let ph = PageHeader::from_bytes(
+                    data[page_off..page_off + header_size].try_into().unwrap(),
+                );
+                assert_eq!(ph.row_count, 2, "Name page must carry two rows");
+                let body_start = page_off + header_size;
+                let body_all = &data[body_start..];
+                let body_len = crate::serialized_page::encoded_len(body_all, 2).unwrap();
+                // CRC covers exactly the encoded body (no padding for Serialized).
+                let body = &body_all[..body_len];
+                assert_eq!(crc32fast::hash(body), ph.page_crc32, "page CRC mismatch");
+                found = Some(body);
+                break;
+            }
+        }
+        let body = found.expect("Name page must be present in the index");
+
+        let rows = crate::serialized_page::decode(body, 2).unwrap();
+        assert_eq!(rows.len(), 2);
+        let n0: Name = rkyv::from_bytes::<Name, rkyv::rancor::Error>(rows[0]).unwrap();
+        let n1: Name = rkyv::from_bytes::<Name, rkyv::rancor::Error>(rows[1]).unwrap();
+        let mut got = [n0.text, n1.text];
+        got.sort();
+        assert_eq!(got, ["alice".to_owned(), "bob".to_owned()]);
     }
 
     #[test]
