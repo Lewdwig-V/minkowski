@@ -255,15 +255,16 @@ impl SortedRunReader {
 
         // Compute and bounds-check data.
         let item_size = self.item_size_for_slot(slot)?;
-        let data_len = if slot == crate::format::ALLOCATOR_SLOT {
-            header.row_count as usize
-        } else {
-            PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
-                LsmError::Format(format!(
-                    "page ({arch_id}, {slot}, {page_index}): data length overflow"
-                ))
-            })?
-        };
+        let data_len =
+            if slot == crate::format::ALLOCATOR_SLOT || arch_id == crate::format::SPARSE_ARCH_ID {
+                header.row_count as usize
+            } else {
+                PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "page ({arch_id}, {slot}, {page_index}): data length overflow"
+                    ))
+                })?
+            };
         let data_start = offset.checked_add(header_size).ok_or_else(|| {
             LsmError::Format(format!(
                 "page ({arch_id}, {slot}, {page_index}): data start overflow"
@@ -380,15 +381,16 @@ impl SortedRunReader {
         let header = PageHeader::from_bytes(header_bytes);
 
         let item_size = self.item_size_for_slot(slot)?;
-        let data_len = if slot == crate::format::ALLOCATOR_SLOT {
-            header.row_count as usize
-        } else {
-            PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
-                LsmError::Format(format!(
-                    "page ({arch_id}, {slot}, {page_index}): data length overflow"
-                ))
-            })?
-        };
+        let data_len =
+            if slot == crate::format::ALLOCATOR_SLOT || arch_id == crate::format::SPARSE_ARCH_ID {
+                header.row_count as usize
+            } else {
+                PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "page ({arch_id}, {slot}, {page_index}): data length overflow"
+                    ))
+                })?
+            };
         let data_start = offset.checked_add(header_size).ok_or_else(|| {
             LsmError::Format(format!(
                 "page ({arch_id}, {slot}, {page_index}): data start overflow"
@@ -441,7 +443,7 @@ impl SortedRunReader {
             .index
             .iter()
             .map(|e| e.arch_id)
-            .filter(|&id| id != crate::format::META_ARCH_ID)
+            .filter(|&id| id != crate::format::META_ARCH_ID && id != crate::format::SPARSE_ARCH_ID)
             .collect();
         ids.sort_unstable();
         ids.dedup();
