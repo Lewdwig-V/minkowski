@@ -32,7 +32,7 @@ use crate::bloom;
 use crate::error::LsmError;
 use crate::format::{
     ALLOCATOR_SLOT, ENTITY_SLOT, Footer, Header, IndexEntry, MAGIC, META_ARCH_ID, PAGE_SIZE,
-    PageHeader, VERSION,
+    PageHeader, SPARSE_ARCH_ID, VERSION,
 };
 use crate::manifest::SortedRunMeta;
 use crate::reader::SortedRunReader;
@@ -256,6 +256,30 @@ impl<'a> CompactionWriter<'a> {
         }
 
         // ── 2. Build output schema (union of all components) ─────────────────
+
+        // Sparse baseline pages: carry forward from the newest input run
+        // (newest-wins, same as the allocator), preserving each page's
+        // (slot, page_index) VERBATIM. Sparse pages are self-describing (the
+        // component name lives in the blob) and use a separate SPARSE_ARCH_ID
+        // page space, so they need no schema entry and no re-slotting — carrying
+        // them forward byte-for-byte from the newest input is sufficient.
+        let sparse_carry: Vec<(u16, u16, Vec<u8>)> =
+            match self.inputs.iter().max_by_key(|r| r.sequence_range().hi()) {
+                Some(newest) => {
+                    let mut out = Vec::new();
+                    for slot in newest.component_slots_for_arch(SPARSE_ARCH_ID) {
+                        for result in newest.slot_pages(SPARSE_ARCH_ID, slot) {
+                            let (page_index, page) = result?;
+                            newest.validate_page_crc(&page)?;
+                            let len = page.header().row_count as usize;
+                            out.push((slot, page_index, page.data()[..len].to_vec()));
+                        }
+                    }
+                    out
+                }
+                None => Vec::new(),
+            };
+
         let all_components = self.collect_all_components();
         let output_schema = self.build_output_schema(&all_components)?;
 
@@ -306,6 +330,7 @@ impl<'a> CompactionWriter<'a> {
                 None => Vec::new(),
             };
         total_pages += allocator_pages.len();
+        total_pages += sparse_carry.len();
 
         // ── 5. Open temp file ─────────────────────────────────────────────────
         let seq_lo = self.output_seq_range.lo().get();
@@ -546,6 +571,36 @@ impl<'a> CompactionWriter<'a> {
                 arch_id: META_ARCH_ID,
                 slot: ALLOCATOR_SLOT,
                 page_index,
+                _pad: 0,
+                file_offset,
+            });
+        }
+
+        // ── 8c. Carry forward sparse baseline pages (verbatim) ───────────────
+        for (slot, page_index, payload) in &sparse_carry {
+            // Each payload came from a source page whose row_count is a u16, so
+            // it is ≤ u16::MAX; assert it before the narrowing cast below.
+            debug_assert!(
+                u16::try_from(payload.len()).is_ok(),
+                "sparse carry payload {} exceeds u16::MAX",
+                payload.len()
+            );
+            let page_crc = crc32fast::hash(payload);
+            let file_offset = w.stream_position()?;
+            let ph = PageHeader {
+                arch_id: SPARSE_ARCH_ID,
+                slot: *slot,
+                page_index: *page_index,
+                row_count: payload.len() as u16,
+                page_crc32: page_crc,
+                _padding: 0,
+            };
+            w.write_all(ph.as_bytes())?;
+            w.write_all(payload)?;
+            index_entries.push(IndexEntry {
+                arch_id: SPARSE_ARCH_ID,
+                slot: *slot,
+                page_index: *page_index,
                 _pad: 0,
                 file_offset,
             });
@@ -792,10 +847,12 @@ mod tests {
         seq_hi: u64,
     ) -> (tempfile::TempDir, SortedRunReader) {
         let dir = tempfile::tempdir().unwrap();
+        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             world,
             SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap(),
             dir.path(),
+            &codecs,
         )
         .unwrap()
         .unwrap();

@@ -7,9 +7,11 @@ use minkowski::World;
 
 use crate::allocator_meta;
 use crate::bloom;
+use crate::codec::CodecRegistry;
 use crate::error::LsmError;
 use crate::format::*;
 use crate::schema::SchemaSection;
+use crate::sparse_page;
 use crate::types::SeqRange;
 
 /// The value passed to an [`EntryObserver`] for each entity written to an
@@ -42,10 +44,11 @@ fn to_u16(value: usize, label: &str) -> Result<u16, LsmError> {
 /// on recovery, so we refuse to write it rather than lose data.
 fn arch_id_to_u16(value: usize) -> Result<u16, LsmError> {
     let id = to_u16(value, "arch_idx")?;
-    // META_ARCH_ID is u16::MAX, so it is the only reserved arch_id value.
-    if id == META_ARCH_ID {
+    // Reserved sentinels (META_ARCH_ID = 0xFFFF, SPARSE_ARCH_ID = 0xFFFD) must
+    // never be a real archetype id, or recovery would misclassify the pages.
+    if id == META_ARCH_ID || id == SPARSE_ARCH_ID {
         return Err(LsmError::Format(format!(
-            "arch_idx {value} collides with reserved META_ARCH_ID"
+            "arch_idx {value} collides with a reserved arch_id sentinel"
         )));
     }
     Ok(id)
@@ -67,8 +70,9 @@ pub fn flush(
     world: &World,
     sequence_range: SeqRange,
     output_dir: &Path,
+    codecs: &CodecRegistry,
 ) -> Result<Option<PathBuf>, LsmError> {
-    flush_observed(world, sequence_range, output_dir, None)
+    flush_observed(world, sequence_range, output_dir, codecs, None)
 }
 
 /// Like [`flush`], but invokes `observer` once per entity ID written to an
@@ -81,6 +85,7 @@ pub fn flush_observed(
     world: &World,
     sequence_range: SeqRange,
     output_dir: &Path,
+    codecs: &CodecRegistry,
     mut observer: Option<&mut dyn FnMut(EntityKey)>,
 ) -> Result<Option<PathBuf>, LsmError> {
     // ── 1. Collect dirty page set ───────────────────────────────────────────
@@ -100,8 +105,57 @@ pub fn flush_observed(
         }
     }
 
+    // ── 1b. Collect sparse component blobs (complete current sparse state) ───
+    // Each sparse component becomes one self-describing blob (its stable NAME is
+    // embedded by `sparse_page::encode`), chunked into SPARSE_ARCH_ID pages.
+    // Sparse components are deliberately NOT added to the archetype schema, so
+    // they cannot perturb archetype component slot assignments; recovery reads
+    // the component name from the blob, not from the schema.
+    struct SparseBlob {
+        name: String,
+        blob: Vec<u8>,
+    }
+    let mut sparse_blobs: Vec<SparseBlob> = Vec::new();
+    for comp_id in world.sparse_component_ids() {
+        if !codecs.has_codec(comp_id) {
+            // A sparse component with storage but no codec cannot be serialized
+            // to the baseline. Warn loudly rather than drop silently — if it
+            // holds live entries they will not survive recovery. The fix is to
+            // register the component via CodecRegistry before persisting.
+            let name = world.component_name(comp_id).unwrap_or("<unknown>");
+            eprintln!(
+                "warning: sparse component '{name}' (id={comp_id}) has no registered codec; \
+                 its data will NOT be persisted to the LSM baseline"
+            );
+            continue;
+        }
+        let entries = codecs
+            .serialize_sparse(comp_id, world)
+            .map_err(|e| LsmError::Format(format!("sparse serialize failed: {e}")))?;
+        if entries.is_empty() {
+            continue;
+        }
+        // Use the codec's stable name (explicit or type_name default) so that
+        // recovery resolves the same codec via `resolve_name`.
+        let name = codecs
+            .stable_name(comp_id)
+            .expect("has_codec guard ensures stable_name is Some")
+            .to_owned();
+        let blob = sparse_page::encode(&name, &entries);
+        sparse_blobs.push(SparseBlob { name, blob });
+    }
+    // Deterministic order so a grouping-slot index is stable across identical
+    // flushes (the slot is purely a per-run page grouping key).
+    sparse_blobs.sort_by(|a, b| a.name.cmp(&b.name));
+    // Each blob is non-empty (it always carries at least a name + count header),
+    // so `div_ceil` yields ≥ 1 page per component.
+    let sparse_page_count: usize = sparse_blobs
+        .iter()
+        .map(|s| s.blob.len().div_ceil(ALLOCATOR_PAGE_MAX_BYTES))
+        .sum();
+
     // ── 2. Early return if nothing dirty ────────────────────────────────────
-    if dirty.is_empty() {
+    if dirty.is_empty() && sparse_blobs.is_empty() {
         return Ok(None);
     }
 
@@ -111,6 +165,10 @@ pub fn flush_observed(
         seen_comp_ids.insert(comp_id);
     }
 
+    // Schema contains ONLY archetype (dirty) components. Sparse components are
+    // intentionally excluded — they carry their name in their own blob and use
+    // a separate `SPARSE_ARCH_ID` page space, so they never affect archetype
+    // slot assignment.
     let components: Vec<(String, std::alloc::Layout)> = seen_comp_ids
         .iter()
         .map(|&comp_id| {
@@ -185,7 +243,8 @@ pub fn flush_observed(
     // (a) Header — write with crc32 = 0, patch later.
     let page_count = dirty.len()
         + entity_dirty.values().map(BTreeSet::len).sum::<usize>()
-        + allocator_page_count;
+        + allocator_page_count
+        + sparse_page_count;
     let header = Header {
         magic: MAGIC,
         version: VERSION,
@@ -388,6 +447,48 @@ pub fn flush_observed(
         });
     }
 
+    // (d3) Sparse component pages — complete current sparse state under
+    //      SPARSE_ARCH_ID. The `slot` is a per-run grouping index (the blob's
+    //      position in name-sorted order), NOT a schema slot — recovery reads
+    //      the component name from the blob. Each blob is chunked at
+    //      ALLOCATOR_PAGE_MAX_BYTES (the row_count u16 cap); recovery
+    //      concatenates chunks per slot before decode.
+    for (group_idx, s) in sparse_blobs.iter().enumerate() {
+        let slot = to_u16(group_idx, "sparse group slot")?;
+        for (page_index, chunk) in s.blob.chunks(ALLOCATOR_PAGE_MAX_BYTES).enumerate() {
+            let page_index = to_u16(page_index, "sparse page_index")?;
+            let page_crc = crc32fast::hash(chunk);
+            let file_offset = w.stream_position()?;
+            let ph = PageHeader {
+                arch_id: SPARSE_ARCH_ID,
+                slot,
+                page_index,
+                // chunk.len() <= ALLOCATOR_PAGE_MAX_BYTES == u16::MAX, so this fits.
+                row_count: chunk.len() as u16,
+                page_crc32: page_crc,
+                _padding: 0,
+            };
+            w.write_all(ph.as_bytes())?;
+            w.write_all(chunk)?;
+            index_entries.push(IndexEntry {
+                arch_id: SPARSE_ARCH_ID,
+                slot,
+                page_index,
+                _pad: 0,
+                file_offset,
+            });
+        }
+    }
+
+    // Bypass-path integrity: the header's `page_count` must equal the number of
+    // pages actually written (one index entry per page). A mismatch corrupts the
+    // file (the reader trusts `page_count`), so assert it in release builds.
+    assert_eq!(
+        index_entries.len(),
+        page_count,
+        "page_count header must match the number of pages written"
+    );
+
     // (e) Sparse index — sort by (arch_id, slot, page_index) so the reader
     //     can binary-search.  Component pages are already sorted by their
     //     write order, but entity pages (slot = ENTITY_SLOT) are appended
@@ -516,6 +617,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         assert!(result.is_none());
@@ -531,6 +633,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -548,6 +651,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         let path = result.unwrap();
@@ -565,6 +669,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -590,6 +695,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap()
         .unwrap();
@@ -614,10 +720,12 @@ mod tests {
         let observed_clone = Rc::clone(&observed);
 
         let dir = tempfile::tempdir().unwrap();
+        let codecs = CodecRegistry::new();
         let result = flush_observed(
             &world,
             SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
             dir.path(),
+            &codecs,
             Some(&mut |key: EntityKey| {
                 observed_clone.borrow_mut().push(key.0);
             }),
@@ -634,6 +742,58 @@ mod tests {
     }
 
     #[test]
+    fn flush_persists_sparse_pages() {
+        use crate::codec::CodecRegistry;
+        use crate::format::SPARSE_ARCH_ID;
+        use crate::reader::SortedRunReader;
+        use crate::sparse_page;
+        use crate::types::{SeqNo, SeqRange};
+        use minkowski::World;
+
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Pos {
+            x: f32,
+            y: f32,
+        }
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Tag(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Tag>("tag", &mut world).unwrap();
+
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let e1 = world.spawn((Pos { x: 3.0, y: 4.0 },));
+        let e2 = world.spawn((Pos { x: 5.0, y: 6.0 },));
+        world.insert_sparse::<Tag>(e1, Tag(111));
+        world.insert_sparse::<Tag>(e2, Tag(222));
+
+        let range = SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap();
+        let path = flush(&world, range, dir.path(), &codecs).unwrap().unwrap();
+
+        let reader = SortedRunReader::open(&path).unwrap();
+        // Sparse components are NOT in the archetype schema; the single sparse
+        // component occupies grouping slot 0 and carries its name in the blob.
+        let mut blob = Vec::new();
+        for result in reader.slot_pages(SPARSE_ARCH_ID, 0) {
+            let (_pi, page) = result.unwrap();
+            reader.validate_page_crc(&page).unwrap();
+            blob.extend_from_slice(&page.data()[..page.header().row_count as usize]);
+        }
+        let (name, entries) = sparse_page::decode(&blob).unwrap();
+        assert_eq!(name, "tag");
+        let mut tags: Vec<u64> = entries.iter().map(|(e, _)| *e).collect();
+        tags.sort_unstable();
+        let mut want = vec![e1.to_bits(), e2.to_bits()];
+        want.sort_unstable();
+        assert_eq!(tags, want);
+    }
+
+    #[test]
     fn flush_produces_run_with_bloom_filter() {
         let mut world = World::new();
         world.spawn((Pos { x: 1.0, y: 2.0 },));
@@ -645,6 +805,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap()
         .unwrap();

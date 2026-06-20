@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use minkowski::World;
 
+use crate::codec::CodecRegistry;
 use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
 use crate::manifest_log::{ManifestEntry, ManifestLog};
@@ -22,8 +23,9 @@ pub fn flush_and_record<const N: usize>(
     manifest: &mut LsmManifest<N>,
     log: &mut ManifestLog,
     output_dir: &Path,
+    codecs: &CodecRegistry,
 ) -> Result<Option<PathBuf>, LsmError> {
-    let Some(path) = flush(world, sequence_range, output_dir)? else {
+    let Some(path) = flush(world, sequence_range, output_dir, codecs)? else {
         return Ok(None);
     };
 
@@ -103,6 +105,7 @@ pub fn cleanup_orphans<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::CodecRegistry;
     use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 
     #[derive(Clone, Copy)]
@@ -125,12 +128,14 @@ mod tests {
         let log_path = dir.path().join("manifest.log");
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
+        let codecs = CodecRegistry::new();
         let result = flush_and_record(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             &mut manifest,
             &mut log,
             dir.path(),
+            &codecs,
         )
         .unwrap();
         assert!(result.is_some());
@@ -149,12 +154,14 @@ mod tests {
         let log_path = dir.path().join("manifest.log");
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
+        let codecs = CodecRegistry::new();
         let result = flush_and_record(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             &mut manifest,
             &mut log,
             dir.path(),
+            &codecs,
         )
         .unwrap();
         assert!(result.is_none());

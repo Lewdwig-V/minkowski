@@ -12,6 +12,7 @@ pub mod reader;
 pub mod recovery;
 pub mod schema;
 pub(crate) mod schema_match;
+pub mod sparse_page;
 pub mod types;
 pub mod writer;
 

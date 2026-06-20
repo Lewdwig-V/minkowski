@@ -39,7 +39,7 @@ fn setup() -> (World, CodecRegistry) {
 }
 
 fn bench_lsm_flush(c: &mut Criterion) {
-    let (world, _codecs) = setup();
+    let (world, codecs) = setup();
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
 
@@ -52,6 +52,7 @@ fn bench_lsm_flush(c: &mut Criterion) {
                 &mut manifest,
                 &mut log,
                 dir.path(),
+                &codecs,
             )
             .unwrap();
         });
@@ -69,6 +70,7 @@ fn bench_lsm_recover(c: &mut Criterion) {
         &mut manifest,
         &mut log,
         dir.path(),
+        &codecs,
     )
     .unwrap()
     .expect("flush");

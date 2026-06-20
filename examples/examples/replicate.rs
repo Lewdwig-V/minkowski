@@ -70,6 +70,7 @@ fn source_side(tx: &mpsc::Sender<WireMessage>) {
         &mut manifest,
         &mut log,
         &lsm_dir,
+        &codecs,
     )
     .unwrap()
     .expect("flush");

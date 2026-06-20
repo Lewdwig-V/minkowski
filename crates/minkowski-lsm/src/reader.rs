@@ -254,16 +254,20 @@ impl SortedRunReader {
         let header = PageHeader::from_bytes(header_bytes);
 
         // Compute and bounds-check data.
-        let item_size = self.item_size_for_slot(slot)?;
-        let data_len = if slot == crate::format::ALLOCATOR_SLOT {
-            header.row_count as usize
-        } else {
-            PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
-                LsmError::Format(format!(
-                    "page ({arch_id}, {slot}, {page_index}): data length overflow"
-                ))
-            })?
-        };
+        let data_len =
+            if slot == crate::format::ALLOCATOR_SLOT || arch_id == crate::format::SPARSE_ARCH_ID {
+                // Sparse/allocator pages store a raw byte chunk in `row_count`;
+                // their `slot` is a grouping index, not a schema slot, so do
+                // NOT resolve it via `item_size_for_slot`.
+                header.row_count as usize
+            } else {
+                let item_size = self.item_size_for_slot(slot)?;
+                PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "page ({arch_id}, {slot}, {page_index}): data length overflow"
+                    ))
+                })?
+            };
         let data_start = offset.checked_add(header_size).ok_or_else(|| {
             LsmError::Format(format!(
                 "page ({arch_id}, {slot}, {page_index}): data start overflow"
@@ -294,7 +298,14 @@ impl SortedRunReader {
     /// fast path (direct memcpy, skipping rkyv bytecheck). The CRC covers
     /// `row_count * item_size` bytes — the actual data, not zero-padding.
     pub fn validate_page_crc(&self, page: &PageRef<'_>) -> Result<CrcProof, LsmError> {
-        let item_size = self.item_size_for_slot(page.header().slot)?;
+        // Sparse pages store `chunk.len()` in `row_count` (byte count, not row
+        // count), so item_size is always 1. This mirrors `page_ref_at`'s
+        // `data_len` special-case for `SPARSE_ARCH_ID`.
+        let item_size = if page.header().arch_id == crate::format::SPARSE_ARCH_ID {
+            1
+        } else {
+            self.item_size_for_slot(page.header().slot)?
+        };
         let actual_len = page.header().row_count as usize * item_size;
         let payload = &page.data()[..actual_len];
 
@@ -379,16 +390,20 @@ impl SortedRunReader {
         let header_bytes: &[u8; 16] = buf[offset..header_end].try_into().expect("16 bytes");
         let header = PageHeader::from_bytes(header_bytes);
 
-        let item_size = self.item_size_for_slot(slot)?;
-        let data_len = if slot == crate::format::ALLOCATOR_SLOT {
-            header.row_count as usize
-        } else {
-            PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
-                LsmError::Format(format!(
-                    "page ({arch_id}, {slot}, {page_index}): data length overflow"
-                ))
-            })?
-        };
+        let data_len =
+            if slot == crate::format::ALLOCATOR_SLOT || arch_id == crate::format::SPARSE_ARCH_ID {
+                // Sparse/allocator pages store a raw byte chunk in `row_count`;
+                // their `slot` is a grouping index, not a schema slot, so do
+                // NOT resolve it via `item_size_for_slot`.
+                header.row_count as usize
+            } else {
+                let item_size = self.item_size_for_slot(slot)?;
+                PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "page ({arch_id}, {slot}, {page_index}): data length overflow"
+                    ))
+                })?
+            };
         let data_start = offset.checked_add(header_size).ok_or_else(|| {
             LsmError::Format(format!(
                 "page ({arch_id}, {slot}, {page_index}): data start overflow"
@@ -441,7 +456,7 @@ impl SortedRunReader {
             .index
             .iter()
             .map(|e| e.arch_id)
-            .filter(|&id| id != crate::format::META_ARCH_ID)
+            .filter(|&id| id != crate::format::META_ARCH_ID && id != crate::format::SPARSE_ARCH_ID)
             .collect();
         ids.sort_unstable();
         ids.dedup();
@@ -536,10 +551,12 @@ mod tests {
             },));
         }
         let dir = tempfile::tempdir().unwrap();
+        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             dir.path(),
+            &codecs,
         )
         .unwrap()
         .unwrap();
@@ -626,10 +643,12 @@ mod tests {
         world.spawn((Vel { dx: 1.0, dy: 0.0 },));
 
         let dir = tempfile::tempdir().unwrap();
+        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
+            &codecs,
         )
         .unwrap()
         .unwrap();
@@ -707,10 +726,12 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
+        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
             dir.path(),
+            &codecs,
         )
         .unwrap()
         .unwrap();

@@ -27,6 +27,7 @@ fn serialize(c: &mut Criterion) {
                 &mut manifest,
                 &mut log,
                 &lsm_dir,
+                &codecs,
             )
             .unwrap();
         });
@@ -48,6 +49,7 @@ fn serialize(c: &mut Criterion) {
             &mut manifest,
             &mut log,
             &lsm_dir,
+            &codecs,
         )
         .unwrap()
         .expect("flush");
@@ -99,6 +101,7 @@ fn serialize(c: &mut Criterion) {
             &mut manifest,
             &mut log,
             &lsm_dir,
+            &codecs,
         )
         .unwrap()
         .expect("flush");
