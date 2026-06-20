@@ -95,6 +95,7 @@ fn main() {
         &mut manifest,
         &mut log,
         &lsm_dir,
+        &codecs,
     )
     .unwrap()
     .expect("baseline flush");
