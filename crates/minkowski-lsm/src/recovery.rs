@@ -733,6 +733,96 @@ mod tests {
         );
     }
 
+    /// Sparse counterpart to the dense codec-id-divergence bug: reflushing a
+    /// RECOVERED world must preserve its sparse components. `recover_world` builds
+    /// a fresh world and re-registers codecs into it with compacted local ids, so
+    /// the recovered world's sparse `ComponentId` diverges from the codec
+    /// registry's id. The old id-keyed sparse flush (`has_codec(comp_id)` /
+    /// `serialize_sparse(comp_id)`) then selected the wrong codec (or none) on
+    /// reflush and silently dropped the sparse baseline. Resolving the sparse
+    /// codec by component TYPE fixes it.
+    #[test]
+    fn reflush_recovered_world_preserves_sparse() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Pos7r {
+            x: f32,
+        }
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag7r(u32);
+        // No codec, registered first → the codec registry's ids start gapped, so
+        // recovery's compacted ids diverge from the registry's.
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct Filler(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        world.register_component::<Filler>(); // id 0, no codec
+        codecs.register::<Pos7r>(&mut world).unwrap(); // id 1
+        codecs.register::<Tag7r>(&mut world).unwrap(); // id 2
+
+        let e = world.spawn((Pos7r { x: 1.0 },));
+        world.insert_sparse::<Tag7r>(e, Tag7r(7));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("baseline flush");
+
+        // Recover into a fresh world (codecs re-registered with compacted ids:
+        // the recovered Tag7r id differs from the registry's id).
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let mut recovered = result.world;
+        assert_eq!(
+            recovered.get::<Tag7r>(e).copied(),
+            Some(Tag7r(7)),
+            "baseline sparse must recover"
+        );
+
+        // Mutate and REFLUSH the recovered world with the same codecs.
+        let e2 = recovered.spawn((Pos7r { x: 2.0 },));
+        recovered.insert_sparse::<Tag7r>(e2, Tag7r(8));
+        let (mut manifest2, mut log2) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &recovered,
+            SeqRange::new(SeqNo::from(1u64), SeqNo::from(2u64)).unwrap(),
+            &mut manifest2,
+            &mut log2,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("reflush of recovered world");
+
+        // Recover once more: both sparse entries must survive the reflush.
+        let (result2, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let final_world = result2.world;
+        assert_eq!(
+            final_world.get::<Tag7r>(e).copied(),
+            Some(Tag7r(7)),
+            "original sparse must survive reflush of a recovered world"
+        );
+        assert_eq!(
+            final_world.get::<Tag7r>(e2).copied(),
+            Some(Tag7r(8)),
+            "new sparse must survive reflush of a recovered world"
+        );
+    }
+
     #[test]
     fn recover_restores_sparse_components() {
         #[derive(Clone, Copy, Archive, Serialize, Deserialize)]

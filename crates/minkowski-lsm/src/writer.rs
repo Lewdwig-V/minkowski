@@ -162,30 +162,28 @@ pub fn flush_observed(
     }
     let mut sparse_blobs: Vec<SparseBlob> = Vec::new();
     for comp_id in world.sparse_component_ids() {
-        if !codecs.has_codec(comp_id) {
-            // A sparse component with storage but no codec cannot be serialized
-            // to the baseline. Warn loudly rather than drop silently — if it
-            // holds live entries they will not survive recovery. The fix is to
-            // register the component via CodecRegistry before persisting.
+        // Resolve the codec by the world's component TYPE, not its per-world
+        // ComponentId: a registry built against (or re-registered into) a
+        // different world assigns the same type a different id, so an id-keyed
+        // lookup would pick the wrong codec or none — silently dropping or
+        // corrupting sparse baseline data. `serialize_sparse_by_type` returns the
+        // codec's stable name (recovery resolves it back via `resolve_name`).
+        let Some(result) = codecs.serialize_sparse_by_type(world, comp_id) else {
+            // No codec registered for this sparse component's type. Warn loudly
+            // rather than drop silently — its live entries will not survive
+            // recovery. Register the type via CodecRegistry before persisting.
             let name = world.component_name(comp_id).unwrap_or("<unknown>");
             eprintln!(
                 "warning: sparse component '{name}' (id={comp_id}) has no registered codec; \
                  its data will NOT be persisted to the LSM baseline"
             );
             continue;
-        }
-        let entries = codecs
-            .serialize_sparse(comp_id, world)
-            .map_err(|e| LsmError::Format(format!("sparse serialize failed: {e}")))?;
+        };
+        let (name, entries) =
+            result.map_err(|e| LsmError::Format(format!("sparse serialize failed: {e}")))?;
         if entries.is_empty() {
             continue;
         }
-        // Use the codec's stable name (explicit or type_name default) so that
-        // recovery resolves the same codec via `resolve_name`.
-        let name = codecs
-            .stable_name(comp_id)
-            .expect("has_codec guard ensures stable_name is Some")
-            .to_owned();
         let blob = sparse_page::encode(&name, &entries);
         sparse_blobs.push(SparseBlob { name, blob });
     }
