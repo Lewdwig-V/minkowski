@@ -49,6 +49,11 @@ pub(crate) struct ComponentInfo {
     pub name: &'static str,
     pub layout: Layout,
     pub drop_fn: Option<unsafe fn(*mut u8)>,
+    /// `TypeId` of the concrete component type, or `None` for slots registered
+    /// via [`ComponentRegistry::register_raw`] (recovery placeholders with no
+    /// concrete Rust type). Lets external registries confirm a `ComponentId`
+    /// resolves to the type they expect.
+    pub type_id: Option<TypeId>,
 }
 
 #[doc(hidden)]
@@ -92,6 +97,7 @@ impl ComponentRegistry {
             name: std::any::type_name::<T>(),
             layout: Layout::new::<T>(),
             drop_fn,
+            type_id: Some(type_id),
         });
         self.by_type.insert(type_id, id);
         self.version += 1;
@@ -113,6 +119,7 @@ impl ComponentRegistry {
             name,
             layout,
             drop_fn: None,
+            type_id: None,
         });
         self.version += 1;
         id

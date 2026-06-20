@@ -129,14 +129,37 @@ pub fn flush_observed(
                 // Only fires when this component actually contributes a page to the
                 // run; a component whose every dirty page is past `arch_len` writes
                 // nothing and must not trip a false positive.
-                if writes_any && !codecs.has_codec(comp_id) {
-                    let name = world.component_name(comp_id).unwrap_or("<unknown>");
-                    return Err(LsmError::Format(format!(
-                        "dense component '{name}' (id={comp_id}) has no registered codec; \
-                         it cannot be persisted to the LSM baseline because its native \
-                         bytes are not provably raw-copyable. Register it via \
-                         CodecRegistry::register before flushing."
-                    )));
+                if writes_any {
+                    if !codecs.has_codec(comp_id) {
+                        let name = world.component_name(comp_id).unwrap_or("<unknown>");
+                        return Err(LsmError::Format(format!(
+                            "dense component '{name}' (id={comp_id}) has no registered codec; \
+                             it cannot be persisted to the LSM baseline because its native \
+                             bytes are not provably raw-copyable. Register it via \
+                             CodecRegistry::register before flushing."
+                        )));
+                    }
+                    // `has_codec(comp_id)` only proves *some* codec sits at this
+                    // numeric id. ComponentId is a per-world index, so a registry
+                    // built against a different world could hold a raw-copyable
+                    // codec at the same id while THIS world's component there is a
+                    // different, possibly non-raw-copyable type — silently passing
+                    // the gate above and persisting native bytes that dangle on
+                    // recovery. Confirm the codec describes the exact type being
+                    // flushed by comparing TypeIds (stable across worlds, so a
+                    // recovered world re-flushed with its codecs still validates).
+                    let codec_ty = codecs.type_id(comp_id);
+                    let world_ty = world.component_type_id(comp_id);
+                    if codec_ty != world_ty {
+                        let name = world.component_name(comp_id).unwrap_or("<unknown>");
+                        return Err(LsmError::Format(format!(
+                            "dense component '{name}' (id={comp_id}) does not match its \
+                             registered codec's type (codec {codec_ty:?}, world \
+                             {world_ty:?}); the CodecRegistry was built for a different \
+                             component identity. A codec must be registered for the exact \
+                             component type being flushed."
+                        )));
+                    }
                 }
             }
         }
@@ -943,6 +966,52 @@ mod tests {
         let msg = format!("{}", result.unwrap_err());
         assert!(
             msg.contains("no registered codec"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Codex P1 regression: `has_codec(comp_id)` is a per-world numeric-id lookup.
+    /// A `CodecRegistry` built against one world holds a codec at some id; if a
+    /// DIFFERENT world has a DIFFERENT component type at that same id, the codec
+    /// gate would pass on the id alone while the flushed column is actually the
+    /// other type — persisting native bytes that dangle on recovery. The flush
+    /// must compare the codec's TypeId to the flushed world's component TypeId
+    /// and reject the mismatch. (Same type from another world is sound — the
+    /// TypeId matches — so the failure is keyed on type identity, not world.)
+    #[test]
+    fn flush_rejects_codec_for_wrong_type_at_same_id() {
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Acodec(u32);
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct Bworld(u64);
+
+        // Registry built against `other`: Acodec is its first component → id 0.
+        let mut other = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Acodec>(&mut other).unwrap();
+
+        // The world we actually flush has a DIFFERENT type as its first
+        // component → also id 0. `has_codec(0)` is true (Acodec's codec), but
+        // the column bytes are Bworld's. The TypeId check must catch this.
+        let mut world = World::new();
+        world.spawn((Bworld(7),));
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            dir.path(),
+            &codecs,
+        );
+        assert!(
+            result.is_err(),
+            "flushing a column whose codec is registered for a different type must error"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("does not match its registered codec's type"),
             "unexpected error: {msg}"
         );
     }
