@@ -34,10 +34,13 @@ type DeserializeFn = fn(&[u8]) -> Result<Vec<u8>, CodecError>;
 /// Type-erased component registration: registers the concrete type into a World.
 type RegisterFn = fn(&mut World) -> ComponentId;
 
+/// Serialized sparse entries for one component: `(entity_bits, value_bytes)`.
+pub type SparseEntries = Vec<(u64, Vec<u8>)>;
+
 /// Type-erased sparse serialization: iterates World's sparse storage for a component,
 /// returning `(entity_bits, serialized_bytes)` pairs.
 type SerializeSparseFn =
-    fn(&World, ComponentId, &CodecRegistry) -> Result<Vec<(u64, Vec<u8>)>, CodecError>;
+    fn(&World, ComponentId, &CodecRegistry) -> Result<SparseEntries, CodecError>;
 
 /// Type-erased sparse insertion: deserializes bytes and inserts into World's sparse storage.
 type InsertSparseFn = fn(&mut World, Entity, &[u8]) -> Result<(), CodecError>;
@@ -261,15 +264,19 @@ impl CodecRegistry {
 
         let register_fn: RegisterFn = |world| world.register_component::<T>();
 
-        let serialize_sparse_fn: SerializeSparseFn = |world, comp_id, codecs| {
+        let serialize_sparse_fn: SerializeSparseFn = |world, comp_id, _codecs| {
             let mut entries = Vec::new();
             if let Some(iter) = world.iter_sparse::<T>(comp_id) {
                 for (entity, value) in iter {
-                    let mut buf = Vec::new();
-                    // SAFETY: value is a valid &T from the sparse HashMap.
-                    unsafe {
-                        codecs.serialize(comp_id, value as *const T as *const u8, &mut buf)?;
-                    }
+                    // Serialize `T` directly — this closure is monomorphized for
+                    // `T`, so it does not need to dispatch through the registry by
+                    // `comp_id`. `comp_id` is the WORLD's sparse id, used only to
+                    // iterate `iter_sparse`; it need not equal this codec's
+                    // registry id (they diverge after recovery re-registers into a
+                    // fresh world). Routing the serialize through `comp_id` would
+                    // pick the wrong codec across worlds.
+                    let buf = rkyv::api::high::to_bytes_in::<_, rancor::Error>(value, Vec::new())
+                        .map_err(|e| CodecError::Serialize(e.to_string()))?;
                     entries.push((entity.to_bits(), buf));
                 }
             }
@@ -322,8 +329,10 @@ impl CodecRegistry {
         }
     }
 
-    /// Deserialize component bytes into a raw byte buffer.
-    pub fn deserialize(&self, id: ComponentId, bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
+    /// Deserialize component bytes into a raw byte buffer. Internal to the
+    /// crate: callers outside use [`decode`](Self::decode), which gates the
+    /// raw-copy fast path on a [`CrcProof`].
+    pub(crate) fn deserialize(&self, id: ComponentId, bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
         let codec = self
             .codecs
             .get(&id)
@@ -347,15 +356,11 @@ impl CodecRegistry {
         self.by_name.get(name).copied()
     }
 
-    /// Check if a component has a registered codec.
-    pub fn has_codec(&self, id: ComponentId) -> bool {
-        self.codecs.contains_key(&id)
-    }
-
     /// If the archived representation matches the native layout (same size),
     /// returns `Some(size)` — the zero-copy load path can copy archived bytes
-    /// directly into BlobVec without typed deserialization.
-    pub fn raw_copy_size(&self, id: ComponentId) -> Option<usize> {
+    /// directly into BlobVec without typed deserialization. Internal to the
+    /// crate; gated by [`decode`](Self::decode).
+    pub(crate) fn raw_copy_size(&self, id: ComponentId) -> Option<usize> {
         self.codecs.get(&id).and_then(|c| c.raw_copy_size)
     }
 
@@ -363,8 +368,8 @@ impl CodecRegistry {
     /// memcpy, no rkyv bytecheck) when a [`CrcProof`] is provided and the
     /// component's archived layout matches its native layout.
     ///
-    /// Without a proof, falls through to [`deserialize`](Self::deserialize)
-    /// which runs full rkyv validation — safe for untrusted bytes.
+    /// Without a proof, falls through to full rkyv validation — safe for
+    /// untrusted bytes.
     pub fn decode(
         &self,
         id: ComponentId,
@@ -387,17 +392,25 @@ impl CodecRegistry {
         ids
     }
 
-    /// Serialize all entries for a sparse component.
-    pub fn serialize_sparse(
+    /// Serialize all entries for a world's sparse component, resolving the codec
+    /// by the world's component **type** at `world_comp_id` — never by matching
+    /// the registry's id. `ComponentId` is a per-world index, so a registry whose
+    /// ids diverge from the flushed world's (e.g. after recovery re-registers
+    /// into a fresh world) would otherwise select the wrong codec or none. On
+    /// success returns the codec's stable name (for the on-disk blob; recovery
+    /// resolves it back via `resolve_name`) and the serialized entries. Returns
+    /// `None` if no codec is registered for that type.
+    pub fn serialize_sparse_by_type(
         &self,
-        id: ComponentId,
         world: &World,
-    ) -> Result<Vec<(u64, Vec<u8>)>, CodecError> {
-        let codec = self
-            .codecs
-            .get(&id)
-            .ok_or(CodecError::UnregisteredComponent(id))?;
-        (codec.serialize_sparse_fn)(world, id, self)
+        world_comp_id: ComponentId,
+    ) -> Option<Result<(String, SparseEntries), CodecError>> {
+        let ty = world.component_type_id(world_comp_id)?;
+        let codec = self.codecs.values().find(|c| c.type_id == ty)?;
+        match (codec.serialize_sparse_fn)(world, world_comp_id, self) {
+            Ok(entries) => Some(Ok((codec.name.clone(), entries))),
+            Err(e) => Some(Err(e)),
+        }
     }
 
     /// Insert a sparse component value from serialized bytes.
@@ -544,8 +557,8 @@ mod tests {
         codecs.register::<Pos>(&mut world).unwrap();
         codecs.register::<Vel>(&mut world).unwrap();
 
-        assert!(codecs.has_codec(world.component_id::<Pos>().unwrap()));
-        assert!(codecs.has_codec(world.component_id::<Vel>().unwrap()));
+        assert!(codecs.has_codec_for_type(std::any::TypeId::of::<Pos>()));
+        assert!(codecs.has_codec_for_type(std::any::TypeId::of::<Vel>()));
         assert_eq!(codecs.registered_ids().len(), 2);
     }
 
