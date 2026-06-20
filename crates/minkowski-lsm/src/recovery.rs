@@ -396,11 +396,24 @@ fn materialize_world(
         // Pre-resolve the per-column item size for this archetype's components,
         // used to slice column bytes when compacting a page down to its live
         // rows. `component_layouts` was built from the on-disk schema entries
-        // and is keyed by component name.
+        // and is keyed by component name. A missing entry is unreachable today
+        // (the signature is derived from the same schema via `entry_for_slot`,
+        // which errors first), but return an explicit error rather than
+        // silently treating a non-ZST component as a ZST (which would copy no
+        // bytes for its rows in the slow-path compaction → silent data loss).
+        // This guards against any future change that decouples the signature
+        // from the schema.
         let item_sizes: Vec<usize> = comp_pairs
             .iter()
-            .map(|(_, name)| component_layouts.get(*name).map_or(0, |(size, _)| *size))
-            .collect();
+            .map(|(_, name)| {
+                component_layouts.get(*name).map_or(
+                    Err(LsmError::Format(format!(
+                        "component {name} in archetype {sig:?} has no resolved layout"
+                    ))),
+                    |(size, _)| Ok(*size),
+                )
+            })
+            .collect::<Result<_, _>>()?;
 
         for (&page_index, entity_page) in entity_pages {
             let row_count = entity_page.row_count as usize;
