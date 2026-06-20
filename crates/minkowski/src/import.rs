@@ -196,10 +196,13 @@ impl World {
     ///
     /// # Safety
     /// Each column slice must be the native (in-memory) byte image of
-    /// `entities.len()` consecutive values of the corresponding component type.
-    /// For LSM recovery this is guaranteed by the raw-copyable invariant enforced
-    /// at both codec registration and flush (a dense component without a codec is
-    /// refused), plus per-page CRC validation on read.
+    /// `entities.len()` consecutive values of the corresponding component type,
+    /// and ownership of those values is moved into the archetype column (which
+    /// holds the component's `drop_fn`). This holds for POD columns (no drop,
+    /// trivial ownership) and for heap columns reconstructed by decoding rkyv
+    /// bytes into native values whose ownership is transferred into the buffer.
+    /// LSM recovery guarantees the column kind matches the codec (RawCopy vs
+    /// Serialized) and validates each source page's CRC on read.
     ///
     /// - The entities in `page.entities` must be unique and must not already be
     ///   placed in any archetype (across this and prior imported pages). The LSM
