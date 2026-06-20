@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use minkowski::World;
+use minkowski_lsm::codec::CodecRegistry;
 use minkowski_lsm::error::LsmError;
 use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog, ManifestTag};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
@@ -47,6 +48,7 @@ fn three_flushes_then_replay() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap()
     .unwrap();
@@ -65,6 +67,7 @@ fn three_flushes_then_replay() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap()
     .unwrap();
@@ -78,6 +81,7 @@ fn three_flushes_then_replay() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap()
     .unwrap();
@@ -124,6 +128,7 @@ fn corrupt_tail_partial_recovery() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
     world.clear_all_dirty_pages();
@@ -135,6 +140,7 @@ fn corrupt_tail_partial_recovery() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -177,6 +183,7 @@ fn replay_converges_at_every_truncation_prefix() {
             &mut manifest,
             &mut log,
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         world.clear_all_dirty_pages();
@@ -255,6 +262,7 @@ fn replay_truncates_log_on_promote_of_missing_run() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -305,6 +313,7 @@ fn cleanup_removes_orphans_and_tmp() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -342,6 +351,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -410,6 +420,7 @@ fn replay_truncates_log_on_invalid_level_byte() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -466,6 +477,7 @@ fn replay_truncates_log_on_unknown_tag_byte() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -520,6 +532,7 @@ fn replay_truncates_log_on_inverted_seq_range() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -587,6 +600,7 @@ fn replay_truncates_log_on_zero_page_count() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -657,6 +671,7 @@ fn replay_truncates_log_on_invalid_compaction_input_level() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -729,6 +744,7 @@ fn replay_truncates_log_on_remove_of_missing_run() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
 
@@ -782,6 +798,7 @@ fn recover_then_flush_then_recover_roundtrips_state() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
     world.clear_all_dirty_pages();
@@ -792,6 +809,7 @@ fn recover_then_flush_then_recover_roundtrips_state() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
     drop(log);
@@ -941,6 +959,7 @@ fn flush_and_record_clean_world_no_change() {
         &mut manifest,
         &mut log,
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
     assert!(result.is_none());

@@ -2,6 +2,11 @@
 
 ## 1.3.0
 
+### Persistence (`minkowski-persist`, `minkowski-lsm`)
+
+- **LSM recovery cutover** — `Snapshot` / v2 `.snap` files removed. Use `recover_world(lsm_dir, manifest_log, wal, codecs)` for crash recovery (LSM page merge + WAL tail replay). `AutoCheckpoint` flushes dirty pages via `flush_and_record` instead of full-world snapshots. **Breaking:** `acknowledge_snapshot` → `acknowledge_flush`; `WalEntry::Checkpoint { snapshot_seq }` → `{ flush_seq }`. Existing v2 snapshot files are not supported — rebuild from WAL or accept data loss.
+- **`LsmRecovery`** — merges sorted runs (L3→L0, latest sequence wins), restores allocator metadata pages, materializes `World` for WAL replay.
+
 ### Query Planner (`minkowski`)
 
 - **Build-time join elimination** — inner joins that are pure component-presence filters are merged into the left-side scan at plan build time. No `run_join()` materialization, no sort, no intersection. `PlanWarning::JoinEliminated` informs users when the optimization fires. (#122)

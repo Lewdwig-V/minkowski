@@ -493,22 +493,24 @@ mod tests {
 
     #[test]
     fn full_recovery_with_persistent_index() {
-        use crate::snapshot::Snapshot;
         use crate::wal::{Wal, WalConfig};
         use minkowski_lsm::codec::CodecRegistry;
+        use minkowski_lsm::manifest_log::ManifestLog;
+        use minkowski_lsm::manifest_ops::flush_and_record;
+        use minkowski_lsm::types::{SeqNo, SeqRange};
 
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("recovery.wal");
-        let snap_path = dir.path().join("checkpoint.snap");
+        let lsm_dir = dir.path().join("lsm");
+        let manifest_log = lsm_dir.join("manifest.log");
         let idx_path = dir.path().join("score.idx");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
 
         let config = WalConfig {
             max_segment_bytes: 64 * 1024 * 1024,
             max_bytes_between_checkpoints: None,
         };
 
-        // Phase 1: create world, spawn entities via WAL, build & save index
-        let checkpoint_seq;
         {
             let mut world = World::new();
             let mut codecs = CodecRegistry::new();
@@ -516,7 +518,6 @@ mod tests {
 
             let mut wal = Wal::create(&wal_dir, &codecs, config.clone()).unwrap();
 
-            // Spawn 10 entities with Score components via WAL
             for i in 0..10 {
                 let e = world.alloc_entity();
                 let mut cs = minkowski::EnumChangeSet::new();
@@ -525,85 +526,71 @@ mod tests {
                 cs.apply(&mut world).unwrap();
             }
 
-            // Build and save index
             let mut idx = BTreeIndex::<Score>::new();
             idx.rebuild(&mut world);
             idx.save(&idx_path).unwrap();
 
-            // Save snapshot
-            checkpoint_seq = wal.next_seq();
-            let snap = Snapshot::new();
-            snap.save(&snap_path, &world, &codecs, checkpoint_seq)
-                .unwrap();
-            wal.acknowledge_snapshot(checkpoint_seq).unwrap();
+            let flush_seq = wal.next_seq();
+            let (mut manifest, mut log) = ManifestLog::recover::<4>(&manifest_log).unwrap();
+            flush_and_record(
+                &world,
+                SeqRange::new(SeqNo::from(0u64), SeqNo::from(flush_seq)).unwrap(),
+                &mut manifest,
+                &mut log,
+                &lsm_dir,
+                &codecs,
+            )
+            .unwrap()
+            .expect("flush");
+            wal.acknowledge_flush(flush_seq).unwrap();
 
-            // Phase 2: more WAL mutations AFTER checkpoint+index save
             let e = world.alloc_entity();
             let mut cs = minkowski::EnumChangeSet::new();
             cs.spawn_bundle(&mut world, e, (Score(99),)).unwrap();
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
 
-            // Spawn another post-checkpoint entity
             let e2 = world.alloc_entity();
             let mut cs2 = minkowski::EnumChangeSet::new();
             cs2.spawn_bundle(&mut world, e2, (Score(88),)).unwrap();
             wal.append(&cs2, &codecs).unwrap();
             cs2.apply(&mut world).unwrap();
-
-            // "Crash" — drop everything
         }
 
-        // Phase 3: recover
         {
             let mut codecs = CodecRegistry::new();
-            // Must re-register codecs before loading
             let mut tmp_world = World::new();
             codecs
                 .register_as::<Score>("score", &mut tmp_world)
                 .unwrap();
             drop(tmp_world);
 
-            // Load snapshot
-            let snap = Snapshot::new();
-            let (mut world, _snap_seq) = snap.load(&snap_path, &codecs).unwrap();
-
-            // Capture tick AFTER snapshot restore, BEFORE WAL replay.
-            // This is the sync point for the persistent index — the index
-            // was saved alongside the snapshot, so it's consistent with
-            // post-restore state. WAL replay will advance ticks beyond
-            // this point, and update() will catch exactly that delta.
-            let post_restore_tick = world.change_tick();
-
-            // Replay WAL from checkpoint onwards
             let mut wal = Wal::open(&wal_dir, &codecs, config.clone()).unwrap();
-            wal.replay_from(checkpoint_seq, &mut world, &codecs)
+            let (result, _, _) = minkowski_lsm::recovery::LsmRecovery::recover::<4>(
+                &lsm_dir,
+                &manifest_log,
+                &codecs,
+            )
+            .unwrap();
+            let mut world = result.world;
+            for id in codecs.registered_ids() {
+                codecs.register_one(id, &mut world);
+            }
+            let post_lsm_tick = world.change_tick();
+            let mut idx = load_btree_index::<Score>(&idx_path, post_lsm_tick).unwrap();
+            wal.replay_from(result.flush_seq, &mut world, &codecs)
                 .unwrap();
-
-            // Load persistent index and catch up from post-restore tick
-            let mut idx = load_btree_index::<Score>(&idx_path, post_restore_tick).unwrap();
             idx.update(&mut world);
 
-            // Verify: all 12 entities present (10 original + Score(99) + Score(88))
             let mut total = 0;
             for i in 0..100 {
                 total += idx.get(&Score(i)).len();
             }
             assert_eq!(total, 12, "expected 12 entities in index after recovery");
 
-            // Specifically check the post-checkpoint entities
-            assert_eq!(
-                idx.get(&Score(99)).len(),
-                1,
-                "post-checkpoint Score(99) missing"
-            );
-            assert_eq!(
-                idx.get(&Score(88)).len(),
-                1,
-                "post-checkpoint Score(88) missing"
-            );
+            assert_eq!(idx.get(&Score(99)).len(), 1);
+            assert_eq!(idx.get(&Score(88)).len(), 1);
 
-            // Check original entities survived
             for i in 0..10 {
                 assert_eq!(idx.get(&Score(i)).len(), 1, "original Score({i}) missing");
             }

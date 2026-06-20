@@ -5,15 +5,19 @@
 //! enter the World. Same external composition pattern as
 //! [`SpatialIndex`](minkowski::SpatialIndex).
 //!
-//! `BlobRef` derives rkyv `Archive`/`Serialize`/`Deserialize` and can be
-//! registered with [`CodecRegistry`](crate::CodecRegistry) like any other
-//! persistable component.
+//! `BlobRef` wraps a heap-allocated `String`, so it is **not** raw-copyable
+//! and cannot be registered with [`CodecRegistry`](crate::CodecRegistry)
+//! (registration returns [`CodecError::NotRawCopyable`](crate::CodecError)).
+//! It remains fully usable as an in-memory component (spawn, query, get) and
+//! as the key type for [`BlobStore`] orphan-detection. Persist the key by
+//! other means (e.g. a companion raw-copyable ID component); do not attempt
+//! codec registration on `BlobRef` itself.
 
 /// Reference to an externally-stored blob.
 ///
-/// The ECS stores only this key string — the actual blob bytes live in an
-/// external object store. Persistence serializes the key, not the remote blob.
-/// On snapshot restore, keys are restored but remote blobs must still exist.
+/// Wraps a key string pointing to data in an external object store; blob bytes
+/// never enter the World. See the [module documentation](self) for persistence
+/// constraints and usage guidance.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(compare(PartialEq), derive(Debug))]
 pub struct BlobRef(String);
@@ -147,12 +151,18 @@ mod tests {
     }
 
     #[test]
-    fn blob_ref_codec_registration() {
+    fn blob_ref_codec_registration_is_rejected() {
+        // BlobRef wraps a String (heap-allocated). Its rkyv archived
+        // representation has a different size than the native type, so it fails
+        // the raw-copyability check and must NOT be registerable with CodecRegistry.
+        // Storing heap-pointer bytes verbatim to disk and memcpy-ing them back
+        // on restore would produce dangling pointers.
         let mut world = World::new();
         let mut codecs = crate::CodecRegistry::new();
-        codecs.register::<BlobRef>(&mut world).unwrap();
-
-        let id = world.component_id::<BlobRef>().unwrap();
-        assert!(codecs.stable_name(id).is_some());
+        let err = codecs.register::<BlobRef>(&mut world).unwrap_err();
+        assert!(
+            matches!(err, crate::CodecError::NotRawCopyable { .. }),
+            "expected NotRawCopyable, got {err:?}"
+        );
     }
 }

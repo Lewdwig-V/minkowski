@@ -77,6 +77,7 @@ pub mod command;
 pub mod component;
 pub mod debounce;
 pub mod entity;
+pub mod import;
 pub mod index;
 pub(crate) mod lock_table;
 pub(crate) mod pool;
@@ -97,6 +98,7 @@ pub use command::CommandBuffer;
 pub use component::ComponentId;
 pub use debounce::{HashDebounce, SubscriptionDebounce};
 pub use entity::Entity;
+pub use import::{ImportError, ImportPage, ImportTarget};
 pub use index::{
     BTreeIndex, HasBTreeIndex, HasHashIndex, HashIndex, SpatialCost, SpatialExpr, SpatialIndex,
 };

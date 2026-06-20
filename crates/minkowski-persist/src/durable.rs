@@ -108,7 +108,18 @@ impl<S: Transact> Transact for Durable<S> {
                         let mut wal = self.wal.lock();
                         if wal.checkpoint_needed() {
                             let mut handler = handler_mutex.lock();
-                            let _ = handler.on_checkpoint_needed(world, &mut wal, &self.codecs);
+                            // Operational, not fatal: the transaction is already
+                            // committed and durable in the WAL. But a failed flush
+                            // is the recovery baseline failing to advance — surface
+                            // it rather than swallow it (e.g. full disk, bad perms).
+                            if let Err(e) =
+                                handler.on_checkpoint_needed(world, &mut wal, &self.codecs)
+                            {
+                                eprintln!(
+                                    "warning: LSM checkpoint failed (commit is durable in WAL, \
+                                     recovery baseline did not advance): {e}"
+                                );
+                            }
                         }
                     }
 
@@ -211,7 +222,7 @@ mod tests {
             _codecs: &CodecRegistry,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            wal.acknowledge_snapshot(wal.next_seq())?;
+            wal.acknowledge_flush(wal.next_seq())?;
             Ok(())
         }
     }

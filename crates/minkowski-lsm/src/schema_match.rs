@@ -85,10 +85,12 @@ mod tests {
         seq_hi: u64,
     ) -> (tempfile::TempDir, SortedRunReader) {
         let dir = tempfile::tempdir().unwrap();
+        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             world,
             SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap(),
             dir.path(),
+            &codecs,
         )
         .unwrap()
         .unwrap();

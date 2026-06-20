@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 minkowski = { path = "../crates/minkowski" }
 minkowski-persist = { path = "../crates/minkowski-persist" }
+minkowski-lsm = { path = "../crates/minkowski-lsm" }
 minkowski-observe = { path = "../crates/minkowski-observe" }
 rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 fastrand = "2"

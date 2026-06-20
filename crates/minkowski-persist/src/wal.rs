@@ -595,8 +595,8 @@ impl Wal {
                 while let Some((entry, next_pos, _proof)) = read_next_frame(&seg_file, pos)? {
                     let frame_bytes = next_pos - pos;
                     match entry {
-                        WalEntry::Checkpoint { snapshot_seq } => {
-                            wal.last_checkpoint_seq = Some(snapshot_seq);
+                        WalEntry::Checkpoint { flush_seq } => {
+                            wal.last_checkpoint_seq = Some(flush_seq);
                             seg_mutation_bytes = 0;
                             found = true;
                         }
@@ -654,13 +654,13 @@ impl Wal {
 
     /// Record that a snapshot was taken at the given seq.
     /// Writes a `Checkpoint` entry to the WAL stream and resets the byte counter.
-    pub fn acknowledge_snapshot(&mut self, seq: u64) -> Result<(), WalError> {
+    pub fn acknowledge_flush(&mut self, seq: u64) -> Result<(), WalError> {
         assert!(
             seq <= self.next_seq,
             "cannot checkpoint future sequence {seq}, WAL is at {}",
             self.next_seq
         );
-        let entry = WalEntry::Checkpoint { snapshot_seq: seq };
+        let entry = WalEntry::Checkpoint { flush_seq: seq };
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
             .map_err(|e| WalError::Format(e.to_string()))?;
 
@@ -926,8 +926,8 @@ impl Wal {
                     has_mutations = true;
                     bytes_after_checkpoint += frame_bytes;
                 }
-                WalEntry::Checkpoint { snapshot_seq } => {
-                    self.last_checkpoint_seq = Some(snapshot_seq);
+                WalEntry::Checkpoint { flush_seq } => {
+                    self.last_checkpoint_seq = Some(flush_seq);
                     bytes_after_checkpoint = 0;
                 }
                 WalEntry::Schema(_) => {}
@@ -1825,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledge_snapshot_writes_checkpoint_and_resets() {
+    fn acknowledge_flush_writes_checkpoint_and_resets() {
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("test.wal");
 
@@ -1857,14 +1857,14 @@ mod tests {
         assert!(wal.checkpoint_needed());
 
         let seq = wal.next_seq();
-        wal.acknowledge_snapshot(seq).unwrap();
+        wal.acknowledge_flush(seq).unwrap();
 
         assert_eq!(wal.last_checkpoint_seq(), Some(seq));
         assert!(!wal.checkpoint_needed());
     }
 
     #[test]
-    fn acknowledge_snapshot_survives_reopen() {
+    fn acknowledge_flush_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("test.wal");
 
@@ -1886,7 +1886,7 @@ mod tests {
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
 
-            wal.acknowledge_snapshot(wal.next_seq()).unwrap();
+            wal.acknowledge_flush(wal.next_seq()).unwrap();
         }
 
         let wal2 = Wal::open(&wal_dir, &codecs, config).unwrap();
@@ -1928,7 +1928,7 @@ mod tests {
             cs.apply(&mut world).unwrap();
         }
         let ckpt_seq = wal.next_seq();
-        wal.acknowledge_snapshot(ckpt_seq).unwrap();
+        wal.acknowledge_flush(ckpt_seq).unwrap();
         assert_eq!(wal.last_checkpoint_seq(), Some(ckpt_seq));
 
         // Write more records to force rollover past the checkpoint's segment
@@ -1991,7 +1991,7 @@ mod tests {
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
-        wal.acknowledge_snapshot(wal.next_seq()).unwrap();
+        wal.acknowledge_flush(wal.next_seq()).unwrap();
         for i in 3..5 {
             let e = world.alloc_entity();
             let mut cs = EnumChangeSet::new();

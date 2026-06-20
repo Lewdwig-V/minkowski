@@ -31,7 +31,8 @@ use std::path::{Path, PathBuf};
 use crate::bloom;
 use crate::error::LsmError;
 use crate::format::{
-    ENTITY_SLOT, Footer, Header, IndexEntry, MAGIC, PAGE_SIZE, PageHeader, VERSION,
+    ALLOCATOR_SLOT, ENTITY_SLOT, Footer, Header, IndexEntry, MAGIC, META_ARCH_ID, PAGE_SIZE,
+    PageHeader, SPARSE_ARCH_ID, VERSION,
 };
 use crate::manifest::SortedRunMeta;
 use crate::reader::SortedRunReader;
@@ -255,6 +256,30 @@ impl<'a> CompactionWriter<'a> {
         }
 
         // ── 2. Build output schema (union of all components) ─────────────────
+
+        // Sparse baseline pages: carry forward from the newest input run
+        // (newest-wins, same as the allocator), preserving each page's
+        // (slot, page_index) VERBATIM. Sparse pages are self-describing (the
+        // component name lives in the blob) and use a separate SPARSE_ARCH_ID
+        // page space, so they need no schema entry and no re-slotting — carrying
+        // them forward byte-for-byte from the newest input is sufficient.
+        let sparse_carry: Vec<(u16, u16, Vec<u8>)> =
+            match self.inputs.iter().max_by_key(|r| r.sequence_range().hi()) {
+                Some(newest) => {
+                    let mut out = Vec::new();
+                    for slot in newest.component_slots_for_arch(SPARSE_ARCH_ID) {
+                        for result in newest.slot_pages(SPARSE_ARCH_ID, slot) {
+                            let (page_index, page) = result?;
+                            newest.validate_page_crc(&page)?;
+                            let len = page.header().row_count as usize;
+                            out.push((slot, page_index, page.data()[..len].to_vec()));
+                        }
+                    }
+                    out
+                }
+                None => Vec::new(),
+            };
+
         let all_components = self.collect_all_components();
         let output_schema = self.build_output_schema(&all_components)?;
 
@@ -285,6 +310,27 @@ impl<'a> CompactionWriter<'a> {
         if total_pages == 0 {
             return Err(LsmError::Format("cannot compact: zero pages".to_owned()));
         }
+
+        // Allocator metadata: carry forward from the input run with the highest
+        // seq_hi. Compaction has no live World, so without this the free list and
+        // generations are lost once every flush that wrote them is compacted away
+        // (recovery would then rebuild generations from live entities only).
+        let allocator_pages: Vec<Vec<u8>> =
+            match self.inputs.iter().max_by_key(|r| r.sequence_range().hi()) {
+                Some(newest) => {
+                    let mut pages = Vec::new();
+                    for result in newest.slot_pages(META_ARCH_ID, ALLOCATOR_SLOT) {
+                        let (_page_index, page) = result?;
+                        newest.validate_page_crc(&page)?;
+                        let len = page.header().row_count as usize;
+                        pages.push(page.data()[..len].to_vec());
+                    }
+                    pages
+                }
+                None => Vec::new(),
+            };
+        total_pages += allocator_pages.len();
+        total_pages += sparse_carry.len();
 
         // ── 5. Open temp file ─────────────────────────────────────────────────
         let seq_lo = self.output_seq_range.lo().get();
@@ -502,6 +548,62 @@ impl<'a> CompactionWriter<'a> {
                     file_offset,
                 });
             }
+        }
+
+        // ── 8b. Carry forward allocator metadata pages ───────────────────────
+        for (page_index, payload) in allocator_pages.iter().enumerate() {
+            let page_index = u16::try_from(page_index)
+                .map_err(|_| LsmError::Format("allocator page_index exceeds u16".to_owned()))?;
+            let page_crc = crc32fast::hash(payload);
+            let file_offset = w.stream_position()?;
+            let ph = PageHeader {
+                arch_id: META_ARCH_ID,
+                slot: ALLOCATOR_SLOT,
+                page_index,
+                // payload came from a validated page whose row_count is u16.
+                row_count: payload.len() as u16,
+                page_crc32: page_crc,
+                _padding: 0,
+            };
+            w.write_all(ph.as_bytes())?;
+            w.write_all(payload)?;
+            index_entries.push(IndexEntry {
+                arch_id: META_ARCH_ID,
+                slot: ALLOCATOR_SLOT,
+                page_index,
+                _pad: 0,
+                file_offset,
+            });
+        }
+
+        // ── 8c. Carry forward sparse baseline pages (verbatim) ───────────────
+        for (slot, page_index, payload) in &sparse_carry {
+            // Each payload came from a source page whose row_count is a u16, so
+            // it is ≤ u16::MAX; assert it before the narrowing cast below.
+            debug_assert!(
+                u16::try_from(payload.len()).is_ok(),
+                "sparse carry payload {} exceeds u16::MAX",
+                payload.len()
+            );
+            let page_crc = crc32fast::hash(payload);
+            let file_offset = w.stream_position()?;
+            let ph = PageHeader {
+                arch_id: SPARSE_ARCH_ID,
+                slot: *slot,
+                page_index: *page_index,
+                row_count: payload.len() as u16,
+                page_crc32: page_crc,
+                _padding: 0,
+            };
+            w.write_all(ph.as_bytes())?;
+            w.write_all(payload)?;
+            index_entries.push(IndexEntry {
+                arch_id: SPARSE_ARCH_ID,
+                slot: *slot,
+                page_index: *page_index,
+                _pad: 0,
+                file_offset,
+            });
         }
 
         // ── 9. Write sparse index (sorted) ──────────────────────────────────
@@ -745,10 +847,12 @@ mod tests {
         seq_hi: u64,
     ) -> (tempfile::TempDir, SortedRunReader) {
         let dir = tempfile::tempdir().unwrap();
+        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             world,
             SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap(),
             dir.path(),
+            &codecs,
         )
         .unwrap()
         .unwrap();

@@ -1,3 +1,4 @@
+pub mod allocator_meta;
 pub mod bloom;
 pub mod codec;
 pub(crate) mod compaction_writer;
@@ -8,10 +9,13 @@ pub mod manifest;
 pub mod manifest_log;
 pub mod manifest_ops;
 pub mod reader;
+pub mod recovery;
 pub mod schema;
 pub(crate) mod schema_match;
+pub mod sparse_page;
 pub mod types;
 pub mod writer;
 
 pub use bloom::{BlockedBloomFilter, pack_page_key};
 pub use compactor::{COMPACTION_TRIGGER, CompactionReport, compact_one, compact_one_observed};
+pub use recovery::{LsmRecovery, RecoveryResult};

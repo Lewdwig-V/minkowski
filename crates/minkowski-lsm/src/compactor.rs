@@ -464,7 +464,8 @@ mod tests {
             },));
         }
         let seq_range = SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap();
-        flush_and_record(&world, seq_range, manifest, log, run_dir)
+        let codecs = crate::codec::CodecRegistry::new();
+        flush_and_record(&world, seq_range, manifest, log, run_dir, &codecs)
             .unwrap()
             .expect("world is dirty, flush must return Some")
     }
@@ -634,9 +635,17 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
-                .unwrap()
-                .expect("world is dirty");
+            let codecs = crate::codec::CodecRegistry::new();
+            flush_and_record(
+                &world,
+                seq_range,
+                &mut manifest,
+                &mut log,
+                dir.path(),
+                &codecs,
+            )
+            .unwrap()
+            .expect("world is dirty");
         }
 
         assert_eq!(manifest.runs_at_level(Level::L0).len(), n_runs);
@@ -798,9 +807,17 @@ mod tests {
                 },));
             }
             let seq_range = SeqRange::new(SeqNo::from(i * 10), SeqNo::from(i * 10 + 9)).unwrap();
-            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
-                .unwrap()
-                .expect("world is dirty");
+            let codecs = crate::codec::CodecRegistry::new();
+            flush_and_record(
+                &world,
+                seq_range,
+                &mut manifest,
+                &mut log,
+                dir.path(),
+                &codecs,
+            )
+            .unwrap()
+            .expect("world is dirty");
         }
 
         assert_eq!(manifest.runs_at_level(Level::L0).len(), 8);
@@ -908,9 +925,17 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
-                .unwrap()
-                .expect("world is dirty");
+            let codecs = crate::codec::CodecRegistry::new();
+            flush_and_record(
+                &world,
+                seq_range,
+                &mut manifest,
+                &mut log,
+                dir.path(),
+                &codecs,
+            )
+            .unwrap()
+            .expect("world is dirty");
         }
 
         assert_eq!(
@@ -1009,9 +1034,17 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
-                .unwrap()
-                .expect("world is dirty");
+            let codecs = crate::codec::CodecRegistry::new();
+            flush_and_record(
+                &world,
+                seq_range,
+                &mut manifest,
+                &mut log,
+                dir.path(),
+                &codecs,
+            )
+            .unwrap()
+            .expect("world is dirty");
         }
 
         // All 4 runs at L0
@@ -1121,9 +1154,17 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
-                .unwrap()
-                .expect("world is dirty");
+            let codecs = crate::codec::CodecRegistry::new();
+            flush_and_record(
+                &world,
+                seq_range,
+                &mut manifest,
+                &mut log,
+                dir.path(),
+                &codecs,
+            )
+            .unwrap()
+            .expect("world is dirty");
         }
 
         // Runs 2, 3: both (Pos,) and (Pos, Vel)
@@ -1159,9 +1200,17 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
-                .unwrap()
-                .expect("world is dirty");
+            let codecs = crate::codec::CodecRegistry::new();
+            flush_and_record(
+                &world,
+                seq_range,
+                &mut manifest,
+                &mut log,
+                dir.path(),
+                &codecs,
+            )
+            .unwrap()
+            .expect("world is dirty");
         }
 
         assert_eq!(manifest.runs_at_level(Level::L0).len(), 4);

@@ -264,7 +264,7 @@ impl World {
 
     /// Drain orphaned entity IDs from aborted transactions.
     /// Called automatically at the top of every &mut self entry point.
-    fn drain_orphans(&mut self) {
+    pub(crate) fn drain_orphans(&mut self) {
         self.entities.materialize_reserved();
         if !self
             .orphan_queue
