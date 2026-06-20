@@ -536,10 +536,13 @@ fn materialize_world(
                 LsmError::Format(format!("import page build failed for {sig:?}: {e}"))
             })?;
             // SAFETY: each column slice is the native byte image of a raw-copyable
-            // component (enforced at codec registration); the source pages passed
-            // per-page CRC validation on read; every entity in `entities` is
-            // alive per the allocator state restored above (dead rows were
-            // filtered out).
+            // component. Raw-copyability is enforced at BOTH ends: codec
+            // registration rejects non-raw-copyable types, AND the dense flush
+            // path refuses to persist any dense component lacking a codec — so a
+            // run can only contain dense columns proven raw-copyable. The source
+            // pages passed per-page CRC validation on read, and every entity in
+            // `entities` is alive per the allocator state restored above (dead
+            // rows were filtered out).
             unsafe {
                 world.import_page(&import_page).map_err(|e| {
                     LsmError::Format(format!("import_page failed for {sig:?}: {e}"))
@@ -770,15 +773,15 @@ mod tests {
         dir: &Path,
         lo: u64,
         hi: u64,
+        codecs: &CodecRegistry,
     ) {
-        let codecs = CodecRegistry::new();
         flush_and_record(
             world,
             SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap(),
             manifest,
             log,
             dir,
-            &codecs,
+            codecs,
         )
         .unwrap()
         .expect("dirty world must flush");
@@ -805,7 +808,7 @@ mod tests {
         }
 
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10, &codecs);
 
         let (manifest_check, _) = ManifestLog::recover::<4>(&log_path).unwrap();
         assert_eq!(manifest_check.total_runs(), 1);
@@ -830,12 +833,12 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 5);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 5, &codecs);
 
         for (pos,) in world.query::<(&mut Pos,)>() {
             pos.x = 99.0;
         }
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 5, 10);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 5, 10, &codecs);
 
         let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
         let x = result.world.query::<(&Pos,)>().next().unwrap().0.x;
@@ -889,7 +892,7 @@ mod tests {
         );
 
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10, &codecs);
 
         let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
 
@@ -937,7 +940,7 @@ mod tests {
         };
 
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10, &codecs);
 
         let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
         assert_eq!(result.world.query::<(&Pos,)>().count(), n);
@@ -994,6 +997,7 @@ mod tests {
                 dir.path(),
                 seq * 10,
                 seq * 10 + 9,
+                &codecs,
             );
         }
 

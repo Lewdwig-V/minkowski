@@ -184,9 +184,10 @@ impl BlobVec {
     /// - `bytes.len()` must equal `count * item_layout.size()`.
     /// - `bytes` must be a valid native (in-memory) representation of `count`
     ///   consecutive items of this column's type. For LSM recovery this is
-    ///   guaranteed by the raw-copyable invariant enforced at codec registration
-    ///   (a type whose archived size equals its native size carries no live
-    ///   pointers, so its native bytes are position-independent).
+    ///   guaranteed by the raw-copyable invariant enforced at both codec
+    ///   registration and flush — a dense component without a codec is refused,
+    ///   and a type whose archived size equals its native size carries no live
+    ///   pointers, so its native bytes are position-independent.
     pub(crate) unsafe fn append_bytes_unchecked(&mut self, bytes: &[u8], count: usize) {
         let size = self.item_layout.size();
         if size == 0 {

@@ -9,32 +9,47 @@ use minkowski_lsm::schema::SchemaEntry;
 use minkowski_lsm::types::{SeqNo, SeqRange};
 use minkowski_lsm::writer::flush;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[repr(C)]
 struct Pos {
     x: f32,
     y: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[repr(C)]
 struct Vel {
     dx: f32,
     dy: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[repr(C)]
 struct Health(u32);
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Build a `CodecRegistry` with the flushable test components (`Pos`/`Vel`/
+/// `Health`) registered. The dense flush gate refuses any dense component
+/// lacking a codec, so every persisted dense column must be registered here.
+fn test_codecs(world: &mut World) -> CodecRegistry {
+    let mut codecs = CodecRegistry::new();
+    codecs.register_as::<Pos>("pos", world).unwrap();
+    codecs.register_as::<Vel>("vel", world).unwrap();
+    codecs.register_as::<Health>("health", world).unwrap();
+    codecs
+}
+
 /// Flush the world and return (tempdir, path, reader).
 /// The tempdir must be kept alive for the duration of the test.
-fn flush_and_open(world: &World) -> (tempfile::TempDir, SortedRunReader) {
+fn flush_and_open(world: &mut World) -> (tempfile::TempDir, SortedRunReader) {
     let dir = tempfile::tempdir().unwrap();
+    let codecs = test_codecs(world);
     let path = flush(
         world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap()
     .expect("flush should produce a file");
@@ -60,7 +75,7 @@ fn round_trip_single_archetype() {
         ));
     }
 
-    let (_dir, reader) = flush_and_open(&world);
+    let (_dir, reader) = flush_and_open(&mut world);
 
     // There is one archetype (arch_id = 0).
     let schema = reader.schema();
@@ -118,7 +133,7 @@ fn round_trip_partial_page() {
         },));
     }
 
-    let (_dir, reader) = flush_and_open(&world);
+    let (_dir, reader) = flush_and_open(&mut world);
     let schema = reader.schema();
     assert_eq!(schema.len(), 1);
 
@@ -182,7 +197,7 @@ fn multi_archetype_flush() {
         "should have at least 2 archetypes"
     );
 
-    let (_dir, reader) = flush_and_open(&world);
+    let (_dir, reader) = flush_and_open(&mut world);
     let schema = reader.schema();
 
     // Schema must contain all three component types.
@@ -260,12 +275,13 @@ fn crc_corruption_detected() {
         },));
     }
 
+    let codecs = test_codecs(&mut world);
     let dir = tempfile::tempdir().unwrap();
     let path = flush(
         &world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(50u64)).unwrap(),
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap()
     .unwrap();
@@ -333,12 +349,13 @@ fn header_crc_corruption_detected() {
         },));
     }
 
+    let codecs = test_codecs(&mut world);
     let dir = tempfile::tempdir().unwrap();
     let path = flush(
         &world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap()
     .unwrap();
@@ -393,7 +410,7 @@ fn schema_contains_correct_entries() {
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.5, dy: -0.5 }));
 
-    let (_dir, reader) = flush_and_open(&world);
+    let (_dir, reader) = flush_and_open(&mut world);
     let schema = reader.schema();
 
     assert_eq!(schema.len(), 2, "schema should have exactly 2 entries");
@@ -433,7 +450,7 @@ fn sparse_index_finds_all_pages() {
         },));
     }
 
-    let (_dir, reader) = flush_and_open(&world);
+    let (_dir, reader) = flush_and_open(&mut world);
 
     let schema = reader.schema();
     let pos_slot = schema
@@ -494,7 +511,7 @@ fn entity_pages_match_world() {
         },));
     }
 
-    let (_dir, reader) = flush_and_open(&world);
+    let (_dir, reader) = flush_and_open(&mut world);
 
     let entity_page = reader
         .get_page(0, ENTITY_SLOT, 0)
@@ -519,10 +536,13 @@ fn entity_pages_match_world() {
 
 #[test]
 fn zst_component_round_trip() {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Marker;
 
     let mut world = World::new();
+    let mut codecs = CodecRegistry::new();
+    codecs.register_as::<Marker>("marker", &mut world).unwrap();
     for _ in 0..5 {
         world.spawn((Marker,));
     }
@@ -531,7 +551,7 @@ fn zst_component_round_trip() {
         &world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap()
     .unwrap();
