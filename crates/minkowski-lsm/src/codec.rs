@@ -329,8 +329,10 @@ impl CodecRegistry {
         }
     }
 
-    /// Deserialize component bytes into a raw byte buffer.
-    pub fn deserialize(&self, id: ComponentId, bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
+    /// Deserialize component bytes into a raw byte buffer. Internal to the
+    /// crate: callers outside use [`decode`](Self::decode), which gates the
+    /// raw-copy fast path on a [`CrcProof`].
+    pub(crate) fn deserialize(&self, id: ComponentId, bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
         let codec = self
             .codecs
             .get(&id)
@@ -354,15 +356,11 @@ impl CodecRegistry {
         self.by_name.get(name).copied()
     }
 
-    /// Check if a component has a registered codec.
-    pub fn has_codec(&self, id: ComponentId) -> bool {
-        self.codecs.contains_key(&id)
-    }
-
     /// If the archived representation matches the native layout (same size),
     /// returns `Some(size)` — the zero-copy load path can copy archived bytes
-    /// directly into BlobVec without typed deserialization.
-    pub fn raw_copy_size(&self, id: ComponentId) -> Option<usize> {
+    /// directly into BlobVec without typed deserialization. Internal to the
+    /// crate; gated by [`decode`](Self::decode).
+    pub(crate) fn raw_copy_size(&self, id: ComponentId) -> Option<usize> {
         self.codecs.get(&id).and_then(|c| c.raw_copy_size)
     }
 
@@ -370,8 +368,8 @@ impl CodecRegistry {
     /// memcpy, no rkyv bytecheck) when a [`CrcProof`] is provided and the
     /// component's archived layout matches its native layout.
     ///
-    /// Without a proof, falls through to [`deserialize`](Self::deserialize)
-    /// which runs full rkyv validation — safe for untrusted bytes.
+    /// Without a proof, falls through to full rkyv validation — safe for
+    /// untrusted bytes.
     pub fn decode(
         &self,
         id: ComponentId,
@@ -559,8 +557,8 @@ mod tests {
         codecs.register::<Pos>(&mut world).unwrap();
         codecs.register::<Vel>(&mut world).unwrap();
 
-        assert!(codecs.has_codec(world.component_id::<Pos>().unwrap()));
-        assert!(codecs.has_codec(world.component_id::<Vel>().unwrap()));
+        assert!(codecs.has_codec_for_type(std::any::TypeId::of::<Pos>()));
+        assert!(codecs.has_codec_for_type(std::any::TypeId::of::<Vel>()));
         assert_eq!(codecs.registered_ids().len(), 2);
     }
 
