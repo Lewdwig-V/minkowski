@@ -259,6 +259,87 @@ mod tests {
         );
     }
 
+    /// Codex PR #199 P1 scenario: a checkpoint triggered by a sparse-only
+    /// removal writes NO run (flush returns None) yet still acknowledges the
+    /// flush. Verify the removed sparse component does NOT resurrect on recovery.
+    #[test]
+    fn sparse_only_removal_checkpoint_does_not_resurrect() {
+        use crate::recover::recover_world;
+        use crate::wal::WalConfig;
+
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct TagR(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("testr.wal");
+        let lsm_dir = dir.path().join("lsmr");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<TagR>("tag_r", &mut world).unwrap();
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(128),
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+        let mut handler = AutoCheckpoint::new(&lsm_dir);
+
+        // Spawn e (recorded in WAL) and attach a sparse component in-memory.
+        let e = world.alloc_entity();
+        let mut cs = minkowski::EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world).unwrap();
+        world.insert_sparse::<TagR>(e, TagR(7));
+
+        // Checkpoint 1: writes run A containing the sparse TagR.
+        handler
+            .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+            .unwrap();
+
+        // Force the exact Codex condition: no archetype page is dirty at the
+        // next checkpoint (a complete flush would clear dirty bits), and the
+        // only mutation since is a sparse removal.
+        world.clear_all_dirty_pages();
+        let mut cs2 = minkowski::EnumChangeSet::new();
+        cs2.remove_sparse::<TagR>(&mut world, e);
+        wal.append(&cs2, &codecs).unwrap();
+        cs2.apply(&mut world).unwrap();
+
+        // Checkpoint 2: flush finds nothing to persist (no dirty pages, no sparse
+        // entries) and returns None — but on_checkpoint_needed still acks.
+        handler
+            .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+            .unwrap();
+
+        // FAITHFULNESS CHECK: checkpoint 2 must have written NO run (flush None),
+        // so only run A exists — this is Codex's exact premise.
+        let run_count = std::fs::read_dir(&lsm_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "run"))
+            .count();
+        assert_eq!(run_count, 1, "checkpoint 2 must write no run (flush None)");
+
+        // Recover from scratch. The removal lives only in the WAL tail; recovery
+        // must apply it on top of run A's (stale) sparse baseline.
+        let log_path = lsm_dir.join("manifest.log");
+        let mut wal2 = Wal::open(&wal_dir, &codecs, WalConfig::default()).unwrap();
+        let recovered = recover_world(&lsm_dir, &log_path, &mut wal2, &codecs).unwrap();
+
+        assert_eq!(
+            recovered.get::<TagR>(e),
+            None,
+            "a sparse component removed via a no-run checkpoint must not resurrect"
+        );
+        // The entity itself must still be alive (only its sparse component went).
+        assert_eq!(recovered.get::<Pos>(e).map(|p| p.x), Some(1.0));
+    }
+
     #[test]
     fn auto_checkpoint_saves_registered_index() {
         use crate::index::load_btree_index;

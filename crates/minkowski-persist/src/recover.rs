@@ -34,6 +34,16 @@ pub fn recover_world(
         for id in codecs.registered_ids() {
             codecs.register_one(id, &mut world);
         }
+        // INVARIANT (replay floor): we replay from the newest LSM run's seq_hi,
+        // NOT the WAL's last acknowledged flush_seq. `AutoCheckpoint` may
+        // acknowledge a flush_seq ahead of the LSM baseline when a checkpoint
+        // had nothing to persist (e.g. a sparse-only removal → `flush` returns
+        // None). That is benign ONLY because the WAL is never truncated below
+        // this floor, so every mutation in `[result.flush_seq, end)` — including
+        // such a removal — is still replayed on top of the baseline. If WAL
+        // truncation is ever added it MUST NOT delete records at or above the
+        // newest run's seq_hi, or removed state would resurrect. Covered by
+        // `checkpoint::tests::sparse_only_removal_checkpoint_does_not_resurrect`.
         wal.replay_from(result.flush_seq, &mut world, codecs)?;
         Ok(world)
     } else {
