@@ -127,15 +127,9 @@ impl LsmRecovery {
                     if blob.is_empty() {
                         continue;
                     }
-                    let entries = sparse_page::decode(&blob)?;
-                    let name = reader
-                        .schema()
-                        .entry_for_slot(slot)
-                        .ok_or_else(|| {
-                            LsmError::Format(format!("sparse slot {slot} missing from schema"))
-                        })?
-                        .name()
-                        .to_owned();
+                    // The blob is self-describing: it carries the component's
+                    // stable name. The page `slot` is only a grouping index.
+                    let (name, entries) = sparse_page::decode(&blob)?;
                     components.push((name, entries));
                 }
                 if !components.is_empty() {
@@ -749,6 +743,294 @@ mod tests {
             gen_after,
             gen_before.as_slice(),
             "generations must survive compaction"
+        );
+    }
+
+    // ── Group-C Task-7 tests ──────────────────────────────────────────────
+
+    /// (a) A despawned entity's sparse component must NOT resurface after
+    /// flush+recover. The flush captures net state: despawn erases sparse
+    /// storage before the snapshot is written.
+    #[test]
+    fn sparse_despawn_before_checkpoint_leaves_nothing() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Pos7a {
+            x: f32,
+            y: f32,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag7a(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos7a>("pos7a", &mut world).unwrap();
+        codecs.register_as::<Tag7a>("tag7a", &mut world).unwrap();
+
+        // Spawn entity, attach sparse, then despawn — all before flush.
+        let e = world.spawn((Pos7a { x: 1.0, y: 2.0 },));
+        world.insert_sparse::<Tag7a>(e, Tag7a(5));
+        world.despawn(e);
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        // Spawn a second entity so the world is non-empty and flush actually runs.
+        world.spawn((Pos7a { x: 9.0, y: 9.0 },));
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        // Entity is dead: not alive, sparse must not resurrect.
+        assert!(
+            !recovered.is_alive(e),
+            "despawned entity must not be alive after recovery"
+        );
+        assert!(
+            recovered.get::<Tag7a>(e).is_none(),
+            "sparse component of despawned entity must not appear after recovery"
+        );
+    }
+
+    /// (b) More than u16::MAX bytes of sparse data forces ≥2 pages per
+    /// component. Recovery must concatenate them and return every entry.
+    #[test]
+    fn sparse_multipage_round_trips() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Pos7b {
+            x: f32,
+            y: f32,
+        }
+
+        // Each sparse entry encodes to 8 (entity_bits) + 4 (value_len) + 4 (u32) = 16 bytes.
+        // 5000 entries → 4 (header) + 5000 * 16 = 80_004 bytes > u16::MAX (65_535).
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag7b(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos7b>("pos7b", &mut world).unwrap();
+        codecs.register_as::<Tag7b>("tag7b", &mut world).unwrap();
+
+        let n: u32 = 5_000;
+        let entities: Vec<_> = (0..n)
+            .map(|i| {
+                let e = world.spawn((Pos7b {
+                    x: i as f32,
+                    y: 0.0,
+                },));
+                world.insert_sparse::<Tag7b>(e, Tag7b(i));
+                e
+            })
+            .collect();
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        // Check count via iter_sparse.
+        let comp_id = recovered
+            .component_id::<Tag7b>()
+            .expect("Tag7b must be registered");
+        let count = recovered
+            .iter_sparse::<Tag7b>(comp_id)
+            .map_or(0, std::iter::Iterator::count);
+        assert_eq!(count, n as usize, "all {n} sparse entries must survive");
+
+        // Spot-check a sample of values.
+        for &i in &[0u32, 1, 99, 999, 2500, 4999] {
+            let e = entities[i as usize];
+            assert_eq!(
+                recovered.get::<Tag7b>(e).copied(),
+                Some(Tag7b(i)),
+                "entity {i} sparse value mismatch"
+            );
+        }
+    }
+
+    /// (c) An index reused by a new entity after despawn must carry the new
+    /// entity's sparse value, not the old one. Recovery must honour the entity
+    /// generation embedded in sparse entries.
+    #[test]
+    fn sparse_generation_reuse_round_trips() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Pos7c {
+            x: f32,
+            y: f32,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag7c(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos7c>("pos7c", &mut world).unwrap();
+        codecs.register_as::<Tag7c>("tag7c", &mut world).unwrap();
+
+        // Spawn `a`, attach sparse, then despawn to free the index.
+        let a = world.spawn((Pos7c { x: 1.0, y: 0.0 },));
+        world.insert_sparse::<Tag7c>(a, Tag7c(1));
+        world.despawn(a);
+
+        // Spawn enough entities to force reuse of `a`'s index. The allocator
+        // returns freed indices from a free-list (LIFO), so the first spawn
+        // after a single despawn reuses the same index with a bumped generation.
+        let b = world.spawn((Pos7c { x: 2.0, y: 0.0 },));
+
+        // If the allocator didn't reuse immediately, spawn more until reuse.
+        let b = if b.index() == a.index() {
+            b
+        } else {
+            // Pad until the recycled slot shows up.
+            let mut found = b;
+            for _ in 0..32 {
+                let e = world.spawn((Pos7c { x: 3.0, y: 0.0 },));
+                if e.index() == a.index() {
+                    found = e;
+                    break;
+                }
+            }
+            found
+        };
+
+        // Whatever happened, b must have a different generation than a.
+        assert_ne!(
+            b.generation(),
+            a.generation(),
+            "recycled entity must have bumped generation"
+        );
+
+        world.insert_sparse::<Tag7c>(b, Tag7c(2));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        assert_eq!(
+            recovered.get::<Tag7c>(b).copied(),
+            Some(Tag7c(2)),
+            "new entity's sparse must survive"
+        );
+        assert!(
+            recovered.get::<Tag7c>(a).is_none(),
+            "old (stale generation) entity's sparse must not appear"
+        );
+    }
+
+    /// (d) When two flushes cover the same entity's sparse component, the
+    /// newer run's value must win over the older run's value.
+    #[test]
+    fn sparse_newest_run_wins() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Pos7d {
+            x: f32,
+            y: f32,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag7d(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos7d>("pos7d", &mut world).unwrap();
+        codecs.register_as::<Tag7d>("tag7d", &mut world).unwrap();
+
+        // First flush: entity e has Tag7d(1).
+        let e = world.spawn((Pos7d { x: 1.0, y: 2.0 },));
+        world.insert_sparse::<Tag7d>(e, Tag7d(1));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("first flush");
+
+        // Second flush: overwrite sparse to Tag7d(2). Spawn an extra archetype
+        // entity so the second flush is non-trivially dirty.
+        world.insert_sparse::<Tag7d>(e, Tag7d(2));
+        world.spawn((Pos7d { x: 99.0, y: 99.0 },));
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(1u64), SeqNo::from(2u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("second flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        assert_eq!(
+            recovered.get::<Tag7d>(e).copied(),
+            Some(Tag7d(2)),
+            "newer run's sparse value must win"
         );
     }
 

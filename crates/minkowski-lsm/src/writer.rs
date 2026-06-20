@@ -105,9 +105,13 @@ pub fn flush_observed(
     }
 
     // ── 1b. Collect sparse component blobs (complete current sparse state) ───
+    // Each sparse component becomes one self-describing blob (its stable NAME is
+    // embedded by `sparse_page::encode`), chunked into SPARSE_ARCH_ID pages.
+    // Sparse components are deliberately NOT added to the archetype schema, so
+    // they cannot perturb archetype component slot assignments; recovery reads
+    // the component name from the blob, not from the schema.
     struct SparseBlob {
         name: String,
-        layout: std::alloc::Layout,
         blob: Vec<u8>,
     }
     let mut sparse_blobs: Vec<SparseBlob> = Vec::new();
@@ -123,22 +127,16 @@ pub fn flush_observed(
             continue;
         }
         // Use the codec's stable name (explicit or type_name default) so that
-        // the schema slot name matches what recovery uses to look up the codec.
-        // `world.component_name` returns the Rust type_name, which differs from
-        // an explicit stable name registered via `register_as`.
+        // recovery resolves the same codec via `resolve_name`.
         let name = codecs
             .stable_name(comp_id)
             .expect("has_codec guard ensures stable_name is Some")
             .to_owned();
-        let layout = world
-            .component_layout(comp_id)
-            .ok_or_else(|| LsmError::Format(format!("sparse component {comp_id} no layout")))?;
-        sparse_blobs.push(SparseBlob {
-            name,
-            layout,
-            blob: sparse_page::encode(&entries),
-        });
+        let blob = sparse_page::encode(&name, &entries);
+        sparse_blobs.push(SparseBlob { name, blob });
     }
+    // Deterministic order so a grouping-slot index is stable across identical
+    // flushes (the slot is purely a per-run page grouping key).
     sparse_blobs.sort_by(|a, b| a.name.cmp(&b.name));
     let sparse_page_count: usize = sparse_blobs
         .iter()
@@ -156,7 +154,11 @@ pub fn flush_observed(
         seen_comp_ids.insert(comp_id);
     }
 
-    let mut components: Vec<(String, std::alloc::Layout)> = seen_comp_ids
+    // Schema contains ONLY archetype (dirty) components. Sparse components are
+    // intentionally excluded — they carry their name in their own blob and use
+    // a separate `SPARSE_ARCH_ID` page space, so they never affect archetype
+    // slot assignment.
+    let components: Vec<(String, std::alloc::Layout)> = seen_comp_ids
         .iter()
         .map(|&comp_id| {
             let name = world
@@ -168,13 +170,6 @@ pub fn flush_observed(
             (name.to_owned(), layout)
         })
         .collect();
-
-    // Add sparse-only components to the schema so their slots resolve.
-    // `from_components` deduplicates by name, so components that appear in
-    // both archetype columns and sparse storage are not double-counted.
-    for s in &sparse_blobs {
-        components.push((s.name.clone(), s.layout));
-    }
 
     let schema = SchemaSection::from_components(&components)?;
 
@@ -441,14 +436,14 @@ pub fn flush_observed(
         });
     }
 
-    // (d3) Sparse component pages — complete current sparse state, keyed by the
-    //      component's schema slot under SPARSE_ARCH_ID. Each blob is chunked at
+    // (d3) Sparse component pages — complete current sparse state under
+    //      SPARSE_ARCH_ID. The `slot` is a per-run grouping index (the blob's
+    //      position in name-sorted order), NOT a schema slot — recovery reads
+    //      the component name from the blob. Each blob is chunked at
     //      ALLOCATOR_PAGE_MAX_BYTES (the row_count u16 cap); recovery
     //      concatenates chunks per slot before decode.
-    for s in &sparse_blobs {
-        let slot = schema
-            .slot_for(&s.name)
-            .expect("sparse component must be in schema");
+    for (group_idx, s) in sparse_blobs.iter().enumerate() {
+        let slot = to_u16(group_idx, "sparse group slot")?;
         for (page_index, chunk) in s.blob.chunks(ALLOCATOR_PAGE_MAX_BYTES).enumerate() {
             let page_index = to_u16(page_index, "sparse page_index")?;
             let page_crc = crc32fast::hash(chunk);
@@ -761,17 +756,16 @@ mod tests {
         let path = flush(&world, range, dir.path(), &codecs).unwrap().unwrap();
 
         let reader = SortedRunReader::open(&path).unwrap();
-        let tag_slot = reader
-            .schema()
-            .slot_for("tag")
-            .expect("tag must be in schema");
+        // Sparse components are NOT in the archetype schema; the single sparse
+        // component occupies grouping slot 0 and carries its name in the blob.
         let mut blob = Vec::new();
-        for result in reader.slot_pages(SPARSE_ARCH_ID, tag_slot) {
+        for result in reader.slot_pages(SPARSE_ARCH_ID, 0) {
             let (_pi, page) = result.unwrap();
             reader.validate_page_crc(&page).unwrap();
             blob.extend_from_slice(&page.data()[..page.header().row_count as usize]);
         }
-        let entries = sparse_page::decode(&blob).unwrap();
+        let (name, entries) = sparse_page::decode(&blob).unwrap();
+        assert_eq!(name, "tag");
         let mut tags: Vec<u64> = entries.iter().map(|(e, _)| *e).collect();
         tags.sort_unstable();
         let mut want = vec![e1.to_bits(), e2.to_bits()];

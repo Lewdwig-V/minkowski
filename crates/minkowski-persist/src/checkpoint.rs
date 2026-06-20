@@ -178,6 +178,87 @@ mod tests {
         assert_eq!(runs.len(), 1);
     }
 
+    /// (f) Regression test (Codex-#5): sparse components must survive a full
+    /// `AutoCheckpoint` → `recover_world` round-trip. Before the sparse
+    /// durability feature, `acknowledge_flush` advanced past sparse state that
+    /// was never written to LSM, silently losing it on recovery.
+    #[test]
+    fn checkpoint_then_recover_preserves_sparse() {
+        use crate::recover::recover_world;
+        use crate::wal::WalConfig;
+
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag7f(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test7f.wal");
+        let lsm_dir = dir.path().join("lsm7f");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Tag7f>("tag7f", &mut world).unwrap();
+
+        // Low threshold so that a handful of WAL appends trigger a checkpoint.
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(128),
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+
+        // Spawn an entity and record it in the WAL.
+        let e = world.alloc_entity();
+        let mut cs = minkowski::EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world).unwrap();
+
+        // Attach a sparse component directly to the world (not via WAL, so it
+        // only exists in the in-memory world and must be captured by the LSM
+        // flush triggered by the checkpoint).
+        world.insert_sparse::<Tag7f>(e, Tag7f(42));
+
+        // Append more records until checkpoint is needed.
+        for i in 0..10u32 {
+            let e2 = world.alloc_entity();
+            let mut cs2 = minkowski::EnumChangeSet::new();
+            cs2.spawn_bundle(
+                &mut world,
+                e2,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            )
+            .unwrap();
+            wal.append(&cs2, &codecs).unwrap();
+            cs2.apply(&mut world).unwrap();
+        }
+
+        assert!(wal.checkpoint_needed(), "checkpoint must be needed");
+
+        // Run the checkpoint: flushes world (including sparse) to LSM.
+        let mut handler = AutoCheckpoint::new(&lsm_dir);
+        handler
+            .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+            .unwrap();
+
+        assert!(!wal.checkpoint_needed(), "checkpoint must be acknowledged");
+
+        // Recover via a fresh WAL handle — simulates a crash-reopen.
+        let log_path = lsm_dir.join("manifest.log");
+        let mut wal2 = Wal::open(&wal_dir, &codecs, WalConfig::default()).unwrap();
+        let recovered = recover_world(&lsm_dir, &log_path, &mut wal2, &codecs).unwrap();
+
+        assert_eq!(
+            recovered.get::<Tag7f>(e).copied(),
+            Some(Tag7f(42)),
+            "sparse component must survive checkpoint → recover round-trip"
+        );
+    }
+
     #[test]
     fn auto_checkpoint_saves_registered_index() {
         use crate::index::load_btree_index;

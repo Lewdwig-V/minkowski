@@ -254,11 +254,14 @@ impl SortedRunReader {
         let header = PageHeader::from_bytes(header_bytes);
 
         // Compute and bounds-check data.
-        let item_size = self.item_size_for_slot(slot)?;
         let data_len =
             if slot == crate::format::ALLOCATOR_SLOT || arch_id == crate::format::SPARSE_ARCH_ID {
+                // Sparse/allocator pages store a raw byte chunk in `row_count`;
+                // their `slot` is a grouping index, not a schema slot, so do
+                // NOT resolve it via `item_size_for_slot`.
                 header.row_count as usize
             } else {
+                let item_size = self.item_size_for_slot(slot)?;
                 PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
                     LsmError::Format(format!(
                         "page ({arch_id}, {slot}, {page_index}): data length overflow"
@@ -387,11 +390,14 @@ impl SortedRunReader {
         let header_bytes: &[u8; 16] = buf[offset..header_end].try_into().expect("16 bytes");
         let header = PageHeader::from_bytes(header_bytes);
 
-        let item_size = self.item_size_for_slot(slot)?;
         let data_len =
             if slot == crate::format::ALLOCATOR_SLOT || arch_id == crate::format::SPARSE_ARCH_ID {
+                // Sparse/allocator pages store a raw byte chunk in `row_count`;
+                // their `slot` is a grouping index, not a schema slot, so do
+                // NOT resolve it via `item_size_for_slot`.
                 header.row_count as usize
             } else {
+                let item_size = self.item_size_for_slot(slot)?;
                 PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
                     LsmError::Format(format!(
                         "page ({arch_id}, {slot}, {page_index}): data length overflow"
