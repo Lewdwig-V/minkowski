@@ -88,6 +88,7 @@ mod tests {
             &mut manifest,
             &mut log,
             &lsm_dir,
+            &codecs,
         )
         .unwrap()
         .expect("flush");

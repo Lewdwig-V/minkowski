@@ -7,6 +7,7 @@ use minkowski::World;
 
 use crate::allocator_meta;
 use crate::bloom;
+use crate::codec::CodecRegistry;
 use crate::error::LsmError;
 use crate::format::*;
 use crate::schema::SchemaSection;
@@ -67,8 +68,9 @@ pub fn flush(
     world: &World,
     sequence_range: SeqRange,
     output_dir: &Path,
+    codecs: &CodecRegistry,
 ) -> Result<Option<PathBuf>, LsmError> {
-    flush_observed(world, sequence_range, output_dir, None)
+    flush_observed(world, sequence_range, output_dir, codecs, None)
 }
 
 /// Like [`flush`], but invokes `observer` once per entity ID written to an
@@ -81,8 +83,10 @@ pub fn flush_observed(
     world: &World,
     sequence_range: SeqRange,
     output_dir: &Path,
+    codecs: &CodecRegistry,
     mut observer: Option<&mut dyn FnMut(EntityKey)>,
 ) -> Result<Option<PathBuf>, LsmError> {
+    let _ = codecs; // unused until sparse serialization (next commit)
     // ── 1. Collect dirty page set ───────────────────────────────────────────
     // Key: (arch_idx, comp_id, page_index)
     let mut dirty: BTreeSet<(usize, usize, usize)> = BTreeSet::new();
@@ -516,6 +520,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         assert!(result.is_none());
@@ -531,6 +536,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -548,6 +554,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         let path = result.unwrap();
@@ -565,6 +572,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -590,6 +598,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap()
         .unwrap();
@@ -614,10 +623,12 @@ mod tests {
         let observed_clone = Rc::clone(&observed);
 
         let dir = tempfile::tempdir().unwrap();
+        let codecs = CodecRegistry::new();
         let result = flush_observed(
             &world,
             SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
             dir.path(),
+            &codecs,
             Some(&mut |key: EntityKey| {
                 observed_clone.borrow_mut().push(key.0);
             }),
@@ -645,6 +656,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap()
         .unwrap();

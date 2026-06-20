@@ -71,7 +71,7 @@ impl CheckpointHandler for AutoCheckpoint {
         &mut self,
         world: &mut World,
         wal: &mut Wal,
-        _codecs: &CodecRegistry,
+        codecs: &CodecRegistry,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let flush_seq = wal.next_seq();
         let lo = wal.last_checkpoint_seq().unwrap_or(0);
@@ -80,7 +80,14 @@ impl CheckpointHandler for AutoCheckpoint {
 
         let mut manifest = self.manifest.lock();
         let mut log = self.manifest_log.lock();
-        flush_and_record(world, seq_range, &mut manifest, &mut log, &self.lsm_dir)?;
+        flush_and_record(
+            world,
+            seq_range,
+            &mut manifest,
+            &mut log,
+            &self.lsm_dir,
+            codecs,
+        )?;
 
         // Best-effort compaction when L0 is over threshold.
         while manifest

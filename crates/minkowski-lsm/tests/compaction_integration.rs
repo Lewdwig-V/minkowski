@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use minkowski::World;
+use minkowski_lsm::codec::CodecRegistry;
 use minkowski_lsm::compactor::{compact_one, compact_one_observed};
 use minkowski_lsm::format::ENTITY_SLOT;
 use minkowski_lsm::manifest::LsmManifest;
@@ -37,9 +38,16 @@ fn do_flush<const N: usize>(
     seq_hi: u64,
 ) -> std::path::PathBuf {
     let seq_range = SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap();
-    flush_and_record(world, seq_range, manifest, log, run_dir)
-        .unwrap()
-        .expect("world must be dirty for flush to produce Some")
+    flush_and_record(
+        world,
+        seq_range,
+        manifest,
+        log,
+        run_dir,
+        &CodecRegistry::new(),
+    )
+    .unwrap()
+    .expect("world must be dirty for flush to produce Some")
 }
 
 /// Collect all entity IDs from the entity-slot pages of arch_id 0 in a reader.

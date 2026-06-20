@@ -390,12 +390,14 @@ mod tests {
         lo: u64,
         hi: u64,
     ) {
+        let codecs = CodecRegistry::new();
         flush_and_record(
             world,
             SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap(),
             manifest,
             log,
             dir,
+            &codecs,
         )
         .unwrap()
         .expect("dirty world must flush");

@@ -538,10 +538,12 @@ mod tests {
             },));
         }
         let dir = tempfile::tempdir().unwrap();
+        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             dir.path(),
+            &codecs,
         )
         .unwrap()
         .unwrap();
@@ -628,10 +630,12 @@ mod tests {
         world.spawn((Vel { dx: 1.0, dy: 0.0 },));
 
         let dir = tempfile::tempdir().unwrap();
+        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
+            &codecs,
         )
         .unwrap()
         .unwrap();
@@ -709,10 +713,12 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
+        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
             dir.path(),
+            &codecs,
         )
         .unwrap()
         .unwrap();

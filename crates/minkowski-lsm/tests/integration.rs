@@ -1,6 +1,7 @@
 use std::alloc::Layout;
 
 use minkowski::World;
+use minkowski_lsm::codec::CodecRegistry;
 use minkowski_lsm::error::LsmError;
 use minkowski_lsm::format::{ENTITY_SLOT, PAGE_SIZE};
 use minkowski_lsm::reader::SortedRunReader;
@@ -33,6 +34,7 @@ fn flush_and_open(world: &World) -> (tempfile::TempDir, SortedRunReader) {
         world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap()
     .expect("flush should produce a file");
@@ -227,6 +229,7 @@ fn no_dirty_pages_no_file() {
         &world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap();
     assert!(
@@ -262,6 +265,7 @@ fn crc_corruption_detected() {
         &world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(50u64)).unwrap(),
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap()
     .unwrap();
@@ -334,6 +338,7 @@ fn header_crc_corruption_detected() {
         &world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap()
     .unwrap();
@@ -526,6 +531,7 @@ fn zst_component_round_trip() {
         &world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
         dir.path(),
+        &CodecRegistry::new(),
     )
     .unwrap()
     .unwrap();
