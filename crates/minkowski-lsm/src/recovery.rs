@@ -132,9 +132,14 @@ impl LsmRecovery {
                     let (name, entries) = sparse_page::decode(&blob)?;
                     components.push((name, entries));
                 }
-                if !components.is_empty() {
-                    sparse = Some(StoredSparse { seq_hi, components });
-                }
+                // Update UNCONDITIONALLY (even when `components` is empty). Every
+                // flush writes the COMPLETE current sparse state, so the newest
+                // run is authoritative: a run with no sparse pages means sparse
+                // is genuinely empty and must supersede an older run's data.
+                // Skipping the update on empty would resurrect components removed
+                // between flushes (e.g. a live entity whose sparse component was
+                // removed before the newer flush).
+                sparse = Some(StoredSparse { seq_hi, components });
             }
 
             for arch_id in reader.archetype_ids() {
@@ -1034,8 +1039,79 @@ mod tests {
         );
     }
 
+    /// (g) A sparse component removed from a still-alive entity between two
+    /// flushes must NOT be resurrected: the newer run authoritatively has no
+    /// sparse pages, so it supersedes the older run that did. Regression for the
+    /// "newest run wins even when empty" rule.
+    #[test]
+    fn sparse_removed_before_second_flush_does_not_resurrect() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Pos7g {
+            x: f32,
+            y: f32,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag7g(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos7g>("pos7g", &mut world).unwrap();
+        codecs.register_as::<Tag7g>("tag7g", &mut world).unwrap();
+
+        // First flush: entity e (alive) has Tag7g(7).
+        let e = world.spawn((Pos7g { x: 1.0, y: 2.0 },));
+        world.insert_sparse::<Tag7g>(e, Tag7g(7));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("first flush");
+
+        // Remove the sparse component while e stays alive, then flush again
+        // (spawn another entity so the second flush is dirty). The second run
+        // therefore has NO sparse pages.
+        let mut cs = minkowski::EnumChangeSet::new();
+        cs.remove_sparse::<Tag7g>(&mut world, e);
+        cs.apply(&mut world).unwrap();
+        world.spawn((Pos7g { x: 9.0, y: 9.0 },));
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(1u64), SeqNo::from(2u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("second flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        assert_eq!(
+            recovered.get::<Tag7g>(e),
+            None,
+            "removed sparse component must not be resurrected by recovery"
+        );
+    }
+
     /// Sparse components must survive compaction: the compactor carries the
-    /// newest run's sparse pages forward, re-slotted to the output schema.
+    /// newest run's sparse pages forward verbatim (self-describing blobs).
     #[test]
     fn recover_restores_sparse_after_compaction() {
         #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
