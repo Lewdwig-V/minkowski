@@ -5,19 +5,15 @@
 //! enter the World. Same external composition pattern as
 //! [`SpatialIndex`](minkowski::SpatialIndex).
 //!
-//! `BlobRef` wraps a heap-allocated `String`, so it is **not** raw-copyable
-//! and cannot be registered with [`CodecRegistry`](crate::CodecRegistry)
-//! (registration returns [`CodecError::NotRawCopyable`](crate::CodecError)).
-//! It remains fully usable as an in-memory component (spawn, query, get) and
-//! as the key type for [`BlobStore`] orphan-detection. Persist the key by
-//! other means (e.g. a companion raw-copyable ID component); do not attempt
-//! codec registration on `BlobRef` itself.
+//! `BlobRef` wraps a heap-allocated `String`. It persists via
+//! [`CodecRegistry`](crate::CodecRegistry) as a Serialized (rkyv) column — its
+//! key string is captured on flush and restored on recovery. Register it like
+//! any other component (`codecs.register::<BlobRef>(&mut world)`).
 
 /// Reference to an externally-stored blob.
 ///
 /// Wraps a key string pointing to data in an external object store; blob bytes
-/// never enter the World. See the [module documentation](self) for persistence
-/// constraints and usage guidance.
+/// never enter the World.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(compare(PartialEq), derive(Debug))]
 pub struct BlobRef(String);
@@ -151,18 +147,19 @@ mod tests {
     }
 
     #[test]
-    fn blob_ref_codec_registration_is_rejected() {
-        // BlobRef wraps a String (heap-allocated). Its rkyv archived
-        // representation has a different size than the native type, so it fails
-        // the raw-copyability check and must NOT be registerable with CodecRegistry.
-        // Storing heap-pointer bytes verbatim to disk and memcpy-ing them back
-        // on restore would produce dangling pointers.
+    fn blob_ref_codec_registration_succeeds() {
+        // BlobRef wraps a String (heap-allocated). It now persists as a
+        // Serialized (rkyv) column, so registration must succeed and classify it
+        // as Serialized.
         let mut world = World::new();
         let mut codecs = crate::CodecRegistry::new();
-        let err = codecs.register::<BlobRef>(&mut world).unwrap_err();
-        assert!(
-            matches!(err, crate::CodecError::NotRawCopyable { .. }),
-            "expected NotRawCopyable, got {err:?}"
+        codecs
+            .register::<BlobRef>(&mut world)
+            .expect("BlobRef is persistable as a Serialized column");
+        let ty = std::any::TypeId::of::<BlobRef>();
+        assert_eq!(
+            codecs.storage_kind_for_type(ty),
+            Some(minkowski_lsm::StorageKind::Serialized)
         );
     }
 }

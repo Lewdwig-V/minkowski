@@ -19,3 +19,4 @@ pub mod writer;
 pub use bloom::{BlockedBloomFilter, pack_page_key};
 pub use compactor::{COMPACTION_TRIGGER, CompactionReport, compact_one, compact_one_observed};
 pub use recovery::{LsmRecovery, RecoveryResult};
+pub use schema::StorageKind;
