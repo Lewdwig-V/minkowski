@@ -11,18 +11,27 @@ use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog, ManifestTag};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
 use minkowski_lsm::types::{Level, SeqNo, SeqRange};
 
-#[derive(Clone, Copy)]
-#[expect(dead_code)]
+#[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[repr(C)]
 struct Pos {
     x: f32,
     y: f32,
 }
 
-#[derive(Clone, Copy)]
-#[expect(dead_code)]
+#[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[repr(C)]
 struct Vel {
     dx: f32,
     dy: f32,
+}
+
+/// Build a `CodecRegistry` with `Pos`/`Vel` registered — the dense flush gate
+/// refuses any dense component lacking a codec.
+fn mk_codecs(world: &mut World) -> CodecRegistry {
+    let mut codecs = CodecRegistry::new();
+    codecs.register_as::<Pos>("pos", world).unwrap();
+    codecs.register_as::<Vel>("vel", world).unwrap();
+    codecs
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -34,6 +43,7 @@ fn three_flushes_then_replay() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
 
     // Flush 1: spawn some entities.
     for i in 0..5 {
@@ -48,7 +58,7 @@ fn three_flushes_then_replay() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap()
     .unwrap();
@@ -67,7 +77,7 @@ fn three_flushes_then_replay() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap()
     .unwrap();
@@ -81,7 +91,7 @@ fn three_flushes_then_replay() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap()
     .unwrap();
@@ -119,6 +129,7 @@ fn corrupt_tail_partial_recovery() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 2.0 },));
 
     // Two good flushes.
@@ -128,7 +139,7 @@ fn corrupt_tail_partial_recovery() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
     world.clear_all_dirty_pages();
@@ -140,7 +151,7 @@ fn corrupt_tail_partial_recovery() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -170,6 +181,7 @@ fn replay_converges_at_every_truncation_prefix() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     for i in 0..3u64 {
         world.spawn((Pos {
             x: i as f32,
@@ -183,7 +195,7 @@ fn replay_converges_at_every_truncation_prefix() {
             &mut manifest,
             &mut log,
             dir.path(),
-            &CodecRegistry::new(),
+            &codecs,
         )
         .unwrap();
         world.clear_all_dirty_pages();
@@ -254,6 +266,7 @@ fn replay_truncates_log_on_promote_of_missing_run() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // Real flush: produces a genuine AddRunAndSequence entry.
     flush_and_record(
@@ -262,7 +275,7 @@ fn replay_truncates_log_on_promote_of_missing_run() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -304,6 +317,7 @@ fn cleanup_removes_orphans_and_tmp() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 2.0 },));
 
     // One real flush.
@@ -313,7 +327,7 @@ fn cleanup_removes_orphans_and_tmp() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -343,6 +357,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush, produces a valid AddRunAndSequence frame.
     flush_and_record(
@@ -351,7 +366,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -413,6 +428,7 @@ fn replay_truncates_log_on_invalid_level_byte() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     flush_and_record(
         &world,
@@ -420,7 +436,7 @@ fn replay_truncates_log_on_invalid_level_byte() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -470,6 +486,7 @@ fn replay_truncates_log_on_unknown_tag_byte() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     flush_and_record(
         &world,
@@ -477,7 +494,7 @@ fn replay_truncates_log_on_unknown_tag_byte() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -524,6 +541,7 @@ fn replay_truncates_log_on_inverted_seq_range() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush, produces a valid AddRunAndSequence frame.
     flush_and_record(
@@ -532,7 +550,7 @@ fn replay_truncates_log_on_inverted_seq_range() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -592,6 +610,7 @@ fn replay_truncates_log_on_zero_page_count() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush — produces a valid AddRunAndSequence entry.
     flush_and_record(
@@ -600,7 +619,7 @@ fn replay_truncates_log_on_zero_page_count() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -663,6 +682,7 @@ fn replay_truncates_log_on_invalid_compaction_input_level() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush so there's something to survive the replay truncation.
     flush_and_record(
@@ -671,7 +691,7 @@ fn replay_truncates_log_on_invalid_compaction_input_level() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -736,6 +756,7 @@ fn replay_truncates_log_on_remove_of_missing_run() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush — produces a valid AddRunAndSequence entry.
     flush_and_record(
@@ -744,7 +765,7 @@ fn replay_truncates_log_on_remove_of_missing_run() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
 
@@ -791,6 +812,7 @@ fn recover_then_flush_then_recover_roundtrips_state() {
 
     // Two flushes produce two AddRunAndSequence frames.
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     flush_and_record(
         &world,
@@ -798,7 +820,7 @@ fn recover_then_flush_then_recover_roundtrips_state() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
     world.clear_all_dirty_pages();
@@ -809,7 +831,7 @@ fn recover_then_flush_then_recover_roundtrips_state() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
     drop(log);
@@ -950,6 +972,7 @@ fn flush_and_record_clean_world_no_change() {
     let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
     let mut world = World::new();
+    let codecs = mk_codecs(&mut world);
     world.spawn((Pos { x: 1.0, y: 2.0 },));
     world.clear_all_dirty_pages();
 
@@ -959,7 +982,7 @@ fn flush_and_record_clean_world_no_change() {
         &mut manifest,
         &mut log,
         dir.path(),
-        &CodecRegistry::new(),
+        &codecs,
     )
     .unwrap();
     assert!(result.is_none());

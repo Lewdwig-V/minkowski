@@ -20,7 +20,8 @@ use minkowski_lsm::writer::EntityKey;
 
 // ── Component types ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[repr(C)]
 struct Pos {
     x: f32,
     y: f32,
@@ -28,9 +29,12 @@ struct Pos {
 
 // ── Helper ───────────────────────────────────────────────────────────────────
 
-/// Do one flush from `world` (which must have dirty pages) and return the run path.
+/// Do one flush from `world` (which must have dirty pages) and return the run
+/// path. Registers `Pos` in a codec registry first — the dense flush gate
+/// refuses any dense component lacking a codec. `register_component` is
+/// idempotent, so reusing the same world across calls is fine.
 fn do_flush<const N: usize>(
-    world: &World,
+    world: &mut World,
     manifest: &mut LsmManifest<N>,
     log: &mut ManifestLog,
     run_dir: &std::path::Path,
@@ -38,16 +42,11 @@ fn do_flush<const N: usize>(
     seq_hi: u64,
 ) -> std::path::PathBuf {
     let seq_range = SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap();
-    flush_and_record(
-        world,
-        seq_range,
-        manifest,
-        log,
-        run_dir,
-        &CodecRegistry::new(),
-    )
-    .unwrap()
-    .expect("world must be dirty for flush to produce Some")
+    let mut codecs = CodecRegistry::new();
+    codecs.register_as::<Pos>("pos", world).unwrap();
+    flush_and_record(world, seq_range, manifest, log, run_dir, &codecs)
+        .unwrap()
+        .expect("world must be dirty for flush to produce Some")
 }
 
 /// Collect all entity IDs from the entity-slot pages of arch_id 0 in a reader.
@@ -108,7 +107,7 @@ fn flush_four_times_then_compact_consolidates_l0_to_l1() {
             y: 0.0,
         },));
         do_flush(
-            &world,
+            &mut world,
             &mut manifest,
             &mut log,
             dir.path(),
@@ -181,7 +180,7 @@ fn compact_preserves_all_entities() {
         }
         let lo = (flush_i as u64) * 10;
         let hi = lo + 9;
-        do_flush(&world, &mut manifest, &mut log, dir.path(), lo, hi);
+        do_flush(&mut world, &mut manifest, &mut log, dir.path(), lo, hi);
     }
 
     assert_eq!(
@@ -239,7 +238,7 @@ fn compact_with_entity_updates_keeps_newest_version() {
     let _b0 = world0.spawn((Pos { x: 0.0, y: 0.0 },));
     let hero_entity = world0.spawn((Pos { x: 1.0, y: 2.0 },));
     let hero_bits = hero_entity.to_bits();
-    do_flush(&world0, &mut manifest, &mut log, dir.path(), 0, 9);
+    do_flush(&mut world0, &mut manifest, &mut log, dir.path(), 0, 9);
 
     // --- Flush 1: update hero's Pos ---
     // We create a new world where the hero entity is represented with the same
@@ -259,17 +258,17 @@ fn compact_with_entity_updates_keeps_newest_version() {
         hero_bits,
         "hero entity must have the same bits in world1"
     );
-    do_flush(&world1, &mut manifest, &mut log, dir.path(), 10, 19);
+    do_flush(&mut world1, &mut manifest, &mut log, dir.path(), 10, 19);
 
     // --- Flush 2: new entities (to get a dirty page) ---
     let mut world2 = World::new();
     world2.spawn((Pos { x: 100.0, y: 200.0 },));
-    do_flush(&world2, &mut manifest, &mut log, dir.path(), 20, 29);
+    do_flush(&mut world2, &mut manifest, &mut log, dir.path(), 20, 29);
 
     // --- Flush 3: new entities ---
     let mut world3 = World::new();
     world3.spawn((Pos { x: 200.0, y: 300.0 },));
-    do_flush(&world3, &mut manifest, &mut log, dir.path(), 30, 39);
+    do_flush(&mut world3, &mut manifest, &mut log, dir.path(), 30, 39);
 
     assert_eq!(manifest.runs_at_level(Level::L0).len(), 4);
 
@@ -309,7 +308,7 @@ fn compact_emits_exactly_one_compaction_commit_entry() {
             y: 0.0,
         },));
         do_flush(
-            &world,
+            &mut world,
             &mut manifest,
             &mut log,
             dir.path(),
@@ -384,7 +383,7 @@ fn needs_compaction_parity_with_compact_one() {
             y: 0.0,
         },));
         do_flush(
-            &world,
+            &mut world,
             &mut manifest,
             &mut log,
             dir.path(),
@@ -403,7 +402,7 @@ fn needs_compaction_parity_with_compact_one() {
     {
         let mut world = World::new();
         world.spawn((Pos { x: 99.0, y: 0.0 },));
-        do_flush(&world, &mut manifest, &mut log, dir.path(), 30, 39);
+        do_flush(&mut world, &mut manifest, &mut log, dir.path(), 30, 39);
     }
     assert!(
         manifest.needs_compaction().unwrap(),
@@ -455,7 +454,7 @@ fn compact_then_recover_roundtrips_state() {
             all_bits.insert(e.to_bits());
         }
         let lo = (flush_i as u64) * 10;
-        do_flush(&world, &mut manifest, &mut log, dir.path(), lo, lo + 9);
+        do_flush(&mut world, &mut manifest, &mut log, dir.path(), lo, lo + 9);
     }
 
     assert_eq!(manifest.runs_at_level(Level::L0).len(), n_flushes);
@@ -545,7 +544,7 @@ fn compact_one_observed_fires_for_each_output_entity() {
             all_bits.insert(e.to_bits());
         }
         let lo = (flush_i as u64) * 10;
-        do_flush(&world, &mut manifest, &mut log, dir.path(), lo, lo + 9);
+        do_flush(&mut world, &mut manifest, &mut log, dir.path(), lo, lo + 9);
     }
 
     let observed: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));

@@ -2010,6 +2010,22 @@ impl World {
         }
     }
 
+    /// `TypeId` of the component registered at `id`, or `None` if unregistered
+    /// or registered without a concrete type (via [`register_component_raw`],
+    /// e.g. a recovery placeholder). `ComponentId` is a *per-world* index;
+    /// external registries (e.g. a persistence `CodecRegistry`) use this to
+    /// confirm an id resolves to the *type* they expect rather than trusting the
+    /// numeric id across worlds.
+    ///
+    /// [`register_component_raw`]: World::register_component_raw
+    pub fn component_type_id(&self, id: ComponentId) -> Option<std::any::TypeId> {
+        if id < self.components.len() {
+            self.components.info(id).type_id
+        } else {
+            None
+        }
+    }
+
     /// Number of registered component types.
     pub fn component_count(&self) -> usize {
         self.components.len()

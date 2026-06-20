@@ -527,23 +527,33 @@ mod tests {
     use minkowski::World;
     use std::path::PathBuf;
 
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Vel {
         dx: f32,
         dy: f32,
     }
 
+    /// Build a `CodecRegistry` with `Pos`/`Vel` registered — the dense flush
+    /// gate refuses any dense component lacking a codec.
+    fn test_codecs(world: &mut World) -> crate::codec::CodecRegistry {
+        let mut codecs = crate::codec::CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", world).unwrap();
+        codecs.register_as::<Vel>("vel", world).unwrap();
+        codecs
+    }
+
     /// Helper: spawn entities and flush to a sorted run file.
     fn flush_world_with_pos(n: usize) -> (tempfile::TempDir, std::path::PathBuf, World) {
         let mut world = World::new();
+        let codecs = test_codecs(&mut world);
         for i in 0..n {
             world.spawn((Pos {
                 x: i as f32,
@@ -551,7 +561,6 @@ mod tests {
             },));
         }
         let dir = tempfile::tempdir().unwrap();
-        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
@@ -638,12 +647,12 @@ mod tests {
     #[test]
     fn archetype_ids_returns_sorted_unique() {
         let mut world = World::new();
+        let codecs = test_codecs(&mut world);
         // Create two archetypes
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         world.spawn((Vel { dx: 1.0, dy: 0.0 },));
 
         let dir = tempfile::tempdir().unwrap();
-        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
@@ -712,6 +721,7 @@ mod tests {
     #[test]
     fn multi_component_index_lookup() {
         let mut world = World::new();
+        let codecs = test_codecs(&mut world);
         for i in 0..10 {
             world.spawn((
                 Pos {
@@ -726,7 +736,6 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let codecs = crate::codec::CodecRegistry::new();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),

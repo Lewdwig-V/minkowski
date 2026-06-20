@@ -108,8 +108,8 @@ mod tests {
     use crate::codec::CodecRegistry;
     use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Pos {
         x: f32,
         y: f32,
@@ -118,6 +118,8 @@ mod tests {
     #[test]
     fn flush_and_record_dirty_world() {
         let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
         for i in 0..5 {
             world.spawn((Pos {
                 x: i as f32,
@@ -128,7 +130,6 @@ mod tests {
         let log_path = dir.path().join("manifest.log");
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
 
-        let codecs = CodecRegistry::new();
         let result = flush_and_record(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),

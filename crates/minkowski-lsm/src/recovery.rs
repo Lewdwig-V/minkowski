@@ -252,6 +252,11 @@ fn archetype_signature(reader: &SortedRunReader, arch_id: u16) -> Result<Archety
     Ok(names)
 }
 
+/// Resolve a sparse component's stable name to the codec registry's
+/// `ComponentId`. Sparse restore (`apply_sparse`) uses this id to locate the
+/// codec, whose `insert_sparse_fn` re-registers the concrete type into the
+/// recovered world itself — so the *registry* id (not a recovered-world local
+/// id) is the correct value here.
 fn resolve_schema_component(
     codecs: &CodecRegistry,
     world: &World,
@@ -264,6 +269,32 @@ fn resolve_schema_component(
         .registered_ids()
         .into_iter()
         .find(|&id| world.component_name(id).is_some_and(|n| n == schema_name))
+}
+
+/// Resolve a dense archetype component (stored in the schema under its Rust
+/// `type_name`) to the RECOVERED world's local `ComponentId`.
+///
+/// `register_one` populated `world` with fresh, sequentially-assigned local ids
+/// in sorted `registered_ids()` order. Those ids need NOT equal the codec
+/// registry's ids: if the registry has a gap (e.g. a non-codec component
+/// occupied an earlier id in the world the registry was built against), or was
+/// built against a differently-ordered world, the registry id and the recovered
+/// world's local id diverge. Resolving through the registry id (`resolve_name`)
+/// would then return an id absent from `world`, failing `import_target`. The
+/// schema stores `World::component_name` (the `type_name`), which matches the
+/// recovered world's `component_name` for every codec-registered type, so we
+/// resolve against the world's own table. Returns `None` for a schema component
+/// with no codec (a legacy run predating the dense raw-copy gate) so the caller
+/// registers a raw placeholder.
+fn resolve_local_component(world: &World, type_name: &str) -> Option<ComponentId> {
+    let mut id = 0;
+    while let Some(name) = world.component_name(id) {
+        if name == type_name {
+            return Some(id);
+        }
+        id += 1;
+    }
+    None
 }
 
 /// Build the entity-allocator state for recovery.
@@ -329,7 +360,7 @@ fn materialize_world(
     // layout, and build name -> ComponentId.
     let mut name_to_id: HashMap<String, ComponentId> = HashMap::new();
     for (name, (size, align)) in component_layouts {
-        let id = if let Some(local_id) = resolve_schema_component(codecs, &world, name) {
+        let id = if let Some(local_id) = resolve_local_component(&world, name) {
             local_id
         } else {
             let layout = Layout::from_size_align(*size, *align).map_err(|_| {
@@ -536,10 +567,13 @@ fn materialize_world(
                 LsmError::Format(format!("import page build failed for {sig:?}: {e}"))
             })?;
             // SAFETY: each column slice is the native byte image of a raw-copyable
-            // component (enforced at codec registration); the source pages passed
-            // per-page CRC validation on read; every entity in `entities` is
-            // alive per the allocator state restored above (dead rows were
-            // filtered out).
+            // component. Raw-copyability is enforced at BOTH ends: codec
+            // registration rejects non-raw-copyable types, AND the dense flush
+            // path refuses to persist any dense component lacking a codec — so a
+            // run can only contain dense columns proven raw-copyable. The source
+            // pages passed per-page CRC validation on read, and every entity in
+            // `entities` is alive per the allocator state restored above (dead
+            // rows were filtered out).
             unsafe {
                 world.import_page(&import_page).map_err(|e| {
                     LsmError::Format(format!("import_page failed for {sig:?}: {e}"))
@@ -644,6 +678,59 @@ mod tests {
         assert_eq!(recovered.get::<ZComp>(both).copied(), Some(ZComp(20)));
         assert_eq!(recovered.get::<ZComp>(zonly).copied(), Some(ZComp(99)));
         assert_eq!(recovered.get::<AComp>(zonly), None);
+    }
+
+    /// Codex P2 (round 3) regression: a codec registered at a NON-CONTIGUOUS id
+    /// must still recover. When a non-codec component takes an earlier id in the
+    /// world the registry is built against, the codec lands at a gapped id (here
+    /// id 1, with id 0 codec-less). Recovery's `register_one` compacts that codec
+    /// to local id 0 in the fresh world; resolving the schema name through the
+    /// registry id (1) would then point at a component absent from the recovered
+    /// world and fail `import_target`. Resolving against the recovered world's
+    /// own component table fixes it. (End-to-end flush + recover.)
+    #[test]
+    fn recover_codec_at_noncontiguous_id() {
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Payload(u64);
+
+        // A bare component type with no codec, registered FIRST so it occupies
+        // ComponentId 0 in the world the registry is built against.
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct Filler(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        // Filler takes id 0 (no codec); Payload's codec lands at registry id 1.
+        world.register_component::<Filler>();
+        codecs.register::<Payload>(&mut world).unwrap();
+
+        let e = world.spawn((Payload(42),));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        assert_eq!(
+            result.world.get::<Payload>(e).copied(),
+            Some(Payload(42)),
+            "component whose codec sits at a gapped registry id must recover"
+        );
     }
 
     #[test]
@@ -770,15 +857,15 @@ mod tests {
         dir: &Path,
         lo: u64,
         hi: u64,
+        codecs: &CodecRegistry,
     ) {
-        let codecs = CodecRegistry::new();
         flush_and_record(
             world,
             SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap(),
             manifest,
             log,
             dir,
-            &codecs,
+            codecs,
         )
         .unwrap()
         .expect("dirty world must flush");
@@ -805,7 +892,7 @@ mod tests {
         }
 
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10, &codecs);
 
         let (manifest_check, _) = ManifestLog::recover::<4>(&log_path).unwrap();
         assert_eq!(manifest_check.total_runs(), 1);
@@ -830,12 +917,12 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 2.0 },));
 
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 5);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 5, &codecs);
 
         for (pos,) in world.query::<(&mut Pos,)>() {
             pos.x = 99.0;
         }
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 5, 10);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 5, 10, &codecs);
 
         let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
         let x = result.world.query::<(&Pos,)>().next().unwrap().0.x;
@@ -889,7 +976,7 @@ mod tests {
         );
 
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10, &codecs);
 
         let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
 
@@ -937,7 +1024,7 @@ mod tests {
         };
 
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
-        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10);
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10, &codecs);
 
         let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
         assert_eq!(result.world.query::<(&Pos,)>().count(), n);
@@ -994,6 +1081,7 @@ mod tests {
                 dir.path(),
                 seq * 10,
                 seq * 10 + 9,
+                &codecs,
             );
         }
 

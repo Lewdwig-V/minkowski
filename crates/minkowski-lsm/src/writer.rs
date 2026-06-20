@@ -108,13 +108,43 @@ pub fn flush_observed(
         // rows from older runs against the authoritative persisted allocator.
         for &comp_id in world.archetype_component_ids(arch_idx) {
             if let Some(pages) = world.column_dirty_pages(arch_idx, comp_id) {
+                let mut writes_any = false;
                 for page in pages {
                     let start_row = page * PAGE_SIZE;
                     if start_row >= arch_len {
                         continue;
                     }
+                    writes_any = true;
                     dirty.insert((arch_idx, comp_id, page));
                     entity_dirty.entry(arch_idx).or_default().insert(page);
+                }
+                // Soundness gate: a dense column is persisted as NATIVE bytes and
+                // memcpy'd back verbatim on recovery, which is only sound for a
+                // raw-copyable (POD) type. Codec registration certifies
+                // raw-copyability per TYPE. Resolve the codec by the flushed
+                // world's component *type*, never by its per-world ComponentId:
+                // a registry built against a different world can file the same
+                // type under a different id (so id-keyed lookup over-rejects) or
+                // a different type under this id (so id-keyed lookup is unsound).
+                // No codec for this type ⇒ its native bytes are not provably
+                // position-independent (may hold heap pointers like String/Vec) ⇒
+                // hard-error rather than persist bytes that would dangle on
+                // recovery. (Mirrors the sparse skip-warn above, but dense data
+                // must hard-error — it cannot be silently dropped.) Only fires
+                // when the component actually contributes a page to the run.
+                if writes_any {
+                    let has_codec = world
+                        .component_type_id(comp_id)
+                        .is_some_and(|ty| codecs.has_codec_for_type(ty));
+                    if !has_codec {
+                        let name = world.component_name(comp_id).unwrap_or("<unknown>");
+                        return Err(LsmError::Format(format!(
+                            "dense component '{name}' (id={comp_id}) has no registered codec \
+                             for its type; it cannot be persisted to the LSM baseline because \
+                             its native bytes are not provably raw-copyable. Register it via \
+                             CodecRegistry::register before flushing."
+                        )));
+                    }
                 }
             }
         }
@@ -608,23 +638,34 @@ mod tests {
     use crate::types::{SeqNo, SeqRange};
     use minkowski::World;
 
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Vel {
         dx: f32,
         dy: f32,
     }
 
+    /// Build a `CodecRegistry` with the module-level `Pos`/`Vel` test components
+    /// registered, mirroring real callers that register dense components before
+    /// flushing. The dense flush gate refuses any dense component lacking a codec.
+    fn codecs_with(world: &mut World) -> CodecRegistry {
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", world).unwrap();
+        codecs.register_as::<Vel>("vel", world).unwrap();
+        codecs
+    }
+
     #[test]
     fn flush_no_dirty_pages_returns_none() {
         let mut world = World::new();
+        let codecs = codecs_with(&mut world);
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         world.clear_all_dirty_pages();
         let dir = tempfile::tempdir().unwrap();
@@ -632,7 +673,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
-            &CodecRegistry::new(),
+            &codecs,
         )
         .unwrap();
         assert!(result.is_none());
@@ -641,13 +682,14 @@ mod tests {
     #[test]
     fn flush_dirty_pages_creates_file() {
         let mut world = World::new();
+        let codecs = codecs_with(&mut world);
         world.spawn((Pos { x: 1.0, y: 2.0 },)); // Pages are dirty from spawn.
         let dir = tempfile::tempdir().unwrap();
         let result = flush(
             &world,
             SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
             dir.path(),
-            &CodecRegistry::new(),
+            &codecs,
         )
         .unwrap();
         assert!(result.is_some());
@@ -659,13 +701,14 @@ mod tests {
     #[test]
     fn file_has_correct_header_magic() {
         let mut world = World::new();
+        let codecs = codecs_with(&mut world);
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         let dir = tempfile::tempdir().unwrap();
         let result = flush(
             &world,
             SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             dir.path(),
-            &CodecRegistry::new(),
+            &codecs,
         )
         .unwrap();
         let path = result.unwrap();
@@ -676,6 +719,7 @@ mod tests {
     #[test]
     fn flush_multi_component() {
         let mut world = World::new();
+        let codecs = codecs_with(&mut world);
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.5, dy: -0.5 }));
         world.spawn((Pos { x: 3.0, y: 4.0 }, Vel { dx: 1.0, dy: 1.0 }));
         let dir = tempfile::tempdir().unwrap();
@@ -683,7 +727,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             dir.path(),
-            &CodecRegistry::new(),
+            &codecs,
         )
         .unwrap();
         assert!(result.is_some());
@@ -709,6 +753,7 @@ mod tests {
     #[test]
     fn flush_archetype_shrink_page_count_matches() {
         let mut world = World::new();
+        let codecs = codecs_with(&mut world);
         // 600 entities → 3 pages of 256.
         let mut all = Vec::new();
         for i in 0..600u32 {
@@ -730,7 +775,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
             dir.path(),
-            &CodecRegistry::new(),
+            &codecs,
         )
         .unwrap()
         .unwrap();
@@ -745,13 +790,14 @@ mod tests {
     #[test]
     fn header_crc_is_valid() {
         let mut world = World::new();
+        let codecs = codecs_with(&mut world);
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         let dir = tempfile::tempdir().unwrap();
         let path = flush(
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
             dir.path(),
-            &CodecRegistry::new(),
+            &codecs,
         )
         .unwrap()
         .unwrap();
@@ -768,6 +814,7 @@ mod tests {
         use std::rc::Rc;
 
         let mut world = World::new();
+        let codecs = codecs_with(&mut world);
         let e1 = world.spawn((Pos { x: 0.0, y: 0.0 },));
         let e2 = world.spawn((Pos { x: 1.0, y: 1.0 },));
         let e3 = world.spawn((Pos { x: 2.0, y: 2.0 },));
@@ -776,7 +823,6 @@ mod tests {
         let observed_clone = Rc::clone(&observed);
 
         let dir = tempfile::tempdir().unwrap();
-        let codecs = CodecRegistry::new();
         let result = flush_observed(
             &world,
             SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
@@ -852,6 +898,7 @@ mod tests {
     #[test]
     fn flush_produces_run_with_bloom_filter() {
         let mut world = World::new();
+        let codecs = codecs_with(&mut world);
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         world.spawn((Pos { x: 3.0, y: 4.0 },));
         world.spawn((Pos { x: 5.0, y: 6.0 },));
@@ -861,7 +908,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
-            &CodecRegistry::new(),
+            &codecs,
         )
         .unwrap()
         .unwrap();
@@ -874,6 +921,120 @@ mod tests {
         assert!(
             footer.bloom_filter_offset > 0,
             "bloom_filter_offset must be non-zero for dirty flush"
+        );
+    }
+
+    /// Soundness gate: a dense component registered in core but absent from the
+    /// `CodecRegistry` is not provably raw-copyable. Flushing its native bytes
+    /// would memcpy a possibly heap-owning value back verbatim on recovery (UB).
+    /// The flush path must hard-error rather than persist such a column.
+    #[test]
+    fn flush_rejects_dense_component_without_codec() {
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct Uncodec(u32);
+
+        let mut world = World::new();
+        world.spawn((Uncodec(1),)); // registered in core, NOT in the CodecRegistry
+        let dir = tempfile::tempdir().unwrap();
+        let codecs = CodecRegistry::new();
+        let result = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            dir.path(),
+            &codecs,
+        );
+        assert!(
+            result.is_err(),
+            "flushing a codec-less dense component must error"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("no registered codec"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Codex P1 regression: `has_codec(comp_id)` is a per-world numeric-id lookup.
+    /// A `CodecRegistry` built against one world holds a codec at some id; if a
+    /// DIFFERENT world has a DIFFERENT component type at that same id, an id-keyed
+    /// gate would pass while the flushed column is actually the other (possibly
+    /// non-raw-copyable) type — persisting native bytes that dangle on recovery.
+    /// Resolving the codec by the flushed world's component *type* rejects this:
+    /// the registry has no codec for `Bworld`.
+    #[test]
+    fn flush_rejects_codec_for_wrong_type_at_same_id() {
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Acodec(u32);
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct Bworld(u64);
+
+        // Registry built against `other`: Acodec is its first component → id 0.
+        let mut other = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Acodec>(&mut other).unwrap();
+
+        // The world we actually flush has a DIFFERENT type as its first
+        // component → also id 0. An id-keyed `has_codec(0)` would pass (Acodec's
+        // codec), but the column bytes are Bworld's, which has no codec.
+        let mut world = World::new();
+        world.spawn((Bworld(7),));
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            dir.path(),
+            &codecs,
+        );
+        assert!(
+            result.is_err(),
+            "flushing a column whose type has no codec must error"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("no registered codec for its type"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Codex P2 regression: the gate must resolve the codec by TYPE, not by the
+    /// flushed world's numeric `ComponentId`. A registry that filed a type under
+    /// a different id than the flushed world (e.g. after recovery re-registers
+    /// components into a fresh world in a different order) must still flush — the
+    /// codec for the type exists, just under another id.
+    #[test]
+    fn flush_accepts_codec_for_type_at_different_id() {
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Filler(u32);
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Payload(u64);
+
+        // Registry built against `other`: Filler at id 0, Payload at id 1.
+        let mut other = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Filler>(&mut other).unwrap();
+        codecs.register::<Payload>(&mut other).unwrap();
+
+        // Flushed world has only Payload → id 0 (a DIFFERENT id than the registry
+        // filed it under). Resolving by type, the Payload codec is found anyway.
+        let mut world = World::new();
+        world.spawn((Payload(7),));
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            dir.path(),
+            &codecs,
+        );
+        assert!(
+            result.is_ok(),
+            "a codec resolved by type must accept a type filed under a different id: {result:?}"
         );
     }
 }

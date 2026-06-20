@@ -430,21 +430,30 @@ mod tests {
 
     // ── Component types ──────────────────────────────────────────────────────
 
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Vel {
         dx: f32,
         dy: f32,
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
+
+    /// Build a `CodecRegistry` with `Pos`/`Vel` registered — the dense flush
+    /// gate refuses any dense component lacking a codec.
+    fn test_codecs(world: &mut World) -> crate::codec::CodecRegistry {
+        let mut codecs = crate::codec::CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", world).unwrap();
+        codecs.register_as::<Vel>("vel", world).unwrap();
+        codecs
+    }
 
     /// Flush a fresh world with N_ENTITIES Pos entities as L0 run `seq_no`.
     /// Returns the path of the written run.
@@ -457,6 +466,7 @@ mod tests {
         n_entities: usize,
     ) -> PathBuf {
         let mut world = World::new();
+        let codecs = test_codecs(&mut world);
         for i in 0..n_entities {
             world.spawn((Pos {
                 x: i as f32,
@@ -464,7 +474,6 @@ mod tests {
             },));
         }
         let seq_range = SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap();
-        let codecs = crate::codec::CodecRegistry::new();
         flush_and_record(&world, seq_range, manifest, log, run_dir, &codecs)
             .unwrap()
             .expect("world is dirty, flush must return Some")
@@ -635,7 +644,7 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            let codecs = crate::codec::CodecRegistry::new();
+            let codecs = test_codecs(&mut world);
             flush_and_record(
                 &world,
                 seq_range,
@@ -807,7 +816,7 @@ mod tests {
                 },));
             }
             let seq_range = SeqRange::new(SeqNo::from(i * 10), SeqNo::from(i * 10 + 9)).unwrap();
-            let codecs = crate::codec::CodecRegistry::new();
+            let codecs = test_codecs(&mut world);
             flush_and_record(
                 &world,
                 seq_range,
@@ -925,7 +934,7 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            let codecs = crate::codec::CodecRegistry::new();
+            let codecs = test_codecs(&mut world);
             flush_and_record(
                 &world,
                 seq_range,
@@ -1034,7 +1043,7 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            let codecs = crate::codec::CodecRegistry::new();
+            let codecs = test_codecs(&mut world);
             flush_and_record(
                 &world,
                 seq_range,
@@ -1154,7 +1163,7 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            let codecs = crate::codec::CodecRegistry::new();
+            let codecs = test_codecs(&mut world);
             flush_and_record(
                 &world,
                 seq_range,
@@ -1200,7 +1209,7 @@ mod tests {
             let lo = (run_i as u64) * 10;
             let hi = lo + 9;
             let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
-            let codecs = crate::codec::CodecRegistry::new();
+            let codecs = test_codecs(&mut world);
             flush_and_record(
                 &world,
                 seq_range,

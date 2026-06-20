@@ -198,7 +198,8 @@ impl World {
     /// Each column slice must be the native (in-memory) byte image of
     /// `entities.len()` consecutive values of the corresponding component type.
     /// For LSM recovery this is guaranteed by the raw-copyable invariant enforced
-    /// at codec registration plus per-page CRC validation on read.
+    /// at both codec registration and flush (a dense component without a codec is
+    /// refused), plus per-page CRC validation on read.
     ///
     /// - The entities in `page.entities` must be unique and must not already be
     ///   placed in any archetype (across this and prior imported pages). The LSM

@@ -105,6 +105,11 @@ struct ComponentCodec {
     /// accepted non-ZST components (raw-copyability is enforced at registration,
     /// so the archived layout matches native); `None` for ZSTs (nothing to copy).
     raw_copy_size: Option<usize>,
+    /// `TypeId` of the concrete component type this codec was registered for.
+    /// `ComponentId` is a per-world index, so the flush gate compares this to the
+    /// flushed world's `component_type_id` to confirm the codec actually
+    /// describes the type whose native bytes are being persisted.
+    type_id: std::any::TypeId,
 }
 
 /// Maps ComponentId to rkyv codecs. Separate from core's ComponentRegistry —
@@ -120,6 +125,16 @@ impl CodecRegistry {
             codecs: HashMap::new(),
             by_name: HashMap::new(),
         }
+    }
+
+    /// Whether a codec is registered for the given component *type*, regardless
+    /// of which numeric `ComponentId` it was filed under. The flush gate uses
+    /// this to certify a dense column's type is raw-copyable: `ComponentId` is a
+    /// per-world index, so resolving by type (not id) is correct across a
+    /// registry and world that assigned the type different ids (e.g. after
+    /// recovery re-registers components into a fresh world).
+    pub fn has_codec_for_type(&self, type_id: std::any::TypeId) -> bool {
+        self.codecs.values().any(|c| c.type_id == type_id)
     }
 
     /// Register a component type for persistence.
@@ -280,6 +295,7 @@ impl CodecRegistry {
                 serialize_sparse_fn,
                 insert_sparse_fn,
                 raw_copy_size,
+                type_id: std::any::TypeId::of::<T>(),
             },
         );
         Ok(())

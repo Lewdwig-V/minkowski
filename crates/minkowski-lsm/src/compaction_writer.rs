@@ -830,8 +830,8 @@ mod tests {
 
     // ── Component types ──────────────────────────────────────────────────────
 
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Pos {
         x: f32,
         y: f32,
@@ -840,14 +840,18 @@ mod tests {
     // ── Helper ───────────────────────────────────────────────────────────────
 
     /// Flush `world` to a temp dir and open a reader. Returns the dir (kept
-    /// alive by the caller) and the reader.
+    /// alive by the caller) and the reader. Registers `Pos` into a codec
+    /// registry first — the dense flush gate refuses any dense component
+    /// lacking a codec. `register_component` is idempotent, so reusing the same
+    /// world across calls is fine.
     fn flush_to_reader(
-        world: &World,
+        world: &mut World,
         seq_lo: u64,
         seq_hi: u64,
     ) -> (tempfile::TempDir, SortedRunReader) {
         let dir = tempfile::tempdir().unwrap();
-        let codecs = crate::codec::CodecRegistry::new();
+        let mut codecs = crate::codec::CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", world).unwrap();
         let path = flush(
             world,
             SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap(),
@@ -886,12 +890,12 @@ mod tests {
     fn build_emit_list_from_two_runs_dedup_keeps_newest() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
-        let (_dir_old, reader_old) = flush_to_reader(&world, 1, 10);
+        let (_dir_old, reader_old) = flush_to_reader(&mut world, 1, 10);
 
         // "Modify" the entity — in this test we just flush the same world
         // again (the entity is still dirty) to represent a newer run containing
         // the same entity ID.
-        let (_dir_new, reader_new) = flush_to_reader(&world, 11, 20);
+        let (_dir_new, reader_new) = flush_to_reader(&mut world, 11, 20);
 
         let old_arch = pos_arch_id(&reader_old);
         let new_arch = pos_arch_id(&reader_new);
@@ -928,7 +932,7 @@ mod tests {
         let mut world_old = World::new();
         let e1 = world_old.spawn((Pos { x: 1.0, y: 0.0 },));
         let e2 = world_old.spawn((Pos { x: 2.0, y: 0.0 },));
-        let (_dir_old, reader_old) = flush_to_reader(&world_old, 1, 10);
+        let (_dir_old, reader_old) = flush_to_reader(&mut world_old, 1, 10);
 
         // Newer run: only E3 (index 2 — placeholder spawns advance past 0, 1).
         let mut world_new = World::new();
@@ -940,7 +944,7 @@ mod tests {
         world_new.despawn(ph1);
         world_new.despawn(ph2);
         let e3 = world_new.spawn((Pos { x: 3.0, y: 0.0 },));
-        let (_dir_new, reader_new) = flush_to_reader(&world_new, 11, 20);
+        let (_dir_new, reader_new) = flush_to_reader(&mut world_new, 11, 20);
 
         let old_arch = pos_arch_id(&reader_old);
         let new_arch = pos_arch_id(&reader_new);
@@ -976,7 +980,7 @@ mod tests {
     fn build_emit_list_skips_inputs_where_archetype_missing() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
-        let (_dir, reader) = flush_to_reader(&world, 0, 10);
+        let (_dir, reader) = flush_to_reader(&mut world, 0, 10);
 
         let arch = pos_arch_id(&reader);
 
@@ -1001,7 +1005,7 @@ mod tests {
     fn build_emit_list_rejects_length_mismatch() {
         let mut world = World::new();
         world.spawn((Pos { x: 0.0, y: 0.0 },));
-        let (_dir, reader) = flush_to_reader(&world, 0, 10);
+        let (_dir, reader) = flush_to_reader(&mut world, 0, 10);
 
         let inputs = [&reader, &reader]; // len 2
         let arch_ids = [Some(0u16)]; // len 1 — mismatch
@@ -1055,7 +1059,7 @@ mod tests {
         let e1 = world_a.spawn((Pos { x: 1.0, y: 10.0 },));
         let e2 = world_a.spawn((Pos { x: 2.0, y: 20.0 },));
         let e3 = world_a.spawn((Pos { x: 3.0, y: 30.0 },));
-        let (_dir_a, reader_a) = flush_to_reader(&world_a, 1, 10);
+        let (_dir_a, reader_a) = flush_to_reader(&mut world_a, 1, 10);
 
         // ── Build run B (E4, E5) ──────────────────────────────────────────────
         // Advance allocator past indices 0, 1, 2 (used by E1–E3) so E4/E5
@@ -1069,7 +1073,7 @@ mod tests {
         world_b.despawn(ph3);
         let e4 = world_b.spawn((Pos { x: 4.0, y: 40.0 },));
         let e5 = world_b.spawn((Pos { x: 5.0, y: 50.0 },));
-        let (_dir_b, reader_b) = flush_to_reader(&world_b, 11, 20);
+        let (_dir_b, reader_b) = flush_to_reader(&mut world_b, 11, 20);
 
         // ── Discover component name ───────────────────────────────────────────
         let arch_info_a = arch_component_names(&reader_a);
@@ -1166,7 +1170,7 @@ mod tests {
         // ── Run OLD: entity E with Pos.x = 1.0 ───────────────────────────────
         let mut world_old = World::new();
         let e = world_old.spawn((Pos { x: 1.0, y: 0.0 },));
-        let (_dir_old, reader_old) = flush_to_reader(&world_old, 1, 5);
+        let (_dir_old, reader_old) = flush_to_reader(&mut world_old, 1, 5);
 
         // ── Run NEW: same entity bits (re-created in a new world at index 0)
         //    but with Pos.x = 2.0 to represent the updated value.
@@ -1178,7 +1182,7 @@ mod tests {
             e_new.to_bits(),
             "entity IDs must match for the update test to be meaningful"
         );
-        let (_dir_new, reader_new) = flush_to_reader(&world_new, 6, 10);
+        let (_dir_new, reader_new) = flush_to_reader(&mut world_new, 6, 10);
 
         // ── Discover component name ───────────────────────────────────────────
         let arch_info = arch_component_names(&reader_old);
@@ -1282,8 +1286,8 @@ mod tests {
         let _e1 = world.spawn((Pos { x: 1.0, y: 0.0 },));
         let _e2 = world.spawn((Pos { x: 2.0, y: 0.0 },));
 
-        let (_dir_a, reader_a) = flush_to_reader(&world, 1, 5);
-        let (_dir_b, reader_b) = flush_to_reader(&world, 6, 10);
+        let (_dir_a, reader_a) = flush_to_reader(&mut world, 1, 5);
+        let (_dir_b, reader_b) = flush_to_reader(&mut world, 6, 10);
 
         let arch_info = arch_component_names(&reader_a);
         assert_eq!(arch_info.len(), 1);

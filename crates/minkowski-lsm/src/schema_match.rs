@@ -64,28 +64,32 @@ mod tests {
     use minkowski::World;
 
     // Component types used in tests.
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
-    #[derive(Clone, Copy)]
-    #[expect(dead_code)]
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[repr(C)]
     struct Vel {
         dx: f32,
         dy: f32,
     }
 
-    /// Helper: flush a world to a temp dir, return the reader.
+    /// Helper: flush a world to a temp dir, return the reader. Registers
+    /// `Pos`/`Vel` codecs first — the dense flush gate refuses any dense
+    /// component lacking a codec. `register_component` is idempotent.
     fn flush_to_reader(
-        world: &World,
+        world: &mut World,
         seq_lo: u64,
         seq_hi: u64,
     ) -> (tempfile::TempDir, SortedRunReader) {
         let dir = tempfile::tempdir().unwrap();
-        let codecs = crate::codec::CodecRegistry::new();
+        let mut codecs = crate::codec::CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", world).unwrap();
+        codecs.register_as::<Vel>("vel", world).unwrap();
         let path = flush(
             world,
             SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap(),
@@ -103,7 +107,7 @@ mod tests {
     fn single_archetype_found() {
         let mut world = World::new();
         world.spawn((Pos { x: 1.0, y: 2.0 },));
-        let (_dir, reader) = flush_to_reader(&world, 0, 10);
+        let (_dir, reader) = flush_to_reader(&mut world, 0, 10);
 
         // We don't know the exact name ahead of time — check the positive path
         // by enumerating arch_ids, looking up the name from the schema, and
@@ -122,7 +126,7 @@ mod tests {
     fn nonexistent_returns_none() {
         let mut world = World::new();
         world.spawn((Pos { x: 1.0, y: 2.0 },));
-        let (_dir, reader) = flush_to_reader(&world, 0, 10);
+        let (_dir, reader) = flush_to_reader(&mut world, 0, 10);
 
         let result = find_archetype_by_components(&reader, &["DoesNotExist"]);
         assert!(result.is_none());
@@ -137,7 +141,7 @@ mod tests {
         let mut world_a = World::new();
         world_a.spawn((Pos { x: 0.0, y: 0.0 },));
         world_a.spawn((Pos { x: 1.0, y: 1.0 }, Vel { dx: 1.0, dy: 0.0 }));
-        let (_dir_a, reader_a) = flush_to_reader(&world_a, 0, 10);
+        let (_dir_a, reader_a) = flush_to_reader(&mut world_a, 0, 10);
 
         // Run B: spawn (Pos, Vel) first, then (Pos,).
         // A different world means different archetype registration order, so
@@ -145,7 +149,7 @@ mod tests {
         let mut world_b = World::new();
         world_b.spawn((Pos { x: 2.0, y: 2.0 }, Vel { dx: 2.0, dy: 0.0 }));
         world_b.spawn((Pos { x: 3.0, y: 3.0 },));
-        let (_dir_b, reader_b) = flush_to_reader(&world_b, 10, 20);
+        let (_dir_b, reader_b) = flush_to_reader(&mut world_b, 10, 20);
 
         // Resolve the actual component names used in run A for each archetype.
         let arch_ids_a = reader_a.archetype_ids();
