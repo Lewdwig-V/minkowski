@@ -5,6 +5,36 @@ use std::io::Write;
 use crate::error::LsmError;
 use crate::format::ENTITY_SLOT;
 
+/// How a dense component column is encoded on disk.
+///
+/// `RawCopy` columns are plain-old-data: native bytes are flushed verbatim and
+/// recovered by bulk `memcpy`. `Serialized` columns contain heap-backed data
+/// (`String`, `Vec`, …) whose native bytes hold live pointers; they are
+/// rkyv-serialized to a variable-length page body and decoded per row on
+/// recovery. The kind is derived from the codec at flush time and recorded here
+/// so the reader, recovery, and compaction all branch consistently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageKind {
+    RawCopy = 0,
+    Serialized = 1,
+}
+
+impl StorageKind {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(byte: u8) -> Result<Self, LsmError> {
+        match byte {
+            0 => Ok(StorageKind::RawCopy),
+            1 => Ok(StorageKind::Serialized),
+            other => Err(LsmError::Format(format!(
+                "invalid storage_kind byte {other} (expected 0=RawCopy or 1=Serialized)"
+            ))),
+        }
+    }
+}
+
 /// One entry in the schema section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaEntry {
@@ -12,6 +42,7 @@ pub struct SchemaEntry {
     pub(crate) name: String,
     pub(crate) item_size: u32,
     pub(crate) item_align: u32,
+    pub(crate) storage_kind: StorageKind,
 }
 
 impl SchemaEntry {
@@ -34,6 +65,11 @@ impl SchemaEntry {
     pub fn item_align(&self) -> u32 {
         self.item_align
     }
+
+    /// On-disk storage kind for this column (RawCopy or Serialized).
+    pub fn storage_kind(&self) -> StorageKind {
+        self.storage_kind
+    }
 }
 
 /// The complete schema section of a sorted run.
@@ -50,22 +86,22 @@ impl SchemaSection {
     /// Sorts by name lexicographically and assigns sequential slot indices
     /// starting from 0.  The entity pseudo-column (`ENTITY_SLOT = 0xFFFF`) is
     /// NOT included — callers must handle it separately.
-    pub fn from_components(components: &[(String, Layout)]) -> Result<Self, LsmError> {
-        // Deduplicate by name (take the first layout seen for a given name).
-        let mut seen: Vec<(String, Layout)> = Vec::with_capacity(components.len());
-        for (name, layout) in components {
-            if !seen.iter().any(|(n, _)| n == name) {
-                seen.push((name.clone(), *layout));
+    pub fn from_components(components: &[(String, Layout, StorageKind)]) -> Result<Self, LsmError> {
+        // Deduplicate by name (take the first (layout, kind) seen for a name).
+        let mut seen: Vec<(String, Layout, StorageKind)> = Vec::with_capacity(components.len());
+        for (name, layout, kind) in components {
+            if !seen.iter().any(|(n, _, _)| n == name) {
+                seen.push((name.clone(), *layout, *kind));
             }
         }
 
         // Sort lexicographically for deterministic slot assignment.
-        seen.sort_by(|(a, _), (b, _)| a.cmp(b));
+        seen.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
 
         let mut entries = Vec::with_capacity(seen.len());
         let mut name_to_slot = HashMap::with_capacity(seen.len());
 
-        for (slot_idx, (name, layout)) in seen.into_iter().enumerate() {
+        for (slot_idx, (name, layout, kind)) in seen.into_iter().enumerate() {
             let slot = u16::try_from(slot_idx).map_err(|_| {
                 LsmError::Format(format!(
                     "too many components: slot index {slot_idx} exceeds u16"
@@ -84,6 +120,7 @@ impl SchemaSection {
                 name,
                 item_size: layout.size() as u32,
                 item_align: layout.align() as u32,
+                storage_kind: kind,
             });
         }
 
@@ -123,11 +160,12 @@ impl SchemaSection {
     ///
     /// Wire format per entry:
     /// ```text
-    /// slot:       u16 LE
-    /// name_len:   u16 LE
-    /// name:       [u8; name_len]  (UTF-8)
-    /// item_size:  u32 LE
-    /// item_align: u32 LE
+    /// slot:         u16 LE
+    /// name_len:     u16 LE
+    /// name:         [u8; name_len]  (UTF-8)
+    /// item_size:    u32 LE
+    /// item_align:   u32 LE
+    /// storage_kind: u8  (0=RawCopy, 1=Serialized)
     /// ```
     /// The entire section is zero-padded to the next 64-byte boundary.
     ///
@@ -149,9 +187,11 @@ impl SchemaSection {
             writer.write_all(name_bytes)?;
             writer.write_all(&entry.item_size.to_le_bytes())?;
             writer.write_all(&entry.item_align.to_le_bytes())?;
+            writer.write_all(&[entry.storage_kind.as_u8()])?;
 
             // 2 (slot) + 2 (name_len) + name_len + 4 (item_size) + 4 (item_align)
-            written += 2 + 2 + name_len + 4 + 4;
+            //   + 1 (storage_kind)
+            written += 2 + 2 + name_len + 4 + 4 + 1;
         }
 
         // Pad to 64-byte boundary with zeros.
@@ -237,12 +277,22 @@ impl SchemaSection {
             ]);
             cursor += 4;
 
+            // storage_kind: u8
+            if cursor + 1 > data.len() {
+                return Err(LsmError::Format(format!(
+                    "schema entry {i}: unexpected end of data reading storage_kind"
+                )));
+            }
+            let storage_kind = StorageKind::from_u8(data[cursor])?;
+            cursor += 1;
+
             name_to_slot.insert(name.clone(), slot);
             entries.push(SchemaEntry {
                 slot,
                 name,
                 item_size,
                 item_align,
+                storage_kind,
             });
         }
 
@@ -297,16 +347,63 @@ mod tests {
 
     // Helper: build a SchemaSection from simple (name, size, align) triples.
     fn make_schema(specs: &[(&str, usize, usize)]) -> SchemaSection {
-        let components: Vec<(String, Layout)> = specs
+        let components: Vec<(String, Layout, StorageKind)> = specs
             .iter()
             .map(|(name, size, align)| {
                 (
                     (*name).to_owned(),
                     Layout::from_size_align(*size, *align).unwrap(),
+                    StorageKind::RawCopy,
                 )
             })
             .collect();
         SchemaSection::from_components(&components).unwrap()
+    }
+
+    #[test]
+    fn storage_kind_round_trips_through_schema_section() {
+        let components = vec![
+            ("Pod".to_owned(), Layout::new::<u64>(), StorageKind::RawCopy),
+            (
+                "Heap".to_owned(),
+                Layout::new::<u64>(),
+                StorageKind::Serialized,
+            ),
+        ];
+        let schema = SchemaSection::from_components(&components).unwrap();
+
+        let mut buf = Vec::new();
+        schema.write_to(&mut buf).unwrap();
+        let recovered = SchemaSection::read_from(&buf, schema.len() as u32).unwrap();
+
+        // "Heap" sorts before "Pod" lexicographically → slot 0.
+        assert_eq!(recovered.entry_for_slot(0).unwrap().name(), "Heap");
+        assert_eq!(
+            recovered.entry_for_slot(0).unwrap().storage_kind(),
+            StorageKind::Serialized
+        );
+        assert_eq!(recovered.entry_for_slot(1).unwrap().name(), "Pod");
+        assert_eq!(
+            recovered.entry_for_slot(1).unwrap().storage_kind(),
+            StorageKind::RawCopy
+        );
+    }
+
+    #[test]
+    fn read_from_rejects_invalid_storage_kind_byte() {
+        let components = vec![("X".to_owned(), Layout::new::<u32>(), StorageKind::RawCopy)];
+        let schema = SchemaSection::from_components(&components).unwrap();
+        let mut buf = Vec::new();
+        schema.write_to(&mut buf).unwrap();
+        // The storage_kind byte is the last content byte before padding: it sits
+        // at offset 2 (slot) + 2 (name_len) + name_len + 4 (item_size) + 4 (item_align).
+        // name "X" → offset 13.
+        buf[13] = 0xAA;
+        let result = SchemaSection::read_from(&buf, 1);
+        assert!(
+            matches!(result, Err(LsmError::Format(_))),
+            "expected Format error on invalid storage_kind byte, got {result:?}"
+        );
     }
 
     #[test]
@@ -379,10 +476,10 @@ mod tests {
     fn padding_is_multiple_of_64() {
         for n in 0usize..=8 {
             // Vary name lengths to hit different raw sizes.
-            let specs: Vec<(String, Layout)> = (0..n)
+            let specs: Vec<(String, Layout, StorageKind)> = (0..n)
                 .map(|i| {
                     let name = format!("Comp{i:0>3}");
-                    (name, layout_of::<u64>())
+                    (name, layout_of::<u64>(), StorageKind::RawCopy)
                 })
                 .collect();
             let schema = SchemaSection::from_components(&specs).unwrap();

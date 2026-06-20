@@ -212,7 +212,7 @@ pub fn flush_observed(
     // intentionally excluded — they carry their name in their own blob and use
     // a separate `SPARSE_ARCH_ID` page space, so they never affect archetype
     // slot assignment.
-    let components: Vec<(String, std::alloc::Layout)> = seen_comp_ids
+    let components: Vec<(String, std::alloc::Layout, crate::schema::StorageKind)> = seen_comp_ids
         .iter()
         .map(|&comp_id| {
             let name = world
@@ -221,7 +221,8 @@ pub fn flush_observed(
             let layout = world
                 .component_layout(comp_id)
                 .expect("dirty component must have a layout");
-            (name.to_owned(), layout)
+            // Task 5 derives this from the codec; for now every column is RawCopy.
+            (name.to_owned(), layout, crate::schema::StorageKind::RawCopy)
         })
         .collect();
 

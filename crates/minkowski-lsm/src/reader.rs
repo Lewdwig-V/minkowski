@@ -719,6 +719,44 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_stale_version() {
+        let (_dir, path, _world) = flush_world_with_pos(3);
+
+        // Overwrite the version field (bytes 8..12) with a stale value (1),
+        // then fix up the header CRC (covers bytes 0..40) so the file passes
+        // magic + CRC checks but fails the version gate inside validate_and_parse.
+        let mut data = std::fs::read(&path).unwrap();
+        data[8..12].copy_from_slice(&1u32.to_le_bytes());
+
+        let new_header_crc = crc32fast::hash(&data[..40]);
+        data[40..44].copy_from_slice(&new_header_crc.to_le_bytes());
+
+        // Recompute total CRC (entire file with total_crc32 field zeroed).
+        let file_len = data.len();
+        let total_crc32_offset = (file_len - 64) + 32;
+        data[total_crc32_offset..total_crc32_offset + 4].copy_from_slice(&[0, 0, 0, 0]);
+        let new_total_crc = crc32fast::hash(&data);
+        data[total_crc32_offset..total_crc32_offset + 4]
+            .copy_from_slice(&new_total_crc.to_le_bytes());
+
+        std::fs::write(&path, &data).unwrap();
+
+        let result = SortedRunReader::open(&path);
+        match result {
+            Ok(_) => panic!("expected Format error for stale version, got Ok"),
+            Err(LsmError::Format(msg)) => {
+                assert!(
+                    msg.contains("unsupported version"),
+                    "expected 'unsupported version' in error, got: {msg}"
+                );
+            }
+            Err(other) => {
+                panic!("expected Format error for stale version, got: {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn multi_component_index_lookup() {
         let mut world = World::new();
         let codecs = test_codecs(&mut world);

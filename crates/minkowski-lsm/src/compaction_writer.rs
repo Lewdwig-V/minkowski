@@ -720,7 +720,7 @@ impl<'a> CompactionWriter<'a> {
     /// Build the output schema from the given component names + layout info
     /// sourced from the first input that carries each component.
     fn build_output_schema(&self, all_components: &[String]) -> Result<SchemaSection, LsmError> {
-        let mut components: Vec<(String, std::alloc::Layout)> =
+        let mut components: Vec<(String, std::alloc::Layout, crate::schema::StorageKind)> =
             Vec::with_capacity(all_components.len());
 
         'outer: for comp_name in all_components {
@@ -742,7 +742,7 @@ impl<'a> CompactionWriter<'a> {
                              size={size} align={align}"
                         ))
                     })?;
-                components.push((comp_name.clone(), layout));
+                components.push((comp_name.clone(), layout, entry.storage_kind()));
                 continue 'outer;
             }
             return Err(LsmError::Format(format!(
