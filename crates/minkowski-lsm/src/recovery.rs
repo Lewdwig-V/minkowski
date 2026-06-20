@@ -4,12 +4,12 @@ use std::alloc::Layout;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use minkowski::{ComponentId, Entity, EnumChangeSet, World};
+use minkowski::{ComponentId, Entity, World};
 
 use crate::allocator_meta;
 use crate::codec::CodecRegistry;
 use crate::error::LsmError;
-use crate::format::{ALLOCATOR_SLOT, ENTITY_SLOT, META_ARCH_ID, PAGE_SIZE, SPARSE_ARCH_ID};
+use crate::format::{ALLOCATOR_SLOT, META_ARCH_ID, SPARSE_ARCH_ID};
 use crate::manifest::{LsmManifest, SortedRunMeta};
 use crate::manifest_log::ManifestLog;
 use crate::manifest_ops::cleanup_orphans;
@@ -29,7 +29,18 @@ pub struct RecoveryResult {
 pub struct LsmRecovery;
 
 type ArchetypeSig = Vec<String>;
-type PageKey = (ArchetypeSig, u16, u16);
+
+/// Identifies a column within an archetype: the entity pseudo-column or a named
+/// component. Keying by NAME (not the run's positional schema slot) is what
+/// fixes the multi-archetype reconstruction bug — a component's bytes are
+/// reassembled and imported by identity, never by signature position.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ColumnKey {
+    Entity,
+    Component(String),
+}
+
+type PageKey = (ArchetypeSig, ColumnKey, u16);
 /// Raw sparse entries for one component: `(entity_bits, rkyv_value_bytes)`.
 type SparseEntries = Vec<(u64, Vec<u8>)>;
 
@@ -150,20 +161,21 @@ impl LsmRecovery {
                 let sig = archetype_signature(&reader, arch_id)?;
 
                 for slot in reader.component_slots_for_arch(arch_id) {
+                    // component_slots_for_arch excludes ENTITY_SLOT, so every slot
+                    // here has a named schema entry.
+                    let (name, item_size) = {
+                        let entry = reader.schema().entry_for_slot(slot).ok_or_else(|| {
+                            LsmError::Format(format!("missing schema entry for slot {slot}"))
+                        })?;
+                        (entry.name().to_owned(), entry.item_size as usize)
+                    };
                     for result in reader.slot_pages(arch_id, slot) {
                         let (page_index, page) = result?;
                         reader.validate_page_crc(&page)?;
-                        let item_size = reader.schema().entry_for_slot(slot).map_or(8, |e| {
-                            if slot == ENTITY_SLOT {
-                                8
-                            } else {
-                                e.item_size as usize
-                            }
-                        });
                         let payload_len = page.header().row_count as usize * item_size;
                         store_page(
                             &mut pages,
-                            (sig.clone(), slot, page_index),
+                            (sig.clone(), ColumnKey::Component(name.clone()), page_index),
                             seq_hi,
                             page.header().row_count,
                             &page.data()[..payload_len],
@@ -177,7 +189,7 @@ impl LsmRecovery {
                     let payload_len = page.header().row_count as usize * 8;
                     store_page(
                         &mut pages,
-                        (sig.clone(), ENTITY_SLOT, page_index),
+                        (sig.clone(), ColumnKey::Entity, page_index),
                         seq_hi,
                         page.header().row_count,
                         &page.data()[..payload_len],
@@ -254,6 +266,36 @@ fn resolve_schema_component(
         .find(|&id| world.component_name(id).is_some_and(|n| n == schema_name))
 }
 
+/// Build the entity-allocator state for recovery. Starts from the persisted
+/// allocator (authoritative for free slots and recycled generations) and
+/// overlays the generation of every entity that appears on disk, so each
+/// imported entity is alive before `import_page` checks `is_alive`.
+fn build_allocator_state(
+    by_sig: &BTreeMap<ArchetypeSig, BTreeMap<ColumnKey, BTreeMap<u16, StoredPage>>>,
+    stored: Option<&StoredAllocator>,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut generations = stored.map(|a| a.generations.clone()).unwrap_or_default();
+    let free_list = stored.map(|a| a.free_list.clone()).unwrap_or_default();
+
+    for columns in by_sig.values() {
+        if let Some(entity_pages) = columns.get(&ColumnKey::Entity) {
+            for page in entity_pages.values() {
+                for chunk in page.data.chunks_exact(8).take(page.row_count as usize) {
+                    let entity =
+                        Entity::from_bits(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+                    let idx = entity.index() as usize;
+                    if generations.len() <= idx {
+                        generations.resize(idx + 1, 0);
+                    }
+                    generations[idx] = entity.generation();
+                }
+            }
+        }
+    }
+
+    (generations, free_list)
+}
+
 fn materialize_world(
     pages: BTreeMap<PageKey, StoredPage>,
     allocator: Option<&StoredAllocator>,
@@ -265,8 +307,9 @@ fn materialize_world(
         codecs.register_one(id, &mut world);
     }
 
+    // Register any component present on disk but lacking a codec, preserving its
+    // layout, and build name -> ComponentId.
     let mut name_to_id: HashMap<String, ComponentId> = HashMap::new();
-
     for (name, (size, align)) in component_layouts {
         let id = if let Some(local_id) = resolve_schema_component(codecs, &world, name) {
             local_id
@@ -282,98 +325,93 @@ fn materialize_world(
         name_to_id.insert(name.clone(), id);
     }
 
-    let mut by_sig: BTreeMap<ArchetypeSig, BTreeMap<(u16, u16), StoredPage>> = BTreeMap::new();
-    for (key, page) in pages {
-        let (sig, slot, page_index) = key;
+    // Group pages: signature -> column -> page_index -> page.
+    let mut by_sig: BTreeMap<ArchetypeSig, BTreeMap<ColumnKey, BTreeMap<u16, StoredPage>>> =
+        BTreeMap::new();
+    for ((sig, col, page_index), page) in pages {
         by_sig
             .entry(sig)
             .or_default()
-            .insert((slot, page_index), page);
+            .entry(col)
+            .or_default()
+            .insert(page_index, page);
     }
 
-    let mut changeset = EnumChangeSet::new();
+    // Allocator-first: import_page checks `is_alive`, so generations must be set
+    // before any entity is placed.
+    let (generations, free_list) = build_allocator_state(&by_sig, allocator);
+    world.restore_allocator_state(generations, free_list);
 
-    if let Some(alloc) = &allocator {
-        world.restore_allocator_state(alloc.generations.clone(), alloc.free_list.clone());
-    }
-
-    for (sig, sig_pages) in by_sig {
-        let comp_ids: Vec<ComponentId> = sig
+    for (sig, columns) in &by_sig {
+        // Resolve (comp_id, name) and sort by comp_id — the canonical archetype
+        // key and the order import_page expects its columns in.
+        let mut comp_pairs: Vec<(ComponentId, &String)> = sig
             .iter()
             .map(|name| {
                 name_to_id
                     .get(name)
                     .copied()
+                    .map(|id| (id, name))
                     .ok_or_else(|| LsmError::Format(format!("unregistered component {name}")))
             })
             .collect::<Result<_, _>>()?;
+        comp_pairs.sort_by_key(|(id, _)| *id);
+        let comp_ids: Vec<ComponentId> = comp_pairs.iter().map(|(id, _)| *id).collect();
 
-        let max_row = sig_pages
-            .iter()
-            .filter(|((slot, _), _)| *slot == ENTITY_SLOT)
-            .map(|((_, page_index), stored)| {
-                *page_index as usize * PAGE_SIZE + stored.row_count as usize
-            })
-            .max()
-            .unwrap_or(0);
+        let target = world
+            .import_target(&comp_ids)
+            .map_err(|e| LsmError::Format(format!("import_target failed for {sig:?}: {e}")))?;
 
-        for row in 0..max_row {
-            let page_index = (row / PAGE_SIZE) as u16;
-            let row_in_page = row % PAGE_SIZE;
+        let entity_pages = columns
+            .get(&ColumnKey::Entity)
+            .ok_or_else(|| LsmError::Format(format!("archetype {sig:?} has no entity pages")))?;
 
-            let entity_page = sig_pages.get(&(ENTITY_SLOT, page_index)).ok_or_else(|| {
-                LsmError::Format("missing entity page during recovery".to_owned())
-            })?;
-            if row_in_page >= entity_page.row_count as usize {
-                continue;
+        for (&page_index, entity_page) in entity_pages {
+            let row_count = entity_page.row_count as usize;
+
+            let mut entities: Vec<Entity> = Vec::with_capacity(row_count);
+            for chunk in entity_page.data.chunks_exact(8).take(row_count) {
+                entities.push(Entity::from_bits(u64::from_le_bytes(
+                    chunk.try_into().expect("8 bytes"),
+                )));
             }
-            let entity_offset = row_in_page * 8;
-            let entity_bits = u64::from_le_bytes(
-                entity_page.data[entity_offset..entity_offset + 8]
-                    .try_into()
-                    .expect("8 bytes"),
-            );
-            let entity = Entity::from_bits(entity_bits);
 
-            let mut raw_components: Vec<(ComponentId, Vec<u8>, Layout)> = Vec::new();
-            for (slot_idx, comp_name) in sig.iter().enumerate() {
-                let slot = slot_idx as u16;
-                let comp_id = comp_ids[slot_idx];
-                let (size, align) = component_layouts[comp_name];
-                let layout = Layout::from_size_align(size, align).map_err(|_| {
-                    LsmError::Format(format!("invalid layout for component {comp_name}"))
-                })?;
-                let col_page_index = (row / PAGE_SIZE) as u16;
-                let col_row_in_page = row % PAGE_SIZE;
-                let col_page = sig_pages.get(&(slot, col_page_index)).ok_or_else(|| {
+            let mut col_slices: Vec<&[u8]> = Vec::with_capacity(comp_pairs.len());
+            for (_, name) in &comp_pairs {
+                let col_pages = columns
+                    .get(&ColumnKey::Component((*name).clone()))
+                    .ok_or_else(|| {
+                        LsmError::Format(format!("archetype {sig:?} missing column {name}"))
+                    })?;
+                let page = col_pages.get(&page_index).ok_or_else(|| {
                     LsmError::Format(format!(
-                        "missing component page slot={slot} page_index={col_page_index}"
+                        "archetype {sig:?} column {name} missing page {page_index}"
                     ))
                 })?;
-                if col_row_in_page >= col_page.row_count as usize {
-                    return Err(LsmError::Format(
-                        "component page shorter than entity page".to_owned(),
-                    ));
+                if page.row_count as usize != row_count {
+                    return Err(LsmError::Format(format!(
+                        "archetype {sig:?} column {name} page {page_index} has {} rows, \
+                         entity page has {row_count}",
+                        page.row_count
+                    )));
                 }
-                let item_size = layout.size();
-                let offset = col_row_in_page * item_size;
-                let end = offset + item_size;
-                raw_components.push((comp_id, col_page.data[offset..end].to_vec(), layout));
+                col_slices.push(&page.data);
             }
 
-            let ptrs: Vec<_> = raw_components
-                .iter()
-                .map(|(id, raw, layout)| (*id, raw.as_ptr(), *layout))
-                .collect();
-            changeset.record_spawn(entity, &ptrs);
+            let import_page = target.page(&entities, &col_slices).map_err(|e| {
+                LsmError::Format(format!("import page build failed for {sig:?}: {e}"))
+            })?;
+            // SAFETY: each column slice is the native byte image of a raw-copyable
+            // component (enforced at codec registration); the source pages passed
+            // per-page CRC validation on read; every entity is alive per the
+            // allocator state restored above.
+            unsafe {
+                world.import_page(&import_page).map_err(|e| {
+                    LsmError::Format(format!("import_page failed for {sig:?}: {e}"))
+                })?;
+            }
         }
     }
-
-    changeset
-        .apply(&mut world)
-        .map_err(|e| LsmError::Format(format!("recovery changeset apply failed: {e}")))?;
-
-    reconcile_allocator(&mut world, allocator);
 
     Ok(world)
 }
@@ -414,29 +452,6 @@ fn apply_sparse(
     Ok(())
 }
 
-fn reconcile_allocator(world: &mut World, stored: Option<&StoredAllocator>) {
-    let mut max_index = 0u32;
-    for arch_idx in 0..world.archetype_count() {
-        for &entity in world.archetype_entities(arch_idx) {
-            max_index = max_index.max(entity.index());
-        }
-    }
-
-    let mut generations = stored.map(|a| a.generations.clone()).unwrap_or_default();
-    if generations.len() <= max_index as usize {
-        generations.resize(max_index as usize + 1, 0);
-    }
-
-    for arch_idx in 0..world.archetype_count() {
-        for &entity in world.archetype_entities(arch_idx) {
-            generations[entity.index() as usize] = entity.generation();
-        }
-    }
-
-    let free_list = stored.map(|a| a.free_list.clone()).unwrap_or_default();
-    world.restore_allocator_state(generations, free_list);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +461,55 @@ mod tests {
     use crate::manifest_ops::flush_and_record;
     use crate::types::{SeqNo, SeqRange};
     use rkyv::{Archive, Deserialize, Serialize};
+
+    /// codex #4 regression: a multi-archetype world where one archetype omits a
+    /// component that name-sorts before one it has. The pre-rewrite
+    /// materialize_world keyed columns by signature *position*, so the
+    /// `{z_comp}`-only archetype read its column at position 0 (a_comp's slot) →
+    /// "missing component page slot=0" / corruption. Name-keyed reconstruction
+    /// restores both archetypes correctly.
+    #[test]
+    fn recover_multi_archetype_nonuniform_components() {
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct AComp(u32);
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct ZComp(u64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<AComp>("a_comp", &mut world).unwrap();
+        codecs.register_as::<ZComp>("z_comp", &mut world).unwrap();
+
+        let both = world.spawn((AComp(10), ZComp(20)));
+        let zonly = world.spawn((ZComp(99),));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        assert_eq!(recovered.get::<AComp>(both).copied(), Some(AComp(10)));
+        assert_eq!(recovered.get::<ZComp>(both).copied(), Some(ZComp(20)));
+        assert_eq!(recovered.get::<ZComp>(zonly).copied(), Some(ZComp(99)));
+        assert_eq!(recovered.get::<AComp>(zonly), None);
+    }
 
     #[test]
     fn recover_restores_sparse_components() {
@@ -1234,5 +1298,74 @@ mod tests {
         let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
         let recovered = result.world;
         assert_eq!(recovered.get::<Tag2>(e).copied(), Some(Tag2(999)));
+    }
+
+    /// Multi-page extension of the codex #4 regression: both a two-component
+    /// archetype and a one-component (name-sorted-later) archetype span several
+    /// pages. Exercises the per-`page_index` column reassembly in the rewritten
+    /// materialize_world across differently-shaped archetypes.
+    #[test]
+    fn recover_multipage_nonuniform_archetypes() {
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct AComp(u32);
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct ZComp(u64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<AComp>("a_comp", &mut world).unwrap();
+        codecs.register_as::<ZComp>("z_comp", &mut world).unwrap();
+
+        // N = 522 > 2 * PAGE_SIZE (2 * 256 = 512), so each archetype spans 3+ pages.
+        let n: u32 = 522;
+        let mut both_entities = Vec::new();
+        let mut z_entities = Vec::new();
+        for i in 0..n {
+            both_entities.push(world.spawn((AComp(i), ZComp(i as u64 + 1000))));
+        }
+        for i in 0..n {
+            z_entities.push(world.spawn((ZComp(i as u64 + 5000),)));
+        }
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let mut recovered = result.world;
+
+        // Spot-check entities from the first, middle, and last pages of each archetype.
+        for &i in &[0u32, 1, n / 2, n - 2, n - 1] {
+            let be = both_entities[i as usize];
+            assert_eq!(recovered.get::<AComp>(be).copied(), Some(AComp(i)));
+            assert_eq!(
+                recovered.get::<ZComp>(be).copied(),
+                Some(ZComp(i as u64 + 1000))
+            );
+
+            let ze = z_entities[i as usize];
+            assert_eq!(
+                recovered.get::<ZComp>(ze).copied(),
+                Some(ZComp(i as u64 + 5000))
+            );
+            assert_eq!(recovered.get::<AComp>(ze), None);
+        }
+        assert_eq!(recovered.query::<(&AComp,)>().count(), n as usize);
+        assert_eq!(recovered.query::<(&ZComp,)>().count(), (2 * n) as usize);
     }
 }
