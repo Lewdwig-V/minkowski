@@ -50,6 +50,11 @@ pub fn encode(name: &str, entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
 pub fn decode(bytes: &[u8]) -> Result<DecodedSparse, LsmError> {
     let mut pos = 0usize;
     let name_len = read_u32(bytes, &mut pos)? as usize;
+    if name_len == 0 {
+        return Err(LsmError::Format(
+            "sparse_page: component name is empty".to_owned(),
+        ));
+    }
     let name_end = pos
         .checked_add(name_len)
         .filter(|&e| e <= bytes.len())

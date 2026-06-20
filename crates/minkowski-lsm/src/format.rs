@@ -15,9 +15,12 @@ pub const META_ARCH_ID: u16 = 0xFFFF;
 pub const ALLOCATOR_SLOT: u16 = 0xFFFE;
 
 /// Special `arch_id` for sparse-component baseline pages. Pages keyed
-/// `(SPARSE_ARCH_ID, component_schema_slot, page_index)` hold a chunk of a
-/// length-prefixed sparse blob (see `sparse_page`). Distinct from
-/// `META_ARCH_ID` (0xFFFF) and the allocator (which lives under META_ARCH_ID).
+/// `(SPARSE_ARCH_ID, grouping_slot, page_index)` hold a chunk of a
+/// length-prefixed, self-describing sparse blob (see `sparse_page`). The
+/// `grouping_slot` is the blob's position in name-sorted order within a single
+/// run — it is NOT a schema slot and has no cross-run meaning; the component
+/// name lives in the blob. Distinct from `META_ARCH_ID` (0xFFFF) and the
+/// allocator (which lives under META_ARCH_ID).
 pub const SPARSE_ARCH_ID: u16 = 0xFFFD;
 
 /// Number of rows per page — re-exported from the minkowski crate for
@@ -86,7 +89,10 @@ impl Header {
 pub struct PageHeader {
     /// Archetype index within this run.
     pub arch_id: u16,
-    /// Component slot within the archetype, or [`ENTITY_SLOT`].
+    /// Component slot within the archetype, or [`ENTITY_SLOT`]. When
+    /// `arch_id == SPARSE_ARCH_ID` this is a per-run grouping index (the
+    /// name-sort rank of the sparse component), not a schema slot; when
+    /// `slot == ALLOCATOR_SLOT` the page holds allocator metadata bytes.
     pub slot: u16,
     /// Which page of the column (0-based).
     pub page_index: u16,

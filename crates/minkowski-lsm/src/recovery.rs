@@ -49,7 +49,8 @@ struct StoredAllocator {
 
 struct StoredSparse {
     seq_hi: u64,
-    /// (component stable name, entries) resolved against the winning run's schema.
+    /// (component stable name, entries). The name is decoded directly from each
+    /// self-describing blob — the run's schema is never consulted for sparse.
     components: Vec<(String, SparseEntries)>,
 }
 
@@ -395,8 +396,18 @@ fn apply_sparse(
             ))
         })?;
         for (entity_bits, value) in entries {
+            let entity = Entity::from_bits(*entity_bits);
+            // Defense-in-depth: only restore sparse for entities that are alive
+            // in the materialized world. A blob entry was live at flush time, so
+            // co-located allocator state normally keeps it alive here — but
+            // guarding against any despawn-cleanup gap or allocator/sparse
+            // selection divergence prevents inserting a phantom entry under a
+            // dead (index, generation). Generation match is the source of truth.
+            if !world.is_alive(entity) {
+                continue;
+            }
             codecs
-                .insert_sparse_raw(comp_id, world, Entity::from_bits(*entity_bits), value)
+                .insert_sparse_raw(comp_id, world, entity, value)
                 .map_err(|e| LsmError::Format(format!("sparse restore failed for {name}: {e}")))?;
         }
     }
@@ -483,6 +494,62 @@ mod tests {
 
         assert_eq!(recovered.get::<Tag>(e1).copied(), Some(Tag(111)));
         assert_eq!(recovered.get::<Tag>(e2).copied(), Some(Tag(222)));
+        // The archetype component must survive alongside the sparse one — the
+        // sparse-restore path overlays onto already-materialized entities.
+        assert_eq!(recovered.get::<SparsePos>(e1).map(|p| p.x), Some(1.0));
+        assert_eq!(recovered.get::<SparsePos>(e2).map(|p| p.x), Some(3.0));
+    }
+
+    /// Two distinct sparse component types in a single flush must both round-trip
+    /// — they occupy grouping slots 0 and 1 (name-sorted) under SPARSE_ARCH_ID
+    /// and decode independently.
+    #[test]
+    fn recover_restores_two_sparse_component_types() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct PosI {
+            x: f32,
+            y: f32,
+        }
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct TagA(u32);
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct TagB(u64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<PosI>("pos_i", &mut world).unwrap();
+        codecs.register_as::<TagA>("tag_a", &mut world).unwrap();
+        codecs.register_as::<TagB>("tag_b", &mut world).unwrap();
+
+        let e = world.spawn((PosI { x: 1.0, y: 1.0 },));
+        world.insert_sparse::<TagA>(e, TagA(10));
+        world.insert_sparse::<TagB>(e, TagB(20));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        assert_eq!(recovered.get::<TagA>(e).copied(), Some(TagA(10)));
+        assert_eq!(recovered.get::<TagB>(e).copied(), Some(TagB(20)));
     }
 
     #[derive(Clone, Copy, Archive, Serialize, Deserialize)]

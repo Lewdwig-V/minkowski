@@ -44,10 +44,11 @@ fn to_u16(value: usize, label: &str) -> Result<u16, LsmError> {
 /// on recovery, so we refuse to write it rather than lose data.
 fn arch_id_to_u16(value: usize) -> Result<u16, LsmError> {
     let id = to_u16(value, "arch_idx")?;
-    // META_ARCH_ID is u16::MAX, so it is the only reserved arch_id value.
-    if id == META_ARCH_ID {
+    // Reserved sentinels (META_ARCH_ID = 0xFFFF, SPARSE_ARCH_ID = 0xFFFD) must
+    // never be a real archetype id, or recovery would misclassify the pages.
+    if id == META_ARCH_ID || id == SPARSE_ARCH_ID {
         return Err(LsmError::Format(format!(
-            "arch_idx {value} collides with reserved META_ARCH_ID"
+            "arch_idx {value} collides with a reserved arch_id sentinel"
         )));
     }
     Ok(id)
@@ -116,8 +117,16 @@ pub fn flush_observed(
     }
     let mut sparse_blobs: Vec<SparseBlob> = Vec::new();
     for comp_id in world.sparse_component_ids() {
-        // Skip sparse components with no codec — they cannot be serialized.
         if !codecs.has_codec(comp_id) {
+            // A sparse component with storage but no codec cannot be serialized
+            // to the baseline. Warn loudly rather than drop silently — if it
+            // holds live entries they will not survive recovery. The fix is to
+            // register the component via CodecRegistry before persisting.
+            let name = world.component_name(comp_id).unwrap_or("<unknown>");
+            eprintln!(
+                "warning: sparse component '{name}' (id={comp_id}) has no registered codec; \
+                 its data will NOT be persisted to the LSM baseline"
+            );
             continue;
         }
         let entries = codecs
@@ -138,9 +147,11 @@ pub fn flush_observed(
     // Deterministic order so a grouping-slot index is stable across identical
     // flushes (the slot is purely a per-run page grouping key).
     sparse_blobs.sort_by(|a, b| a.name.cmp(&b.name));
+    // Each blob is non-empty (it always carries at least a name + count header),
+    // so `div_ceil` yields ≥ 1 page per component.
     let sparse_page_count: usize = sparse_blobs
         .iter()
-        .map(|s| s.blob.len().div_ceil(ALLOCATOR_PAGE_MAX_BYTES).max(1))
+        .map(|s| s.blob.len().div_ceil(ALLOCATOR_PAGE_MAX_BYTES))
         .sum();
 
     // ── 2. Early return if nothing dirty ────────────────────────────────────
@@ -468,6 +479,15 @@ pub fn flush_observed(
             });
         }
     }
+
+    // Bypass-path integrity: the header's `page_count` must equal the number of
+    // pages actually written (one index entry per page). A mismatch corrupts the
+    // file (the reader trusts `page_count`), so assert it in release builds.
+    assert_eq!(
+        index_entries.len(),
+        page_count,
+        "page_count header must match the number of pages written"
+    );
 
     // (e) Sparse index — sort by (arch_id, slot, page_index) so the reader
     //     can binary-search.  Component pages are already sorted by their

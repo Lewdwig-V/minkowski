@@ -578,6 +578,13 @@ impl<'a> CompactionWriter<'a> {
 
         // ── 8c. Carry forward sparse baseline pages (verbatim) ───────────────
         for (slot, page_index, payload) in &sparse_carry {
+            // Each payload came from a source page whose row_count is a u16, so
+            // it is ≤ u16::MAX; assert it before the narrowing cast below.
+            debug_assert!(
+                u16::try_from(payload.len()).is_ok(),
+                "sparse carry payload {} exceeds u16::MAX",
+                payload.len()
+            );
             let page_crc = crc32fast::hash(payload);
             let file_offset = w.stream_position()?;
             let ph = PageHeader {
