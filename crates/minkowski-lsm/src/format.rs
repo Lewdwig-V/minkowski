@@ -14,6 +14,12 @@ pub const META_ARCH_ID: u16 = 0xFFFF;
 /// Special `slot` for entity-allocator state pages (`generations` + `free_list`).
 pub const ALLOCATOR_SLOT: u16 = 0xFFFE;
 
+/// Special `arch_id` for sparse-component baseline pages. Pages keyed
+/// `(SPARSE_ARCH_ID, component_schema_slot, page_index)` hold a chunk of a
+/// length-prefixed sparse blob (see `sparse_page`). Distinct from
+/// `META_ARCH_ID` (0xFFFF) and the allocator (which lives under META_ARCH_ID).
+pub const SPARSE_ARCH_ID: u16 = 0xFFFD;
+
 /// Number of rows per page — re-exported from the minkowski crate for
 /// convenience so callers do not need to depend on both crates.
 pub const PAGE_SIZE: usize = minkowski::PAGE_SIZE;
