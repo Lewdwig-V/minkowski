@@ -295,7 +295,14 @@ impl SortedRunReader {
     /// fast path (direct memcpy, skipping rkyv bytecheck). The CRC covers
     /// `row_count * item_size` bytes — the actual data, not zero-padding.
     pub fn validate_page_crc(&self, page: &PageRef<'_>) -> Result<CrcProof, LsmError> {
-        let item_size = self.item_size_for_slot(page.header().slot)?;
+        // Sparse pages store `chunk.len()` in `row_count` (byte count, not row
+        // count), so item_size is always 1. This mirrors `page_ref_at`'s
+        // `data_len` special-case for `SPARSE_ARCH_ID`.
+        let item_size = if page.header().arch_id == crate::format::SPARSE_ARCH_ID {
+            1
+        } else {
+            self.item_size_for_slot(page.header().slot)?
+        };
         let actual_len = page.header().row_count as usize * item_size;
         let payload = &page.data()[..actual_len];
 
