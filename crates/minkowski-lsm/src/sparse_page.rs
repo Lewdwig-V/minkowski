@@ -65,7 +65,15 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedSparse, LsmError> {
     pos = name_end;
 
     let count = read_u32(bytes, &mut pos)? as usize;
-    let mut entries = Vec::with_capacity(count);
+    // Cap the pre-allocation against the remaining bytes to avoid an OOM
+    // panic on a corrupt or attacker-crafted blob with a huge `count`. Each
+    // entry is at least 8 (entity_bits) + 4 (value_len) + 0 (empty value) =
+    // 12 bytes, so `remaining / 12` is an upper bound on the number of
+    // complete entries that could possibly follow. The loop's per-entry
+    // truncation check still fires on a short body; this just prevents the
+    // `Vec::with_capacity(count)` from requesting ~96 GB for count=u32::MAX.
+    let max_entries = (bytes.len() - pos) / 12;
+    let mut entries = Vec::with_capacity(count.min(max_entries));
     for _ in 0..count {
         let entity_bits = read_u64(bytes, &mut pos)?;
         let value_len = read_u32(bytes, &mut pos)? as usize;
@@ -141,5 +149,27 @@ mod tests {
         let mut blob = encode("c", &[(1u64, vec![1, 2, 3])]);
         blob.push(0xAB);
         assert!(decode(&blob).is_err());
+    }
+
+    /// A corrupt or attacker-crafted blob with `count = u32::MAX` must NOT
+    /// trigger an OOM panic in `Vec::with_capacity`. The pre-allocation is
+    /// capped against the remaining bytes (min entry = 12 bytes), so the loop
+    /// runs at most `remaining / 12` iterations before hitting the truncation
+    /// check and returning `Err`.
+    #[test]
+    fn decode_huge_count_does_not_oom() {
+        // Hand-craft: name_len=1, name="c", count=0xFFFF_FFFF, then a short body
+        // (no real entries). Without the cap this would attempt
+        // Vec::with_capacity(4_294_967_295) → OOM panic.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes()); // name_len
+        blob.extend_from_slice(b"c");
+        blob.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // count
+        blob.extend_from_slice(&[0u8; 8]); // a few trailing bytes, far short of 4B entries
+        let result = decode(&blob);
+        assert!(
+            result.is_err(),
+            "a huge count with a short body must error, not OOM"
+        );
     }
 }

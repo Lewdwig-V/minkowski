@@ -266,10 +266,22 @@ fn resolve_schema_component(
         .find(|&id| world.component_name(id).is_some_and(|n| n == schema_name))
 }
 
-/// Build the entity-allocator state for recovery. Starts from the persisted
-/// allocator (authoritative for free slots and recycled generations) and
-/// overlays the generation of every entity that appears on disk, so each
-/// imported entity is alive before `import_page` checks `is_alive`.
+/// Build the entity-allocator state for recovery.
+///
+/// When a persisted allocator (`stored`) is available it is AUTHORITATIVE — it
+/// was written by the newest run and carries the free list plus the bumped
+/// generations of every despawned entity. We return it verbatim. On-disk
+/// entity pages may carry stale (older-generation) rows from runs that wrote
+/// them when those entities were still alive; if we overlaid those generations
+/// unconditionally we would downgrade the persisted allocator's dead generations
+/// back to alive, resurrecting despawned entities. The dead-row filter in
+/// `materialize_world` drops those stale rows against the authoritative
+/// allocator instead.
+///
+/// When `stored` is `None` (no run has allocator metadata — e.g. a run written
+/// before allocator persistence was wired), we rebuild generations from the
+/// on-disk entity pages. This path cannot detect despawns that happened before
+/// the flush, so it is only a fallback; the normal path always has `stored`.
 fn build_allocator_state(
     by_sig: &BTreeMap<ArchetypeSig, BTreeMap<ColumnKey, BTreeMap<u16, StoredPage>>>,
     stored: Option<&StoredAllocator>,
@@ -277,17 +289,23 @@ fn build_allocator_state(
     let mut generations = stored.map(|a| a.generations.clone()).unwrap_or_default();
     let free_list = stored.map(|a| a.free_list.clone()).unwrap_or_default();
 
-    for columns in by_sig.values() {
-        if let Some(entity_pages) = columns.get(&ColumnKey::Entity) {
-            for page in entity_pages.values() {
-                for chunk in page.data.chunks_exact(8).take(page.row_count as usize) {
-                    let entity =
-                        Entity::from_bits(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
-                    let idx = entity.index() as usize;
-                    if generations.len() <= idx {
-                        generations.resize(idx + 1, 0);
+    // Only overlay on-disk generations when there is no persisted allocator.
+    // With a persisted allocator this loop is skipped — the allocator is the
+    // single source of truth for alive/dead state.
+    if stored.is_none() {
+        for columns in by_sig.values() {
+            if let Some(entity_pages) = columns.get(&ColumnKey::Entity) {
+                for page in entity_pages.values() {
+                    for chunk in page.data.chunks_exact(8).take(page.row_count as usize) {
+                        let entity = Entity::from_bits(u64::from_le_bytes(
+                            chunk.try_into().expect("8 bytes"),
+                        ));
+                        let idx = entity.index() as usize;
+                        if generations.len() <= idx {
+                            generations.resize(idx + 1, 0);
+                        }
+                        generations[idx] = entity.generation();
                     }
-                    generations[idx] = entity.generation();
                 }
             }
         }
@@ -319,6 +337,15 @@ fn materialize_world(
                     "invalid layout for component {name}: size={size}, align={align}"
                 ))
             })?;
+            // Intentional leak: World::register_component_raw requires a
+            // &'static str for the component name. We leak one Box<str> per
+            // on-disk component that has no registered codec. The volume is
+            // bounded by the component type count (not the entity count), and
+            // recovery runs once per process lifetime, so this does not grow
+            // unbounded. Re-running recovery for the same component would leak
+            // a second copy; if that matters, intern names in a static
+            // registry keyed by name. For now the leak is the documented cost
+            // of recovering a codecless component.
             let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
             world.register_component_raw(leaked, layout)
         };
@@ -366,45 +393,140 @@ fn materialize_world(
             .get(&ColumnKey::Entity)
             .ok_or_else(|| LsmError::Format(format!("archetype {sig:?} has no entity pages")))?;
 
+        // Pre-resolve the per-column item size for this archetype's components,
+        // used to slice column bytes when compacting a page down to its live
+        // rows. `component_layouts` was built from the on-disk schema entries
+        // and is keyed by component name.
+        let item_sizes: Vec<usize> = comp_pairs
+            .iter()
+            .map(|(_, name)| component_layouts.get(*name).map_or(0, |(size, _)| *size))
+            .collect();
+
         for (&page_index, entity_page) in entity_pages {
             let row_count = entity_page.row_count as usize;
 
-            let mut entities: Vec<Entity> = Vec::with_capacity(row_count);
+            // Read the raw entity handles for this page.
+            let mut page_entities: Vec<Entity> = Vec::with_capacity(row_count);
             for chunk in entity_page.data.chunks_exact(8).take(row_count) {
-                entities.push(Entity::from_bits(u64::from_le_bytes(
+                page_entities.push(Entity::from_bits(u64::from_le_bytes(
                     chunk.try_into().expect("8 bytes"),
                 )));
             }
 
-            let mut col_slices: Vec<&[u8]> = Vec::with_capacity(comp_pairs.len());
-            for (_, name) in &comp_pairs {
-                let col_pages = columns
-                    .get(&ColumnKey::Component((*name).clone()))
-                    .ok_or_else(|| {
-                        LsmError::Format(format!("archetype {sig:?} missing column {name}"))
-                    })?;
-                let page = col_pages.get(&page_index).ok_or_else(|| {
-                    LsmError::Format(format!(
-                        "archetype {sig:?} column {name} missing page {page_index}"
-                    ))
-                })?;
-                if page.row_count as usize != row_count {
-                    return Err(LsmError::Format(format!(
-                        "archetype {sig:?} column {name} page {page_index} has {} rows, \
-                         entity page has {row_count}",
-                        page.row_count
-                    )));
+            // Dead-row filter: the persisted allocator is authoritative for
+            // alive/dead state. A stale page from an older run may carry
+            // entities that were alive when that run was written but have since
+            // been despawned (their generations were bumped). Importing them
+            // would resurrect despawned entities with stale component bytes and
+            // collide with survivors already imported from a newer page. Drop
+            // any entity whose current generation in the restored allocator
+            // does not match the on-disk handle's generation, OR that has
+            // already been placed by an earlier page in this recovery (a
+            // survivor that appears on both the newer page and a stale
+            // higher-index page from an older run — `store_page` keeps both
+            // because their page_index keys differ).
+            //
+            // Page iteration order (BTreeMap ascending by page_index) processes
+            // lower-index pages first. Because `swap_remove` only moves a
+            // survivor to a lower-or-equal row, the newer run places a survivor
+            // at a page_index <= the stale page's index, so the newer page is
+            // always seen first and the survivor is imported with current bytes;
+            // the stale page then skips it as already-placed.
+            let mut live_mask: Vec<bool> = Vec::with_capacity(row_count);
+            let mut live_count = 0usize;
+            for &e in &page_entities {
+                let alive = world.is_alive(e) && !world.is_placed(e);
+                live_mask.push(alive);
+                if alive {
+                    live_count += 1;
                 }
-                col_slices.push(&page.data);
+            }
+            if live_count == 0 {
+                continue;
             }
 
-            let import_page = target.page(&entities, &col_slices).map_err(|e| {
+            // Fast path: every entity on the page is alive — use the contiguous
+            // column slices directly, no copy.
+            let (entities, col_slices): (Vec<Entity>, Vec<Vec<u8>>) = if live_count == row_count {
+                let cols: Vec<Vec<u8>> = comp_pairs
+                    .iter()
+                    .map(|(_, name)| {
+                        let col_pages = columns
+                            .get(&ColumnKey::Component((*name).clone()))
+                            .ok_or_else(|| {
+                                LsmError::Format(format!("archetype {sig:?} missing column {name}"))
+                            })?;
+                        let page = col_pages.get(&page_index).ok_or_else(|| {
+                            LsmError::Format(format!(
+                                "archetype {sig:?} column {name} missing page {page_index}"
+                            ))
+                        })?;
+                        if page.row_count as usize != row_count {
+                            return Err(LsmError::Format(format!(
+                                "archetype {sig:?} column {name} page {page_index} has {} rows, \
+                                 entity page has {row_count}",
+                                page.row_count
+                            )));
+                        }
+                        Ok(page.data.clone())
+                    })
+                    .collect::<Result<_, _>>()?;
+                (page_entities.clone(), cols)
+            } else {
+                // Slow path: compact the page down to its live rows. Rebuild
+                // the entity Vec and each column's byte buffer with only the
+                // rows whose entity is alive, so `import_page` sees a
+                // consistent (entities, columns) pair with no dead rows.
+                let mut live_entities = Vec::with_capacity(live_count);
+                for (&e, &alive) in page_entities.iter().zip(live_mask.iter()) {
+                    if alive {
+                        live_entities.push(e);
+                    }
+                }
+                let mut live_cols: Vec<Vec<u8>> = Vec::with_capacity(comp_pairs.len());
+                for (i, (_, name)) in comp_pairs.iter().enumerate() {
+                    let col_pages = columns
+                        .get(&ColumnKey::Component((*name).clone()))
+                        .ok_or_else(|| {
+                            LsmError::Format(format!("archetype {sig:?} missing column {name}"))
+                        })?;
+                    let page = col_pages.get(&page_index).ok_or_else(|| {
+                        LsmError::Format(format!(
+                            "archetype {sig:?} column {name} missing page {page_index}"
+                        ))
+                    })?;
+                    if page.row_count as usize != row_count {
+                        return Err(LsmError::Format(format!(
+                            "archetype {sig:?} column {name} page {page_index} has {} rows, \
+                             entity page has {row_count}",
+                            page.row_count
+                        )));
+                    }
+                    let item_size = item_sizes[i];
+                    let mut buf =
+                        Vec::with_capacity(live_count.checked_mul(item_size).unwrap_or(0));
+                    for (row, &alive) in live_mask.iter().enumerate() {
+                        if alive {
+                            let start = row * item_size;
+                            let end = start + item_size;
+                            buf.extend_from_slice(&page.data[start..end]);
+                        }
+                    }
+                    live_cols.push(buf);
+                }
+                (live_entities, live_cols)
+            };
+
+            // Borrow the column bytes back as slices for `ImportPage::page`.
+            let col_refs: Vec<&[u8]> = col_slices.iter().map(Vec::as_slice).collect();
+            let import_page = target.page(&entities, &col_refs).map_err(|e| {
                 LsmError::Format(format!("import page build failed for {sig:?}: {e}"))
             })?;
             // SAFETY: each column slice is the native byte image of a raw-copyable
             // component (enforced at codec registration); the source pages passed
-            // per-page CRC validation on read; every entity is alive per the
-            // allocator state restored above.
+            // per-page CRC validation on read; every entity in `entities` is
+            // alive per the allocator state restored above (dead rows were
+            // filtered out).
             unsafe {
                 world.import_page(&import_page).map_err(|e| {
                     LsmError::Format(format!("import_page failed for {sig:?}: {e}"))
@@ -1367,5 +1489,239 @@ mod tests {
         }
         assert_eq!(recovered.query::<(&AComp,)>().count(), n as usize);
         assert_eq!(recovered.query::<(&ZComp,)>().count(), (2 * n) as usize);
+    }
+
+    /// HIGH finding regression: when an archetype shrinks across flushes (despawns
+    /// reduce the row count so the highest page is skipped by `flush` because
+    /// `row_count == 0`), the stale higher-index pages from the older run survive
+    /// on disk. Without the fix, `build_allocator_state` overwrites the
+    /// authoritative persisted allocator's bumped (dead) generations with the
+    /// stale on-disk (alive) generations, so `import_page` resurrects the
+    /// despawned entities with their pre-despawn component bytes.
+    ///
+    /// This test must FAIL on the unfixed code (resurrected entities appear alive
+    /// and the recovered count is too high) and PASS after the fix (persisted
+    /// allocator is the single source of truth; stale rows are dropped).
+    #[test]
+    fn recover_archetype_shrink_does_not_resurrect_dead_entities() {
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct ShrinkPos {
+            x: f32,
+            y: f32,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<ShrinkPos>("shrink_pos", &mut world)
+            .unwrap();
+
+        // 600 entities → 3 pages of 256 (pages 0, 1, 2).
+        let n_spawn: u32 = 600;
+        let mut all = Vec::with_capacity(n_spawn as usize);
+        for i in 0..n_spawn {
+            all.push(world.spawn((ShrinkPos {
+                x: i as f32,
+                y: 0.0,
+            },)));
+        }
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        // Flush 1: writes pages 0, 1, 2 (seq_hi = 5).
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(5u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush 1");
+
+        // Despawn 500 entities → archetype shrinks to 100 rows (1 page).
+        // swap_remove touches rows on pages 1 and 2 (marking them dirty), but
+        // at flush time `arch_len <= start_row` so those pages are skipped
+        // (row_count == 0 → continue). Only page 0 is rewritten.
+        let to_despawn: Vec<Entity> = all[..500].to_vec();
+        for e in &to_despawn {
+            world.despawn(*e);
+        }
+        let survivors: Vec<Entity> = all[500..].to_vec();
+        assert_eq!(world.query::<(&ShrinkPos,)>().count(), 100);
+
+        // Capture the authoritative allocator state after despawns.
+        let (gen_before, free_before) = {
+            let (g, f) = world.entity_allocator_state();
+            (g.to_vec(), f.to_vec())
+        };
+        assert!(
+            !free_before.is_empty(),
+            "despawns must populate the free list"
+        );
+
+        // Flush 2: writes only page 0 (seq_hi = 10). Pages 1, 2 from flush 1
+        // remain on disk verbatim — the stale entity generations they carry
+        // are the resurrection vector.
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(5u64), SeqNo::from(10u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush 2");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let mut recovered = result.world;
+
+        // Exact entity count: 100 survivors, zero resurrected.
+        assert_eq!(
+            recovered.query::<(&ShrinkPos,)>().count(),
+            100,
+            "despawned entities must not be resurrected by stale pages"
+        );
+
+        // Every despawned entity must be dead and have no component.
+        for e in &to_despawn {
+            assert!(
+                !recovered.is_alive(*e),
+                "despawned entity {e:?} resurrected (alive after recovery)"
+            );
+            assert!(
+                recovered.get::<ShrinkPos>(*e).is_none(),
+                "despawned entity {e:?} has a component after recovery"
+            );
+        }
+
+        // Every survivor must retain its original component value.
+        for (i, &e) in survivors.iter().enumerate() {
+            assert_eq!(
+                recovered.get::<ShrinkPos>(e).copied(),
+                Some(ShrinkPos {
+                    x: (500 + i) as f32,
+                    y: 0.0,
+                }),
+                "survivor {e:?} component corrupted"
+            );
+        }
+
+        // The free list and generations must match the authoritative allocator
+        // state captured before flush 2 — stale on-disk generations must not
+        // downgrade the persisted allocator.
+        let (gen_after, free_after) = recovered.entity_allocator_state();
+        assert_eq!(
+            free_after, free_before,
+            "free list must match the persisted allocator, not be rebuilt from stale rows"
+        );
+        assert_eq!(
+            gen_after, gen_before,
+            "generations must match the persisted allocator, not be downgraded by stale rows"
+        );
+    }
+
+    /// Variant: shrink the archetype AND compact the runs away, then recover.
+    /// Covers the compaction carry-forward interaction with the dead-row filter:
+    /// compaction may carry stale entity pages forward verbatim, so the
+    /// recovery-side filter is the only safety net.
+    #[test]
+    fn recover_archetype_shrink_survives_compaction() {
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct ShrinkPos2 {
+            x: f32,
+            y: f32,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<ShrinkPos2>("shrink_pos2", &mut world)
+            .unwrap();
+
+        let mut all = Vec::new();
+        for i in 0..600u32 {
+            all.push(world.spawn((ShrinkPos2 {
+                x: i as f32,
+                y: 0.0,
+            },)));
+        }
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Flush 1: full 600-entity archetype (3 pages).
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush 1");
+
+        // Despawn 500 → shrink to 100 (1 page).
+        for e in &all[..500] {
+            world.despawn(*e);
+        }
+        let survivors: Vec<Entity> = all[500..].to_vec();
+
+        // Three more dirty flushes to trigger compaction (L0 threshold = 4).
+        // Mutate survivors each time so each flush is non-trivially dirty.
+        for seq in 1..4u64 {
+            for &e in &survivors {
+                let p = world.get_mut::<ShrinkPos2>(e).unwrap();
+                p.y += 1.0;
+            }
+            flush_and_record(
+                &world,
+                SeqRange::new(SeqNo::from(seq), SeqNo::from(seq + 1)).unwrap(),
+                &mut manifest,
+                &mut log,
+                &lsm_dir,
+                &codecs,
+            )
+            .unwrap()
+            .expect("flush");
+        }
+
+        // Compact the L0 runs away — stale pages from flush 1 may be carried
+        // forward by the compactor.
+        let report = compact_one(&mut manifest, &mut log, &lsm_dir).unwrap();
+        assert!(report.is_some(), "4 L0 runs must trigger compaction");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let mut recovered = result.world;
+
+        assert_eq!(
+            recovered.query::<(&ShrinkPos2,)>().count(),
+            100,
+            "despawned entities must not resurrect after compaction"
+        );
+        for e in &all[..500] {
+            assert!(!recovered.is_alive(*e), "despawned {e:?} resurrected");
+        }
+        // Survivors retain the last mutation (y = 3.0).
+        for &e in &survivors {
+            assert_eq!(
+                recovered.get::<ShrinkPos2>(e).map(|p| p.y),
+                Some(3.0),
+                "survivor {e:?} value wrong after compaction"
+            );
+        }
     }
 }

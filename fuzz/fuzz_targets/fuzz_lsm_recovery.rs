@@ -34,6 +34,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let count = (data[0] as usize % 20) + 1;
+    let mut spawned = 0usize;
     for (i, chunk) in data[1..].chunks(4).take(count).enumerate() {
         if chunk.len() < 4 {
             break;
@@ -43,6 +44,14 @@ fuzz_target!(|data: &[u8]| {
             x: f32::from_bits(bits),
             y: i as f32,
         },));
+        spawned += 1;
+    }
+
+    // If no entities were spawned, flush returns None (no dirty pages) and
+    // recovery has no baseline — flush_seq is 0, not seq_hi. There is nothing
+    // to round-trip, so skip the assertions rather than false-positive.
+    if spawned == 0 {
+        return;
     }
 
     let seq_hi = (data.len() as u64).saturating_add(1);
@@ -50,17 +59,18 @@ fuzz_target!(|data: &[u8]| {
         Ok(v) => v,
         Err(_) => return,
     };
-    if flush_and_record(
+    let flush_wrote = match flush_and_record(
         &world,
         SeqRange::new(SeqNo::from(0u64), SeqNo::from(seq_hi)).unwrap(),
         &mut manifest,
         &mut log,
         dir.path(),
-    )
-    .is_err()
-    {
-        return;
-    }
+        &codecs,
+    ) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => return,
+    };
 
     // Capture the source set (bit patterns: exact + NaN-safe) before recovery.
     let mut expected: Vec<u32> = world
@@ -74,7 +84,13 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return,
     };
 
-    assert_eq!(result.flush_seq, seq_hi);
+    // flush_seq matches seq_hi only when a run was actually written. A
+    // spawn-heavy world with no dirty pages (impossible here since we
+    // `spawned > 0` and spawn marks pages dirty) would return None; guard
+    // the assertion for the case where flush returned None for any reason.
+    if flush_wrote {
+        assert_eq!(result.flush_seq, seq_hi);
+    }
 
     // Recovery must reproduce the source world exactly — no dropped entities,
     // no corrupted column bytes.

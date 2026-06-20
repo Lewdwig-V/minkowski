@@ -33,15 +33,40 @@ pub trait CheckpointHandler: Send {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// Monitoring callback fired when a checkpoint flush fails. Receives the
+/// error and runs on the committing thread, inside the checkpoint handler
+/// lock — must be cheap (increment a metric, send a log line) and must not
+/// re-enter `AutoCheckpoint` or the WAL.
+pub type FailureCallback = Box<dyn FnMut(&dyn std::error::Error) + Send + Sync>;
+
 /// Default checkpoint handler: LSM flush of dirty pages + optional compaction.
+///
+/// # Operational monitoring
+/// A flush failure (full disk, bad perms) is non-fatal at the call site — the
+/// transaction is already durable in the WAL — but it means the recovery
+/// baseline is not advancing. Use [`AutoCheckpoint::consecutive_failures`] to
+/// detect sustained degradation, or install an [`AutoCheckpoint::on_failure`]
+/// callback to surface failures to monitoring (metric, log aggregator, alert).
+/// A rising counter signals the WAL is growing unbounded and recovery time is
+/// degrading; sustained failures eventually prevent recovery from completing.
 pub struct AutoCheckpoint {
     lsm_dir: PathBuf,
     manifest: Mutex<DefaultManifest>,
     manifest_log: Mutex<ManifestLog>,
     indexes: Vec<(PathBuf, Arc<Mutex<dyn PersistentIndex>>)>,
+    consecutive_failures: u64,
+    on_failure: Option<FailureCallback>,
 }
 
 impl AutoCheckpoint {
+    /// Create a new auto-checkpoint handler rooted at `lsm_dir`.
+    ///
+    /// # Panics
+    /// Panics if the LSM directory cannot be created or the manifest log
+    /// cannot be recovered. These are non-recoverable operational conditions:
+    /// an unwritable directory or a corrupt manifest log means no checkpoint
+    /// can ever succeed, so the recovery baseline can never advance. Fail fast
+    /// at construction rather than silently degrading on every commit.
     pub fn new(lsm_dir: &Path) -> Self {
         std::fs::create_dir_all(lsm_dir).expect("create LSM directory");
         let manifest_log_path = lsm_dir.join("manifest.log");
@@ -52,6 +77,8 @@ impl AutoCheckpoint {
             manifest: Mutex::new(manifest),
             manifest_log: Mutex::new(log),
             indexes: Vec::new(),
+            consecutive_failures: 0,
+            on_failure: None,
         }
     }
 
@@ -63,6 +90,27 @@ impl AutoCheckpoint {
     /// can always be rebuilt.
     pub fn register_index(&mut self, path: PathBuf, index: Arc<Mutex<dyn PersistentIndex>>) {
         self.indexes.push((path, index));
+    }
+
+    /// Install a callback fired when a checkpoint flush fails. The callback
+    /// receives the error and is invoked on the committing thread, inside the
+    /// checkpoint handler lock — it must be cheap (e.g. increment a metric,
+    /// send a log line) and must not re-enter `AutoCheckpoint` or the WAL.
+    /// Use this to surface baseline-advancement failures to monitoring so a
+    /// silently-growing WAL is caught before recovery can no longer complete.
+    pub fn on_failure<F>(&mut self, handler: F)
+    where
+        F: FnMut(&dyn std::error::Error) + Send + Sync + 'static,
+    {
+        self.on_failure = Some(Box::new(handler));
+    }
+
+    /// Number of consecutive checkpoint failures since the last successful
+    /// flush. Resets to 0 on success. A rising value signals the recovery
+    /// baseline is not advancing (e.g. full disk, bad perms); sustained
+    /// failures cause unbounded WAL growth and eventually prevent recovery.
+    pub fn consecutive_failures(&self) -> u64 {
+        self.consecutive_failures
     }
 }
 
@@ -80,14 +128,26 @@ impl CheckpointHandler for AutoCheckpoint {
 
         let mut manifest = self.manifest.lock();
         let mut log = self.manifest_log.lock();
-        flush_and_record(
+        let flush_result = flush_and_record(
             world,
             seq_range,
             &mut manifest,
             &mut log,
             &self.lsm_dir,
             codecs,
-        )?;
+        );
+
+        // On a flush error, count it and fire the monitoring callback before
+        // returning. The error is still returned so `Durable` can log it; the
+        // counter lets operators detect sustained degradation via a polling
+        // check, and the callback lets them push it to a metric/log sink.
+        if let Err(ref e) = flush_result {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            if let Some(ref mut cb) = self.on_failure {
+                cb(e as &dyn std::error::Error);
+            }
+        }
+        flush_result?;
 
         // Best-effort compaction when L0 is over threshold.
         while manifest
@@ -109,6 +169,8 @@ impl CheckpointHandler for AutoCheckpoint {
         }
 
         wal.acknowledge_flush(flush_seq)?;
+        // Success: reset the consecutive-failure counter.
+        self.consecutive_failures = 0;
         Ok(())
     }
 }
@@ -176,6 +238,103 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "run"))
             .collect();
         assert_eq!(runs.len(), 1);
+    }
+
+    /// A failed checkpoint flush increments `consecutive_failures` and fires
+    /// the `on_failure` callback. A subsequent successful checkpoint resets
+    /// the counter to 0. This covers the monitoring path: operators detect a
+    /// silently-degrading recovery baseline via the counter/callback rather
+    /// than scraping stderr.
+    #[test]
+    fn checkpoint_failure_counter_and_callback() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("fc.wal");
+        let lsm_dir = dir.path().join("lsm_fc");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: Some(128),
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+
+        for i in 0..10 {
+            let e = world.alloc_entity();
+            let mut cs = minkowski::EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            )
+            .unwrap();
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world).unwrap();
+        }
+        assert!(wal.checkpoint_needed());
+
+        // Construct the handler, then make the LSM dir read-only so the flush
+        // cannot write a new run file. The dir exists (created by `new`), so
+        // the error comes from the flush itself, not from construction.
+        let mut handler = AutoCheckpoint::new(&lsm_dir);
+        let failures = Arc::new(AtomicU64::new(0));
+        let failures_cb = Arc::clone(&failures);
+        handler.on_failure(move |_e| {
+            failures_cb.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Remove write permission from the LSM dir to force flush failure.
+        // On unix, chmod 555 (r-x). On Windows this is a no-op; the test
+        // still validates the counter stays 0 on success there.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o555);
+            std::fs::set_permissions(&lsm_dir, perms).unwrap();
+        }
+
+        let result = handler.on_checkpoint_needed(&mut world, &mut wal, &codecs);
+
+        #[cfg(unix)]
+        {
+            assert!(result.is_err(), "flush must fail on a read-only dir");
+            assert_eq!(handler.consecutive_failures(), 1, "counter must increment");
+            assert_eq!(
+                failures.load(Ordering::SeqCst),
+                1,
+                "on_failure callback must fire once"
+            );
+
+            // Restore write permission and retry — the next success resets the
+            // counter to 0.
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&lsm_dir, perms).unwrap();
+            handler
+                .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+                .unwrap();
+            assert_eq!(
+                handler.consecutive_failures(),
+                0,
+                "counter must reset on success"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-unix we can't easily force a flush failure; just confirm
+            // the success path resets the counter and the callback did not fire.
+            let _ = result;
+            assert_eq!(handler.consecutive_failures(), 0);
+            assert_eq!(failures.load(Ordering::SeqCst), 0);
+        }
     }
 
     /// (f) Regression test (Codex-#5): sparse components must survive a full

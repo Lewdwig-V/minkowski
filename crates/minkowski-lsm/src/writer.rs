@@ -95,9 +95,24 @@ pub fn flush_observed(
     let mut entity_dirty: HashMap<usize, BTreeSet<usize>> = HashMap::new();
 
     for arch_idx in 0..world.archetype_count() {
+        let arch_len = world.archetype_len(arch_idx);
+        // Filter out dirty pages beyond the current archetype length. A despawn
+        // can shrink an archetype below a page boundary, leaving the higher-index
+        // pages dirty (swap_remove touched rows there) but with no rows to write
+        // (`arch_len <= start_row` → `row_count == 0`). Keeping them in the set
+        // would inflate the header's `page_count` past the pages actually
+        // written, tripping the release assert and — if the assert were absent —
+        // leaving stale pages from older runs as the only source for those slots.
+        // Dropping them here means the new run simply does not cover those slots;
+        // recovery's dead-row filter (see `materialize_world`) drops any stale
+        // rows from older runs against the authoritative persisted allocator.
         for &comp_id in world.archetype_component_ids(arch_idx) {
             if let Some(pages) = world.column_dirty_pages(arch_idx, comp_id) {
                 for page in pages {
+                    let start_row = page * PAGE_SIZE;
+                    if start_row >= arch_len {
+                        continue;
+                    }
                     dirty.insert((arch_idx, comp_id, page));
                     entity_dirty.entry(arch_idx).or_default().insert(page);
                 }
@@ -626,8 +641,7 @@ mod tests {
     #[test]
     fn flush_dirty_pages_creates_file() {
         let mut world = World::new();
-        world.spawn((Pos { x: 1.0, y: 2.0 },));
-        // Pages are dirty from spawn.
+        world.spawn((Pos { x: 1.0, y: 2.0 },)); // Pages are dirty from spawn.
         let dir = tempfile::tempdir().unwrap();
         let result = flush(
             &world,
@@ -684,6 +698,48 @@ mod tests {
         assert_eq!(header.sequence_hi, 10);
         // 2 components + 1 entity page = 3 page count at minimum.
         assert!(header.page_count >= 3);
+    }
+
+    /// Archetype shrink regression: when despawns reduce the row count below a
+    /// page boundary, the dirty pages beyond the new arch_len must be filtered
+    /// out BEFORE the header's `page_count` is computed. Otherwise the write
+    /// loop skips them (`row_count == 0 → continue`) and the release assert
+    /// `index_entries.len() == page_count` panics. Pre-fix this asserted
+    /// (left=3, right=7) on any shrink that dirties higher-index pages.
+    #[test]
+    fn flush_archetype_shrink_page_count_matches() {
+        let mut world = World::new();
+        // 600 entities → 3 pages of 256.
+        let mut all = Vec::new();
+        for i in 0..600u32 {
+            all.push(world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },)));
+        }
+        // Despawn 500 → archetype shrinks to 100 rows (1 page). swap_remove
+        // touches rows on pages 1 and 2, marking them dirty.
+        for e in &all[..500] {
+            world.despawn(*e);
+        }
+        assert_eq!(world.query::<(&Pos,)>().count(), 100);
+
+        let dir = tempfile::tempdir().unwrap();
+        // Must not panic on the page_count assert.
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            dir.path(),
+            &CodecRegistry::new(),
+        )
+        .unwrap()
+        .unwrap();
+
+        // The run must be readable and report the correct page count.
+        let reader = crate::reader::SortedRunReader::open(&path).unwrap();
+        // Page 0 (the only page with rows) + allocator page + entity page 0.
+        // Exact count is not the point; the point is the file is consistent.
+        assert!(reader.page_count() >= 1);
     }
 
     #[test]
