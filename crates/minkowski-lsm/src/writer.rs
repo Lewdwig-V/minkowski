@@ -120,44 +120,29 @@ pub fn flush_observed(
                 }
                 // Soundness gate: a dense column is persisted as NATIVE bytes and
                 // memcpy'd back verbatim on recovery, which is only sound for a
-                // raw-copyable (POD) type. Codec registration enforces
-                // raw-copyability, so a missing codec means the bytes are not
-                // provably position-independent (they may hold heap pointers like
-                // String/Vec). Refuse to flush rather than write bytes that would
-                // be unsound to restore. (Mirrors the sparse skip-warn above, but
-                // dense data must hard-error — it cannot be silently dropped.)
-                // Only fires when this component actually contributes a page to the
-                // run; a component whose every dirty page is past `arch_len` writes
-                // nothing and must not trip a false positive.
+                // raw-copyable (POD) type. Codec registration certifies
+                // raw-copyability per TYPE. Resolve the codec by the flushed
+                // world's component *type*, never by its per-world ComponentId:
+                // a registry built against a different world can file the same
+                // type under a different id (so id-keyed lookup over-rejects) or
+                // a different type under this id (so id-keyed lookup is unsound).
+                // No codec for this type ⇒ its native bytes are not provably
+                // position-independent (may hold heap pointers like String/Vec) ⇒
+                // hard-error rather than persist bytes that would dangle on
+                // recovery. (Mirrors the sparse skip-warn above, but dense data
+                // must hard-error — it cannot be silently dropped.) Only fires
+                // when the component actually contributes a page to the run.
                 if writes_any {
-                    if !codecs.has_codec(comp_id) {
+                    let has_codec = world
+                        .component_type_id(comp_id)
+                        .is_some_and(|ty| codecs.has_codec_for_type(ty));
+                    if !has_codec {
                         let name = world.component_name(comp_id).unwrap_or("<unknown>");
                         return Err(LsmError::Format(format!(
-                            "dense component '{name}' (id={comp_id}) has no registered codec; \
-                             it cannot be persisted to the LSM baseline because its native \
-                             bytes are not provably raw-copyable. Register it via \
+                            "dense component '{name}' (id={comp_id}) has no registered codec \
+                             for its type; it cannot be persisted to the LSM baseline because \
+                             its native bytes are not provably raw-copyable. Register it via \
                              CodecRegistry::register before flushing."
-                        )));
-                    }
-                    // `has_codec(comp_id)` only proves *some* codec sits at this
-                    // numeric id. ComponentId is a per-world index, so a registry
-                    // built against a different world could hold a raw-copyable
-                    // codec at the same id while THIS world's component there is a
-                    // different, possibly non-raw-copyable type — silently passing
-                    // the gate above and persisting native bytes that dangle on
-                    // recovery. Confirm the codec describes the exact type being
-                    // flushed by comparing TypeIds (stable across worlds, so a
-                    // recovered world re-flushed with its codecs still validates).
-                    let codec_ty = codecs.type_id(comp_id);
-                    let world_ty = world.component_type_id(comp_id);
-                    if codec_ty != world_ty {
-                        let name = world.component_name(comp_id).unwrap_or("<unknown>");
-                        return Err(LsmError::Format(format!(
-                            "dense component '{name}' (id={comp_id}) does not match its \
-                             registered codec's type (codec {codec_ty:?}, world \
-                             {world_ty:?}); the CodecRegistry was built for a different \
-                             component identity. A codec must be registered for the exact \
-                             component type being flushed."
                         )));
                     }
                 }
@@ -972,12 +957,11 @@ mod tests {
 
     /// Codex P1 regression: `has_codec(comp_id)` is a per-world numeric-id lookup.
     /// A `CodecRegistry` built against one world holds a codec at some id; if a
-    /// DIFFERENT world has a DIFFERENT component type at that same id, the codec
-    /// gate would pass on the id alone while the flushed column is actually the
-    /// other type — persisting native bytes that dangle on recovery. The flush
-    /// must compare the codec's TypeId to the flushed world's component TypeId
-    /// and reject the mismatch. (Same type from another world is sound — the
-    /// TypeId matches — so the failure is keyed on type identity, not world.)
+    /// DIFFERENT world has a DIFFERENT component type at that same id, an id-keyed
+    /// gate would pass while the flushed column is actually the other (possibly
+    /// non-raw-copyable) type — persisting native bytes that dangle on recovery.
+    /// Resolving the codec by the flushed world's component *type* rejects this:
+    /// the registry has no codec for `Bworld`.
     #[test]
     fn flush_rejects_codec_for_wrong_type_at_same_id() {
         #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -993,8 +977,8 @@ mod tests {
         codecs.register::<Acodec>(&mut other).unwrap();
 
         // The world we actually flush has a DIFFERENT type as its first
-        // component → also id 0. `has_codec(0)` is true (Acodec's codec), but
-        // the column bytes are Bworld's. The TypeId check must catch this.
+        // component → also id 0. An id-keyed `has_codec(0)` would pass (Acodec's
+        // codec), but the column bytes are Bworld's, which has no codec.
         let mut world = World::new();
         world.spawn((Bworld(7),));
 
@@ -1007,12 +991,50 @@ mod tests {
         );
         assert!(
             result.is_err(),
-            "flushing a column whose codec is registered for a different type must error"
+            "flushing a column whose type has no codec must error"
         );
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("does not match its registered codec's type"),
+            msg.contains("no registered codec for its type"),
             "unexpected error: {msg}"
+        );
+    }
+
+    /// Codex P2 regression: the gate must resolve the codec by TYPE, not by the
+    /// flushed world's numeric `ComponentId`. A registry that filed a type under
+    /// a different id than the flushed world (e.g. after recovery re-registers
+    /// components into a fresh world in a different order) must still flush — the
+    /// codec for the type exists, just under another id.
+    #[test]
+    fn flush_accepts_codec_for_type_at_different_id() {
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Filler(u32);
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Payload(u64);
+
+        // Registry built against `other`: Filler at id 0, Payload at id 1.
+        let mut other = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Filler>(&mut other).unwrap();
+        codecs.register::<Payload>(&mut other).unwrap();
+
+        // Flushed world has only Payload → id 0 (a DIFFERENT id than the registry
+        // filed it under). Resolving by type, the Payload codec is found anyway.
+        let mut world = World::new();
+        world.spawn((Payload(7),));
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            dir.path(),
+            &codecs,
+        );
+        assert!(
+            result.is_ok(),
+            "a codec resolved by type must accept a type filed under a different id: {result:?}"
         );
     }
 }

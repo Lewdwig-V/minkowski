@@ -127,12 +127,14 @@ impl CodecRegistry {
         }
     }
 
-    /// `TypeId` of the component type registered under `id`, or `None` if no
-    /// codec is registered for that id. `ComponentId` is a per-world index, so
-    /// the flush gate compares this to the flushed world's `component_type_id`
-    /// to confirm the codec describes the type actually being persisted.
-    pub fn type_id(&self, id: ComponentId) -> Option<std::any::TypeId> {
-        self.codecs.get(&id).map(|c| c.type_id)
+    /// Whether a codec is registered for the given component *type*, regardless
+    /// of which numeric `ComponentId` it was filed under. The flush gate uses
+    /// this to certify a dense column's type is raw-copyable: `ComponentId` is a
+    /// per-world index, so resolving by type (not id) is correct across a
+    /// registry and world that assigned the type different ids (e.g. after
+    /// recovery re-registers components into a fresh world).
+    pub fn has_codec_for_type(&self, type_id: std::any::TypeId) -> bool {
+        self.codecs.values().any(|c| c.type_id == type_id)
     }
 
     /// Register a component type for persistence.
