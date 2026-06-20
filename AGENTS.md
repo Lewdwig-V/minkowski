@@ -357,7 +357,7 @@ The `minkowski-lsm` crate implements incremental persistence via an LSM tree ove
 
 **Dirty page tracking** (in core crate): `storage::dirty_pages` provides per-column page-level dirty bitsets (256 rows/page). Wired into all BlobVec mutation paths. `flush_and_record` (in `manifest_ops`) reads dirty pages, calls `flush_observed`, records the new run in the manifest, and clears the dirty bits.
 
-**What doesn't exist yet** (Phase 5): `LsmRecovery` (restore World from L2/L3 baseline + L1 delta + WAL tail), `Durable<S>` integration (flush dirty pages instead of full snapshots), migration path from v2 snapshots. These are the remaining Stage 3 work.
+**Stage 3 complete** — incremental persistence with O(delta) flush/recovery via `LsmRecovery`, `recover_world`, and `AutoCheckpoint` (LSM flush + optional compaction). v2 snapshot save/load removed; WAL tail replay starts from the manifest's exclusive sequence upper bound.
 
 ## Key Conventions
 

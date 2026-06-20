@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 minkowski = { path = "../crates/minkowski" }
 minkowski-persist = { path = "../crates/minkowski-persist" }
+minkowski-lsm = { path = "../crates/minkowski-lsm" }
 rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 tempfile = "3"
 
@@ -26,8 +27,8 @@ path = "fuzz_targets/fuzz_reducers.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_snapshot_load"
-path = "fuzz_targets/fuzz_snapshot_load.rs"
+name = "fuzz_lsm_recovery"
+path = "fuzz_targets/fuzz_lsm_recovery.rs"
 doc = false
 
 [[bin]]

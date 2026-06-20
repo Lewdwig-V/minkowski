@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 
 use minkowski::World;
 
+use crate::allocator_meta;
 use crate::bloom;
+use crate::codec::CodecRegistry;
 use crate::error::LsmError;
 use crate::format::*;
 use crate::schema::SchemaSection;
+use crate::sparse_page;
 use crate::types::SeqRange;
 
 /// The value passed to an [`EntryObserver`] for each entity written to an
@@ -35,6 +38,27 @@ fn to_u16(value: usize, label: &str) -> Result<u16, LsmError> {
     u16::try_from(value).map_err(|_| LsmError::Format(format!("{label} {value} exceeds u16")))
 }
 
+/// Convert an archetype index to its on-disk `arch_id`, rejecting the reserved
+/// sentinel range. `META_ARCH_ID` (0xFFFF) keys metadata pages; a real archetype
+/// landing on it would be silently dropped by the reader's `META_ARCH_ID` filter
+/// on recovery, so we refuse to write it rather than lose data.
+fn arch_id_to_u16(value: usize) -> Result<u16, LsmError> {
+    let id = to_u16(value, "arch_idx")?;
+    // Reserved sentinels (META_ARCH_ID = 0xFFFF, SPARSE_ARCH_ID = 0xFFFD) must
+    // never be a real archetype id, or recovery would misclassify the pages.
+    if id == META_ARCH_ID || id == SPARSE_ARCH_ID {
+        return Err(LsmError::Format(format!(
+            "arch_idx {value} collides with a reserved arch_id sentinel"
+        )));
+    }
+    Ok(id)
+}
+
+/// Maximum bytes of allocator metadata per page, bounded by `PageHeader.row_count`
+/// (a `u16`). Blobs larger than this are split across `page_index` 0..N and
+/// concatenated back in order during recovery.
+const ALLOCATOR_PAGE_MAX_BYTES: usize = u16::MAX as usize;
+
 /// Flush dirty pages from the World to a new sorted run file.
 ///
 /// Returns `Ok(Some(path))` if dirty pages were written, `Ok(None)` if there
@@ -46,8 +70,9 @@ pub fn flush(
     world: &World,
     sequence_range: SeqRange,
     output_dir: &Path,
+    codecs: &CodecRegistry,
 ) -> Result<Option<PathBuf>, LsmError> {
-    flush_observed(world, sequence_range, output_dir, None)
+    flush_observed(world, sequence_range, output_dir, codecs, None)
 }
 
 /// Like [`flush`], but invokes `observer` once per entity ID written to an
@@ -60,6 +85,7 @@ pub fn flush_observed(
     world: &World,
     sequence_range: SeqRange,
     output_dir: &Path,
+    codecs: &CodecRegistry,
     mut observer: Option<&mut dyn FnMut(EntityKey)>,
 ) -> Result<Option<PathBuf>, LsmError> {
     // ── 1. Collect dirty page set ───────────────────────────────────────────
@@ -69,9 +95,24 @@ pub fn flush_observed(
     let mut entity_dirty: HashMap<usize, BTreeSet<usize>> = HashMap::new();
 
     for arch_idx in 0..world.archetype_count() {
+        let arch_len = world.archetype_len(arch_idx);
+        // Filter out dirty pages beyond the current archetype length. A despawn
+        // can shrink an archetype below a page boundary, leaving the higher-index
+        // pages dirty (swap_remove touched rows there) but with no rows to write
+        // (`arch_len <= start_row` → `row_count == 0`). Keeping them in the set
+        // would inflate the header's `page_count` past the pages actually
+        // written, tripping the release assert and — if the assert were absent —
+        // leaving stale pages from older runs as the only source for those slots.
+        // Dropping them here means the new run simply does not cover those slots;
+        // recovery's dead-row filter (see `materialize_world`) drops any stale
+        // rows from older runs against the authoritative persisted allocator.
         for &comp_id in world.archetype_component_ids(arch_idx) {
             if let Some(pages) = world.column_dirty_pages(arch_idx, comp_id) {
                 for page in pages {
+                    let start_row = page * PAGE_SIZE;
+                    if start_row >= arch_len {
+                        continue;
+                    }
                     dirty.insert((arch_idx, comp_id, page));
                     entity_dirty.entry(arch_idx).or_default().insert(page);
                 }
@@ -79,8 +120,57 @@ pub fn flush_observed(
         }
     }
 
+    // ── 1b. Collect sparse component blobs (complete current sparse state) ───
+    // Each sparse component becomes one self-describing blob (its stable NAME is
+    // embedded by `sparse_page::encode`), chunked into SPARSE_ARCH_ID pages.
+    // Sparse components are deliberately NOT added to the archetype schema, so
+    // they cannot perturb archetype component slot assignments; recovery reads
+    // the component name from the blob, not from the schema.
+    struct SparseBlob {
+        name: String,
+        blob: Vec<u8>,
+    }
+    let mut sparse_blobs: Vec<SparseBlob> = Vec::new();
+    for comp_id in world.sparse_component_ids() {
+        if !codecs.has_codec(comp_id) {
+            // A sparse component with storage but no codec cannot be serialized
+            // to the baseline. Warn loudly rather than drop silently — if it
+            // holds live entries they will not survive recovery. The fix is to
+            // register the component via CodecRegistry before persisting.
+            let name = world.component_name(comp_id).unwrap_or("<unknown>");
+            eprintln!(
+                "warning: sparse component '{name}' (id={comp_id}) has no registered codec; \
+                 its data will NOT be persisted to the LSM baseline"
+            );
+            continue;
+        }
+        let entries = codecs
+            .serialize_sparse(comp_id, world)
+            .map_err(|e| LsmError::Format(format!("sparse serialize failed: {e}")))?;
+        if entries.is_empty() {
+            continue;
+        }
+        // Use the codec's stable name (explicit or type_name default) so that
+        // recovery resolves the same codec via `resolve_name`.
+        let name = codecs
+            .stable_name(comp_id)
+            .expect("has_codec guard ensures stable_name is Some")
+            .to_owned();
+        let blob = sparse_page::encode(&name, &entries);
+        sparse_blobs.push(SparseBlob { name, blob });
+    }
+    // Deterministic order so a grouping-slot index is stable across identical
+    // flushes (the slot is purely a per-run page grouping key).
+    sparse_blobs.sort_by(|a, b| a.name.cmp(&b.name));
+    // Each blob is non-empty (it always carries at least a name + count header),
+    // so `div_ceil` yields ≥ 1 page per component.
+    let sparse_page_count: usize = sparse_blobs
+        .iter()
+        .map(|s| s.blob.len().div_ceil(ALLOCATOR_PAGE_MAX_BYTES))
+        .sum();
+
     // ── 2. Early return if nothing dirty ────────────────────────────────────
-    if dirty.is_empty() {
+    if dirty.is_empty() && sparse_blobs.is_empty() {
         return Ok(None);
     }
 
@@ -90,6 +180,10 @@ pub fn flush_observed(
         seen_comp_ids.insert(comp_id);
     }
 
+    // Schema contains ONLY archetype (dirty) components. Sparse components are
+    // intentionally excluded — they carry their name in their own blob and use
+    // a separate `SPARSE_ARCH_ID` page space, so they never affect archetype
+    // slot assignment.
     let components: Vec<(String, std::alloc::Layout)> = seen_comp_ids
         .iter()
         .map(|&comp_id| {
@@ -152,8 +246,20 @@ pub fn flush_observed(
 
     let mut w = BufWriter::new(file);
 
+    // Allocator metadata blob — encoded once, up front, so its page count is
+    // known before the header is written. encode() always returns at least a
+    // 16-byte length prefix, so there is always ≥ 1 allocator page.
+    let (generations, free_list) = world.entity_allocator_state();
+    let allocator_meta_bytes = allocator_meta::encode(generations, free_list);
+    let allocator_page_count = allocator_meta_bytes
+        .len()
+        .div_ceil(ALLOCATOR_PAGE_MAX_BYTES);
+
     // (a) Header — write with crc32 = 0, patch later.
-    let page_count = dirty.len() + entity_dirty.values().map(BTreeSet::len).sum::<usize>();
+    let page_count = dirty.len()
+        + entity_dirty.values().map(BTreeSet::len).sum::<usize>()
+        + allocator_page_count
+        + sparse_page_count;
     let header = Header {
         magic: MAGIC,
         version: VERSION,
@@ -197,13 +303,13 @@ pub fn flush_observed(
     }
     // Validate all indices fit in u16 before sorting.
     for job in &component_jobs {
-        to_u16(job.arch_idx, "arch_idx")?;
+        arch_id_to_u16(job.arch_idx)?;
         to_u16(job.page_index, "page_index")?;
     }
     component_jobs.sort_by_key(|j| (j.arch_idx as u16, j.slot, j.page_index as u16));
 
     for job in &component_jobs {
-        let arch_id = to_u16(job.arch_idx, "arch_idx")?;
+        let arch_id = arch_id_to_u16(job.arch_idx)?;
         let page_idx = to_u16(job.page_index, "page_index")?;
 
         let arch_len = world.archetype_len(job.arch_idx);
@@ -264,13 +370,13 @@ pub fn flush_observed(
     }
     // Validate all entity job indices fit in u16 before sorting.
     for &(arch_idx, page_index) in &entity_jobs {
-        to_u16(arch_idx, "arch_idx")?;
+        arch_id_to_u16(arch_idx)?;
         to_u16(page_index, "page_index")?;
     }
     entity_jobs.sort_by_key(|&(arch_idx, page_index)| (arch_idx as u16, page_index as u16));
 
     for &(arch_idx, page_index) in &entity_jobs {
-        let arch_id = to_u16(arch_idx, "arch_idx")?;
+        let arch_id = arch_id_to_u16(arch_idx)?;
         let page_idx = to_u16(page_index, "page_index")?;
 
         let entities = world.archetype_entities(arch_idx);
@@ -325,6 +431,78 @@ pub fn flush_observed(
             file_offset,
         });
     }
+
+    // (d2) Allocator metadata pages — always written when flushing dirty pages.
+    //      Chunked at u16::MAX bytes/page (the row_count limit) and keyed by
+    //      page_index; recovery concatenates them back in order before decode.
+    for (page_index, chunk) in allocator_meta_bytes
+        .chunks(ALLOCATOR_PAGE_MAX_BYTES)
+        .enumerate()
+    {
+        let page_index = to_u16(page_index, "allocator page_index")?;
+        let page_crc = crc32fast::hash(chunk);
+        let file_offset = w.stream_position()?;
+        let ph = PageHeader {
+            arch_id: META_ARCH_ID,
+            slot: ALLOCATOR_SLOT,
+            page_index,
+            // chunk.len() <= ALLOCATOR_PAGE_MAX_BYTES == u16::MAX, so this fits.
+            row_count: chunk.len() as u16,
+            page_crc32: page_crc,
+            _padding: 0,
+        };
+        w.write_all(ph.as_bytes())?;
+        w.write_all(chunk)?;
+        index_entries.push(IndexEntry {
+            arch_id: META_ARCH_ID,
+            slot: ALLOCATOR_SLOT,
+            page_index,
+            _pad: 0,
+            file_offset,
+        });
+    }
+
+    // (d3) Sparse component pages — complete current sparse state under
+    //      SPARSE_ARCH_ID. The `slot` is a per-run grouping index (the blob's
+    //      position in name-sorted order), NOT a schema slot — recovery reads
+    //      the component name from the blob. Each blob is chunked at
+    //      ALLOCATOR_PAGE_MAX_BYTES (the row_count u16 cap); recovery
+    //      concatenates chunks per slot before decode.
+    for (group_idx, s) in sparse_blobs.iter().enumerate() {
+        let slot = to_u16(group_idx, "sparse group slot")?;
+        for (page_index, chunk) in s.blob.chunks(ALLOCATOR_PAGE_MAX_BYTES).enumerate() {
+            let page_index = to_u16(page_index, "sparse page_index")?;
+            let page_crc = crc32fast::hash(chunk);
+            let file_offset = w.stream_position()?;
+            let ph = PageHeader {
+                arch_id: SPARSE_ARCH_ID,
+                slot,
+                page_index,
+                // chunk.len() <= ALLOCATOR_PAGE_MAX_BYTES == u16::MAX, so this fits.
+                row_count: chunk.len() as u16,
+                page_crc32: page_crc,
+                _padding: 0,
+            };
+            w.write_all(ph.as_bytes())?;
+            w.write_all(chunk)?;
+            index_entries.push(IndexEntry {
+                arch_id: SPARSE_ARCH_ID,
+                slot,
+                page_index,
+                _pad: 0,
+                file_offset,
+            });
+        }
+    }
+
+    // Bypass-path integrity: the header's `page_count` must equal the number of
+    // pages actually written (one index entry per page). A mismatch corrupts the
+    // file (the reader trusts `page_count`), so assert it in release builds.
+    assert_eq!(
+        index_entries.len(),
+        page_count,
+        "page_count header must match the number of pages written"
+    );
 
     // (e) Sparse index — sort by (arch_id, slot, page_index) so the reader
     //     can binary-search.  Component pages are already sorted by their
@@ -454,6 +632,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         assert!(result.is_none());
@@ -462,13 +641,13 @@ mod tests {
     #[test]
     fn flush_dirty_pages_creates_file() {
         let mut world = World::new();
-        world.spawn((Pos { x: 1.0, y: 2.0 },));
-        // Pages are dirty from spawn.
+        world.spawn((Pos { x: 1.0, y: 2.0 },)); // Pages are dirty from spawn.
         let dir = tempfile::tempdir().unwrap();
         let result = flush(
             &world,
             SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -486,6 +665,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(10u64), SeqNo::from(20u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         let path = result.unwrap();
@@ -503,6 +683,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -519,6 +700,48 @@ mod tests {
         assert!(header.page_count >= 3);
     }
 
+    /// Archetype shrink regression: when despawns reduce the row count below a
+    /// page boundary, the dirty pages beyond the new arch_len must be filtered
+    /// out BEFORE the header's `page_count` is computed. Otherwise the write
+    /// loop skips them (`row_count == 0 → continue`) and the release assert
+    /// `index_entries.len() == page_count` panics. Pre-fix this asserted
+    /// (left=3, right=7) on any shrink that dirties higher-index pages.
+    #[test]
+    fn flush_archetype_shrink_page_count_matches() {
+        let mut world = World::new();
+        // 600 entities → 3 pages of 256.
+        let mut all = Vec::new();
+        for i in 0..600u32 {
+            all.push(world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },)));
+        }
+        // Despawn 500 → archetype shrinks to 100 rows (1 page). swap_remove
+        // touches rows on pages 1 and 2, marking them dirty.
+        for e in &all[..500] {
+            world.despawn(*e);
+        }
+        assert_eq!(world.query::<(&Pos,)>().count(), 100);
+
+        let dir = tempfile::tempdir().unwrap();
+        // Must not panic on the page_count assert.
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            dir.path(),
+            &CodecRegistry::new(),
+        )
+        .unwrap()
+        .unwrap();
+
+        // The run must be readable and report the correct page count.
+        let reader = crate::reader::SortedRunReader::open(&path).unwrap();
+        // Page 0 (the only page with rows) + allocator page + entity page 0.
+        // Exact count is not the point; the point is the file is consistent.
+        assert!(reader.page_count() >= 1);
+    }
+
     #[test]
     fn header_crc_is_valid() {
         let mut world = World::new();
@@ -528,6 +751,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap()
         .unwrap();
@@ -552,10 +776,12 @@ mod tests {
         let observed_clone = Rc::clone(&observed);
 
         let dir = tempfile::tempdir().unwrap();
+        let codecs = CodecRegistry::new();
         let result = flush_observed(
             &world,
             SeqRange::new(SeqNo::from(1u64), SeqNo::from(5u64)).unwrap(),
             dir.path(),
+            &codecs,
             Some(&mut |key: EntityKey| {
                 observed_clone.borrow_mut().push(key.0);
             }),
@@ -572,6 +798,58 @@ mod tests {
     }
 
     #[test]
+    fn flush_persists_sparse_pages() {
+        use crate::codec::CodecRegistry;
+        use crate::format::SPARSE_ARCH_ID;
+        use crate::reader::SortedRunReader;
+        use crate::sparse_page;
+        use crate::types::{SeqNo, SeqRange};
+        use minkowski::World;
+
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Pos {
+            x: f32,
+            y: f32,
+        }
+        #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[repr(C)]
+        struct Tag(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Tag>("tag", &mut world).unwrap();
+
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let e1 = world.spawn((Pos { x: 3.0, y: 4.0 },));
+        let e2 = world.spawn((Pos { x: 5.0, y: 6.0 },));
+        world.insert_sparse::<Tag>(e1, Tag(111));
+        world.insert_sparse::<Tag>(e2, Tag(222));
+
+        let range = SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap();
+        let path = flush(&world, range, dir.path(), &codecs).unwrap().unwrap();
+
+        let reader = SortedRunReader::open(&path).unwrap();
+        // Sparse components are NOT in the archetype schema; the single sparse
+        // component occupies grouping slot 0 and carries its name in the blob.
+        let mut blob = Vec::new();
+        for result in reader.slot_pages(SPARSE_ARCH_ID, 0) {
+            let (_pi, page) = result.unwrap();
+            reader.validate_page_crc(&page).unwrap();
+            blob.extend_from_slice(&page.data()[..page.header().row_count as usize]);
+        }
+        let (name, entries) = sparse_page::decode(&blob).unwrap();
+        assert_eq!(name, "tag");
+        let mut tags: Vec<u64> = entries.iter().map(|(e, _)| *e).collect();
+        tags.sort_unstable();
+        let mut want = vec![e1.to_bits(), e2.to_bits()];
+        want.sort_unstable();
+        assert_eq!(tags, want);
+    }
+
+    #[test]
     fn flush_produces_run_with_bloom_filter() {
         let mut world = World::new();
         world.spawn((Pos { x: 1.0, y: 2.0 },));
@@ -583,6 +861,7 @@ mod tests {
             &world,
             SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
             dir.path(),
+            &CodecRegistry::new(),
         )
         .unwrap()
         .unwrap();

@@ -80,6 +80,17 @@ pub enum CodecError {
         existing_id: ComponentId,
         new_id: ComponentId,
     },
+    #[error(
+        "component {name:?} is not raw-copyable: native size is {native_size}, \
+         rkyv archived size is {archived_size} (it likely contains heap-allocated \
+         data such as String or Vec). LSM persistence requires plain-old-data \
+         components whose bytes are position-independent."
+    )]
+    NotRawCopyable {
+        name: String,
+        native_size: usize,
+        archived_size: usize,
+    },
 }
 
 struct ComponentCodec {
@@ -90,10 +101,9 @@ struct ComponentCodec {
     register_fn: RegisterFn,
     serialize_sparse_fn: SerializeSparseFn,
     insert_sparse_fn: InsertSparseFn,
-    /// When `Some(size)`, the archived representation has the same size as the
-    /// native type — archived bytes can be copied directly into BlobVec without
-    /// typed deserialization. True for `#[repr(C)]` types of primitives on
-    /// little-endian platforms where rkyv's archived layout matches native.
+    /// Byte size for the direct-memcpy decode fast path. Always `Some(size)` for
+    /// accepted non-ZST components (raw-copyability is enforced at registration,
+    /// so the archived layout matches native); `None` for ZSTs (nothing to copy).
     raw_copy_size: Option<usize>,
 }
 
@@ -185,12 +195,26 @@ impl CodecRegistry {
 
         let layout = Layout::new::<T>();
 
-        // If the archived type has the same size as the native type, archived
-        // bytes can be copied directly into BlobVec without rkyv::from_bytes.
-        // This is true for #[repr(C)] structs of primitives on LE platforms.
-        let raw_copy_size = if std::mem::size_of::<T>() == std::mem::size_of::<T::Archived>()
-            && layout.size() > 0
-        {
+        // Raw-copyability invariant: a component is persistable only if its rkyv
+        // archived representation has the same size as the native type. This is
+        // a proxy for "plain-old-data, no heap indirection" — such bytes are
+        // position-independent and safe to memcpy back into a column on recovery.
+        // Types with heap data (String, Vec, ...) have a differently-sized
+        // archived form and are rejected here, at the single registration source,
+        // so nothing un-raw-copyable can ever reach a flush, run, or import.
+        // ZSTs satisfy `0 == 0` and are accepted (trivially raw-copyable).
+        let raw_copyable = std::mem::size_of::<T>() == std::mem::size_of::<T::Archived>();
+        if !raw_copyable {
+            return Err(CodecError::NotRawCopyable {
+                name: stable_name,
+                native_size: std::mem::size_of::<T>(),
+                archived_size: std::mem::size_of::<T::Archived>(),
+            });
+        }
+
+        // The decode fast-path still needs a positive byte count to memcpy; ZSTs
+        // have nothing to copy, so their `raw_copy_size` stays `None`.
+        let raw_copy_size = if layout.size() > 0 {
             Some(layout.size())
         } else {
             None
@@ -694,5 +718,82 @@ mod tests {
                 .to_string()
                 .contains("unknown component name")
         );
+    }
+}
+
+#[cfg(test)]
+mod raw_copy_tests {
+    use super::*;
+    use minkowski::World;
+    use rkyv::{Archive, Deserialize, Serialize};
+
+    #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+    #[repr(C)]
+    struct Plain {
+        x: f32,
+        y: u32,
+    }
+
+    #[derive(Clone, Archive, Serialize, Deserialize)]
+    struct WithHeap {
+        label: String,
+    }
+
+    #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+    #[repr(C)]
+    struct ZstTag;
+
+    #[test]
+    fn raw_copyable_type_registers_ok() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        assert!(codecs.register_as::<Plain>("plain", &mut world).is_ok());
+    }
+
+    #[test]
+    fn non_raw_copyable_type_is_rejected() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        let err = codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap_err();
+        assert!(
+            matches!(err, CodecError::NotRawCopyable { ref name, .. } if name == "with_heap"),
+            "expected NotRawCopyable, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn zst_component_registers_ok() {
+        // Zero-sized tag components have archived size == native size (both 0),
+        // so they are trivially raw-copyable and must NOT be rejected.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        assert!(codecs.register_as::<ZstTag>("zst_tag", &mut world).is_ok());
+    }
+
+    #[test]
+    fn zst_decode_round_trip() {
+        // The decode() path for ZSTs takes the deserialize() fallback because
+        // raw_copy_size is None (nothing to memcpy for a ZST). Verify it
+        // succeeds without error and returns an empty buffer.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<ZstTag>("zst_tag", &mut world).unwrap();
+        let id = world.component_id::<ZstTag>().unwrap();
+
+        // Serialize a ZstTag to get canonical rkyv bytes.
+        let tag = ZstTag;
+        let mut buf = Vec::new();
+        unsafe {
+            codecs
+                .serialize(id, &tag as *const ZstTag as *const u8, &mut buf)
+                .unwrap();
+        }
+
+        // decode() with no proof falls through to deserialize() (full rkyv validation).
+        let raw = codecs.decode(id, &buf, None).unwrap();
+        // ZST has no bytes; the returned buffer is empty.
+        assert_eq!(raw.len(), 0);
     }
 }
