@@ -187,7 +187,6 @@ impl BlobVec {
     ///   guaranteed by the raw-copyable invariant enforced at codec registration
     ///   (a type whose archived size equals its native size carries no live
     ///   pointers, so its native bytes are position-independent).
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) unsafe fn append_bytes_unchecked(&mut self, bytes: &[u8], count: usize) {
         let size = self.item_layout.size();
         if size == 0 {
