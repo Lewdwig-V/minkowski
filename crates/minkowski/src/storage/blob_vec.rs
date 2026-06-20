@@ -172,6 +172,42 @@ impl BlobVec {
         self.dirty_pages.mark_row(row);
     }
 
+    /// Bulk-append `count` items by copying `bytes` (== `count * item_layout.size()`)
+    /// to the end of the column in a single memcpy. For zero-sized types only the
+    /// logical length advances; no bytes are copied.
+    ///
+    /// Unlike [`push`], this does NOT mark pages dirty or advance the changed
+    /// tick: it is a recovery primitive that reconstructs already-committed state,
+    /// which must not be re-flushed.
+    ///
+    /// # Safety
+    /// - `bytes.len()` must equal `count * item_layout.size()`.
+    /// - `bytes` must be a valid native (in-memory) representation of `count`
+    ///   consecutive items of this column's type. For LSM recovery this is
+    ///   guaranteed by the raw-copyable invariant enforced at codec registration
+    ///   (a type whose archived size equals its native size carries no live
+    ///   pointers, so its native bytes are position-independent).
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) unsafe fn append_bytes_unchecked(&mut self, bytes: &[u8], count: usize) {
+        let size = self.item_layout.size();
+        if size == 0 {
+            self.len += count;
+            return;
+        }
+        assert_eq!(
+            bytes.len(),
+            count * size,
+            "append_bytes_unchecked: byte length must equal count * item_size"
+        );
+        self.reserve(count);
+        let dst = self.ptr_at(self.len);
+        // SAFETY: `reserve` guarantees capacity for `count` more items starting at
+        // `dst`; `bytes` is valid for `bytes.len()` reads; src and dst are distinct
+        // allocations so the copy is non-overlapping.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, count * size) };
+        self.len += count;
+    }
+
     /// Returns a raw pointer to the element at `row`.
     ///
     /// # Change detection invariant
@@ -866,5 +902,60 @@ mod tests {
         assert!(bv.dirty_pages.any_dirty());
         bv.dirty_pages.clear();
         assert!(!bv.dirty_pages.any_dirty());
+    }
+
+    #[test]
+    fn append_bytes_unchecked_bulk_copies() {
+        let mut bv = bv_for::<u32>();
+        let src = [10u32, 20, 30];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(src.as_ptr() as *const u8, std::mem::size_of_val(&src))
+        };
+        unsafe { bv.append_bytes_unchecked(bytes, 3) };
+        assert_eq!(bv.len(), 3);
+        unsafe {
+            assert_eq!(read_val::<u32>(&bv, 0), 10);
+            assert_eq!(read_val::<u32>(&bv, 1), 20);
+            assert_eq!(read_val::<u32>(&bv, 2), 30);
+        }
+    }
+
+    #[test]
+    fn append_bytes_unchecked_appends_after_existing() {
+        let mut bv = bv_for::<u32>();
+        unsafe { push_val(&mut bv, 1u32) };
+        let src = [2u32, 3];
+        let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, 8) };
+        unsafe { bv.append_bytes_unchecked(bytes, 2) };
+        assert_eq!(bv.len(), 3);
+        unsafe {
+            assert_eq!(read_val::<u32>(&bv, 0), 1);
+            assert_eq!(read_val::<u32>(&bv, 1), 2);
+            assert_eq!(read_val::<u32>(&bv, 2), 3);
+        }
+    }
+
+    #[test]
+    fn append_bytes_unchecked_zst_advances_len() {
+        let mut bv = BlobVec::new(Layout::new::<()>(), None, 0, default_pool());
+        unsafe { bv.append_bytes_unchecked(&[], 5) };
+        assert_eq!(bv.len(), 5);
+    }
+
+    #[test]
+    fn append_bytes_unchecked_does_not_mark_dirty() {
+        let mut bv = bv_for::<u32>();
+        let src = [7u32];
+        let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, 4) };
+        unsafe { bv.append_bytes_unchecked(bytes, 1) };
+        assert!(
+            !bv.dirty_pages.any_dirty(),
+            "recovery append must not dirty pages"
+        );
+        assert_eq!(
+            bv.changed_tick,
+            crate::tick::Tick::default(),
+            "recovery append must not advance changed_tick"
+        );
     }
 }
