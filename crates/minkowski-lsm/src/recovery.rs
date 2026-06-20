@@ -751,4 +751,63 @@ mod tests {
             "generations must survive compaction"
         );
     }
+
+    /// Sparse components must survive compaction: the compactor carries the
+    /// newest run's sparse pages forward, re-slotted to the output schema.
+    #[test]
+    fn recover_restores_sparse_after_compaction() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct SparsePos2 {
+            x: f32,
+            y: f32,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag2(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<SparsePos2>("sparse_pos2", &mut world)
+            .unwrap();
+        codecs.register_as::<Tag2>("tag2", &mut world).unwrap();
+
+        let e = world.spawn((SparsePos2 { x: 1.0, y: 2.0 },));
+        world.insert_sparse::<Tag2>(e, Tag2(999));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Flush 4 times to trigger compaction (L0 threshold is 4)
+        for i in 0..4u64 {
+            world.spawn((SparsePos2 {
+                x: i as f32,
+                y: 0.0,
+            },));
+            flush_and_record(
+                &world,
+                SeqRange::new(SeqNo::from(i), SeqNo::from(i + 1)).unwrap(),
+                &mut manifest,
+                &mut log,
+                &lsm_dir,
+                &codecs,
+            )
+            .unwrap()
+            .expect("flush");
+        }
+
+        compact_one(&mut manifest, &mut log, &lsm_dir)
+            .unwrap()
+            .expect("compaction ran");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+        assert_eq!(recovered.get::<Tag2>(e).copied(), Some(Tag2(999)));
+    }
 }

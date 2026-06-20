@@ -32,7 +32,7 @@ use crate::bloom;
 use crate::error::LsmError;
 use crate::format::{
     ALLOCATOR_SLOT, ENTITY_SLOT, Footer, Header, IndexEntry, MAGIC, META_ARCH_ID, PAGE_SIZE,
-    PageHeader, VERSION,
+    PageHeader, SPARSE_ARCH_ID, VERSION,
 };
 use crate::manifest::SortedRunMeta;
 use crate::reader::SortedRunReader;
@@ -256,7 +256,44 @@ impl<'a> CompactionWriter<'a> {
         }
 
         // ── 2. Build output schema (union of all components) ─────────────────
-        let all_components = self.collect_all_components();
+
+        // Sparse baseline pages: carry forward from the newest input run
+        // (newest-wins, same as the allocator). Resolve each page's component
+        // NAME from the newest input's schema so it can be re-slotted into the
+        // output schema (slots are not stable across runs).
+        let sparse_carry: Vec<(String, u16, Vec<u8>)> =
+            match self.inputs.iter().max_by_key(|r| r.sequence_range().hi()) {
+                Some(newest) => {
+                    let mut out = Vec::new();
+                    for slot in newest.component_slots_for_arch(SPARSE_ARCH_ID) {
+                        let name = newest
+                            .schema()
+                            .entry_for_slot(slot)
+                            .ok_or_else(|| {
+                                LsmError::Format(format!(
+                                    "sparse slot {slot} missing from input schema"
+                                ))
+                            })?
+                            .name()
+                            .to_owned();
+                        for result in newest.slot_pages(SPARSE_ARCH_ID, slot) {
+                            let (page_index, page) = result?;
+                            newest.validate_page_crc(&page)?;
+                            let len = page.header().row_count as usize;
+                            out.push((name.clone(), page_index, page.data()[..len].to_vec()));
+                        }
+                    }
+                    out
+                }
+                None => Vec::new(),
+            };
+
+        let mut all_components = self.collect_all_components();
+        for (name, _, _) in &sparse_carry {
+            if !all_components.contains(name) {
+                all_components.push(name.clone());
+            }
+        }
         let output_schema = self.build_output_schema(&all_components)?;
 
         // ── 3. Build per-archetype slot translation tables ───────────────────
@@ -306,6 +343,7 @@ impl<'a> CompactionWriter<'a> {
                 None => Vec::new(),
             };
         total_pages += allocator_pages.len();
+        total_pages += sparse_carry.len();
 
         // ── 5. Open temp file ─────────────────────────────────────────────────
         let seq_lo = self.output_seq_range.lo().get();
@@ -546,6 +584,34 @@ impl<'a> CompactionWriter<'a> {
                 arch_id: META_ARCH_ID,
                 slot: ALLOCATOR_SLOT,
                 page_index,
+                _pad: 0,
+                file_offset,
+            });
+        }
+
+        // ── 8c. Carry forward sparse baseline pages (re-slotted to output schema) ──
+        for (name, page_index, payload) in &sparse_carry {
+            let output_slot = output_schema.slot_for(name).ok_or_else(|| {
+                LsmError::Format(format!(
+                    "sparse component {name} missing from output schema"
+                ))
+            })?;
+            let page_crc = crc32fast::hash(payload);
+            let file_offset = w.stream_position()?;
+            let ph = PageHeader {
+                arch_id: SPARSE_ARCH_ID,
+                slot: output_slot,
+                page_index: *page_index,
+                row_count: payload.len() as u16,
+                page_crc32: page_crc,
+                _padding: 0,
+            };
+            w.write_all(ph.as_bytes())?;
+            w.write_all(payload)?;
+            index_entries.push(IndexEntry {
+                arch_id: SPARSE_ARCH_ID,
+                slot: output_slot,
+                page_index: *page_index,
                 _pad: 0,
                 file_offset,
             });
