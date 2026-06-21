@@ -15,6 +15,7 @@ rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+iai-callgrind = "0.16.1"
 tempfile = "3"
 
 [[bench]]
@@ -55,4 +56,8 @@ harness = false
 
 [[bench]]
 name = "planner"
+harness = false
+
+[[bench]]
+name = "ecs_icount"
 harness = false

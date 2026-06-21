@@ -306,6 +306,28 @@ across levels. In Minkowski, the in-memory World IS the merged view.
    which level holds a given page — without a filter this is one I/O per level.
    See design section below.
 
+### Finish the TigerBeetle read model (the bloom's missing consumer)
+
+**Status (2026-06-21): the blocked bloom filter is built but has no consumer.**
+`SortedRunReader` builds and holds a `BloomView` and exposes `contains_page(...)`,
+but nothing calls it. The reason is an architectural divergence from TigerBeetle:
+TigerBeetle's bloom lives on its **disk-resident LSM read path** (point lookups
+walk levels, skipping tables via a *lookup-key-keyed* filter). Minkowski instead
+keeps the **whole World resident in RAM** — `manifest.rs` states the in-memory
+World *is* the merged view; the LSM is durability/recovery. So there is no
+point-lookup-against-disk path to consume the filter, and recovery is a *full
+enumeration* (it reads every page to rebuild the World, so a per-page bloom probe
+skips nothing). Recovery is also RAM-bound (it materializes the whole World), so
+an exact `HashMap<page_key, newest_run>` dedup strictly beats a probabilistic
+bloom there. Compounding it, the current filter is keyed by *page coordinate*
+(`pack_page_key(arch_id, slot, page_index)`), not by lookup key.
+
+The bloom's genuine home is a **key-driven LSM point-read path for non-resident
+data** — the demand-paged working set (Stage 6 below): resident World as the hot
+set + entity/key-keyed LSM point-reads for the cold tail. Until that lands, the
+bloom is dormant scaffolding and would need **re-keying from page-coords to the
+lookup key**. (Benchmarking 2026-06-21 confirmed the gap; see `docs/performance.md`.)
+
 ### BlockedBloomFilter design
 
 A **Blocked Bloom Filter** (also called a Cache-line Bloom Filter) partitions the

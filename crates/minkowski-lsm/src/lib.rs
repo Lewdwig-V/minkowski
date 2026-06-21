@@ -1,4 +1,6 @@
 pub mod allocator_meta;
+#[cfg(feature = "bench-support")]
+pub mod bench_support;
 pub mod bloom;
 pub mod codec;
 pub(crate) mod compaction_writer;

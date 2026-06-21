@@ -6,6 +6,9 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+bench-support = []
+
 [dependencies]
 minkowski = { path = "../minkowski" }
 crc32fast = "1"
@@ -16,3 +19,9 @@ thiserror = "2"
 [dev-dependencies]
 static_assertions = "1"
 tempfile = "3"
+iai-callgrind = "0.16.1"
+
+[[bench]]
+name = "page_codec"
+harness = false
+required-features = ["bench-support"]

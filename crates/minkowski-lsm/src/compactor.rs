@@ -66,6 +66,11 @@ pub struct CompactionReport {
     pub input_run_count: usize,
     pub output_path: PathBuf,
     pub output_bytes: u64,
+    /// Sum of `size_bytes` across every input run consumed by this compaction.
+    /// Captured from the manifest's `from_level` metas before the inputs are
+    /// removed, so `output_bytes / input_bytes` is an exact write-amplification
+    /// ratio for this job (no estimation).
+    pub input_bytes: u64,
 }
 
 // ── Picker ────────────────────────────────────────────────────────────────────
@@ -313,17 +318,24 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
         )));
     }
 
+    // Sum input sizes from the manifest metas while validating each input
+    // exists at `from_level`. Captured before removal so the report carries an
+    // exact write-amplification denominator.
+    let mut input_bytes: u64 = 0;
     for input_path in &job.input_paths {
-        let exists = manifest
+        let meta = manifest
             .runs_at_level(job.from_level)
             .iter()
-            .any(|m| m.path() == input_path.as_path());
-        if !exists {
-            return Err(LsmError::Format(format!(
-                "execute_compaction: input run {} not found at level {} in manifest",
-                input_path.display(),
-                job.from_level
-            )));
+            .find(|m| m.path() == input_path.as_path());
+        match meta {
+            Some(m) => input_bytes = input_bytes.saturating_add(m.size_bytes().get()),
+            None => {
+                return Err(LsmError::Format(format!(
+                    "execute_compaction: input run {} not found at level {} in manifest",
+                    input_path.display(),
+                    job.from_level
+                )));
+            }
         }
     }
 
@@ -364,6 +376,7 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
         input_run_count: job.input_paths.len(),
         output_path: output_meta.path().to_path_buf(),
         output_bytes: output_meta.size_bytes().get(),
+        input_bytes,
     })
 }
 
