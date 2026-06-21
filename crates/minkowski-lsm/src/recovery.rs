@@ -44,11 +44,24 @@ type PageKey = (ArchetypeSig, ColumnKey, u16);
 /// Raw sparse entries for one component: `(entity_bits, rkyv_value_bytes)`.
 type SparseEntries = Vec<(u64, Vec<u8>)>;
 
-#[derive(Clone)]
+/// How a stored page's Serialized rows should be decoded on recovery.
+/// `Unchecked` carries the page's [`CrcProof`] and is chosen only when the
+/// source run's decode fingerprint matched this binary (spec §2.1). RawCopy and
+/// entity pages always use `Checked` (the mode is ignored for RawCopy decode).
+enum DecodeMode {
+    Checked,
+    Unchecked(crate::codec::CrcProof),
+}
+
+// `StoredPage` does NOT derive `Clone`: `DecodeMode::Unchecked` holds a
+// `CrcProof`, which is deliberately non-`Clone` (it is an unforgeable integrity
+// token). Recovery only inserts/overwrites pages by value, so `Clone` is never
+// required.
 struct StoredPage {
     seq_hi: u64,
     row_count: u16,
     data: Vec<u8>,
+    decode_mode: DecodeMode,
 }
 
 #[derive(Clone)]
@@ -95,6 +108,14 @@ impl LsmRecovery {
             let reader = SortedRunReader::open(meta.path())?;
             let seq_hi = meta.sequence_range().hi().get();
             max_seq_hi = max_seq_hi.max(seq_hi);
+
+            // Spec §2.1: the unchecked decode path is allowed for this run only if
+            // its stamped fingerprint is present (non-zero) AND equals the layout
+            // this binary would produce for the same Serialized columns. Computed
+            // ONCE per run; mismatch or absent (0) ⇒ checked decode everywhere.
+            let run_allows_unchecked = reader.decode_fingerprint() != 0
+                && reader.decode_fingerprint()
+                    == crate::fingerprint::run_fingerprint(reader.schema(), codecs);
 
             for entry in reader.schema().entries() {
                 component_layouts
@@ -179,7 +200,7 @@ impl LsmRecovery {
                     };
                     for result in reader.slot_pages(arch_id, slot) {
                         let (page_index, page) = result?;
-                        reader.validate_page_crc(&page)?;
+                        let proof = reader.validate_page_crc(&page)?;
                         // RawCopy pages are zero-padded to the full stride, so we
                         // slice the live `row_count * item_size` prefix. Serialized
                         // pages are variable-length (`[offsets][values]`); the
@@ -191,12 +212,22 @@ impl LsmRecovery {
                             }
                             crate::schema::StorageKind::Serialized => page.data(),
                         };
+                        // Only Serialized pages from a fingerprint-matched run may
+                        // skip bytecheck; everything else decodes checked.
+                        let decode_mode = if run_allows_unchecked
+                            && matches!(kind, crate::schema::StorageKind::Serialized)
+                        {
+                            DecodeMode::Unchecked(proof)
+                        } else {
+                            DecodeMode::Checked
+                        };
                         store_page(
                             &mut pages,
                             (sig.clone(), ColumnKey::Component(name.clone()), page_index),
                             seq_hi,
                             page.header().row_count,
                             payload,
+                            decode_mode,
                         );
                     }
                 }
@@ -211,6 +242,8 @@ impl LsmRecovery {
                         seq_hi,
                         page.header().row_count,
                         &page.data()[..payload_len],
+                        // Entity pages are raw 8-byte IDs, never Serialized.
+                        DecodeMode::Checked,
                     );
                 }
             }
@@ -246,6 +279,7 @@ fn store_page(
     seq_hi: u64,
     row_count: u16,
     data: &[u8],
+    decode_mode: DecodeMode,
 ) {
     if pages
         .get(&key)
@@ -257,6 +291,7 @@ fn store_page(
                 seq_hi,
                 row_count,
                 data: data.to_vec(),
+                decode_mode,
             },
         );
     }
@@ -391,6 +426,7 @@ fn native_column_page(
     codecs: &CodecRegistry,
     item_size: usize,
     live_mask: Option<&[bool]>,
+    decode_mode: &DecodeMode,
 ) -> Result<Vec<u8>, LsmError> {
     let row_count = page.row_count as usize;
     let is_live = |row: usize| live_mask.is_none_or(|mask| mask[row]);
@@ -427,14 +463,32 @@ fn native_column_page(
             let mut buf = Vec::new();
             for (row, slice) in rows.iter().enumerate() {
                 if is_live(row) {
-                    let native = codecs
-                        .deserialize_by_type(ty, slice)
-                        .ok_or_else(|| {
-                            LsmError::Format(
-                                "no codec for serialized column type on recovery".to_owned(),
-                            )
-                        })?
-                        .map_err(|e| LsmError::Format(format!("serialized decode failed: {e}")))?;
+                    // `Unchecked` skips rkyv bytecheck (gated by the per-run
+                    // fingerprint + the page's `CrcProof`); `Checked` runs the
+                    // full validating decode. Both reconstruct an owning native
+                    // value whose heap ownership rides inside the bytes.
+                    let native = match decode_mode {
+                        DecodeMode::Unchecked(proof) => codecs
+                            .deserialize_unchecked_by_type(ty, slice, proof)
+                            .ok_or_else(|| {
+                                LsmError::Format(
+                                    "no codec for serialized column type on recovery".to_owned(),
+                                )
+                            })?
+                            .map_err(|e| {
+                                LsmError::Format(format!("serialized decode failed: {e}"))
+                            })?,
+                        DecodeMode::Checked => codecs
+                            .deserialize_by_type(ty, slice)
+                            .ok_or_else(|| {
+                                LsmError::Format(
+                                    "no codec for serialized column type on recovery".to_owned(),
+                                )
+                            })?
+                            .map_err(|e| {
+                                LsmError::Format(format!("serialized decode failed: {e}"))
+                            })?,
+                    };
                     buf.extend_from_slice(&native);
                 }
             }
@@ -643,13 +697,18 @@ fn materialize_world(
                         let item_size = item_sizes[i];
                         // All rows alive ⇒ pass `None` (no mask): every row is
                         // materialized.
-                        let native =
-                            native_column_page(page, kind, type_id, codecs, item_size, None)
-                                .map_err(|e| {
-                                    LsmError::Format(format!(
-                                        "archetype {sig:?} column {name}: {e}"
-                                    ))
-                                })?;
+                        let native = native_column_page(
+                            page,
+                            kind,
+                            type_id,
+                            codecs,
+                            item_size,
+                            None,
+                            &page.decode_mode,
+                        )
+                        .map_err(|e| {
+                            LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
+                        })?;
                         // Release invariant: the normalized native buffer must be
                         // exactly `row_count` native items wide. This mirrors the
                         // slow-path assert so a kind/length disagreement can never
@@ -710,6 +769,7 @@ fn materialize_world(
                         codecs,
                         item_size,
                         Some(&live_mask),
+                        &page.decode_mode,
                     )
                     .map_err(|e| {
                         LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
@@ -2570,6 +2630,7 @@ mod tests {
             seq_hi: 1,
             row_count: 4,
             data: crate::serialized_page::encode(&rows),
+            decode_mode: DecodeMode::Checked,
         };
 
         // Rows 0 and 2 live; rows 1 and 3 dead.
@@ -2581,6 +2642,7 @@ mod tests {
             &codecs,
             item_size,
             Some(&mask),
+            &page.decode_mode,
         )
         .unwrap();
 
@@ -2600,6 +2662,131 @@ mod tests {
             drop(tag);
         }
         std::mem::forget(native);
+    }
+
+    /// Fallback guard: a stored decode_fingerprint that does NOT match this
+    /// binary must force recovery onto the checked decode path and still recover
+    /// the value byte-exact. Byte-patches the on-disk fingerprint at footer
+    /// offset +40 (post-`_pad` layout) to a wrong value, repairs `total_crc32`
+    /// (offset +32) so the file still opens, then recovers. Stays green
+    /// throughout wiring: the mismatch takes the unchanged checked path.
+    #[test]
+    fn recover_heap_with_mismatched_fingerprint_uses_checked_path() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("Name", &mut world).unwrap();
+        world.spawn((Name {
+            text: "survives".to_owned(),
+        },));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        let path = flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Corrupt ONLY the stored decode_fingerprint (footer is the last 64 bytes;
+        // decode_fingerprint sits at footer_start + 40, after the explicit
+        // `_pad: u32` that follows `total_crc32` at +32). Then repair total_crc32
+        // so the file still opens — we test the fingerprint gate, not CRC.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let len = f.metadata().unwrap().len();
+            let footer_start = len - 64;
+            // Write a wrong fingerprint.
+            f.seek(SeekFrom::Start(footer_start + 40)).unwrap();
+            f.write_all(&0xA5A5_A5A5_A5A5_A5A5u64.to_le_bytes())
+                .unwrap();
+            // Recompute total_crc32 with its own 4 bytes zeroed.
+            f.seek(SeekFrom::Start(footer_start + 32)).unwrap();
+            f.write_all(&[0u8; 4]).unwrap();
+            f.flush().unwrap();
+            let mut all = Vec::new();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.read_to_end(&mut all).unwrap();
+            let crc = crc32fast::hash(&all);
+            f.seek(SeekFrom::Start(footer_start + 32)).unwrap();
+            f.write_all(&crc.to_le_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+
+        // Recovery must fall back to checked decode and still recover the value.
+        let (mut result, _m, _l) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let got: Vec<String> = result
+            .world
+            .query::<(&Name,)>()
+            .map(|(n,)| n.text.clone())
+            .collect();
+        assert_eq!(got, vec!["survives".to_owned()]);
+    }
+
+    /// Positive end-to-end: a fresh flush stamps this binary's fingerprint, so
+    /// recovery takes the UNCHECKED (bytecheck-skipping) decode path for the
+    /// Serialized `Name` column. Every value must still round-trip exactly. This
+    /// is the definitive exercise of the unchecked path.
+    #[test]
+    fn recover_heap_unchecked_path_matches_values() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("Name", &mut world).unwrap();
+        for i in 0..300u32 {
+            world.spawn((Name {
+                text: format!("entity-{i}"),
+            },));
+        }
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Fresh flush ⇒ stored fingerprint == this binary's ⇒ unchecked path taken.
+        let (mut result, _m, _l) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let mut got: Vec<String> = result
+            .world
+            .query::<(&Name,)>()
+            .map(|(n,)| n.text.clone())
+            .collect();
+        got.sort();
+        let mut want: Vec<String> = (0..300u32).map(|i| format!("entity-{i}")).collect();
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
