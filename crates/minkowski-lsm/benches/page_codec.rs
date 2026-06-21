@@ -12,10 +12,24 @@
 //!   RUSTFLAGS="-C target-cpu=x86-64-v2" \
 //!     cargo bench -p minkowski-lsm --features bench-support --bench page_codec
 //!
+//! Two distinct layers are measured separately, because conflating them is
+//! misleading:
+//!
+//! 1. **Page framing** (`serialized_page::encode`/`decode`) — the Arrow-style
+//!    `[offsets:(n+1)×u32][values]` table *around* already-serialized row bytes.
+//!    `decode` is zero-copy (returns borrowed `&[u8]` slices, no rkyv); `encode`
+//!    builds the offset table and concatenates the row bytes. NO rkyv work here.
+//! 2. **rkyv codec** (`serialize_by_type`/`deserialize_by_type`) — the actual
+//!    per-row rkyv serialize / deserialize. `rkyv_decode_256` is the recovery-
+//!    relevant cost: `from_bytes` + bytecheck + the `AlignedVec` realign + copy
+//!    the native value out (and drop it, leak-free).
+//!
 //! Benches:
-//! - `get_page_pod`: decode one RawCopy dense page via `SortedRunReader::get_page`.
-//! - `serialized_encode_256` / `serialized_decode_256`: the variable-length heap
-//!   column codec on 256 rkyv `BenchName` rows.
+//! - `get_page_pod`: read one RawCopy dense page via `SortedRunReader::get_page`.
+//! - `page_frame_encode_256` / `page_frame_decode_256`: offset-table framing of
+//!   256 already-serialized rows (NOT rkyv — see layer 1 above).
+//! - `rkyv_encode_256` / `rkyv_decode_256`: the real per-row rkyv serialize /
+//!   deserialize of 256 heap `BenchName` rows (layer 2 — this is the rkyv cost).
 //! - `rawcopy_column_256`: a plain memcpy of a 256×`size_of::<BenchPos>()` byte
 //!   column — the POD comparison point against the rkyv path.
 
@@ -28,6 +42,7 @@ use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use minkowski_lsm::bench_support::{
     BenchName, BenchPos, Layout, Shape, WorkloadParams, build_world,
 };
+use minkowski_lsm::codec::CodecRegistry;
 use minkowski_lsm::manifest_log::ManifestLog;
 use minkowski_lsm::manifest_ops::flush_and_record;
 use minkowski_lsm::reader::SortedRunReader;
@@ -134,6 +149,37 @@ fn setup_column() -> Vec<u8> {
     vec![0xA5u8; POD_ROWS * size_of::<BenchPos>()]
 }
 
+/// A codec registry + the `BenchName` TypeId + `HEAP_ROWS` live values, for the
+/// real per-row rkyv *serialize* bench.
+fn setup_rkyv_encode() -> (CodecRegistry, TypeId, Vec<BenchName>) {
+    let (_world, codecs) = build_world(&WorkloadParams {
+        entities: 1,
+        shape: Shape::Heap,
+        layout: Layout::Single,
+        sparse: false,
+        seed: SEED,
+    });
+    let values = (0..HEAP_ROWS)
+        .map(|i| BenchName {
+            text: format!("entity-name-{i}"),
+        })
+        .collect();
+    (codecs, TypeId::of::<BenchName>(), values)
+}
+
+/// A codec registry + the `BenchName` TypeId + `HEAP_ROWS` already-rkyv-serialized
+/// row blobs, for the real per-row rkyv *decode* bench (the recovery-relevant cost).
+fn setup_rkyv_decode() -> (CodecRegistry, TypeId, Vec<Vec<u8>>) {
+    let (_world, codecs) = build_world(&WorkloadParams {
+        entities: 1,
+        shape: Shape::Heap,
+        layout: Layout::Single,
+        sparse: false,
+        seed: SEED,
+    });
+    (codecs, TypeId::of::<BenchName>(), heap_rows())
+}
+
 // ── benches (only the body is measured) ─────────────────────────────────────
 
 #[library_benchmark]
@@ -147,17 +193,58 @@ fn get_page_pod(input: (tempfile::TempDir, SortedRunReader, u16, u16)) {
     black_box(page.data().len());
 }
 
+// Layer 1: page framing (offset table) — NO rkyv.
 #[library_benchmark]
 #[bench::heap(setup = heap_rows)]
-fn serialized_encode_256(rows: Vec<Vec<u8>>) {
+fn page_frame_encode_256(rows: Vec<Vec<u8>>) {
     black_box(serialized_page::encode(black_box(&rows)));
 }
 
 #[library_benchmark]
 #[bench::heap(setup = setup_decode)]
-fn serialized_decode_256(body: Vec<u8>) {
+fn page_frame_decode_256(body: Vec<u8>) {
     let decoded = serialized_page::decode(black_box(&body), HEAP_ROWS).expect("decode ok");
     black_box(decoded.len());
+}
+
+// Layer 2: the actual rkyv codec — this is the rkyv encode/decode overhead.
+#[library_benchmark]
+#[bench::heap(setup = setup_rkyv_encode)]
+fn rkyv_encode_256(input: (CodecRegistry, TypeId, Vec<BenchName>)) {
+    let (codecs, ty, values) = input;
+    for v in &values {
+        let mut buf = Vec::new();
+        // SAFETY: `ty` is `BenchName`'s TypeId; the pointer is a valid, aligned
+        // `BenchName` for the duration of the call.
+        unsafe {
+            codecs
+                .serialize_by_type(ty, std::ptr::from_ref(v).cast::<u8>(), &mut buf)
+                .expect("codec for BenchName")
+                .expect("serialize ok");
+        }
+        black_box(buf.len());
+    }
+}
+
+#[library_benchmark]
+#[bench::heap(setup = setup_rkyv_decode)]
+fn rkyv_decode_256(input: (CodecRegistry, TypeId, Vec<Vec<u8>>)) {
+    let (codecs, ty, rows) = input;
+    for row in &rows {
+        let native = codecs
+            .deserialize_by_type(ty, row)
+            .expect("codec for BenchName")
+            .expect("decode ok");
+        // `native` byte-owns a reconstructed `BenchName` (with a heap `String`).
+        // Read it out and drop it so the `String` is freed exactly once — the
+        // `Vec<u8>` would otherwise leak it (a `Vec<u8>` runs no `BenchName::drop`).
+        // This mirrors the ownership transfer recovery performs.
+        // SAFETY: `native` holds a valid native `BenchName` image (deserialize_by_type
+        // reconstructs the value and transfers ownership into the bytes).
+        let name = unsafe { std::ptr::read(native.as_ptr().cast::<BenchName>()) };
+        black_box(name.text.len());
+        drop(name);
+    }
 }
 
 #[library_benchmark]
@@ -168,7 +255,13 @@ fn rawcopy_column_256(column: Vec<u8>) {
 
 library_benchmark_group!(
     name = page_codec;
-    benchmarks = get_page_pod, serialized_encode_256, serialized_decode_256, rawcopy_column_256
+    benchmarks =
+        get_page_pod,
+        page_frame_encode_256,
+        page_frame_decode_256,
+        rkyv_encode_256,
+        rkyv_decode_256,
+        rawcopy_column_256
 );
 
 main!(library_benchmark_groups = page_codec);
