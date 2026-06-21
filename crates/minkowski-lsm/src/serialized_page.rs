@@ -67,6 +67,18 @@ pub fn decode(data: &[u8], row_count: usize) -> Result<Vec<&[u8]>, LsmError> {
         )));
     }
     let values = &data[table_len..];
+    // The values region must be EXACTLY consumed by the offset table. A `values`
+    // region longer than `offsets[row_count]` implies a row-count under-count
+    // (decoding `n` rows from a body that actually holds more), which would
+    // silently return a truncated row set. Reject it.
+    let declared = off(row_count);
+    if declared != values.len() {
+        return Err(LsmError::Format(format!(
+            "serialized page: values region is {} bytes, offset table accounts for {declared} \
+             (row_count {row_count} under-counts the page)",
+            values.len()
+        )));
+    }
     let mut rows = Vec::with_capacity(row_count);
     for i in 0..row_count {
         let (start, end) = (off(i), off(i + 1));
@@ -145,6 +157,18 @@ mod tests {
         let mut body = encode(&[b"aaaaa".to_vec(), b"bbbbb".to_vec()]);
         body[4..8].copy_from_slice(&8u32.to_le_bytes()); // offsets[1] = 8
         body[8..12].copy_from_slice(&6u32.to_le_bytes()); // offsets[2] = 6 (< 8)
+        assert!(matches!(decode(&body, 2), Err(LsmError::Format(_))));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_data() {
+        // A well-formed body for two rows, with an extra byte appended to the
+        // values region. `offsets[n]` no longer equals `values.len()`, so decode
+        // must reject it rather than silently returning a truncated row set (the
+        // under-count footgun: `decode(body, n)` with `n` smaller than the true
+        // count).
+        let mut body = encode(&[b"aa".to_vec(), b"bbb".to_vec()]);
+        body.push(0xFF); // trailing byte past the values region
         assert!(matches!(decode(&body, 2), Err(LsmError::Format(_))));
     }
 

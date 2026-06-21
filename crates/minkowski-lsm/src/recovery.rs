@@ -514,16 +514,24 @@ fn materialize_world(
         // it), so its `type_id` is always `Some` and it was registered via the
         // typed path — the archetype column holds T's correct drop_fn, never a
         // raw (drop_fn = None) placeholder.
+        // Hard-error on a missing storage kind (mirrors the `item_sizes` block
+        // above). A silent RawCopy default could misclassify a Serialized column,
+        // cloning its raw `[offsets][values]` body into an archetype column as
+        // native heap pointers → corruption. The signature is derived from the
+        // same schema that records the kind, so a missing entry is unreachable
+        // today — but an explicit error keeps the recovery boundary sound against
+        // any future change that decouples the two.
         let col_kinds: Vec<(crate::schema::StorageKind, Option<std::any::TypeId>)> = comp_pairs
             .iter()
             .map(|(id, name)| {
-                let kind = component_kinds
-                    .get(*name)
-                    .copied()
-                    .unwrap_or(crate::schema::StorageKind::RawCopy);
-                (kind, world.component_type_id(*id))
+                let kind = component_kinds.get(*name).copied().ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "component {name} in archetype {sig:?} has no resolved storage kind"
+                    ))
+                })?;
+                Ok::<_, LsmError>((kind, world.component_type_id(*id)))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         for (&page_index, entity_page) in entity_pages {
             let row_count = entity_page.row_count as usize;
@@ -593,9 +601,24 @@ fn materialize_world(
                             )));
                         }
                         let (kind, type_id) = col_kinds[i];
-                        native_column_page(page, kind, type_id, codecs).map_err(|e| {
-                            LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
-                        })
+                        let native =
+                            native_column_page(page, kind, type_id, codecs).map_err(|e| {
+                                LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
+                            })?;
+                        // Release invariant: the normalized native buffer must be
+                        // exactly `row_count` native items wide. This mirrors the
+                        // slow-path assert so a kind/length disagreement can never
+                        // reach `import_page` unchecked on either path (all rows
+                        // alive ⇒ the page width must equal the native stride).
+                        let item_size = item_sizes[i];
+                        assert_eq!(
+                            native.len(),
+                            row_count * item_size,
+                            "normalized column {name} page {page_index} is {} bytes, expected \
+                             {row_count} * {item_size}",
+                            native.len()
+                        );
+                        Ok(native)
                     })
                     .collect::<Result<_, _>>()?;
                 (page_entities.clone(), cols)
@@ -1145,6 +1168,11 @@ mod tests {
         let e2 = world.spawn((Name {
             text: "a much longer name here".to_owned(),
         },));
+        // Empty String: a zero-length rkyv row (offset table with a zero-length
+        // slot) must round-trip through flush → recover.
+        let e3 = world.spawn((Name {
+            text: String::new(),
+        },));
 
         let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
         flush_and_record(
@@ -1169,6 +1197,7 @@ mod tests {
             recovered.get::<Name>(e2).map(|n| n.text.as_str()),
             Some("a much longer name here")
         );
+        assert_eq!(recovered.get::<Name>(e3).map(|n| n.text.as_str()), Some(""));
     }
 
     /// A single archetype mixing a POD (RawCopy) column and a heap (Serialized)
@@ -2090,6 +2119,68 @@ mod tests {
         assert_eq!(
             recovered.get::<Name>(e2).map(|n| n.text.as_str()),
             Some("second")
+        );
+    }
+
+    /// Compaction newest-wins for a heap (Serialized) column when the SAME entity
+    /// carries DIFFERENT heap values across runs. `recover_heap_component_after_compaction`
+    /// only carries entities whose String is constant, so a carry-forward bug that
+    /// picked the OLDER offset-table row would survive it. Here entity `e` is
+    /// flushed with "v1" (run 1), then updated to "v2-longer" (run 2). The
+    /// differing LENGTHS force a different offset table, so picking the stale row
+    /// yields the wrong bytes. Recovery must return the NEWEST value through the
+    /// Serialized re-encode path.
+    #[test]
+    fn compaction_keeps_newest_heap_value() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("name", &mut world).unwrap();
+
+        let e = world.spawn((Name {
+            text: "v1".to_owned(),
+        },));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Flush 4 times to trigger compaction (L0 threshold is 4). At i == 1 the
+        // SAME entity's value changes to a different LENGTH, forcing a distinct
+        // offset table across the input runs.
+        for i in 0..4u64 {
+            if i == 1 {
+                world.get_mut::<Name>(e).unwrap().text = "v2-longer".to_owned();
+            }
+            flush_and_record(
+                &world,
+                SeqRange::new(SeqNo::from(i), SeqNo::from(i + 1)).unwrap(),
+                &mut manifest,
+                &mut log,
+                &lsm_dir,
+                &codecs,
+            )
+            .unwrap()
+            .expect("flush");
+        }
+
+        compact_one(&mut manifest, &mut log, &lsm_dir)
+            .unwrap()
+            .expect("compaction ran");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+        assert_eq!(
+            recovered.get::<Name>(e).map(|n| n.text.as_str()),
+            Some("v2-longer"),
+            "compaction must carry forward the NEWEST heap value, not a stale offset-table row"
         );
     }
 

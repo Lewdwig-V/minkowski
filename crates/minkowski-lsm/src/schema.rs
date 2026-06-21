@@ -23,11 +23,15 @@ impl StorageKind {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
+}
 
-    pub fn from_u8(byte: u8) -> Result<Self, LsmError> {
+impl TryFrom<u8> for StorageKind {
+    type Error = LsmError;
+
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
         match byte {
-            0 => Ok(StorageKind::RawCopy),
-            1 => Ok(StorageKind::Serialized),
+            0 => Ok(Self::RawCopy),
+            1 => Ok(Self::Serialized),
             other => Err(LsmError::Format(format!(
                 "invalid storage_kind byte {other} (expected 0=RawCopy or 1=Serialized)"
             ))),
@@ -283,7 +287,7 @@ impl SchemaSection {
                     "schema entry {i}: unexpected end of data reading storage_kind"
                 )));
             }
-            let storage_kind = StorageKind::from_u8(data[cursor])?;
+            let storage_kind = StorageKind::try_from(data[cursor])?;
             cursor += 1;
 
             name_to_slot.insert(name.clone(), slot);

@@ -1054,9 +1054,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let n0: Name = rkyv::from_bytes::<Name, rkyv::rancor::Error>(rows[0]).unwrap();
         let n1: Name = rkyv::from_bytes::<Name, rkyv::rancor::Error>(rows[1]).unwrap();
-        let mut got = [n0.text, n1.text];
-        got.sort();
-        assert_eq!(got, ["alice".to_owned(), "bob".to_owned()]);
+        // Assert POSITIONALLY (no sort): the dense column row order follows
+        // archetype insertion order = spawn order for this single archetype. Row 0
+        // must be the first spawned entity's value, row 1 the second. Sorting
+        // would mask a transposed offset table.
+        assert_eq!(n0.text, "alice", "row 0 must be the first spawned value");
+        assert_eq!(n1.text, "bob", "row 1 must be the second spawned value");
     }
 
     #[test]

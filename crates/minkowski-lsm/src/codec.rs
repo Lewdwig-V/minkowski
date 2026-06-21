@@ -356,6 +356,14 @@ impl CodecRegistry {
 
     /// Serialize a component value from a raw pointer to bytes.
     ///
+    /// Resolves the codec by per-world `ComponentId`. This is ONLY valid when the
+    /// registry and the world share an id space — e.g. WAL write/replay against
+    /// the same world the registry was built for. For any CROSS-WORLD path
+    /// (recovery, flush), the recovered world's local ids diverge from the
+    /// registry's; use [`serialize_by_type`](Self::serialize_by_type) /
+    /// [`deserialize_by_type`](Self::deserialize_by_type) instead, which key by
+    /// component `TypeId`.
+    ///
     /// # Safety
     /// `ptr` must point to a valid, aligned instance of the component type
     /// registered under `id`. The pointer must be valid for reads of
@@ -378,6 +386,11 @@ impl CodecRegistry {
     /// Deserialize component bytes into a raw byte buffer. Internal to the
     /// crate: callers outside use [`decode`](Self::decode), which gates the
     /// raw-copy fast path on a [`CrcProof`].
+    ///
+    /// Resolves the codec by per-world `ComponentId`, so it is only valid when the
+    /// registry and the world share an id space (e.g. WAL replay against the same
+    /// world). For cross-world paths (recovery, flush) use
+    /// [`deserialize_by_type`](Self::deserialize_by_type), which keys by `TypeId`.
     pub(crate) fn deserialize(&self, id: ComponentId, bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
         let codec = self
             .codecs
