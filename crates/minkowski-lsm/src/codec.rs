@@ -279,7 +279,15 @@ impl CodecRegistry {
         };
 
         let deserialize_fn: DeserializeFn = |bytes| {
-            let value: T = rkyv::from_bytes::<T, rancor::Error>(bytes)
+            // `rkyv::from_bytes` accesses the archive in place and requires the
+            // buffer aligned to the archived type's alignment. Dense recovery
+            // hands us row slices at arbitrary offsets within a page body
+            // (`[offsets:(n+1)×u32][values]`), so the slice is essentially never
+            // aligned — an unaligned `access` is UB (and Miri-rejected). Realign
+            // into an AlignedVec (16-byte aligned, covers all archived alignments).
+            let mut aligned = rkyv::util::AlignedVec::<16>::new();
+            aligned.extend_from_slice(bytes);
+            let value: T = rkyv::from_bytes::<T, rancor::Error>(&aligned)
                 .map_err(|e| CodecError::Deserialize(e.to_string()))?;
             let layout = Layout::new::<T>();
             let mut buf = vec![0u8; layout.size()];
@@ -316,7 +324,12 @@ impl CodecRegistry {
         };
 
         let insert_sparse_fn: InsertSparseFn = |world, entity, data| {
-            let value: T = rkyv::from_bytes::<T, rancor::Error>(data)
+            // Same realignment requirement as `deserialize_fn`: `from_bytes`
+            // accesses the archive in place and the caller-supplied slice is not
+            // guaranteed aligned. Copy into an AlignedVec before decoding.
+            let mut aligned = rkyv::util::AlignedVec::<16>::new();
+            aligned.extend_from_slice(data);
+            let value: T = rkyv::from_bytes::<T, rancor::Error>(&aligned)
                 .map_err(|e| CodecError::Deserialize(e.to_string()))?;
             world.insert_sparse::<T>(entity, value);
             Ok(())
@@ -878,6 +891,46 @@ mod raw_copy_tests {
         let restored = unsafe { std::ptr::read(native.as_ptr() as *const WithHeap) };
         assert_eq!(restored.label, "hello heap");
         std::mem::forget(restored); // bytes still own the String; avoid double free
+    }
+
+    #[test]
+    fn deserialize_by_type_handles_unaligned_input() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        let ty = std::any::TypeId::of::<WithHeap>();
+
+        let value = WithHeap {
+            label: "alignment matters".to_owned(),
+        };
+        let mut bytes = Vec::new();
+        unsafe {
+            codecs
+                .serialize_by_type(ty, &value as *const WithHeap as *const u8, &mut bytes)
+                .unwrap()
+                .unwrap();
+        }
+
+        // Force a misaligned view: prepend one byte, then deserialize from the
+        // offset-1 sub-slice. `access` on this unaligned slice is UB without the
+        // AlignedVec realign — Miri (and strict-alignment targets) catch it.
+        let mut shifted = Vec::with_capacity(bytes.len() + 1);
+        shifted.push(0u8);
+        shifted.extend_from_slice(&bytes);
+        let unaligned = &shifted[1..];
+
+        let native = codecs.deserialize_by_type(ty, unaligned).unwrap().unwrap();
+        // `native` is a `Vec<u8>` byte-owning a `WithHeap`; its buffer is not
+        // guaranteed aligned to `WithHeap`, so read it out unaligned. (Real
+        // recovery memcpys these bytes into an aligned archetype column.) Take
+        // ownership of the reconstructed value, then drop the raw byte buffer.
+        // `Vec<u8>` drop only frees bytes (u8 has no Drop), so the inner `String`
+        // is freed exactly once — by `restored` — with no double free or leak.
+        let restored = unsafe { std::ptr::read_unaligned(native.as_ptr() as *const WithHeap) };
+        drop(native);
+        assert_eq!(restored.label, "alignment matters");
     }
 
     #[test]

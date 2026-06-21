@@ -593,7 +593,9 @@ fn materialize_world(
                             )));
                         }
                         let (kind, type_id) = col_kinds[i];
-                        native_column_page(page, kind, type_id, codecs)
+                        native_column_page(page, kind, type_id, codecs).map_err(|e| {
+                            LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
+                        })
                     })
                     .collect::<Result<_, _>>()?;
                 (page_entities.clone(), cols)
@@ -633,7 +635,9 @@ fn materialize_world(
                     // After normalization the native `item_size` is the correct
                     // stride for both kinds.
                     let (kind, type_id) = col_kinds[i];
-                    let native = native_column_page(page, kind, type_id, codecs)?;
+                    let native = native_column_page(page, kind, type_id, codecs).map_err(|e| {
+                        LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
+                    })?;
                     let item_size = item_sizes[i];
                     // The normalized buffer must be exactly row_count native items
                     // wide, or slicing by item_size disagrees with the row layout.
