@@ -65,6 +65,62 @@ fn splitmix(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Spawn one entity numbered `i` with the shape/layout of `params`. `s` is the
+/// running PRNG state used to pick the archetype bucket under `Layout::Fragmented`.
+/// Shared by `build_world` (initial population) and `grow` (incremental growth).
+fn spawn_one(world: &mut World, params: &WorkloadParams, i: usize, s: &mut u64) {
+    let bucket = if matches!(params.layout, Layout::Fragmented) {
+        (splitmix(s) % 3) as u8
+    } else {
+        0
+    };
+    match params.shape {
+        Shape::Pod => match bucket {
+            0 => {
+                world.spawn((
+                    BenchPos {
+                        x: i as f32,
+                        y: 0.0,
+                    },
+                    BenchVel { dx: 1.0, dy: 0.0 },
+                ));
+            }
+            1 => {
+                world.spawn((BenchPos {
+                    x: i as f32,
+                    y: 0.0,
+                },));
+            }
+            _ => {
+                world.spawn((BenchVel {
+                    dx: 1.0,
+                    dy: i as f32,
+                },));
+            }
+        },
+        Shape::Heap => match bucket {
+            0 => {
+                world.spawn((
+                    BenchName {
+                        text: format!("e{i}"),
+                    },
+                    BenchVel { dx: 1.0, dy: 0.0 },
+                ));
+            }
+            1 => {
+                world.spawn((BenchName {
+                    text: format!("e{i}"),
+                },));
+            }
+            _ => {
+                world.spawn((BenchName {
+                    text: format!("name-{i}-padded"),
+                },));
+            }
+        },
+    }
+}
+
 /// Build a deterministic World + matching CodecRegistry for `params`.
 ///
 /// # Panics
@@ -86,59 +142,28 @@ pub fn build_world(params: &WorkloadParams) -> (World, CodecRegistry) {
 
     let mut s = params.seed;
     for i in 0..params.entities {
-        let bucket = if matches!(params.layout, Layout::Fragmented) {
-            (splitmix(&mut s) % 3) as u8
-        } else {
-            0
-        };
-        match params.shape {
-            Shape::Pod => match bucket {
-                0 => {
-                    world.spawn((
-                        BenchPos {
-                            x: i as f32,
-                            y: 0.0,
-                        },
-                        BenchVel { dx: 1.0, dy: 0.0 },
-                    ));
-                }
-                1 => {
-                    world.spawn((BenchPos {
-                        x: i as f32,
-                        y: 0.0,
-                    },));
-                }
-                _ => {
-                    world.spawn((BenchVel {
-                        dx: 1.0,
-                        dy: i as f32,
-                    },));
-                }
-            },
-            Shape::Heap => match bucket {
-                0 => {
-                    world.spawn((
-                        BenchName {
-                            text: format!("e{i}"),
-                        },
-                        BenchVel { dx: 1.0, dy: 0.0 },
-                    ));
-                }
-                1 => {
-                    world.spawn((BenchName {
-                        text: format!("e{i}"),
-                    },));
-                }
-                _ => {
-                    world.spawn((BenchName {
-                        text: format!("name-{i}-padded"),
-                    },));
-                }
-            },
-        }
+        spawn_one(&mut world, params, i, &mut s);
     }
     let _ = params.sparse; // placeholder until a sparse-enabled bench needs it
     (world, codecs)
+}
+
+/// Spawn `count` ADDITIONAL entities into `world`, numbered `start_index..`, so
+/// successive flushes accumulate and the dataset grows — letting it cascade
+/// through LSM levels (the only way the level-count `N` becomes observable; a
+/// constant dataset just re-supersedes itself and never reaches deep levels).
+/// The components are already registered (from `build_world`), so this only spawns.
+pub fn grow(
+    world: &mut World,
+    params: &WorkloadParams,
+    start_index: usize,
+    count: usize,
+    seed: u64,
+) {
+    let mut s = seed;
+    for i in start_index..start_index + count {
+        spawn_one(world, params, i, &mut s);
+    }
 }
 
 /// Mutate `ratio` (0.0..=1.0) of `BenchVel` rows deterministically so a
