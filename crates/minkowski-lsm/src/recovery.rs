@@ -468,16 +468,28 @@ fn native_column_page(
                     // full validating decode. Both reconstruct an owning native
                     // value whose heap ownership rides inside the bytes.
                     let native = match decode_mode {
-                        DecodeMode::Unchecked(proof) => codecs
-                            .deserialize_unchecked_by_type(ty, slice, proof)
-                            .ok_or_else(|| {
-                                LsmError::Format(
-                                    "no codec for serialized column type on recovery".to_owned(),
-                                )
-                            })?
-                            .map_err(|e| {
-                                LsmError::Format(format!("serialized decode failed: {e}"))
-                            })?,
+                        // SAFETY: this arm is reached only when `run_allows_unchecked`
+                        // held for the source run — i.e. the run's stamped
+                        // `decode_fingerprint` is non-zero and equals this binary's
+                        // recomputed `run_fingerprint` (layout-provenance: the
+                        // archived/native layout of `ty` matches what produced these
+                        // bytes) — AND `proof` is the per-page `CrcProof` certifying
+                        // these exact bytes' integrity (unchanged since the writer
+                        // emitted them). Together the fingerprint gate (layout) and
+                        // the CrcProof (integrity) establish that `slice` is a valid
+                        // rkyv archive of `ty`, satisfying the method's precondition.
+                        DecodeMode::Unchecked(proof) => {
+                            unsafe { codecs.deserialize_unchecked_by_type(ty, slice, proof) }
+                                .ok_or_else(|| {
+                                    LsmError::Format(
+                                        "no codec for serialized column type on recovery"
+                                            .to_owned(),
+                                    )
+                                })?
+                                .map_err(|e| {
+                                    LsmError::Format(format!("serialized decode failed: {e}"))
+                                })?
+                        }
                         DecodeMode::Checked => codecs
                             .deserialize_by_type(ty, slice)
                             .ok_or_else(|| {

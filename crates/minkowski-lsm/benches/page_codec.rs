@@ -273,8 +273,9 @@ fn rkyv_decode_256(input: (CodecRegistry, TypeId, Vec<Vec<u8>>)) {
 fn rkyv_decode_unchecked_256(input: (CodecRegistry, TypeId, Vec<Vec<u8>>, Vec<CrcProof>)) {
     let (codecs, ty, rows, proofs) = input;
     for (row, proof) in rows.iter().zip(proofs.iter()) {
-        let native = codecs
-            .deserialize_unchecked_by_type(ty, row, proof)
+        // SAFETY: `row` was just serialized by this binary's codec for
+        // `BenchName`, so it is a valid archive of that type.
+        let native = unsafe { codecs.deserialize_unchecked_by_type(ty, row, proof) }
             .expect("codec for BenchName")
             .expect("decode ok");
         // Same ownership dance as rkyv_decode_256: read out unaligned, drop once.

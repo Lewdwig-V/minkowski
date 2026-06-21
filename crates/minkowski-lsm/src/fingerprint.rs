@@ -51,40 +51,37 @@ pub fn decode_fingerprint(entries: &[FingerprintEntry<'_>]) -> u64 {
 }
 
 /// The fingerprint for a run, computed over its Serialized schema entries with
-/// archived sizes looked up in `codecs`. THE shared entry point: writer,
-/// compaction, and recovery all call this so their hashes agree by construction.
+/// native + archived layout resolved from the live `codecs` BY THE SCHEMA NAME
+/// (the Rust `type_name`). THE shared entry point: writer, compaction, and
+/// recovery all call this so their hashes agree by construction.
 ///
-/// A Serialized component whose codec is missing (e.g. recovery without it
-/// registered) gets `u64::MAX` as a poison archived size, guaranteeing a
-/// mismatch → checked decode (the run cannot be decoded unchecked anyway).
+/// Returns `0` (fail CLOSED) if ANY Serialized component's layout cannot be
+/// resolved — recovery's `decode_fingerprint() != 0` guard then forces checked
+/// decode. A `u64::MAX` poison sentinel would be WRONG here: the same poison is
+/// hashed at flush and recovery, so it would self-match and wrongly ENABLE the
+/// unchecked path without proving the layout.
 #[must_use]
 pub fn run_fingerprint(schema: &SchemaSection, codecs: &CodecRegistry) -> u64 {
-    let mut entries: Vec<FingerprintEntry<'_>> = schema
+    let mut entries: Vec<FingerprintEntry<'_>> = Vec::new();
+    for e in schema
         .entries()
         .iter()
         .filter(|e| e.storage_kind() == StorageKind::Serialized)
-        .map(|e| {
-            // Source native AND archived layout from the LIVE codecs (this
-            // binary), NOT the on-disk schema. If recovery read native size/align
-            // back from `reader.schema()` (the writer's stamped values), the
-            // native terms would be identical on both sides and detect nothing —
-            // only `archived_size` would discriminate (soundness audit N2). A
-            // missing codec poisons to u64::MAX → guaranteed mismatch → checked.
-            let (native_size, native_align) = codecs
-                .native_layout_by_name(e.name())
-                .map_or((u64::MAX, u64::MAX), |(s, a)| (s as u64, a as u64));
-            let archived_size = codecs
-                .archived_size_by_name(e.name())
-                .map_or(u64::MAX, |s| s as u64);
-            FingerprintEntry {
-                name: e.name(),
-                native_size,
-                native_align,
-                archived_size,
-            }
-        })
-        .collect();
-    entries.sort_by(|a, b| a.name.cmp(b.name)); // schema is already name-sorted; explicit for safety
+    {
+        let Some((native_size, native_align)) = codecs.native_layout_by_type_name(e.name()) else {
+            return 0;
+        };
+        let Some(archived_size) = codecs.archived_size_by_type_name(e.name()) else {
+            return 0;
+        };
+        entries.push(FingerprintEntry {
+            name: e.name(),
+            native_size: native_size as u64,
+            native_align: native_align as u64,
+            archived_size: archived_size as u64,
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(b.name));
     decode_fingerprint(&entries)
 }
 
@@ -133,53 +130,48 @@ mod tests {
         s: String,
     }
 
-    #[test]
-    fn run_fingerprint_uses_live_codec_native_layout_not_schema() {
+    fn heap_schema() -> crate::schema::SchemaSection {
         use crate::schema::{SchemaSection, StorageKind};
-        use minkowski::World;
-        let mut world = World::new();
-        let mut codecs = crate::codec::CodecRegistry::new();
-        codecs.register_as::<HeapC>("hc", &mut world).unwrap();
-        // Two schemas for "hc" differing ONLY in the (bogus) native item_size.
-        let bogus = SchemaSection::from_components(&[(
-            "hc".to_owned(),
-            std::alloc::Layout::from_size_align(999, 1).unwrap(),
-            StorageKind::Serialized,
-        )])
-        .unwrap();
-        let real = SchemaSection::from_components(&[(
-            "hc".to_owned(),
+        // Production stores the Rust type_name as the dense schema name.
+        SchemaSection::from_components(&[(
+            std::any::type_name::<HeapC>().to_owned(),
             std::alloc::Layout::new::<HeapC>(),
             StorageKind::Serialized,
         )])
-        .unwrap();
-        // Native layout comes from the codec, so the bogus schema size is ignored:
-        // both fingerprints are equal. (Pre-fix, they would DIFFER.)
-        assert_eq!(
-            run_fingerprint(&bogus, &codecs),
-            run_fingerprint(&real, &codecs)
-        );
+        .unwrap()
     }
 
     #[test]
-    fn run_fingerprint_poisons_missing_codec() {
-        use crate::schema::{SchemaSection, StorageKind};
+    fn run_fingerprint_resolves_aliased_codec_by_type_name() {
+        use minkowski::World;
+        let mut world = World::new();
+        let mut codecs = crate::codec::CodecRegistry::new();
+        // register_as with an ALIAS != type_name — the case that used to poison.
+        codecs.register_as::<HeapC>("hc-alias", &mut world).unwrap();
+        // Resolves via type_name despite the alias ⇒ a real, non-zero fingerprint.
+        assert_ne!(run_fingerprint(&heap_schema(), &codecs), 0);
+    }
+
+    #[test]
+    fn run_fingerprint_fails_closed_to_zero_on_missing_codec() {
+        // No codec registered for HeapC's type_name ⇒ fail CLOSED to 0 (NOT a
+        // self-matching poison). This is the P1#2 regression guard.
+        let codecs = crate::codec::CodecRegistry::new();
+        assert_eq!(run_fingerprint(&heap_schema(), &codecs), 0);
+    }
+
+    #[test]
+    fn run_fingerprint_present_vs_missing_differ() {
         use minkowski::World;
         let mut world = World::new();
         let mut with = crate::codec::CodecRegistry::new();
-        with.register_as::<HeapC>("hc", &mut world).unwrap();
-        let without = crate::codec::CodecRegistry::new(); // "hc" unregistered
-        let schema = SchemaSection::from_components(&[(
-            "hc".to_owned(),
-            std::alloc::Layout::new::<HeapC>(),
-            StorageKind::Serialized,
-        )])
-        .unwrap();
-        // Missing codec ⇒ u64::MAX poison ⇒ a different fingerprint ⇒ mismatch ⇒
-        // recovery falls back to checked decode. (Closes a Task-2 review gap too.)
+        with.register_as::<HeapC>("hc-alias", &mut world).unwrap();
+        let without = crate::codec::CodecRegistry::new();
+        // Present ⇒ real non-zero hash; missing ⇒ 0. They MUST differ (pre-fix,
+        // both produced the same self-matching poison hash).
         assert_ne!(
-            run_fingerprint(&schema, &with),
-            run_fingerprint(&schema, &without)
+            run_fingerprint(&heap_schema(), &with),
+            run_fingerprint(&heap_schema(), &without)
         );
     }
 }

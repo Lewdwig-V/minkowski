@@ -122,6 +122,11 @@ struct ComponentCodec {
     /// flushed world's `component_type_id` to confirm the codec actually
     /// describes the type whose native bytes are being persisted.
     type_id: std::any::TypeId,
+    /// `std::any::type_name::<T>()` — the dense on-disk schema stores this
+    /// (via `World::component_name`), NOT the codec stable name (which may be a
+    /// `register_as` alias). Fingerprint layout lookups resolve by THIS so an
+    /// aliased codec still resolves.
+    type_name: &'static str,
 }
 
 /// Maps ComponentId to rkyv codecs. Separate from core's ComponentRegistry —
@@ -193,13 +198,19 @@ impl CodecRegistry {
     }
 
     /// Deserialize component bytes into a native-byte buffer by *type*, skipping
-    /// rkyv bytecheck (`access_unchecked` + `deserialize`). The `_proof`
-    /// (unforgeable — only minted by [`CrcProof::verify`]) gates this unsafe fast
-    /// path: a caller cannot reach it without having validated the bytes'
-    /// integrity. Sound ONLY in combination with the recovery fingerprint gate
-    /// (spec §2.1) — the proof covers integrity, the fingerprint covers
-    /// layout-provenance. Returns `None` if no codec is registered for the type.
-    pub fn deserialize_unchecked_by_type(
+    /// rkyv bytecheck (`access_unchecked` + `deserialize`). Returns `None` if no
+    /// codec is registered for the type.
+    ///
+    /// # Safety
+    /// `bytes` MUST be a valid rkyv archive of the type identified by `type_id` —
+    /// i.e. produced by this binary's codec for that type and not since mutated.
+    /// `CrcProof` proves only byte INTEGRITY (the bytes are unchanged since the
+    /// writer emitted them); it does NOT prove the writer emitted a structurally
+    /// valid archive of THIS binary's type. The caller must independently establish
+    /// well-formedness — recovery does so via the per-run decode-fingerprint gate
+    /// (`fingerprint::run_fingerprint` match) before reaching this. Calling with a
+    /// CRC-valid-but-malformed archive is undefined behavior.
+    pub unsafe fn deserialize_unchecked_by_type(
         &self,
         type_id: std::any::TypeId,
         bytes: &[u8],
@@ -444,6 +455,7 @@ impl CodecRegistry {
                 raw_copyable,
                 archived_size: std::mem::size_of::<T::Archived>(),
                 type_id: std::any::TypeId::of::<T>(),
+                type_name: std::any::type_name::<T>(),
             },
         );
         Ok(())
@@ -505,22 +517,21 @@ impl CodecRegistry {
         self.codecs.get(&id).map(|c| c.name.as_str())
     }
 
-    /// The rkyv archived size for a registered component *type*, resolved by its
-    /// stable name. Used to compute the decode fingerprint (spec §2.1).
-    pub fn archived_size_by_name(&self, name: &str) -> Option<usize> {
-        let id = self.by_name.get(name)?;
-        self.codecs.get(id).map(|c| c.archived_size)
+    /// Archived (rkyv) size for the component whose Rust `type_name` is `type_name`
+    /// (the dense schema key). Resolves by `type_name`, NOT the codec stable name.
+    pub fn archived_size_by_type_name(&self, type_name: &str) -> Option<usize> {
+        self.codecs
+            .values()
+            .find(|c| c.type_name == type_name)
+            .map(|c| c.archived_size)
     }
 
-    /// Native (in-memory) size and align for a registered component *type*, by
-    /// stable name. `run_fingerprint` sources native layout from here (the LIVE
-    /// codecs of THIS binary) rather than the on-disk schema, so the fingerprint's
-    /// native terms actually detect a writer-vs-recovery layout divergence
-    /// (soundness audit N2). Returns `None` if no codec is registered.
-    pub fn native_layout_by_name(&self, name: &str) -> Option<(usize, usize)> {
-        let id = self.by_name.get(name)?;
+    /// Native (in-memory) size and align for the component whose Rust `type_name`
+    /// is `type_name` (the dense schema key). Resolves by `type_name`.
+    pub fn native_layout_by_type_name(&self, type_name: &str) -> Option<(usize, usize)> {
         self.codecs
-            .get(id)
+            .values()
+            .find(|c| c.type_name == type_name)
             .map(|c| (c.layout.size(), c.layout.align()))
     }
 
@@ -1148,8 +1159,9 @@ mod raw_copy_tests {
 
         let checked = codecs.deserialize_by_type(ty, &bytes).unwrap().unwrap();
         let proof = CrcProof::verify(&bytes, crc32fast::hash(&bytes)).unwrap();
-        let unchecked = codecs
-            .deserialize_unchecked_by_type(ty, &bytes, &proof)
+        // SAFETY: `bytes` was just serialized by this binary's codec for
+        // `WithHeap`, so it is a valid archive of that type.
+        let unchecked = unsafe { codecs.deserialize_unchecked_by_type(ty, &bytes, &proof) }
             .expect("codec exists")
             .expect("unchecked decode ok");
 
@@ -1172,17 +1184,18 @@ mod raw_copy_tests {
         codecs
             .register_as::<WithHeap>("with_heap", &mut world)
             .unwrap();
-        // POD: archived size == native size.
+        // POD: archived size == native size. Resolve by Rust type_name (the dense
+        // schema key), NOT the register_as alias.
         assert_eq!(
-            codecs.archived_size_by_name("plain"),
+            codecs.archived_size_by_type_name(std::any::type_name::<Plain>()),
             Some(std::mem::size_of::<<Plain as rkyv::Archive>::Archived>())
         );
         // Heap: archived size is rkyv's ArchivedString layout (differs from native).
         assert_eq!(
-            codecs.archived_size_by_name("with_heap"),
+            codecs.archived_size_by_type_name(std::any::type_name::<WithHeap>()),
             Some(std::mem::size_of::<<WithHeap as rkyv::Archive>::Archived>())
         );
-        assert_eq!(codecs.archived_size_by_name("nope"), None);
+        assert_eq!(codecs.archived_size_by_type_name("nope"), None);
     }
 
     #[test]
