@@ -88,6 +88,7 @@ impl LsmRecovery {
         let mut allocator: Option<StoredAllocator> = None;
         let mut sparse: Option<StoredSparse> = None;
         let mut component_layouts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut component_kinds: BTreeMap<String, crate::schema::StorageKind> = BTreeMap::new();
         let mut max_seq_hi = 0u64;
 
         for meta in runs {
@@ -99,6 +100,9 @@ impl LsmRecovery {
                 component_layouts
                     .entry(entry.name().to_owned())
                     .or_insert((entry.item_size() as usize, entry.item_align() as usize));
+                component_kinds
+                    .entry(entry.name().to_owned())
+                    .or_insert(entry.storage_kind());
             }
 
             // Allocator metadata may span multiple pages (large free lists);
@@ -163,22 +167,36 @@ impl LsmRecovery {
                 for slot in reader.component_slots_for_arch(arch_id) {
                     // component_slots_for_arch excludes ENTITY_SLOT, so every slot
                     // here has a named schema entry.
-                    let (name, item_size) = {
+                    let (name, item_size, kind) = {
                         let entry = reader.schema().entry_for_slot(slot).ok_or_else(|| {
                             LsmError::Format(format!("missing schema entry for slot {slot}"))
                         })?;
-                        (entry.name().to_owned(), entry.item_size as usize)
+                        (
+                            entry.name().to_owned(),
+                            entry.item_size as usize,
+                            entry.storage_kind(),
+                        )
                     };
                     for result in reader.slot_pages(arch_id, slot) {
                         let (page_index, page) = result?;
                         reader.validate_page_crc(&page)?;
-                        let payload_len = page.header().row_count as usize * item_size;
+                        // RawCopy pages are zero-padded to the full stride, so we
+                        // slice the live `row_count * item_size` prefix. Serialized
+                        // pages are variable-length (`[offsets][values]`); the
+                        // reader sizes them exactly, so the WHOLE body is the
+                        // payload — slicing by native stride would corrupt them.
+                        let payload: &[u8] = match kind {
+                            crate::schema::StorageKind::RawCopy => {
+                                &page.data()[..page.header().row_count as usize * item_size]
+                            }
+                            crate::schema::StorageKind::Serialized => page.data(),
+                        };
                         store_page(
                             &mut pages,
                             (sig.clone(), ColumnKey::Component(name.clone()), page_index),
                             seq_hi,
                             page.header().row_count,
-                            &page.data()[..payload_len],
+                            payload,
                         );
                     }
                 }
@@ -210,7 +228,13 @@ impl LsmRecovery {
             pages.is_empty() || !component_layouts.is_empty(),
             "recovery: pages present but no component layouts were resolved"
         );
-        let mut world = materialize_world(pages, allocator.as_ref(), &component_layouts, codecs)?;
+        let mut world = materialize_world(
+            pages,
+            allocator.as_ref(),
+            &component_layouts,
+            &component_kinds,
+            codecs,
+        )?;
         apply_sparse(&mut world, sparse.as_ref(), codecs)?;
         Ok((RecoveryResult { world, flush_seq }, manifest, log))
     }
@@ -345,10 +369,85 @@ fn build_allocator_state(
     (generations, free_list)
 }
 
+/// Produce the native-byte image of one stored column page. RawCopy pages are
+/// already native bytes; Serialized pages are decoded row-by-row (rkyv) into a
+/// contiguous native buffer. The returned buffer transfers ownership of any heap
+/// values it reconstructs to its consumer — on import, the archetype column
+/// (which holds T's drop_fn) takes that ownership.
+///
+/// `item_size` is the native stride. `live_mask` selects which rows to
+/// materialize: `None` means every row is live (the all-alive fast path);
+/// `Some(mask)` materializes only the rows where `mask[row]` is `true`, in order.
+///
+/// Decoding ONLY live rows is load-bearing for leak-safety on the slow (dead-row)
+/// path: a decoded Serialized value owns heap data, but a dead row's value is
+/// never imported into the World, so its `drop_fn` would never run — decoding it
+/// at all would leak the heap allocation. RawCopy rows are POD, so dead rows are
+/// simply not copied.
+fn native_column_page(
+    page: &StoredPage,
+    kind: crate::schema::StorageKind,
+    type_id: Option<std::any::TypeId>,
+    codecs: &CodecRegistry,
+    item_size: usize,
+    live_mask: Option<&[bool]>,
+) -> Result<Vec<u8>, LsmError> {
+    let row_count = page.row_count as usize;
+    let is_live = |row: usize| live_mask.is_none_or(|mask| mask[row]);
+    match kind {
+        crate::schema::StorageKind::RawCopy => {
+            // `page.data` is the native bytes (row_count × item_size). Copy out
+            // only the live rows — POD, no ownership, so dead rows are dropped by
+            // simply not copying them.
+            let mut buf = Vec::new();
+            for row in 0..row_count {
+                if is_live(row) {
+                    let start = row * item_size;
+                    let end = start + item_size;
+                    let bytes = page.data.get(start..end).ok_or_else(|| {
+                        LsmError::Format(format!(
+                            "raw-copy page row {row} byte range {start}..{end} out of range \
+                             (page {} bytes)",
+                            page.data.len()
+                        ))
+                    })?;
+                    buf.extend_from_slice(bytes);
+                }
+            }
+            Ok(buf)
+        }
+        crate::schema::StorageKind::Serialized => {
+            let ty = type_id.ok_or_else(|| {
+                LsmError::Format("serialized column has no resolved type for decode".to_owned())
+            })?;
+            // `decode` yields borrowed rkyv byte slices (no heap value is
+            // reconstructed yet). Only LIVE rows are then deserialized into
+            // owning native values; dead rows are never decoded, so nothing leaks.
+            let rows = crate::serialized_page::decode(&page.data, row_count)?;
+            let mut buf = Vec::new();
+            for (row, slice) in rows.iter().enumerate() {
+                if is_live(row) {
+                    let native = codecs
+                        .deserialize_by_type(ty, slice)
+                        .ok_or_else(|| {
+                            LsmError::Format(
+                                "no codec for serialized column type on recovery".to_owned(),
+                            )
+                        })?
+                        .map_err(|e| LsmError::Format(format!("serialized decode failed: {e}")))?;
+                    buf.extend_from_slice(&native);
+                }
+            }
+            Ok(buf)
+        }
+    }
+}
+
 fn materialize_world(
     pages: BTreeMap<PageKey, StoredPage>,
     allocator: Option<&StoredAllocator>,
     component_layouts: &BTreeMap<String, (usize, usize)>,
+    component_kinds: &BTreeMap<String, crate::schema::StorageKind>,
     codecs: &CodecRegistry,
 ) -> Result<World, LsmError> {
     let mut world = World::new();
@@ -446,6 +545,33 @@ fn materialize_world(
             })
             .collect::<Result<_, _>>()?;
 
+        // Per-column normalization metadata, indexed identically to `comp_pairs`
+        // and `item_sizes`. `kind` selects RawCopy (native bytes already) vs
+        // Serialized (per-row rkyv decode); `type_id` is the recovered world's
+        // resolved component TypeId, required to pick the codec for a Serialized
+        // column. A Serialized column ALWAYS has a codec (the flush gate proves
+        // it), so its `type_id` is always `Some` and it was registered via the
+        // typed path — the archetype column holds T's correct drop_fn, never a
+        // raw (drop_fn = None) placeholder.
+        // Hard-error on a missing storage kind (mirrors the `item_sizes` block
+        // above). A silent RawCopy default could misclassify a Serialized column,
+        // cloning its raw `[offsets][values]` body into an archetype column as
+        // native heap pointers → corruption. The signature is derived from the
+        // same schema that records the kind, so a missing entry is unreachable
+        // today — but an explicit error keeps the recovery boundary sound against
+        // any future change that decouples the two.
+        let col_kinds: Vec<(crate::schema::StorageKind, Option<std::any::TypeId>)> = comp_pairs
+            .iter()
+            .map(|(id, name)| {
+                let kind = component_kinds.get(*name).copied().ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "component {name} in archetype {sig:?} has no resolved storage kind"
+                    ))
+                })?;
+                Ok::<_, LsmError>((kind, world.component_type_id(*id)))
+            })
+            .collect::<Result<_, _>>()?;
+
         for (&page_index, entity_page) in entity_pages {
             let row_count = entity_page.row_count as usize;
 
@@ -494,7 +620,8 @@ fn materialize_world(
             let (entities, col_slices): (Vec<Entity>, Vec<Vec<u8>>) = if live_count == row_count {
                 let cols: Vec<Vec<u8>> = comp_pairs
                     .iter()
-                    .map(|(_, name)| {
+                    .enumerate()
+                    .map(|(i, (_, name))| {
                         let col_pages = columns
                             .get(&ColumnKey::Component((*name).clone()))
                             .ok_or_else(|| {
@@ -512,7 +639,30 @@ fn materialize_world(
                                 page.row_count
                             )));
                         }
-                        Ok(page.data.clone())
+                        let (kind, type_id) = col_kinds[i];
+                        let item_size = item_sizes[i];
+                        // All rows alive ⇒ pass `None` (no mask): every row is
+                        // materialized.
+                        let native =
+                            native_column_page(page, kind, type_id, codecs, item_size, None)
+                                .map_err(|e| {
+                                    LsmError::Format(format!(
+                                        "archetype {sig:?} column {name}: {e}"
+                                    ))
+                                })?;
+                        // Release invariant: the normalized native buffer must be
+                        // exactly `row_count` native items wide. This mirrors the
+                        // slow-path assert so a kind/length disagreement can never
+                        // reach `import_page` unchecked on either path (all rows
+                        // alive ⇒ the page width must equal the native stride).
+                        assert_eq!(
+                            native.len(),
+                            row_count * item_size,
+                            "normalized column {name} page {page_index} is {} bytes, expected \
+                             {row_count} * {item_size}",
+                            native.len()
+                        );
+                        Ok(native)
                     })
                     .collect::<Result<_, _>>()?;
                 (page_entities.clone(), cols)
@@ -546,16 +696,33 @@ fn materialize_world(
                             page.row_count
                         )));
                     }
+                    // Materialize ONLY the live rows' native bytes. Passing the
+                    // live mask is load-bearing: decoding a dead Serialized row
+                    // would reconstruct a heap-owning value that is never imported
+                    // into the World (so its drop_fn never runs) → a leak. The
+                    // mask skips dead rows entirely, so they are never decoded.
+                    let (kind, type_id) = col_kinds[i];
                     let item_size = item_sizes[i];
-                    let mut buf =
-                        Vec::with_capacity(live_count.checked_mul(item_size).unwrap_or(0));
-                    for (row, &alive) in live_mask.iter().enumerate() {
-                        if alive {
-                            let start = row * item_size;
-                            let end = start + item_size;
-                            buf.extend_from_slice(&page.data[start..end]);
-                        }
-                    }
+                    let buf = native_column_page(
+                        page,
+                        kind,
+                        type_id,
+                        codecs,
+                        item_size,
+                        Some(&live_mask),
+                    )
+                    .map_err(|e| {
+                        LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
+                    })?;
+                    // The compacted buffer must be exactly `live_count` native
+                    // items wide, or it disagrees with the live-row layout.
+                    assert_eq!(
+                        buf.len(),
+                        live_count * item_size,
+                        "compacted column {name} page {page_index} is {} bytes, expected \
+                         {live_count} * {item_size}",
+                        buf.len()
+                    );
                     live_cols.push(buf);
                 }
                 (live_entities, live_cols)
@@ -566,14 +733,16 @@ fn materialize_world(
             let import_page = target.page(&entities, &col_refs).map_err(|e| {
                 LsmError::Format(format!("import page build failed for {sig:?}: {e}"))
             })?;
-            // SAFETY: each column slice is the native byte image of a raw-copyable
-            // component. Raw-copyability is enforced at BOTH ends: codec
-            // registration rejects non-raw-copyable types, AND the dense flush
-            // path refuses to persist any dense component lacking a codec — so a
-            // run can only contain dense columns proven raw-copyable. The source
-            // pages passed per-page CRC validation on read, and every entity in
-            // `entities` is alive per the allocator state restored above (dead
-            // rows were filtered out).
+            // SAFETY: each column slice is the native (in-memory) byte image of
+            // its component, produced by `native_column_page`: RawCopy columns
+            // are the on-disk native bytes verbatim; Serialized columns are
+            // decoded row-by-row into native values whose heap ownership rides
+            // inside the bytes and transfers into the archetype column (which
+            // holds T's drop_fn — a Serialized column always has a codec, so it
+            // was registered via the typed path, never raw). Every dense column
+            // has a codec (the flush gate proves it). The source pages passed
+            // per-page CRC validation on read, and every entity in `entities` is
+            // alive per the allocator state restored above (dead rows filtered).
             unsafe {
                 world.import_page(&import_page).map_err(|e| {
                     LsmError::Format(format!("import_page failed for {sig:?}: {e}"))
@@ -823,6 +992,93 @@ mod tests {
         );
     }
 
+    /// Dense heap-component counterpart to `reflush_recovered_world_preserves_sparse`.
+    /// A `String`-bearing dense component is flushed as a Serialized column, then
+    /// the world is recovered, mutated, and REFLUSHED from the recovered world.
+    /// `recover_world` re-registers the codec into a fresh world at a possibly
+    /// different local `ComponentId`, so reflush must resolve the Serialized
+    /// codec by component TYPE (`world.component_type_id`), not by id. An id-keyed
+    /// serialize on reflush would select the wrong codec (or none) and silently
+    /// drop the heap baseline — the id-class regression this test pins.
+    #[test]
+    fn reflush_recovered_world_preserves_heap_dense() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+        // No codec, registered first → the codec registry's ids start gapped, so
+        // recovery's compacted ids diverge from the registry's.
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct Filler(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        world.register_component::<Filler>(); // id 0, no codec
+        codecs.register::<Name>(&mut world).unwrap(); // id 1
+
+        let e = world.spawn((Name {
+            text: "alice".to_owned(),
+        },));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("baseline flush");
+
+        // Recover into a fresh world (codec re-registered with a compacted id:
+        // the recovered Name id differs from the registry's id).
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let mut recovered = result.world;
+        assert_eq!(
+            recovered.get::<Name>(e).map(|n| n.text.as_str()),
+            Some("alice"),
+            "baseline heap dense must recover"
+        );
+
+        // Mutate and REFLUSH the recovered world with the same codecs.
+        let e2 = recovered.spawn((Name {
+            text: "bob".to_owned(),
+        },));
+        let (mut manifest2, mut log2) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &recovered,
+            SeqRange::new(SeqNo::from(1u64), SeqNo::from(2u64)).unwrap(),
+            &mut manifest2,
+            &mut log2,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("reflush of recovered world");
+
+        // Recover once more: both heap entries must survive the reflush.
+        let (result2, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let final_world = result2.world;
+        assert_eq!(
+            final_world.get::<Name>(e).map(|n| n.text.as_str()),
+            Some("alice"),
+            "original heap dense must survive reflush of a recovered world"
+        );
+        assert_eq!(
+            final_world.get::<Name>(e2).map(|n| n.text.as_str()),
+            Some("bob"),
+            "new heap dense must survive reflush of a recovered world"
+        );
+    }
+
     #[test]
     fn recover_restores_sparse_components() {
         #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
@@ -926,6 +1182,237 @@ mod tests {
 
         assert_eq!(recovered.get::<TagA>(e).copied(), Some(TagA(10)));
         assert_eq!(recovered.get::<TagB>(e).copied(), Some(TagB(20)));
+    }
+
+    /// Recover a dense column of a heap-backed (`String`) component and assert
+    /// every value is byte-exact. Before heap dense recovery, the page body was
+    /// sliced as `row_count * native_item_size` (a RawCopy assumption), which
+    /// corrupts the variable-length Serialized page → import length mismatch or
+    /// garbage values.
+    #[test]
+    fn recover_dense_string_component_value_exact() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("name", &mut world).unwrap();
+
+        let e1 = world.spawn((Name {
+            text: "alice".to_owned(),
+        },));
+        let e2 = world.spawn((Name {
+            text: "a much longer name here".to_owned(),
+        },));
+        // Empty String: a zero-length rkyv row (offset table with a zero-length
+        // slot) must round-trip through flush → recover.
+        let e3 = world.spawn((Name {
+            text: String::new(),
+        },));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        assert_eq!(
+            recovered.get::<Name>(e1).map(|n| n.text.as_str()),
+            Some("alice")
+        );
+        assert_eq!(
+            recovered.get::<Name>(e2).map(|n| n.text.as_str()),
+            Some("a much longer name here")
+        );
+        assert_eq!(recovered.get::<Name>(e3).map(|n| n.text.as_str()), Some(""));
+    }
+
+    /// A single archetype mixing a POD (RawCopy) column and a heap (Serialized)
+    /// column. Both kinds must coexist in one import: the POD column slices by
+    /// native stride, the heap column decodes per row.
+    #[test]
+    fn recover_mixed_pod_and_heap_archetype() {
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Hp {
+            v: u32,
+        }
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Hp>("hp", &mut world).unwrap();
+        codecs.register_as::<Name>("name", &mut world).unwrap();
+
+        let e = world.spawn((
+            Hp { v: 7 },
+            Name {
+                text: "mixed".to_owned(),
+            },
+        ));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+
+        assert_eq!(recovered.get::<Hp>(e).copied(), Some(Hp { v: 7 }));
+        assert_eq!(
+            recovered.get::<Name>(e).map(|n| n.text.as_str()),
+            Some("mixed")
+        );
+    }
+
+    /// A Serialized column spanning more than one page. Forces the per-page
+    /// decode + import to compose across pages.
+    #[test]
+    fn recover_multipage_serialized_column() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("name", &mut world).unwrap();
+
+        let n = crate::format::PAGE_SIZE + 5;
+        let mut entities = Vec::with_capacity(n);
+        for i in 0..n {
+            entities.push(world.spawn((Name {
+                text: format!("e{i}"),
+            },)));
+        }
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let mut recovered = result.world;
+
+        for (i, &e) in entities.iter().enumerate() {
+            assert_eq!(
+                recovered.get::<Name>(e).map(|n| n.text.clone()),
+                Some(format!("e{i}")),
+                "entity {i} value mismatch"
+            );
+        }
+        assert_eq!(recovered.query::<(&Name,)>().count(), n);
+    }
+
+    /// Drop-safety: a recovered heap column must drop each reconstructed value
+    /// exactly once (no leak, no double-free). The archetype column holds T's
+    /// real `drop_fn` (typed registration, never raw) — so dropping the
+    /// recovered world frees every reconstructed `String` once. Under Miri this
+    /// catches a wrong/missing drop_fn; in a normal build the counter delta
+    /// catches a leak (delta < 2) or a double free would abort.
+    #[test]
+    fn recovered_heap_column_drops_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Archive, Serialize, Deserialize)]
+        struct Tracked {
+            text: String,
+        }
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<Tracked>("tracked", &mut world)
+            .unwrap();
+
+        world.spawn((Tracked {
+            text: "first-tracked-value".to_owned(),
+        },));
+        world.spawn((Tracked {
+            text: "second-tracked-value".to_owned(),
+        },));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+
+        // Drop the source world so only the recovered world owns Tracked values.
+        drop(world);
+
+        let before = DROPS.load(Ordering::SeqCst);
+        {
+            let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+            let mut rw = result.world;
+            assert_eq!(rw.query::<(&Tracked,)>().count(), 2);
+            // rw drops here → each reconstructed Tracked must drop exactly once.
+        }
+        let delta = DROPS.load(Ordering::SeqCst) - before;
+        assert_eq!(
+            delta, 2,
+            "recovered heap column must drop exactly two reconstructed values"
+        );
     }
 
     #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
@@ -1613,6 +2100,133 @@ mod tests {
         assert_eq!(recovered.get::<Tag2>(e).copied(), Some(Tag2(999)));
     }
 
+    /// Heap (Serialized) columns must survive compaction. The compactor copies
+    /// surviving rows from input runs into a fresh output run; for a Serialized
+    /// column the input page body is `[offsets][values]`, not fixed-stride native
+    /// rows, so the carry-forward must rebuild the offset table rather than copy
+    /// `item_size` bytes per row. Two entities flushed across runs (e1 in the
+    /// first, e2 added later) must both recover with their exact String values.
+    #[test]
+    fn recover_heap_component_after_compaction() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("name", &mut world).unwrap();
+
+        let e1 = world.spawn((Name {
+            text: "first".to_owned(),
+        },));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Flush 4 times to trigger compaction (L0 threshold is 4). e2 is added
+        // in the second flush so it lives only in a later run.
+        let mut e2 = e1;
+        for i in 0..4u64 {
+            if i == 1 {
+                e2 = world.spawn((Name {
+                    text: "second".to_owned(),
+                },));
+            }
+            flush_and_record(
+                &world,
+                SeqRange::new(SeqNo::from(i), SeqNo::from(i + 1)).unwrap(),
+                &mut manifest,
+                &mut log,
+                &lsm_dir,
+                &codecs,
+            )
+            .unwrap()
+            .expect("flush");
+        }
+
+        compact_one(&mut manifest, &mut log, &lsm_dir)
+            .unwrap()
+            .expect("compaction ran");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+        assert_eq!(
+            recovered.get::<Name>(e1).map(|n| n.text.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            recovered.get::<Name>(e2).map(|n| n.text.as_str()),
+            Some("second")
+        );
+    }
+
+    /// Compaction newest-wins for a heap (Serialized) column when the SAME entity
+    /// carries DIFFERENT heap values across runs. `recover_heap_component_after_compaction`
+    /// only carries entities whose String is constant, so a carry-forward bug that
+    /// picked the OLDER offset-table row would survive it. Here entity `e` is
+    /// flushed with "v1" (run 1), then updated to "v2-longer" (run 2). The
+    /// differing LENGTHS force a different offset table, so picking the stale row
+    /// yields the wrong bytes. Recovery must return the NEWEST value through the
+    /// Serialized re-encode path.
+    #[test]
+    fn compaction_keeps_newest_heap_value() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("name", &mut world).unwrap();
+
+        let e = world.spawn((Name {
+            text: "v1".to_owned(),
+        },));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Flush 4 times to trigger compaction (L0 threshold is 4). At i == 1 the
+        // SAME entity's value changes to a different LENGTH, forcing a distinct
+        // offset table across the input runs.
+        for i in 0..4u64 {
+            if i == 1 {
+                world.get_mut::<Name>(e).unwrap().text = "v2-longer".to_owned();
+            }
+            flush_and_record(
+                &world,
+                SeqRange::new(SeqNo::from(i), SeqNo::from(i + 1)).unwrap(),
+                &mut manifest,
+                &mut log,
+                &lsm_dir,
+                &codecs,
+            )
+            .unwrap()
+            .expect("flush");
+        }
+
+        compact_one(&mut manifest, &mut log, &lsm_dir)
+            .unwrap()
+            .expect("compaction ran");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+        assert_eq!(
+            recovered.get::<Name>(e).map(|n| n.text.as_str()),
+            Some("v2-longer"),
+            "compaction must carry forward the NEWEST heap value, not a stale offset-table row"
+        );
+    }
+
     /// Multi-page extension of the codex #4 regression: both a two-component
     /// archetype and a one-component (name-sorted-later) archetype span several
     /// pages. Exercises the per-`page_index` column reassembly in the rewritten
@@ -1912,6 +2526,172 @@ mod tests {
                 recovered.get::<ShrinkPos2>(e).map(|p| p.y),
                 Some(3.0),
                 "survivor {e:?} value wrong after compaction"
+            );
+        }
+    }
+
+    #[test]
+    fn native_column_page_decodes_only_live_serialized_rows() {
+        // The slow (dead-row) recovery path must decode ONLY live Serialized
+        // rows. Decoding a dead row reconstructs a heap-owning value that is
+        // never imported into the World (so its drop_fn never runs) — a leak.
+        // This pins the leak-free contract directly on the helper: with a partial
+        // live mask, exactly the live rows are materialized and dead rows are
+        // never deserialized.
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Tag {
+            text: String,
+        }
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Tag>("tag", &mut world).unwrap();
+        let ty = std::any::TypeId::of::<Tag>();
+        let item_size = std::mem::size_of::<Tag>();
+
+        // Build a 4-row Serialized page body.
+        let values = ["zero", "one", "two", "three"];
+        let mut rows: Vec<Vec<u8>> = Vec::new();
+        for v in values {
+            let val = Tag {
+                text: (*v).to_owned(),
+            };
+            let mut buf = Vec::new();
+            // SAFETY: `&val` is a valid, aligned `Tag` matching `ty`.
+            unsafe {
+                codecs
+                    .serialize_by_type(ty, std::ptr::from_ref(&val).cast::<u8>(), &mut buf)
+                    .unwrap()
+                    .unwrap();
+            }
+            rows.push(buf);
+        }
+        let page = StoredPage {
+            seq_hi: 1,
+            row_count: 4,
+            data: crate::serialized_page::encode(&rows),
+        };
+
+        // Rows 0 and 2 live; rows 1 and 3 dead.
+        let mask = [true, false, true, false];
+        let native = native_column_page(
+            &page,
+            crate::schema::StorageKind::Serialized,
+            Some(ty),
+            &codecs,
+            item_size,
+            Some(&mask),
+        )
+        .unwrap();
+
+        // Exactly the two live rows were materialized — dead rows never decoded.
+        // (Reverting the fix so the helper decodes all rows makes this 4×.)
+        assert_eq!(native.len(), 2 * item_size);
+
+        // The buffer owns the two live `Tag`s. Read each out and drop it so its
+        // `String` is freed exactly once; `native` (a `Vec<u8>`) then frees only
+        // its byte buffer, never running `Tag::drop`. No leak, no double-free.
+        for (k, expected) in ["zero", "two"].into_iter().enumerate() {
+            // SAFETY: `native` holds `2 * item_size` bytes that are a valid native
+            // image of two consecutive `Tag`s (the decode wrote them); read the
+            // k-th out by value.
+            let tag = unsafe { std::ptr::read(native.as_ptr().add(k * item_size).cast::<Tag>()) };
+            assert_eq!(tag.text, expected);
+            drop(tag);
+        }
+        std::mem::forget(native);
+    }
+
+    #[test]
+    fn recover_heap_archetype_shrink_survives_compaction() {
+        // Heap (Serialized) analogue of `recover_archetype_shrink_survives_compaction`:
+        // a despawn-shrunk archetype whose stale pages are carried through
+        // compaction lands on the recovery dead-row slow path. The survivors must
+        // recover value-exact through the Serialized per-row decode, and dead rows
+        // must never be decoded (leak-safety — see the unit test above).
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct ShrinkName {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<ShrinkName>("shrink_name", &mut world)
+            .unwrap();
+
+        let mut all = Vec::new();
+        for i in 0..600u32 {
+            all.push(world.spawn((ShrinkName {
+                text: format!("name-{i}"),
+            },)));
+        }
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Flush 1: full 600-entity archetype (3 pages).
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush 1");
+
+        // Despawn 500 → shrink to 100. Survivors keep their original strings.
+        for e in &all[..500] {
+            world.despawn(*e);
+        }
+        let survivors: Vec<Entity> = all[500..].to_vec();
+
+        // Three more dirty flushes to trigger compaction (L0 threshold = 4).
+        // Mutate survivors each round so each flush is non-trivially dirty and
+        // the carried value differs in length (exercises the offset table).
+        for seq in 1..4u64 {
+            for &e in &survivors {
+                let v = world.get_mut::<ShrinkName>(e).unwrap();
+                v.text.push('!');
+            }
+            flush_and_record(
+                &world,
+                SeqRange::new(SeqNo::from(seq), SeqNo::from(seq + 1)).unwrap(),
+                &mut manifest,
+                &mut log,
+                &lsm_dir,
+                &codecs,
+            )
+            .unwrap()
+            .expect("flush");
+        }
+
+        let report = compact_one(&mut manifest, &mut log, &lsm_dir).unwrap();
+        assert!(report.is_some(), "4 L0 runs must trigger compaction");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let mut recovered = result.world;
+
+        assert_eq!(
+            recovered.query::<(&ShrinkName,)>().count(),
+            100,
+            "despawned entities must not resurrect after compaction"
+        );
+        for e in &all[..500] {
+            assert!(!recovered.is_alive(*e), "despawned {e:?} resurrected");
+        }
+        // Survivors retain their original string plus the three mutation suffixes.
+        for (i, &e) in survivors.iter().enumerate() {
+            assert_eq!(
+                recovered.get::<ShrinkName>(e).map(|v| v.text.clone()),
+                Some(format!("name-{}!!!", 500 + i)),
+                "survivor {e:?} heap value wrong after compaction"
             );
         }
     }

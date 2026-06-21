@@ -183,11 +183,11 @@ impl BlobVec {
     /// # Safety
     /// - `bytes.len()` must equal `count * item_layout.size()`.
     /// - `bytes` must be a valid native (in-memory) representation of `count`
-    ///   consecutive items of this column's type. For LSM recovery this is
-    ///   guaranteed by the raw-copyable invariant enforced at both codec
-    ///   registration and flush — a dense component without a codec is refused,
-    ///   and a type whose archived size equals its native size carries no live
-    ///   pointers, so its native bytes are position-independent.
+    ///   consecutive items of this column's type, and ownership of those items
+    ///   is moved into this column (which holds the type's `drop_fn`). For POD
+    ///   types this is trivial; for heap types the bytes carry reconstructed
+    ///   values whose ownership transfers here, so each is dropped exactly once
+    ///   when the column drops or the row is removed.
     pub(crate) unsafe fn append_bytes_unchecked(&mut self, bytes: &[u8], count: usize) {
         let size = self.item_layout.size();
         if size == 0 {

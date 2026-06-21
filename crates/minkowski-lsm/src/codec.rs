@@ -1,6 +1,7 @@
 use std::alloc::Layout;
 use std::collections::HashMap;
 
+use crate::schema::StorageKind;
 use minkowski::component::Component;
 use minkowski::{ComponentId, Entity, World};
 use rkyv::api::high::HighValidator;
@@ -83,17 +84,6 @@ pub enum CodecError {
         existing_id: ComponentId,
         new_id: ComponentId,
     },
-    #[error(
-        "component {name:?} is not raw-copyable: native size is {native_size}, \
-         rkyv archived size is {archived_size} (it likely contains heap-allocated \
-         data such as String or Vec). LSM persistence requires plain-old-data \
-         components whose bytes are position-independent."
-    )]
-    NotRawCopyable {
-        name: String,
-        native_size: usize,
-        archived_size: usize,
-    },
 }
 
 struct ComponentCodec {
@@ -104,10 +94,18 @@ struct ComponentCodec {
     register_fn: RegisterFn,
     serialize_sparse_fn: SerializeSparseFn,
     insert_sparse_fn: InsertSparseFn,
-    /// Byte size for the direct-memcpy decode fast path. Always `Some(size)` for
-    /// accepted non-ZST components (raw-copyability is enforced at registration,
-    /// so the archived layout matches native); `None` for ZSTs (nothing to copy).
+    /// Native byte size, used to gate the direct-memcpy decode fast path:
+    /// `Some(size)` for any non-ZST component, `None` for ZSTs (nothing to copy).
+    /// The fast path only fires when the on-disk bytes actually equal `size`,
+    /// which holds for RawCopy (POD) columns but never for Serialized columns —
+    /// so a heap type carries `Some(native_size)` here yet always falls through
+    /// to full rkyv decode. Raw-copyability itself is recorded in `raw_copyable`,
+    /// not implied by this field.
     raw_copy_size: Option<usize>,
+    /// Whether this type's rkyv archived size equals its native size (POD, no
+    /// heap indirection). RawCopy columns memcpy on recovery; Serialized columns
+    /// decode per row. Derived once at registration.
+    raw_copyable: bool,
     /// `TypeId` of the concrete component type this codec was registered for.
     /// `ComponentId` is a per-world index, so the flush gate compares this to the
     /// flushed world's `component_type_id` to confirm the codec actually
@@ -138,6 +136,49 @@ impl CodecRegistry {
     /// recovery re-registers components into a fresh world).
     pub fn has_codec_for_type(&self, type_id: std::any::TypeId) -> bool {
         self.codecs.values().any(|c| c.type_id == type_id)
+    }
+
+    /// The on-disk storage kind for a registered component *type*, or `None` if
+    /// no codec is registered for it. Resolve by type, never by ComponentId.
+    pub fn storage_kind_for_type(&self, type_id: std::any::TypeId) -> Option<StorageKind> {
+        let codec = self.codecs.values().find(|c| c.type_id == type_id)?;
+        Some(if codec.raw_copyable {
+            StorageKind::RawCopy
+        } else {
+            StorageKind::Serialized
+        })
+    }
+
+    /// Serialize one component value (rkyv) by its *type*. Resolves the codec by
+    /// `TypeId` so it is correct across worlds whose ComponentIds diverge from
+    /// this registry's. Returns `None` if no codec is registered for the type.
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid, aligned instance of the type identified by
+    /// `type_id`, valid for reads of that type's size.
+    pub unsafe fn serialize_by_type(
+        &self,
+        type_id: std::any::TypeId,
+        ptr: *const u8,
+        out: &mut Vec<u8>,
+    ) -> Option<Result<(), CodecError>> {
+        let codec = self.codecs.values().find(|c| c.type_id == type_id)?;
+        Some(unsafe { (codec.serialize_fn)(ptr, out) })
+    }
+
+    /// Deserialize component bytes into a native-byte buffer by *type* (full
+    /// rkyv validation; no raw-copy fast path — Serialized columns are never
+    /// raw-copyable). The returned buffer owns a reconstructed `T`; its drop
+    /// responsibility passes to whatever takes ownership of the bytes (on
+    /// recovery, the archetype column, which holds T's drop_fn). Returns `None`
+    /// if no codec is registered for the type.
+    pub fn deserialize_by_type(
+        &self,
+        type_id: std::any::TypeId,
+        bytes: &[u8],
+    ) -> Option<Result<Vec<u8>, CodecError>> {
+        let codec = self.codecs.values().find(|c| c.type_id == type_id)?;
+        Some((codec.deserialize_fn)(bytes))
     }
 
     /// Register a component type for persistence.
@@ -213,22 +254,13 @@ impl CodecRegistry {
 
         let layout = Layout::new::<T>();
 
-        // Raw-copyability invariant: a component is persistable only if its rkyv
-        // archived representation has the same size as the native type. This is
-        // a proxy for "plain-old-data, no heap indirection" — such bytes are
-        // position-independent and safe to memcpy back into a column on recovery.
-        // Types with heap data (String, Vec, ...) have a differently-sized
-        // archived form and are rejected here, at the single registration source,
-        // so nothing un-raw-copyable can ever reach a flush, run, or import.
-        // ZSTs satisfy `0 == 0` and are accepted (trivially raw-copyable).
+        // Raw-copyability classification: a type whose rkyv archived size equals
+        // its native size is plain-old-data (no heap indirection) — its native
+        // bytes are position-independent and may be flushed/memcpy'd verbatim
+        // (RawCopy). Heap-backed types (String, Vec, …) have a differently-sized
+        // archived form; they persist via rkyv (Serialized) and decode per row on
+        // recovery. ZSTs satisfy 0 == 0 and are RawCopy. No type is rejected here.
         let raw_copyable = std::mem::size_of::<T>() == std::mem::size_of::<T::Archived>();
-        if !raw_copyable {
-            return Err(CodecError::NotRawCopyable {
-                name: stable_name,
-                native_size: std::mem::size_of::<T>(),
-                archived_size: std::mem::size_of::<T::Archived>(),
-            });
-        }
 
         // The decode fast-path still needs a positive byte count to memcpy; ZSTs
         // have nothing to copy, so their `raw_copy_size` stays `None`.
@@ -247,7 +279,15 @@ impl CodecRegistry {
         };
 
         let deserialize_fn: DeserializeFn = |bytes| {
-            let value: T = rkyv::from_bytes::<T, rancor::Error>(bytes)
+            // `rkyv::from_bytes` accesses the archive in place and requires the
+            // buffer aligned to the archived type's alignment. Dense recovery
+            // hands us row slices at arbitrary offsets within a page body
+            // (`[offsets:(n+1)×u32][values]`), so the slice is essentially never
+            // aligned — an unaligned `access` is UB (and Miri-rejected). Realign
+            // into an AlignedVec (16-byte aligned, covers all archived alignments).
+            let mut aligned = rkyv::util::AlignedVec::<16>::new();
+            aligned.extend_from_slice(bytes);
+            let value: T = rkyv::from_bytes::<T, rancor::Error>(&aligned)
                 .map_err(|e| CodecError::Deserialize(e.to_string()))?;
             let layout = Layout::new::<T>();
             let mut buf = vec![0u8; layout.size()];
@@ -284,7 +324,12 @@ impl CodecRegistry {
         };
 
         let insert_sparse_fn: InsertSparseFn = |world, entity, data| {
-            let value: T = rkyv::from_bytes::<T, rancor::Error>(data)
+            // Same realignment requirement as `deserialize_fn`: `from_bytes`
+            // accesses the archive in place and the caller-supplied slice is not
+            // guaranteed aligned. Copy into an AlignedVec before decoding.
+            let mut aligned = rkyv::util::AlignedVec::<16>::new();
+            aligned.extend_from_slice(data);
+            let value: T = rkyv::from_bytes::<T, rancor::Error>(&aligned)
                 .map_err(|e| CodecError::Deserialize(e.to_string()))?;
             world.insert_sparse::<T>(entity, value);
             Ok(())
@@ -302,6 +347,7 @@ impl CodecRegistry {
                 serialize_sparse_fn,
                 insert_sparse_fn,
                 raw_copy_size,
+                raw_copyable,
                 type_id: std::any::TypeId::of::<T>(),
             },
         );
@@ -309,6 +355,14 @@ impl CodecRegistry {
     }
 
     /// Serialize a component value from a raw pointer to bytes.
+    ///
+    /// Resolves the codec by per-world `ComponentId`. This is ONLY valid when the
+    /// registry and the world share an id space — e.g. WAL write/replay against
+    /// the same world the registry was built for. For any CROSS-WORLD path
+    /// (recovery, flush), the recovered world's local ids diverge from the
+    /// registry's; use [`serialize_by_type`](Self::serialize_by_type) /
+    /// [`deserialize_by_type`](Self::deserialize_by_type) instead, which key by
+    /// component `TypeId`.
     ///
     /// # Safety
     /// `ptr` must point to a valid, aligned instance of the component type
@@ -332,6 +386,11 @@ impl CodecRegistry {
     /// Deserialize component bytes into a raw byte buffer. Internal to the
     /// crate: callers outside use [`decode`](Self::decode), which gates the
     /// raw-copy fast path on a [`CrcProof`].
+    ///
+    /// Resolves the codec by per-world `ComponentId`, so it is only valid when the
+    /// registry and the world share an id space (e.g. WAL replay against the same
+    /// world). For cross-world paths (recovery, flush) use
+    /// [`deserialize_by_type`](Self::deserialize_by_type), which keys by `TypeId`.
     pub(crate) fn deserialize(&self, id: ComponentId, bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
         let codec = self
             .codecs
@@ -780,16 +839,111 @@ mod raw_copy_tests {
     }
 
     #[test]
-    fn non_raw_copyable_type_is_rejected() {
+    fn non_raw_copyable_type_registers_and_classifies_serialized() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        let err = codecs
+        codecs
             .register_as::<WithHeap>("with_heap", &mut world)
-            .unwrap_err();
-        assert!(
-            matches!(err, CodecError::NotRawCopyable { ref name, .. } if name == "with_heap"),
-            "expected NotRawCopyable, got {err:?}"
+            .expect("heap-backed components are now persistable");
+        let ty = std::any::TypeId::of::<WithHeap>();
+        assert_eq!(
+            codecs.storage_kind_for_type(ty),
+            Some(crate::schema::StorageKind::Serialized)
         );
+    }
+
+    #[test]
+    fn raw_copyable_and_zst_classify_raw_copy() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Plain>("plain", &mut world).unwrap();
+        codecs.register_as::<ZstTag>("zst", &mut world).unwrap();
+        assert_eq!(
+            codecs.storage_kind_for_type(std::any::TypeId::of::<Plain>()),
+            Some(crate::schema::StorageKind::RawCopy)
+        );
+        assert_eq!(
+            codecs.storage_kind_for_type(std::any::TypeId::of::<ZstTag>()),
+            Some(crate::schema::StorageKind::RawCopy)
+        );
+        assert_eq!(
+            codecs.storage_kind_for_type(std::any::TypeId::of::<WithHeap>()),
+            None,
+            "unregistered type has no kind"
+        );
+    }
+
+    #[test]
+    fn serialize_then_deserialize_by_type_round_trips_heap() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        let ty = std::any::TypeId::of::<WithHeap>();
+
+        let value = WithHeap {
+            label: "hello heap".to_owned(),
+        };
+        let mut bytes = Vec::new();
+        unsafe {
+            codecs
+                .serialize_by_type(ty, &value as *const WithHeap as *const u8, &mut bytes)
+                .expect("codec exists for type")
+                .expect("serialize ok");
+        }
+
+        let native = codecs
+            .deserialize_by_type(ty, &bytes)
+            .expect("codec exists for type")
+            .expect("deserialize ok");
+        // SAFETY: `native` byte-owns a valid `WithHeap` (deserialize_by_type
+        // reconstructs it and transfers ownership into the buffer). Read a
+        // bitwise copy out to assert on, then forget it below so `native`
+        // remains the sole owner of the heap `String` (no double free).
+        let restored = unsafe { std::ptr::read(native.as_ptr() as *const WithHeap) };
+        assert_eq!(restored.label, "hello heap");
+        std::mem::forget(restored); // bytes still own the String; avoid double free
+    }
+
+    #[test]
+    fn deserialize_by_type_handles_unaligned_input() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        let ty = std::any::TypeId::of::<WithHeap>();
+
+        let value = WithHeap {
+            label: "alignment matters".to_owned(),
+        };
+        let mut bytes = Vec::new();
+        unsafe {
+            codecs
+                .serialize_by_type(ty, &value as *const WithHeap as *const u8, &mut bytes)
+                .unwrap()
+                .unwrap();
+        }
+
+        // Force a misaligned view: prepend one byte, then deserialize from the
+        // offset-1 sub-slice. `access` on this unaligned slice is UB without the
+        // AlignedVec realign — Miri (and strict-alignment targets) catch it.
+        let mut shifted = Vec::with_capacity(bytes.len() + 1);
+        shifted.push(0u8);
+        shifted.extend_from_slice(&bytes);
+        let unaligned = &shifted[1..];
+
+        let native = codecs.deserialize_by_type(ty, unaligned).unwrap().unwrap();
+        // `native` is a `Vec<u8>` byte-owning a `WithHeap`; its buffer is not
+        // guaranteed aligned to `WithHeap`, so read it out unaligned. (Real
+        // recovery memcpys these bytes into an aligned archetype column.) Take
+        // ownership of the reconstructed value, then drop the raw byte buffer.
+        // `Vec<u8>` drop only frees bytes (u8 has no Drop), so the inner `String`
+        // is freed exactly once — by `restored` — with no double free or leak.
+        let restored = unsafe { std::ptr::read_unaligned(native.as_ptr() as *const WithHeap) };
+        drop(native);
+        assert_eq!(restored.label, "alignment matters");
     }
 
     #[test]

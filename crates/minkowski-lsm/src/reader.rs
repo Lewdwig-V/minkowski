@@ -12,7 +12,10 @@ use crate::types::{SeqNo, SeqRange};
 pub struct PageRef<'a> {
     /// Header describing the page metadata (owned copy, read from file).
     header: PageHeader,
-    /// Raw page data bytes (full `PAGE_SIZE * item_size`, zero-padded).
+    /// Raw page data bytes, sized to the page's exact data region. For RawCopy
+    /// dense pages this is `PAGE_SIZE * item_size` (zero-padded tail included);
+    /// for Serialized dense pages it is the exact `[offsets][values]` body with
+    /// no padding; for sparse/allocator pages it is the raw byte chunk.
     data: &'a [u8],
     /// Absolute byte offset of this page's header within the file.
     file_offset: u64,
@@ -24,7 +27,9 @@ impl<'a> PageRef<'a> {
         &self.header
     }
 
-    /// Raw page data bytes (full `PAGE_SIZE * item_size`, zero-padded).
+    /// Raw page data bytes, sized to the page's exact data region (RawCopy
+    /// dense pages include the zero-padded tail; Serialized dense pages are the
+    /// exact `[offsets][values]` body with no padding).
     pub fn data(&self) -> &'a [u8] {
         self.data
     }
@@ -253,26 +258,15 @@ impl SortedRunReader {
         let header_bytes: &[u8; 16] = buf[offset..header_end].try_into().expect("16 bytes");
         let header = PageHeader::from_bytes(header_bytes);
 
-        // Compute and bounds-check data.
-        let data_len =
-            if slot == crate::format::ALLOCATOR_SLOT || arch_id == crate::format::SPARSE_ARCH_ID {
-                // Sparse/allocator pages store a raw byte chunk in `row_count`;
-                // their `slot` is a grouping index, not a schema slot, so do
-                // NOT resolve it via `item_size_for_slot`.
-                header.row_count as usize
-            } else {
-                let item_size = self.item_size_for_slot(slot)?;
-                PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
-                    LsmError::Format(format!(
-                        "page ({arch_id}, {slot}, {page_index}): data length overflow"
-                    ))
-                })?
-            };
+        // Compute and bounds-check data. `data_start` must precede `data_len` so
+        // the Serialized branch can peek the offset table within `buf`.
         let data_start = offset.checked_add(header_size).ok_or_else(|| {
             LsmError::Format(format!(
                 "page ({arch_id}, {slot}, {page_index}): data start overflow"
             ))
         })?;
+        let data_len =
+            self.compute_data_len(arch_id, slot, page_index, header.row_count, buf, data_start)?;
         let data_end = data_start.checked_add(data_len).ok_or_else(|| {
             LsmError::Format(format!(
                 "page ({arch_id}, {slot}, {page_index}): data end overflow"
@@ -295,18 +289,24 @@ impl SortedRunReader {
     /// Validate the CRC of a specific page and return a [`CrcProof`] on success.
     ///
     /// The returned token feeds into [`CodecRegistry::decode`]'s `raw_copy_size`
-    /// fast path (direct memcpy, skipping rkyv bytecheck). The CRC covers
-    /// `row_count * item_size` bytes — the actual data, not zero-padding.
+    /// fast path (direct memcpy, skipping rkyv bytecheck). The CRC covers exactly
+    /// the page's data bytes: `row_count * item_size` for RawCopy dense pages
+    /// (excluding the zero-padding tail), the whole `[offsets][values]` body for
+    /// Serialized dense pages, and the raw byte chunk for sparse pages.
     pub fn validate_page_crc(&self, page: &PageRef<'_>) -> Result<CrcProof, LsmError> {
         // Sparse pages store `chunk.len()` in `row_count` (byte count, not row
-        // count), so item_size is always 1. This mirrors `page_ref_at`'s
-        // `data_len` special-case for `SPARSE_ARCH_ID`.
-        let item_size = if page.header().arch_id == crate::format::SPARSE_ARCH_ID {
-            1
+        // count). Serialized dense pages carry a variable-length body whose true
+        // length is the whole `data()` slice (offsets + values, no padding tail) —
+        // `compute_data_len` already sized it exactly. RawCopy dense pages cover
+        // `row_count * item_size` (the data, not the zero-padding).
+        let actual_len = if page.header().arch_id == crate::format::SPARSE_ARCH_ID {
+            page.header().row_count as usize
+        } else if self.slot_is_serialized(page.header().slot) {
+            page.data().len()
         } else {
-            self.item_size_for_slot(page.header().slot)?
+            let item_size = self.item_size_for_slot(page.header().slot)?;
+            page.header().row_count as usize * item_size
         };
-        let actual_len = page.header().row_count as usize * item_size;
         let payload = &page.data()[..actual_len];
 
         CrcProof::verify(payload, page.header().page_crc32).ok_or_else(|| LsmError::Crc {
@@ -390,25 +390,15 @@ impl SortedRunReader {
         let header_bytes: &[u8; 16] = buf[offset..header_end].try_into().expect("16 bytes");
         let header = PageHeader::from_bytes(header_bytes);
 
-        let data_len =
-            if slot == crate::format::ALLOCATOR_SLOT || arch_id == crate::format::SPARSE_ARCH_ID {
-                // Sparse/allocator pages store a raw byte chunk in `row_count`;
-                // their `slot` is a grouping index, not a schema slot, so do
-                // NOT resolve it via `item_size_for_slot`.
-                header.row_count as usize
-            } else {
-                let item_size = self.item_size_for_slot(slot)?;
-                PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
-                    LsmError::Format(format!(
-                        "page ({arch_id}, {slot}, {page_index}): data length overflow"
-                    ))
-                })?
-            };
+        // `data_start` must precede `data_len` so the Serialized branch can peek
+        // the offset table within `buf`.
         let data_start = offset.checked_add(header_size).ok_or_else(|| {
             LsmError::Format(format!(
                 "page ({arch_id}, {slot}, {page_index}): data start overflow"
             ))
         })?;
+        let data_len =
+            self.compute_data_len(arch_id, slot, page_index, header.row_count, buf, data_start)?;
         let data_end = data_start.checked_add(data_len).ok_or_else(|| {
             LsmError::Format(format!(
                 "page ({arch_id}, {slot}, {page_index}): data end overflow"
@@ -485,6 +475,61 @@ impl SortedRunReader {
     }
 
     // ── Private helpers ─────────────────────────────────────────────────────
+
+    /// Whether the schema marks `slot` as a Serialized (variable-length) column.
+    /// Entity/sparse/allocator slots have no schema entry → `false`.
+    fn slot_is_serialized(&self, slot: u16) -> bool {
+        self.schema
+            .entry_for_slot(slot)
+            .is_some_and(|e| e.storage_kind() == crate::schema::StorageKind::Serialized)
+    }
+
+    /// Compute the on-disk byte length of a page's data region. `data_start` is
+    /// the absolute file offset just past the `PageHeader`. Handles three cases:
+    /// sparse/allocator (raw byte count in `row_count`), Serialized dense (length
+    /// from the offset table), and RawCopy dense (`PAGE_SIZE * item_size`).
+    fn compute_data_len(
+        &self,
+        arch_id: u16,
+        slot: u16,
+        page_index: u16,
+        header_row_count: u16,
+        buf: &[u8],
+        data_start: usize,
+    ) -> Result<usize, LsmError> {
+        if slot == crate::format::ALLOCATOR_SLOT || arch_id == crate::format::SPARSE_ARCH_ID {
+            // Sparse/allocator pages store a raw byte chunk in `row_count`; their
+            // `slot` is a grouping index, not a schema slot, so do NOT resolve it
+            // via `item_size_for_slot`.
+            Ok(header_row_count as usize)
+        } else if self.slot_is_serialized(slot) {
+            // Serialized dense pages carry a variable-length body whose total size
+            // lives in the `(n+1)`-entry offset table. Peek the table, bounds-check
+            // it, then let `serialized_page::encoded_len` derive the body length.
+            let row_count = header_row_count as usize;
+            let table_len = 4usize
+                .checked_mul(row_count + 1)
+                .ok_or_else(|| LsmError::Format("offset table length overflow".to_owned()))?;
+            let peek_end = data_start.checked_add(table_len).ok_or_else(|| {
+                LsmError::Format(format!(
+                    "page ({arch_id}, {slot}, {page_index}): offset table overflow"
+                ))
+            })?;
+            if peek_end > buf.len() {
+                return Err(LsmError::Format(format!(
+                    "page ({arch_id}, {slot}, {page_index}): offset table extends beyond file"
+                )));
+            }
+            crate::serialized_page::encoded_len(&buf[data_start..peek_end], row_count)
+        } else {
+            let item_size = self.item_size_for_slot(slot)?;
+            PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
+                LsmError::Format(format!(
+                    "page ({arch_id}, {slot}, {page_index}): data length overflow"
+                ))
+            })
+        }
+    }
 
     /// Item size in bytes for a given slot.
     fn item_size_for_slot(&self, slot: u16) -> Result<usize, LsmError> {
@@ -716,6 +761,44 @@ mod tests {
             "expected Format error for header with lo > hi, got: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn open_rejects_stale_version() {
+        let (_dir, path, _world) = flush_world_with_pos(3);
+
+        // Overwrite the version field (bytes 8..12) with a stale value (1),
+        // then fix up the header CRC (covers bytes 0..40) so the file passes
+        // magic + CRC checks but fails the version gate inside validate_and_parse.
+        let mut data = std::fs::read(&path).unwrap();
+        data[8..12].copy_from_slice(&1u32.to_le_bytes());
+
+        let new_header_crc = crc32fast::hash(&data[..40]);
+        data[40..44].copy_from_slice(&new_header_crc.to_le_bytes());
+
+        // Recompute total CRC (entire file with total_crc32 field zeroed).
+        let file_len = data.len();
+        let total_crc32_offset = (file_len - 64) + 32;
+        data[total_crc32_offset..total_crc32_offset + 4].copy_from_slice(&[0, 0, 0, 0]);
+        let new_total_crc = crc32fast::hash(&data);
+        data[total_crc32_offset..total_crc32_offset + 4]
+            .copy_from_slice(&new_total_crc.to_le_bytes());
+
+        std::fs::write(&path, &data).unwrap();
+
+        let result = SortedRunReader::open(&path);
+        match result {
+            Ok(_) => panic!("expected Format error for stale version, got Ok"),
+            Err(LsmError::Format(msg)) => {
+                assert!(
+                    msg.contains("unsupported version"),
+                    "expected 'unsupported version' in error, got: {msg}"
+                );
+            }
+            Err(other) => {
+                panic!("expected Format error for stale version, got: {other:?}")
+            }
+        }
     }
 
     #[test]
@@ -1007,6 +1090,63 @@ mod tests {
             &[100, 200, 300, 400],
             "entity_pages must find all entities across sparse pages"
         );
+    }
+
+    #[test]
+    fn reader_sizes_serialized_pages_from_offset_table() {
+        use crate::codec::CodecRegistry;
+        use crate::schema::StorageKind;
+
+        #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        struct S {
+            v: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<S>("S", &mut world).unwrap();
+        for s in ["a", "bbbb", "cc"] {
+            world.spawn((S { v: s.to_owned() },));
+        }
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            dir.path(),
+            &codecs,
+        )
+        .unwrap()
+        .unwrap();
+
+        let reader = SortedRunReader::open(&path).unwrap();
+        // The schema keys dense columns by World::component_name (Rust type_name),
+        // NOT the codec stable name. Resolve the slot via the single schema entry.
+        let entry = reader
+            .schema()
+            .entries()
+            .iter()
+            .find(|e| e.name().ends_with('S'))
+            .unwrap();
+        assert_eq!(entry.storage_kind(), StorageKind::Serialized);
+        let slot = entry.slot();
+
+        let page = reader
+            .get_page(0, slot, 0)
+            .unwrap()
+            .expect("Serialized page must be indexed");
+        reader.validate_page_crc(&page).unwrap();
+        let rows = crate::serialized_page::decode(page.data(), 3).unwrap();
+        let mut lens: Vec<usize> = rows
+            .iter()
+            .map(|r| {
+                rkyv::from_bytes::<S, rkyv::rancor::Error>(r)
+                    .unwrap()
+                    .v
+                    .len()
+            })
+            .collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![1, 2, 4]);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 pub const MAGIC: [u8; 8] = *b"MKLSM01\0";
 
 /// File format version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Special `slot` value used in [`PageHeader`] and [`IndexEntry`] to identify
 /// entity-ID pages (as opposed to component-data pages).

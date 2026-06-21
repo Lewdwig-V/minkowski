@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Run Miri on the full test suite via cargo-nextest.
+# Run Miri over the minkowski core crate's lib tests via cargo-nextest.
+# Scope is deliberately `-p minkowski --lib` (the unsafe-heavy core: storage,
+# pool, world), NOT the whole workspace — higher crates (minkowski-lsm, -persist)
+# are covered by their normal test suites + TSan/Loom, and their rkyv/mmap paths
+# are impractical under Miri.
 # Usage: ci/run-miri-subset.sh
 #
 # Exclusions (defined in .config/nextest.toml [profile.default-miri]):
@@ -10,7 +14,7 @@ set -euo pipefail
 
 export MIRIFLAGS="${MIRIFLAGS:--Zmiri-tree-borrows}"
 
-echo "=== Miri full suite (nextest, parallel) ==="
+echo "=== Miri: minkowski core lib tests (nextest, parallel) ==="
 
 # --no-fail-fast: run all tests even if some fail, for full diagnostics.
 cargo +nightly miri nextest run -p minkowski --lib --no-fail-fast

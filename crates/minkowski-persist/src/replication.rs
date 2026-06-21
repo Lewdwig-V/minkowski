@@ -281,6 +281,61 @@ mod tests {
         assert_eq!(replica.query::<(&Pos,)>().count(), 3);
     }
 
+    /// Heap-dense (`String`) component survives a replication batch round trip:
+    /// WAL append → `WalCursor` batch → `apply_batch` into a fresh replica. The
+    /// mutation is rkyv-encoded through the codec (resolved by `TypeId`), so the
+    /// variable-length heap field is carried verbatim across the wire format.
+    /// Asserts the recovered `String` value, not just a POD field.
+    #[test]
+    fn apply_batch_replicates_heap_component() {
+        #[derive(Clone, PartialEq, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        struct Note {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("heap_repl.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Note>("note", &mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(
+            &mut world,
+            e,
+            (Note {
+                text: "replicated".to_owned(),
+            },),
+        )
+        .unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        drop(wal);
+
+        let mut cursor = WalCursor::open(&wal_path, 0).unwrap();
+        let batch = cursor.next_batch(100).unwrap();
+
+        let mut replica = World::new();
+        let mut replica_codecs = CodecRegistry::new();
+        replica_codecs
+            .register_as::<Note>("note", &mut replica)
+            .unwrap();
+
+        apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
+
+        let notes: Vec<String> = replica
+            .query::<(&Note,)>()
+            .map(|n| n.0.text.clone())
+            .collect();
+        assert_eq!(
+            notes,
+            vec!["replicated".to_owned()],
+            "heap String component should survive replication round trip value-exact"
+        );
+    }
+
     #[test]
     fn apply_batch_insert_remove() {
         let dir = tempfile::tempdir().unwrap();

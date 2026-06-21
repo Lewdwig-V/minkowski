@@ -2296,6 +2296,64 @@ mod tests {
         );
     }
 
+    /// Heap-dense (`String`) component survives a WAL append → replay round
+    /// trip. WAL records are rkyv-encoded through the codec (resolved by
+    /// `TypeId`), so a variable-length heap field is carried verbatim. This
+    /// pins that guarantee with an exact-value assertion on the recovered
+    /// `String`, not just a POD field.
+    #[test]
+    fn wal_replays_heap_component() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Note {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("heap.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Note>(&mut world).unwrap();
+
+        // Record a spawn carrying a heap String.
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(
+            &mut world,
+            e,
+            (Note {
+                text: "wal survives".to_owned(),
+            },),
+        )
+        .unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        let seq = wal.append(&cs, &codecs).unwrap();
+        assert_eq!(seq, 0);
+        cs.apply(&mut world).unwrap();
+        assert_eq!(
+            world.get::<Note>(e).map(|n| n.text.as_str()),
+            Some("wal survives")
+        );
+
+        // Replay into a fresh world.
+        let mut world2 = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register::<Note>(&mut world2).unwrap();
+
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay(&mut world2, &codecs2).unwrap();
+
+        let e2 = Entity::from_bits(e.to_bits());
+        assert_eq!(
+            world2.get::<Note>(e2),
+            Some(&Note {
+                text: "wal survives".to_owned()
+            }),
+            "heap String component should survive WAL replay value-exact"
+        );
+    }
+
     #[test]
     fn sparse_wal_replay_sets_sparse_routing_flag() {
         // Verifies that mark_sparse is called during WAL replay so that
