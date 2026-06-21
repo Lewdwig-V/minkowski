@@ -259,6 +259,16 @@ impl CodecRegistry {
             + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
             + rkyv::Portable,
     {
+        // Mechanical enforcement (audit N4): both decode paths realign rows into
+        // `AlignedVec::<16>`, which is only sufficient when the archived type's
+        // alignment is <= 16. Enforce per-monomorphization at COMPILE time.
+        const {
+            assert!(
+                std::mem::align_of::<T::Archived>() <= 16,
+                "T::Archived alignment exceeds the AlignedVec<16> used by decode"
+            );
+        }
+
         let comp_id = world.register_component::<T>();
 
         // Idempotent: same type re-registered with same name is a no-op.
@@ -342,12 +352,33 @@ impl CodecRegistry {
             // archive in place and the row slice is essentially never aligned.
             let mut aligned = rkyv::util::AlignedVec::<16>::new();
             aligned.extend_from_slice(bytes);
+            // Defense-in-depth (audit N3): `access_unchecked` roots at the buffer
+            // tail and reads `size_of::<T::Archived>()` bytes there. The framing
+            // layer (`serialized_page::decode`) already bounds-checks each row
+            // slice against the CRC-validated page body, so a sub-root-size row is
+            // only reachable via a same-binary writer bug — but turn that into a
+            // clean error rather than an OOB read. (Bad INTERNAL structure of a
+            // correctly-sized archive is still trusted — that is the bytecheck we
+            // intentionally skip.)
+            if aligned.len() < std::mem::size_of::<T::Archived>() {
+                return Err(CodecError::Deserialize(format!(
+                    "unchecked decode: row is {} bytes but archived root needs {}",
+                    aligned.len(),
+                    std::mem::size_of::<T::Archived>()
+                )));
+            }
             // SAFETY: the only caller, `deserialize_unchecked_by_type`, requires a
             // `CrcProof` (unforgeable; minted only by a real CRC check), so `bytes`
             // are integrity-verified, writer-authored archive bytes. Combined with
             // the recovery-side fingerprint gate (only runs whose Serialized layout
             // matches this binary reach the unchecked path), these are a valid
             // archive of `T::Archived`; skipping bytecheck is sound. See spec §2/§2.1.
+            // The page framing (offset table → row slices) is validated by
+            // `serialized_page::decode` on BOTH the checked and unchecked paths
+            // before this runs, so the row slice is already guaranteed in-bounds of
+            // the CRC-validated page body; the ONLY validation skipped here is
+            // per-row rkyv bytecheck (internal relative-pointer / length / UTF-8
+            // checks).
             let archived = unsafe { rkyv::access_unchecked::<T::Archived>(&aligned) };
             let value: T = rkyv::deserialize::<T, rancor::Error>(archived)
                 .map_err(|e| CodecError::Deserialize(e.to_string()))?;
@@ -479,6 +510,18 @@ impl CodecRegistry {
     pub fn archived_size_by_name(&self, name: &str) -> Option<usize> {
         let id = self.by_name.get(name)?;
         self.codecs.get(id).map(|c| c.archived_size)
+    }
+
+    /// Native (in-memory) size and align for a registered component *type*, by
+    /// stable name. `run_fingerprint` sources native layout from here (the LIVE
+    /// codecs of THIS binary) rather than the on-disk schema, so the fingerprint's
+    /// native terms actually detect a writer-vs-recovery layout divergence
+    /// (soundness audit N2). Returns `None` if no codec is registered.
+    pub fn native_layout_by_name(&self, name: &str) -> Option<(usize, usize)> {
+        let id = self.by_name.get(name)?;
+        self.codecs
+            .get(id)
+            .map(|c| (c.layout.size(), c.layout.align()))
     }
 
     /// Resolve a stable name to its ComponentId.

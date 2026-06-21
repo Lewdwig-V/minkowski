@@ -63,13 +63,25 @@ pub fn run_fingerprint(schema: &SchemaSection, codecs: &CodecRegistry) -> u64 {
         .entries()
         .iter()
         .filter(|e| e.storage_kind() == StorageKind::Serialized)
-        .map(|e| FingerprintEntry {
-            name: e.name(),
-            native_size: u64::from(e.item_size()),
-            native_align: u64::from(e.item_align()),
-            archived_size: codecs
+        .map(|e| {
+            // Source native AND archived layout from the LIVE codecs (this
+            // binary), NOT the on-disk schema. If recovery read native size/align
+            // back from `reader.schema()` (the writer's stamped values), the
+            // native terms would be identical on both sides and detect nothing —
+            // only `archived_size` would discriminate (soundness audit N2). A
+            // missing codec poisons to u64::MAX → guaranteed mismatch → checked.
+            let (native_size, native_align) = codecs
+                .native_layout_by_name(e.name())
+                .map_or((u64::MAX, u64::MAX), |(s, a)| (s as u64, a as u64));
+            let archived_size = codecs
                 .archived_size_by_name(e.name())
-                .map_or(u64::MAX, |s| s as u64),
+                .map_or(u64::MAX, |s| s as u64);
+            FingerprintEntry {
+                name: e.name(),
+                native_size,
+                native_align,
+                archived_size,
+            }
         })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(b.name)); // schema is already name-sorted; explicit for safety
@@ -114,5 +126,60 @@ mod tests {
         let x = [e("ab", 1, 1, 1), e("c", 1, 1, 1)];
         let y = [e("a", 1, 1, 1), e("bc", 1, 1, 1)];
         assert_ne!(decode_fingerprint(&x), decode_fingerprint(&y));
+    }
+
+    #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct HeapC {
+        s: String,
+    }
+
+    #[test]
+    fn run_fingerprint_uses_live_codec_native_layout_not_schema() {
+        use crate::schema::{SchemaSection, StorageKind};
+        use minkowski::World;
+        let mut world = World::new();
+        let mut codecs = crate::codec::CodecRegistry::new();
+        codecs.register_as::<HeapC>("hc", &mut world).unwrap();
+        // Two schemas for "hc" differing ONLY in the (bogus) native item_size.
+        let bogus = SchemaSection::from_components(&[(
+            "hc".to_owned(),
+            std::alloc::Layout::from_size_align(999, 1).unwrap(),
+            StorageKind::Serialized,
+        )])
+        .unwrap();
+        let real = SchemaSection::from_components(&[(
+            "hc".to_owned(),
+            std::alloc::Layout::new::<HeapC>(),
+            StorageKind::Serialized,
+        )])
+        .unwrap();
+        // Native layout comes from the codec, so the bogus schema size is ignored:
+        // both fingerprints are equal. (Pre-fix, they would DIFFER.)
+        assert_eq!(
+            run_fingerprint(&bogus, &codecs),
+            run_fingerprint(&real, &codecs)
+        );
+    }
+
+    #[test]
+    fn run_fingerprint_poisons_missing_codec() {
+        use crate::schema::{SchemaSection, StorageKind};
+        use minkowski::World;
+        let mut world = World::new();
+        let mut with = crate::codec::CodecRegistry::new();
+        with.register_as::<HeapC>("hc", &mut world).unwrap();
+        let without = crate::codec::CodecRegistry::new(); // "hc" unregistered
+        let schema = SchemaSection::from_components(&[(
+            "hc".to_owned(),
+            std::alloc::Layout::new::<HeapC>(),
+            StorageKind::Serialized,
+        )])
+        .unwrap();
+        // Missing codec ⇒ u64::MAX poison ⇒ a different fingerprint ⇒ mismatch ⇒
+        // recovery falls back to checked decode. (Closes a Task-2 review gap too.)
+        assert_ne!(
+            run_fingerprint(&schema, &with),
+            run_fingerprint(&schema, &without)
+        );
     }
 }
