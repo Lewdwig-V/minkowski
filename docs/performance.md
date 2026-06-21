@@ -129,3 +129,89 @@ Run benchmarks with `cargo bench -p minkowski-bench`.
 |---|---|
 | `serialize/wal_append` | 1.25 µs |
 | `serialize/wal_replay` | 1.06 ms |
+
+---
+
+## LSM Benchmarking & Tuning (2026-06-21)
+
+**Methodology note.** The wall-clock numbers in the v1.3.0 table above are **not**
+a valid cross-machine baseline — machine variance dominates. A same-host re-run
+measured every ECS hot path ~30–38% "slower" than the v1.3.0 doc numbers, but that
+uniform scaling across independent paths is the *signature of a slower host*, not a
+regression. Use **iai-callgrind instruction counts** for regression detection —
+deterministic and machine-independent. (iai benches require valgrind; the repo's
+`target-cpu=native` makes valgrind SIGILL, so run them with
+`RUSTFLAGS="-C target-cpu=x86-64-v2"`.)
+
+### Regression audit — ECS hot paths (instruction-count A/B, same host)
+
+`crates/minkowski-bench/benches/ecs_icount.rs`, v1.3.0 vs HEAD:
+
+| Bench | v1.3.0 | HEAD | Δ |
+|---|---:|---:|---:|
+| `scan_for_each_10k` | 2,633 | 2,761 | +4.9% |
+| `join_for_each_batched_10k` | 18,759 | 18,533 | −1.2% (faster) |
+| `query_mut_10k` | 125,287 | 125,513 | +0.18% (flat) |
+
+**No meaningful regression** — changes are small and mixed (the join fast path even
+improved). The LSM/heap-persistence work *cannot* regress these: the query/iter/
+planner paths live in `minkowski` core and do not link LSM code. The `scan` +4.9%
+is core-planner evolution since v1.3.0, unrelated to the LSM. These benches are now
+the machine-independent regression gate. Run:
+`RUSTFLAGS="-C target-cpu=x86-64-v2" cargo bench -p minkowski-bench --bench ecs_icount`.
+
+### Page-codec instruction counts (256 rows)
+
+`crates/minkowski-lsm/benches/page_codec.rs` (iai-callgrind):
+
+| Op | instr | /row |
+|---|---:|---:|
+| `rawcopy_column_256` (POD memcpy) | 674 | ~3 |
+| `page_frame_decode_256` (offset slicing, zero-copy — NOT rkyv) | 7,471 | ~29 |
+| `page_frame_encode_256` (offset table + value concat — NOT rkyv) | 58,841 | ~230 |
+| `rkyv_decode_256` (real per-row `deserialize_by_type`) | 224,917 | ~879 |
+| `rkyv_encode_256` (real per-row `serialize_by_type`) | 345,510 | ~1,350 |
+
+Heap (Serialized) recovery costs **~879 instr/row vs ~3 for a RawCopy memcpy (~330×)**
+— this quantifies and justifies the hybrid storage-kind design: POD columns stay on
+the memcpy fast path, rkyv is paid only for heap columns. Note the page *framing*
+(`serialized_page::encode`/`decode`) is cheap and zero-copy on decode; the cost is
+the rkyv codec, not the Arrow offset table.
+
+**Optimization opportunity (deferred to the perf shakedown).** Heap recovery re-runs
+full rkyv `bytecheck` per row even though the page is CRC-validated on read. The
+RawCopy path has a `CrcProof` fast lane that skips bytecheck; Serialized columns have
+no equivalent. Given a `CrcProof`, recovery could `from_bytes_unchecked` Serialized
+rows — plausibly **~halving** the ~879 instr/row decode cost.
+
+### Level-count / compaction sweep
+
+`crates/minkowski-persist/benches/lsm_level_sweep.rs`, growing workload, K=4 trigger:
+
+| N | write-amp | total runs | recover µs |
+|---:|---:|---:|---:|
+| 3 | 0.268 | 4 | 55,209 |
+| 4 | 0.275 | 1 | 57,118 |
+| 5 | 0.275 | 1 | 52,789 |
+| 7 | 0.275 | 1 | 56,965 |
+
+**N=4 confirmed.** N=4/5/7 are identical; N=3 caps at L2 (4 uncompacted bottom runs
+vs 1). Write-amp (~0.25–0.275) is driven by the **K=4 merge ratio, not the level
+count** — deeper N only matters at ~4^N-flush extremes (far beyond the ≤100×-RAM
+regime). A *constant* workload is uninformative here (it self-supersedes to a uniform
+0.25); the sweep grows the dataset so it cascades through levels. (`recover µs` is
+wall-clock and host-relative.)
+
+### Running the benchmarks
+
+```sh
+# criterion (wall-clock, host-relative throughput)
+cargo bench -p minkowski-persist --bench lsm_throughput
+cargo bench -p minkowski-persist --bench lsm_compaction      # prints WRITEAMP lines
+cargo bench -p minkowski-persist --bench lsm_level_sweep      # prints SWEEP lines
+# iai-callgrind (instruction counts — needs valgrind + the RUSTFLAGS override)
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo bench -p minkowski-lsm  --features bench-support --bench page_codec
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo bench -p minkowski-bench --bench ecs_icount
+# or capture a full baseline artifact:
+scripts/capture-bench-baseline.sh
+```
