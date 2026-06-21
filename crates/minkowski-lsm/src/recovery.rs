@@ -1941,6 +1941,71 @@ mod tests {
         assert_eq!(recovered.get::<Tag2>(e).copied(), Some(Tag2(999)));
     }
 
+    /// Heap (Serialized) columns must survive compaction. The compactor copies
+    /// surviving rows from input runs into a fresh output run; for a Serialized
+    /// column the input page body is `[offsets][values]`, not fixed-stride native
+    /// rows, so the carry-forward must rebuild the offset table rather than copy
+    /// `item_size` bytes per row. Two entities flushed across runs (e1 in the
+    /// first, e2 added later) must both recover with their exact String values.
+    #[test]
+    fn recover_heap_component_after_compaction() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("name", &mut world).unwrap();
+
+        let e1 = world.spawn((Name {
+            text: "first".to_owned(),
+        },));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Flush 4 times to trigger compaction (L0 threshold is 4). e2 is added
+        // in the second flush so it lives only in a later run.
+        let mut e2 = e1;
+        for i in 0..4u64 {
+            if i == 1 {
+                e2 = world.spawn((Name {
+                    text: "second".to_owned(),
+                },));
+            }
+            flush_and_record(
+                &world,
+                SeqRange::new(SeqNo::from(i), SeqNo::from(i + 1)).unwrap(),
+                &mut manifest,
+                &mut log,
+                &lsm_dir,
+                &codecs,
+            )
+            .unwrap()
+            .expect("flush");
+        }
+
+        compact_one(&mut manifest, &mut log, &lsm_dir)
+            .unwrap()
+            .expect("compaction ran");
+
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+        assert_eq!(
+            recovered.get::<Name>(e1).map(|n| n.text.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            recovered.get::<Name>(e2).map(|n| n.text.as_str()),
+            Some("second")
+        );
+    }
+
     /// Multi-page extension of the codex #4 regression: both a two-component
     /// archetype and a one-component (name-sorted-later) archetype span several
     /// pages. Exercises the per-`page_index` column reassembly in the rewritten

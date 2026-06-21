@@ -404,12 +404,13 @@ impl<'a> CompactionWriter<'a> {
 
             // ── Component pages ──────────────────────────────────────────────
             for &output_slot in &sig_output_slots {
-                let entry = output_schema.entry_for_slot(output_slot).ok_or_else(|| {
+                let out_entry = output_schema.entry_for_slot(output_slot).ok_or_else(|| {
                     LsmError::Format(format!(
                         "output slot {output_slot} not in schema (arch {output_arch_id})"
                     ))
                 })?;
-                let item_size = entry.item_size() as usize;
+                let item_size = out_entry.item_size() as usize;
+                let kind = out_entry.storage_kind();
 
                 for page_idx_usize in 0..pages_per_column {
                     let page_idx = u16::try_from(page_idx_usize).map_err(|_| {
@@ -425,72 +426,181 @@ impl<'a> CompactionWriter<'a> {
                         LsmError::Format("row count per page exceeds u16".to_owned())
                     })?;
 
-                    let mut page_bytes: Vec<u8> = Vec::with_capacity(PAGE_SIZE * item_size);
+                    match kind {
+                        crate::schema::StorageKind::RawCopy => {
+                            let mut page_bytes: Vec<u8> = Vec::with_capacity(PAGE_SIZE * item_size);
 
-                    for emit in &emit_list[row_start..row_end] {
-                        let input_idx = emit.source_input_idx;
-                        let source_row = emit.source_row;
+                            for emit in &emit_list[row_start..row_end] {
+                                let input_idx = emit.source_input_idx;
+                                let source_row = emit.source_row;
 
-                        let input_slot_opt = slot_translations[input_idx]
-                            .iter()
-                            .find(|t| t.output_slot == output_slot)
-                            .map(|t| t.input_slot);
+                                let input_slot_opt = slot_translations[input_idx]
+                                    .iter()
+                                    .find(|t| t.output_slot == output_slot)
+                                    .map(|t| t.input_slot);
 
-                        let Some(input_slot) = input_slot_opt else {
-                            page_bytes.extend(std::iter::repeat_n(0u8, item_size));
-                            continue;
-                        };
+                                let Some(input_slot) = input_slot_opt else {
+                                    page_bytes.extend(std::iter::repeat_n(0u8, item_size));
+                                    continue;
+                                };
 
-                        let source_page_idx =
-                            u16::try_from(source_row / PAGE_SIZE).map_err(|_| {
-                                LsmError::Format("source page index exceeds u16".to_owned())
-                            })?;
-                        let row_within_page = source_row % PAGE_SIZE;
+                                let source_page_idx = u16::try_from(source_row / PAGE_SIZE)
+                                    .map_err(|_| {
+                                        LsmError::Format("source page index exceeds u16".to_owned())
+                                    })?;
+                                let row_within_page = source_row % PAGE_SIZE;
 
-                        let arch_id_in_input = self.arch_ids_per_signature_per_input[sig_idx]
-                            [input_idx]
-                            .expect("emit row references input with no arch_id");
+                                let arch_id_in_input = self.arch_ids_per_signature_per_input
+                                    [sig_idx][input_idx]
+                                    .expect("emit row references input with no arch_id");
 
-                        let page_ref = self.inputs[input_idx]
-                            .get_page(arch_id_in_input, input_slot, source_page_idx)?
-                            .ok_or_else(|| {
-                                LsmError::Format(format!(
-                                    "source page ({arch_id_in_input}, {input_slot}, \
-                                     {source_page_idx}) not found in input {input_idx}"
-                                ))
-                            })?;
+                                let page_ref = self.inputs[input_idx]
+                                    .get_page(arch_id_in_input, input_slot, source_page_idx)?
+                                    .ok_or_else(|| {
+                                        LsmError::Format(format!(
+                                            "source page ({arch_id_in_input}, {input_slot}, \
+                                             {source_page_idx}) not found in input {input_idx}"
+                                        ))
+                                    })?;
 
-                        let data = page_ref.data();
-                        let byte_offset = row_within_page * item_size;
-                        page_bytes.extend_from_slice(&data[byte_offset..byte_offset + item_size]);
+                                let data = page_ref.data();
+                                let byte_offset = row_within_page * item_size;
+                                // `get_page` does not CRC-validate; bounds-check
+                                // rather than panic on a corrupt input page whose
+                                // data region is shorter than the emit-derived
+                                // row offset implies.
+                                let row_bytes = data
+                                    .get(byte_offset..byte_offset + item_size)
+                                    .ok_or_else(|| {
+                                        LsmError::Format(format!(
+                                            "raw-copy page (input {input_idx}, slot {input_slot}): \
+                                             row {row_within_page} at byte {byte_offset} out of \
+                                             range (page {} bytes, item_size {item_size})",
+                                            data.len()
+                                        ))
+                                    })?;
+                                page_bytes.extend_from_slice(row_bytes);
+                            }
+
+                            let page_crc = crc32fast::hash(&page_bytes);
+                            let file_offset = w.stream_position()?;
+
+                            let ph = PageHeader {
+                                arch_id: output_arch_id,
+                                slot: output_slot,
+                                page_index: page_idx,
+                                row_count: row_count_u16,
+                                page_crc32: page_crc,
+                                _padding: 0,
+                            };
+                            w.write_all(ph.as_bytes())?;
+                            w.write_all(&page_bytes)?;
+
+                            let full_page_bytes = PAGE_SIZE * item_size;
+                            if page_bytes.len() < full_page_bytes {
+                                write_zeros(&mut w, full_page_bytes - page_bytes.len())?;
+                            }
+
+                            index_entries.push(IndexEntry {
+                                arch_id: output_arch_id,
+                                slot: output_slot,
+                                page_index: page_idx,
+                                _pad: 0,
+                                file_offset,
+                            });
+                        }
+                        crate::schema::StorageKind::Serialized => {
+                            // Gather each surviving row's rkyv bytes from the
+                            // input page (whose body is `[offsets][values]`) and
+                            // rebuild a fresh offset-table page body. No
+                            // deserialize/reserialize — the winning rows' rkyv
+                            // bytes are byte-copied into a new offset table.
+                            let mut rows: Vec<Vec<u8>> = Vec::with_capacity(rows_in_page);
+
+                            for emit in &emit_list[row_start..row_end] {
+                                let input_idx = emit.source_input_idx;
+                                let source_row = emit.source_row;
+
+                                let input_slot_opt = slot_translations[input_idx]
+                                    .iter()
+                                    .find(|t| t.output_slot == output_slot)
+                                    .map(|t| t.input_slot);
+
+                                // A genuinely-missing Serialized slot is a hard
+                                // error: a zeroed heap value is invalid rkyv, so
+                                // we must NOT zero-fill the way RawCopy does.
+                                let Some(input_slot) = input_slot_opt else {
+                                    return Err(LsmError::Format(format!(
+                                        "serialized column slot {output_slot} missing from \
+                                         input {input_idx} during compaction"
+                                    )));
+                                };
+
+                                let source_page_idx = u16::try_from(source_row / PAGE_SIZE)
+                                    .map_err(|_| {
+                                        LsmError::Format("source page index exceeds u16".to_owned())
+                                    })?;
+                                let row_within_page = source_row % PAGE_SIZE;
+
+                                let arch_id_in_input = self.arch_ids_per_signature_per_input
+                                    [sig_idx][input_idx]
+                                    .expect("emit row references input with no arch_id");
+
+                                let page_ref = self.inputs[input_idx]
+                                    .get_page(arch_id_in_input, input_slot, source_page_idx)?
+                                    .ok_or_else(|| {
+                                        LsmError::Format(format!(
+                                            "source page ({arch_id_in_input}, {input_slot}, \
+                                             {source_page_idx}) not found in input {input_idx}"
+                                        ))
+                                    })?;
+
+                                // Decode the INPUT page using its OWN header row
+                                // count — the offset table is sized by the source
+                                // page, not the output page.
+                                let src_row_count = page_ref.header().row_count as usize;
+                                let src_rows =
+                                    crate::serialized_page::decode(page_ref.data(), src_row_count)?;
+                                // `get_page` does not CRC-validate, so a corrupt
+                                // input header row_count could be smaller than the
+                                // emit-derived row index. Bounds-check rather than
+                                // panic on disk-controlled input.
+                                let src_row = src_rows.get(row_within_page).ok_or_else(|| {
+                                    LsmError::Format(format!(
+                                        "serialized page (input {input_idx}, slot {input_slot}): \
+                                         row {row_within_page} out of range (page row_count \
+                                         {src_row_count})"
+                                    ))
+                                })?;
+                                rows.push(src_row.to_vec());
+                            }
+
+                            let page_bytes = crate::serialized_page::encode(&rows);
+                            let page_crc = crc32fast::hash(&page_bytes);
+                            let file_offset = w.stream_position()?;
+
+                            let ph = PageHeader {
+                                arch_id: output_arch_id,
+                                slot: output_slot,
+                                page_index: page_idx,
+                                row_count: row_count_u16,
+                                page_crc32: page_crc,
+                                _padding: 0,
+                            };
+                            w.write_all(ph.as_bytes())?;
+                            w.write_all(&page_bytes)?;
+                            // Serialized pages are NOT zero-padded: the offset
+                            // table bounds the page exactly.
+
+                            index_entries.push(IndexEntry {
+                                arch_id: output_arch_id,
+                                slot: output_slot,
+                                page_index: page_idx,
+                                _pad: 0,
+                                file_offset,
+                            });
+                        }
                     }
-
-                    let page_crc = crc32fast::hash(&page_bytes);
-                    let file_offset = w.stream_position()?;
-
-                    let ph = PageHeader {
-                        arch_id: output_arch_id,
-                        slot: output_slot,
-                        page_index: page_idx,
-                        row_count: row_count_u16,
-                        page_crc32: page_crc,
-                        _padding: 0,
-                    };
-                    w.write_all(ph.as_bytes())?;
-                    w.write_all(&page_bytes)?;
-
-                    let full_page_bytes = PAGE_SIZE * item_size;
-                    if page_bytes.len() < full_page_bytes {
-                        write_zeros(&mut w, full_page_bytes - page_bytes.len())?;
-                    }
-
-                    index_entries.push(IndexEntry {
-                        arch_id: output_arch_id,
-                        slot: output_slot,
-                        page_index: page_idx,
-                        _pad: 0,
-                        file_offset,
-                    });
                 }
             }
 
