@@ -94,13 +94,15 @@ struct ComponentCodec {
     register_fn: RegisterFn,
     serialize_sparse_fn: SerializeSparseFn,
     insert_sparse_fn: InsertSparseFn,
-    /// Native byte size, used to gate the direct-memcpy decode fast path:
-    /// `Some(size)` for any non-ZST component, `None` for ZSTs (nothing to copy).
-    /// The fast path only fires when the on-disk bytes actually equal `size`,
-    /// which holds for RawCopy (POD) columns but never for Serialized columns —
-    /// so a heap type carries `Some(native_size)` here yet always falls through
-    /// to full rkyv decode. Raw-copyability itself is recorded in `raw_copyable`,
-    /// not implied by this field.
+    /// Native byte size gating the direct-memcpy decode fast path (return the
+    /// on-disk payload verbatim as a native image, skipping rkyv). `Some(size)`
+    /// ONLY for raw-copyable (POD) non-ZST components, whose rkyv payload IS a
+    /// native image; `None` for ZSTs (nothing to copy) AND for Serialized
+    /// (heap-backed) components. A heap payload is never a native image even when
+    /// its length coincidentally equals the native layout size, so memcpy'ing it
+    /// would install archived bytes as native pointer fields → corruption /
+    /// double-free. **Invariant: `Some(_) ⟹ raw_copyable`** — the fast-path gate
+    /// must not be able to fire for a non-raw-copyable type.
     raw_copy_size: Option<usize>,
     /// Whether this type's rkyv archived size equals its native size (POD, no
     /// heap indirection). RawCopy columns memcpy on recovery; Serialized columns
@@ -262,9 +264,13 @@ impl CodecRegistry {
         // recovery. ZSTs satisfy 0 == 0 and are RawCopy. No type is rejected here.
         let raw_copyable = std::mem::size_of::<T>() == std::mem::size_of::<T::Archived>();
 
-        // The decode fast-path still needs a positive byte count to memcpy; ZSTs
-        // have nothing to copy, so their `raw_copy_size` stays `None`.
-        let raw_copy_size = if layout.size() > 0 {
+        // `raw_copy_size` gates the decode() memcpy fast path, which is sound
+        // ONLY for raw-copyable types (their rkyv payload is a native image).
+        // Gate it on `raw_copyable` so the invariant `Some(_) ⟹ raw_copyable`
+        // holds: a Serialized (heap) component must never expose a size, or a
+        // payload whose length coincidentally equals the native layout size
+        // would be memcpy'd as native pointer fields. ZSTs have nothing to copy.
+        let raw_copy_size = if raw_copyable && layout.size() > 0 {
             Some(layout.size())
         } else {
             None
@@ -978,5 +984,60 @@ mod raw_copy_tests {
         let raw = codecs.decode(id, &buf, None).unwrap();
         // ZST has no bytes; the returned buffer is empty.
         assert_eq!(raw.len(), 0);
+    }
+
+    #[test]
+    fn serialized_codec_has_no_raw_copy_size() {
+        // `raw_copy_size` gates decode()'s memcpy fast path (return the payload
+        // verbatim as a native image). That is sound ONLY for raw-copyable (POD)
+        // types. A heap-backed (Serialized) codec must expose `None`, or a
+        // WAL/replication payload whose length coincidentally equals the native
+        // layout size would be installed as native pointer fields → corruption +
+        // double-free. Invariant: `Some(_) ⟹ raw_copyable`.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        let heap_id = world.component_id::<WithHeap>().unwrap();
+        assert_eq!(
+            codecs.raw_copy_size(heap_id),
+            None,
+            "Serialized (heap) codec must not expose a raw_copy_size"
+        );
+
+        // POD types keep their raw_copy_size — the fast path stays enabled.
+        codecs.register_as::<Plain>("plain", &mut world).unwrap();
+        let pod_id = world.component_id::<Plain>().unwrap();
+        assert!(
+            codecs.raw_copy_size(pod_id).is_some(),
+            "raw-copyable (POD) codec keeps its raw_copy_size"
+        );
+    }
+
+    #[test]
+    fn decode_with_proof_never_memcpys_heap_payload() {
+        // Regression (the raw_copy_size soundness hole): a heap codec must never
+        // take decode()'s proof/memcpy fast path, even when the payload length
+        // equals the native layout size. Hand it bytes of exactly that length
+        // that are NOT a valid native image; decode-with-proof must REJECT them
+        // via full rkyv validation, not return them verbatim as a garbage-pointer
+        // native value. Before the fix (`raw_copy_size = Some(native_size)` for
+        // heap types) this returned `Ok(evil)` — the corruption vector.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        let id = world.component_id::<WithHeap>().unwrap();
+
+        let evil = vec![0xABu8; std::mem::size_of::<WithHeap>()];
+        let proof = CrcProof::verify(&evil, crc32fast::hash(&evil))
+            .expect("crc matches the bytes we just hashed");
+        let result = codecs.decode(id, &evil, Some(&proof));
+        assert!(
+            result.is_err(),
+            "heap decode must rkyv-validate, not memcpy garbage as a native image; got {result:?}"
+        );
     }
 }
