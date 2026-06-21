@@ -17,9 +17,25 @@ thiserror = "2"
 crc32fast = "1"
 
 [dev-dependencies]
+# Re-declare minkowski-lsm with the bench-support feature so benches can use
+# `minkowski_lsm::bench_support::*`. Cargo unifies this with the normal
+# dependency above; the feature is only active for dev/bench targets.
+minkowski-lsm = { path = "../minkowski-lsm", features = ["bench-support"] }
 tempfile = "3"
 criterion = "0.5"
 
 [[bench]]
 name = "persist"
+harness = false
+
+[[bench]]
+name = "lsm_throughput"
+harness = false
+
+[[bench]]
+name = "lsm_compaction"
+harness = false
+
+[[bench]]
+name = "lsm_level_sweep"
 harness = false
