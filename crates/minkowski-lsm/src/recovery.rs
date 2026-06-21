@@ -220,9 +220,8 @@ impl LsmRecovery {
                 let mut saw_allocator = false;
                 for result in reader.slot_pages(META_ARCH_ID, ALLOCATOR_SLOT) {
                     let (_page_index, page) = result?;
-                    reader.validate_page_crc(&page)?;
-                    let payload_len = page.header().row_count as usize;
-                    alloc_blob.extend_from_slice(&page.data()[..payload_len]);
+                    let (payload, _proof) = reader.validate_page_crc(&page)?;
+                    alloc_blob.extend_from_slice(payload);
                     saw_allocator = true;
                 }
                 if saw_allocator {
@@ -242,9 +241,8 @@ impl LsmRecovery {
                     let mut blob: Vec<u8> = Vec::new();
                     for result in reader.slot_pages(SPARSE_ARCH_ID, slot) {
                         let (_page_index, page) = result?;
-                        reader.validate_page_crc(&page)?;
-                        let len = page.header().row_count as usize;
-                        blob.extend_from_slice(&page.data()[..len]);
+                        let (payload, _proof) = reader.validate_page_crc(&page)?;
+                        blob.extend_from_slice(payload);
                     }
                     if blob.is_empty() {
                         continue;
@@ -273,30 +271,21 @@ impl LsmRecovery {
                 for slot in reader.component_slots_for_arch(arch_id) {
                     // component_slots_for_arch excludes ENTITY_SLOT, so every slot
                     // here has a named schema entry.
-                    let (name, item_size, kind) = {
+                    let (name, kind) = {
                         let entry = reader.schema().entry_for_slot(slot).ok_or_else(|| {
                             LsmError::Format(format!("missing schema entry for slot {slot}"))
                         })?;
-                        (
-                            entry.name().to_owned(),
-                            entry.item_size as usize,
-                            entry.storage_kind(),
-                        )
+                        (entry.name().to_owned(), entry.storage_kind())
                     };
                     for result in reader.slot_pages(arch_id, slot) {
                         let (page_index, page) = result?;
-                        let proof = reader.validate_page_crc(&page)?;
-                        // RawCopy pages are zero-padded to the full stride, so we
-                        // slice the live `row_count * item_size` prefix. Serialized
-                        // pages are variable-length (`[offsets][values]`); the
-                        // reader sizes them exactly, so the WHOLE body is the
-                        // payload — slicing by native stride would corrupt them.
-                        let payload: &[u8] = match kind {
-                            crate::schema::StorageKind::RawCopy => {
-                                &page.data()[..page.header().row_count as usize * item_size]
-                            }
-                            crate::schema::StorageKind::Serialized => page.data(),
-                        };
+                        // The proven slice already equals the live payload:
+                        // `validate_page_crc` returns `row_count * item_size` for
+                        // RawCopy pages (the live prefix, excluding zero-padding)
+                        // and the whole `[offsets][values]` body for Serialized
+                        // pages. Binding the proof to exactly these bytes here means
+                        // `DecodeMode::Unchecked(proof)` certifies what we store.
+                        let (payload, proof) = reader.validate_page_crc(&page)?;
                         // Only Serialized pages from a fingerprint-matched run may
                         // skip bytecheck; everything else decodes checked.
                         let decode_mode = if run_allows_unchecked
@@ -319,14 +308,13 @@ impl LsmRecovery {
 
                 for result in reader.entity_pages(arch_id) {
                     let (page_index, page) = result?;
-                    reader.validate_page_crc(&page)?;
-                    let payload_len = page.header().row_count as usize * 8;
+                    let (payload, _proof) = reader.validate_page_crc(&page)?;
                     store_page(
                         &mut pages,
                         (sig.clone(), ColumnKey::Entity, page_index),
                         seq_hi,
                         page.header().row_count,
-                        &page.data()[..payload_len],
+                        payload,
                         // Entity pages are raw 8-byte IDs, never Serialized.
                         DecodeMode::Checked,
                     );
@@ -563,14 +551,14 @@ fn native_column_page(
                         // emitted them). Together the fingerprint gate (layout) and
                         // the CrcProof (integrity) establish that `slice` is a valid
                         // rkyv archive of `ty`, satisfying the method's precondition.
-                        DecodeMode::Unchecked(proof) => {
+                        DecodeMode::Unchecked(_proof) => {
                             // Count each unchecked per-page decode call (one per live
                             // Serialized row batch). Thread-local so concurrent tests
                             // on different threads cannot interfere. Used by white-box
                             // tests only.
                             #[cfg(test)]
                             UNCHECKED_SERIALIZED_DECODES.with(|c| c.set(c.get() + 1));
-                            unsafe { codecs.deserialize_unchecked_by_type(ty, slice, proof) }
+                            unsafe { codecs.deserialize_unchecked_by_type(ty, slice) }
                                 .ok_or_else(|| {
                                     LsmError::Format(
                                         "no codec for serialized column type on recovery"

@@ -92,9 +92,11 @@ struct ComponentCodec {
     serialize_fn: SerializeFn,
     deserialize_fn: DeserializeFn,
     /// Like `deserialize_fn` but skips rkyv bytecheck via `access_unchecked`.
-    /// Only reachable through `deserialize_unchecked_by_type`, which requires a
-    /// `CrcProof`. Sound ONLY when the recovery fingerprint gate (spec §2.1) has
-    /// also confirmed the on-disk layout matches this binary's.
+    /// Only reachable through the `unsafe deserialize_unchecked_by_type`, whose
+    /// caller asserts archive validity. Sound ONLY when the recovery fingerprint
+    /// gate (spec §2.1) has confirmed the on-disk layout matches this binary's and
+    /// the per-page `CrcProof` (which gates construction of `DecodeMode::Unchecked`)
+    /// has confirmed byte integrity.
     deserialize_unchecked_fn: DeserializeFn,
     register_fn: RegisterFn,
     serialize_sparse_fn: SerializeSparseFn,
@@ -208,18 +210,16 @@ impl CodecRegistry {
     ///
     /// # Safety
     /// `bytes` MUST be a valid rkyv archive of the type identified by `type_id` —
-    /// i.e. produced by this binary's codec for that type and not since mutated.
-    /// `CrcProof` proves only byte INTEGRITY (the bytes are unchanged since the
-    /// writer emitted them); it does NOT prove the writer emitted a structurally
-    /// valid archive of THIS binary's type. The caller must independently establish
-    /// well-formedness — recovery does so via the per-run decode-fingerprint gate
-    /// (`fingerprint::run_fingerprint` match) before reaching this. Calling with a
-    /// CRC-valid-but-malformed archive is undefined behavior.
+    /// produced by this binary's codec for that type and not since mutated. This
+    /// is NOT implied by a CRC check alone (CRC proves integrity, not rkyv
+    /// well-formedness); recovery establishes it via the per-run decode-fingerprint
+    /// gate (`fingerprint::run_fingerprint` match) plus the per-page `CrcProof`
+    /// (integrity) that gated construction of `DecodeMode::Unchecked`. Calling with
+    /// a CRC-valid-but-malformed archive is undefined behavior.
     pub unsafe fn deserialize_unchecked_by_type(
         &self,
         type_id: std::any::TypeId,
         bytes: &[u8],
-        _proof: &CrcProof,
     ) -> Option<Result<Vec<u8>, CodecError>> {
         let codec = self.codecs.values().find(|c| c.type_id == type_id)?;
         Some((codec.deserialize_unchecked_fn)(bytes))
@@ -383,11 +383,13 @@ impl CodecRegistry {
                     std::mem::size_of::<T::Archived>()
                 )));
             }
-            // SAFETY: the only caller, `deserialize_unchecked_by_type`, requires a
-            // `CrcProof` (unforgeable; minted only by a real CRC check), so `bytes`
-            // are integrity-verified, writer-authored archive bytes. Combined with
-            // the recovery-side fingerprint gate (only runs whose Serialized layout
-            // matches this binary reach the unchecked path), these are a valid
+            // SAFETY: the only caller, the `unsafe deserialize_unchecked_by_type`,
+            // documents a precondition that `bytes` is a valid writer-authored
+            // archive. Recovery discharges it: the per-page `CrcProof` (unforgeable;
+            // minted only by a real CRC check) gates construction of
+            // `DecodeMode::Unchecked`, so `bytes` are integrity-verified; combined
+            // with the recovery-side fingerprint gate (only runs whose Serialized
+            // layout matches this binary reach the unchecked path), these are a valid
             // archive of `T::Archived`; skipping bytecheck is sound. See spec §2/§2.1.
             // The page framing (offset table → row slices) is validated by
             // `serialized_page::decode` on BOTH the checked and unchecked paths
@@ -691,9 +693,10 @@ impl Default for CodecRegistry {
 /// is [`CrcProof::verify`], which runs the actual checksum.
 ///
 /// Used by [`CodecRegistry::decode`] to gate the `raw_copy_size` fast path
-/// (direct memcpy, skipping rkyv bytecheck), and by
-/// [`CodecRegistry::deserialize_unchecked_by_type`] to gate the
-/// bytecheck-skipping Serialized decode path (spec §2.1). Both are
+/// (direct memcpy, skipping rkyv bytecheck), and by recovery to gate
+/// construction of `DecodeMode::Unchecked` — the integrity half of the
+/// precondition for the bytecheck-skipping Serialized decode path
+/// ([`CodecRegistry::deserialize_unchecked_by_type`], spec §2.1). Both are
 /// soundness-critical: without a proof, the unsafe fast paths are unreachable.
 /// Producers: WAL frame reader
 /// ([`minkowski_persist::wal::read_next_frame`]), LSM page validator
@@ -1189,10 +1192,9 @@ mod raw_copy_tests {
         }
 
         let checked = codecs.deserialize_by_type(ty, &bytes).unwrap().unwrap();
-        let proof = CrcProof::verify(&bytes, crc32fast::hash(&bytes)).unwrap();
         // SAFETY: `bytes` was just serialized by this binary's codec for
         // `WithHeap`, so it is a valid archive of that type.
-        let unchecked = unsafe { codecs.deserialize_unchecked_by_type(ty, &bytes, &proof) }
+        let unchecked = unsafe { codecs.deserialize_unchecked_by_type(ty, &bytes) }
             .expect("codec exists")
             .expect("unchecked decode ok");
 
@@ -1233,10 +1235,8 @@ mod raw_copy_tests {
     fn deserialize_unchecked_returns_err_for_truncated_slice() {
         // N3 length guard: `deserialize_unchecked_by_type` must return `Err`
         // (not panic or read OOB) when the byte slice is shorter than
-        // `size_of::<T::Archived>()`. Feed a deliberately-truncated slice with a
-        // freshly-minted `CrcProof` over those exact bytes — the proof proves
-        // integrity of the truncated slice, not of a valid archive. The result
-        // must be `Some(Err(_))`.
+        // `size_of::<T::Archived>()`. Feed a deliberately-truncated slice; the
+        // function must detect the short length and return `Some(Err(_))`.
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
         codecs
@@ -1246,11 +1246,10 @@ mod raw_copy_tests {
 
         // A slice of 1 byte — guaranteed shorter than ArchivedWithHeap.
         let truncated = [0xFFu8; 1];
-        let proof = CrcProof::verify(&truncated, crc32fast::hash(&truncated)).unwrap();
         // SAFETY: we are intentionally testing the length-guard error path with a
         // truncated slice. The function must detect the short length and return
         // `Err` before any archive access.
-        let result = unsafe { codecs.deserialize_unchecked_by_type(ty, &truncated, &proof) };
+        let result = unsafe { codecs.deserialize_unchecked_by_type(ty, &truncated) };
         assert!(
             matches!(result, Some(Err(_))),
             "truncated slice must yield Some(Err(_)), got {result:?}"
