@@ -80,7 +80,7 @@ pub fn run_fingerprint(schema: &SchemaSection, codecs: &CodecRegistry) -> u64 {
 mod tests {
     use super::*;
 
-    fn e<'a>(name: &'a str, ns: u64, na: u64, asz: u64) -> FingerprintEntry<'a> {
+    fn e(name: &str, ns: u64, na: u64, asz: u64) -> FingerprintEntry<'_> {
         FingerprintEntry {
             name,
             native_size: ns,
