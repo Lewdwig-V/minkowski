@@ -91,6 +91,11 @@ struct ComponentCodec {
     layout: Layout,
     serialize_fn: SerializeFn,
     deserialize_fn: DeserializeFn,
+    /// Like `deserialize_fn` but skips rkyv bytecheck via `access_unchecked`.
+    /// Only reachable through `deserialize_unchecked_by_type`, which requires a
+    /// `CrcProof`. Sound ONLY when the recovery fingerprint gate (spec §2.1) has
+    /// also confirmed the on-disk layout matches this binary's.
+    deserialize_unchecked_fn: DeserializeFn,
     register_fn: RegisterFn,
     serialize_sparse_fn: SerializeSparseFn,
     insert_sparse_fn: InsertSparseFn,
@@ -183,6 +188,23 @@ impl CodecRegistry {
         Some((codec.deserialize_fn)(bytes))
     }
 
+    /// Deserialize component bytes into a native-byte buffer by *type*, skipping
+    /// rkyv bytecheck (`access_unchecked` + `deserialize`). The `_proof`
+    /// (unforgeable — only minted by [`CrcProof::verify`]) gates this unsafe fast
+    /// path: a caller cannot reach it without having validated the bytes'
+    /// integrity. Sound ONLY in combination with the recovery fingerprint gate
+    /// (spec §2.1) — the proof covers integrity, the fingerprint covers
+    /// layout-provenance. Returns `None` if no codec is registered for the type.
+    pub fn deserialize_unchecked_by_type(
+        &self,
+        type_id: std::any::TypeId,
+        bytes: &[u8],
+        _proof: &CrcProof,
+    ) -> Option<Result<Vec<u8>, CodecError>> {
+        let codec = self.codecs.values().find(|c| c.type_id == type_id)?;
+        Some((codec.deserialize_unchecked_fn)(bytes))
+    }
+
     /// Register a component type for persistence.
     /// Requires rkyv Archive + Serialize + Deserialize bounds.
     /// Uses `std::any::type_name::<T>()` as the default stable name.
@@ -194,7 +216,8 @@ impl CodecRegistry {
                 rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
             > + Clone,
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
-            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
+            + rkyv::Portable,
     {
         let name = std::any::type_name::<T>().to_owned();
         self.register_with_name::<T>(name, world)
@@ -211,7 +234,8 @@ impl CodecRegistry {
                 rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
             > + Clone,
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
-            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
+            + rkyv::Portable,
     {
         self.register_with_name::<T>(stable_name.to_owned(), world)
     }
@@ -228,7 +252,8 @@ impl CodecRegistry {
                 rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
             > + Clone,
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
-            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
+            + rkyv::Portable,
     {
         let comp_id = world.register_component::<T>();
 
@@ -308,6 +333,33 @@ impl CodecRegistry {
             Ok(buf)
         };
 
+        let deserialize_unchecked_fn: DeserializeFn = |bytes| {
+            // Same realignment as `deserialize_fn`: `access_unchecked` reads the
+            // archive in place and the row slice is essentially never aligned.
+            let mut aligned = rkyv::util::AlignedVec::<16>::new();
+            aligned.extend_from_slice(bytes);
+            // SAFETY: the only caller, `deserialize_unchecked_by_type`, requires a
+            // `CrcProof` (unforgeable; minted only by a real CRC check), so `bytes`
+            // are integrity-verified, writer-authored archive bytes. Combined with
+            // the recovery-side fingerprint gate (only runs whose Serialized layout
+            // matches this binary reach the unchecked path), these are a valid
+            // archive of `T::Archived`; skipping bytecheck is sound. See spec §2/§2.1.
+            let archived = unsafe { rkyv::access_unchecked::<T::Archived>(&aligned) };
+            let value: T = rkyv::deserialize::<T, rancor::Error>(archived)
+                .map_err(|e| CodecError::Deserialize(e.to_string()))?;
+            let layout = Layout::new::<T>();
+            let mut buf = vec![0u8; layout.size()];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &value as *const T as *const u8,
+                    buf.as_mut_ptr(),
+                    layout.size(),
+                );
+            }
+            std::mem::forget(value); // ownership transferred to buf
+            Ok(buf)
+        };
+
         let register_fn: RegisterFn = |world| world.register_component::<T>();
 
         let serialize_sparse_fn: SerializeSparseFn = |world, comp_id, _codecs| {
@@ -349,6 +401,7 @@ impl CodecRegistry {
                 layout,
                 serialize_fn,
                 deserialize_fn,
+                deserialize_unchecked_fn,
                 register_fn,
                 serialize_sparse_fn,
                 insert_sparse_fn,
@@ -1013,6 +1066,47 @@ mod raw_copy_tests {
             codecs.raw_copy_size(pod_id).is_some(),
             "raw-copyable (POD) codec keeps its raw_copy_size"
         );
+    }
+
+    #[test]
+    fn unchecked_decode_matches_checked_for_heap() {
+        // Given CRC-proven bytes, the unchecked path must reconstruct the SAME
+        // native value as the checked path. This is the core correctness guard:
+        // access_unchecked + deserialize == from_bytes for valid bytes.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        let ty = std::any::TypeId::of::<WithHeap>();
+
+        let value = WithHeap {
+            label: "round trip me".to_owned(),
+        };
+        let mut bytes = Vec::new();
+        unsafe {
+            codecs
+                .serialize_by_type(ty, &value as *const WithHeap as *const u8, &mut bytes)
+                .unwrap()
+                .unwrap();
+        }
+
+        let checked = codecs.deserialize_by_type(ty, &bytes).unwrap().unwrap();
+        let proof = CrcProof::verify(&bytes, crc32fast::hash(&bytes)).unwrap();
+        let unchecked = codecs
+            .deserialize_unchecked_by_type(ty, &bytes, &proof)
+            .expect("codec exists")
+            .expect("unchecked decode ok");
+
+        // Each buffer byte-owns a reconstructed WithHeap. Read both out
+        // unaligned (Vec<u8> is byte-aligned), compare, then forget the copies
+        // so the owning buffers free each String exactly once.
+        let a = unsafe { std::ptr::read_unaligned(checked.as_ptr() as *const WithHeap) };
+        let b = unsafe { std::ptr::read_unaligned(unchecked.as_ptr() as *const WithHeap) };
+        assert_eq!(a.label, "round trip me");
+        assert_eq!(a.label, b.label);
+        std::mem::forget(a);
+        std::mem::forget(b);
     }
 
     #[test]
