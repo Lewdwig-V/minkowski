@@ -733,7 +733,9 @@ impl<'a> CompactionWriter<'a> {
             schema_offset,
             bloom_filter_offset,
             total_crc32: 0,
-            reserved: [0u8; 28],
+            _pad: 0,
+            decode_fingerprint: 0,
+            reserved: [0u8; 16],
         };
         w.write_all(footer.as_bytes())?;
         w.flush()?;
