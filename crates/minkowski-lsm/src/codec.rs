@@ -113,6 +113,10 @@ struct ComponentCodec {
     /// heap indirection). RawCopy columns memcpy on recovery; Serialized columns
     /// decode per row. Derived once at registration.
     raw_copyable: bool,
+    /// `size_of::<T::Archived>()` — the rkyv archived layout size, captured at
+    /// registration. Feeds the decode fingerprint (spec §2.1): a change here
+    /// across a binary upgrade fails the gate and forces checked decode.
+    archived_size: usize,
     /// `TypeId` of the concrete component type this codec was registered for.
     /// `ComponentId` is a per-world index, so the flush gate compares this to the
     /// flushed world's `component_type_id` to confirm the codec actually
@@ -407,6 +411,7 @@ impl CodecRegistry {
                 insert_sparse_fn,
                 raw_copy_size,
                 raw_copyable,
+                archived_size: std::mem::size_of::<T::Archived>(),
                 type_id: std::any::TypeId::of::<T>(),
             },
         );
@@ -467,6 +472,13 @@ impl CodecRegistry {
     /// `register_as`, or `type_name` default from `register`).
     pub fn stable_name(&self, id: ComponentId) -> Option<&str> {
         self.codecs.get(&id).map(|c| c.name.as_str())
+    }
+
+    /// The rkyv archived size for a registered component *type*, resolved by its
+    /// stable name. Used to compute the decode fingerprint (spec §2.1).
+    pub fn archived_size_by_name(&self, name: &str) -> Option<usize> {
+        let id = self.by_name.get(name)?;
+        self.codecs.get(id).map(|c| c.archived_size)
     }
 
     /// Resolve a stable name to its ComponentId.
@@ -1107,6 +1119,27 @@ mod raw_copy_tests {
         assert_eq!(a.label, b.label);
         std::mem::forget(a);
         std::mem::forget(b);
+    }
+
+    #[test]
+    fn archived_size_by_name_reports_heap_and_pod() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Plain>("plain", &mut world).unwrap();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        // POD: archived size == native size.
+        assert_eq!(
+            codecs.archived_size_by_name("plain"),
+            Some(std::mem::size_of::<<Plain as rkyv::Archive>::Archived>())
+        );
+        // Heap: archived size is rkyv's ArchivedString layout (differs from native).
+        assert_eq!(
+            codecs.archived_size_by_name("with_heap"),
+            Some(std::mem::size_of::<<WithHeap as rkyv::Archive>::Archived>())
+        );
+        assert_eq!(codecs.archived_size_by_name("nope"), None);
     }
 
     #[test]
