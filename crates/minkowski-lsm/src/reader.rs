@@ -68,6 +68,7 @@ pub struct SortedRunReader {
     bloom: Option<BloomView>,
     sequence_range: SeqRange,
     page_count: u64,
+    decode_fingerprint: u64,
 }
 
 /// Minimum file size: Header (64) + Footer (64).
@@ -80,6 +81,7 @@ struct ParsedMetadata {
     bloom: Option<BloomView>,
     sequence_range: SeqRange,
     page_count: u64,
+    decode_fingerprint: u64,
 }
 
 /// Validate and parse a sorted-run file buffer.
@@ -201,6 +203,7 @@ fn validate_and_parse(buf: &[u8]) -> Result<ParsedMetadata, LsmError> {
         bloom,
         sequence_range,
         page_count,
+        decode_fingerprint: footer.decode_fingerprint,
     })
 }
 
@@ -217,6 +220,7 @@ impl SortedRunReader {
             bloom: parsed.bloom,
             sequence_range: parsed.sequence_range,
             page_count: parsed.page_count,
+            decode_fingerprint: parsed.decode_fingerprint,
         })
     }
 
@@ -319,6 +323,12 @@ impl SortedRunReader {
     /// Get the schema section.
     pub fn schema(&self) -> &SchemaSection {
         &self.schema
+    }
+
+    /// The decode fingerprint stamped at write time (spec §2.1). 0 = absent /
+    /// legacy run → recovery must use checked decode.
+    pub fn decode_fingerprint(&self) -> u64 {
+        self.decode_fingerprint
     }
 
     /// WAL sequence range covered by this sorted run.
@@ -948,7 +958,9 @@ mod tests {
             schema_offset,
             bloom_filter_offset: 0,
             total_crc32: 0,
-            reserved: [0u8; 28],
+            _pad: 0,
+            decode_fingerprint: 0,
+            reserved: [0u8; 16],
         };
 
         let mut file = std::fs::File::create(&path).unwrap();

@@ -194,8 +194,16 @@ pub struct Footer {
     pub bloom_filter_offset: u64,
     /// CRC32 over all page data, headers, and the schema section.
     pub total_crc32: u32,
+    /// Explicit padding to align `decode_fingerprint` to 8 bytes; must be zero
+    /// on write.
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad: u32,
+    /// Decode fingerprint (spec §2.1): `fingerprint::run_fingerprint` over the
+    /// run's Serialized columns at write time. 0 = absent/legacy → recovery uses
+    /// checked decode. Covered by `total_crc32` (integrity-protected).
+    pub decode_fingerprint: u64,
     /// Reserved for future use; must be zero on write.
-    pub reserved: [u8; 28],
+    pub reserved: [u8; 16],
 }
 
 impl Footer {
@@ -274,6 +282,23 @@ mod tests {
         assert_eq!(recovered.sequence_lo, 100);
         assert_eq!(recovered.sequence_hi, 200);
         assert_eq!(recovered.header_crc32, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn footer_round_trip_preserves_decode_fingerprint() {
+        let f = Footer {
+            sparse_index_offset: 1,
+            sparse_index_count: 2,
+            schema_offset: 3,
+            bloom_filter_offset: 4,
+            total_crc32: 5,
+            _pad: 0,
+            decode_fingerprint: 0xDEAD_BEEF_CAFE_F00D,
+            reserved: [0u8; 16],
+        };
+        let recovered = Footer::from_bytes(f.as_bytes());
+        assert_eq!(recovered.decode_fingerprint, 0xDEAD_BEEF_CAFE_F00D);
+        assert_eq!(recovered.total_crc32, 5);
     }
 
     #[test]

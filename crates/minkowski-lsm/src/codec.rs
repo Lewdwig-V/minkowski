@@ -91,6 +91,11 @@ struct ComponentCodec {
     layout: Layout,
     serialize_fn: SerializeFn,
     deserialize_fn: DeserializeFn,
+    /// Like `deserialize_fn` but skips rkyv bytecheck via `access_unchecked`.
+    /// Only reachable through `deserialize_unchecked_by_type`, which requires a
+    /// `CrcProof`. Sound ONLY when the recovery fingerprint gate (spec §2.1) has
+    /// also confirmed the on-disk layout matches this binary's.
+    deserialize_unchecked_fn: DeserializeFn,
     register_fn: RegisterFn,
     serialize_sparse_fn: SerializeSparseFn,
     insert_sparse_fn: InsertSparseFn,
@@ -108,11 +113,20 @@ struct ComponentCodec {
     /// heap indirection). RawCopy columns memcpy on recovery; Serialized columns
     /// decode per row. Derived once at registration.
     raw_copyable: bool,
+    /// `size_of::<T::Archived>()` — the rkyv archived layout size, captured at
+    /// registration. Feeds the decode fingerprint (spec §2.1): a change here
+    /// across a binary upgrade fails the gate and forces checked decode.
+    archived_size: usize,
     /// `TypeId` of the concrete component type this codec was registered for.
     /// `ComponentId` is a per-world index, so the flush gate compares this to the
     /// flushed world's `component_type_id` to confirm the codec actually
     /// describes the type whose native bytes are being persisted.
     type_id: std::any::TypeId,
+    /// `std::any::type_name::<T>()` — the dense on-disk schema stores this
+    /// (via `World::component_name`), NOT the codec stable name (which may be a
+    /// `register_as` alias). Fingerprint layout lookups resolve by THIS so an
+    /// aliased codec still resolves.
+    type_name: &'static str,
 }
 
 /// Maps ComponentId to rkyv codecs. Separate from core's ComponentRegistry —
@@ -183,6 +197,29 @@ impl CodecRegistry {
         Some((codec.deserialize_fn)(bytes))
     }
 
+    /// Deserialize component bytes into a native-byte buffer by *type*, skipping
+    /// rkyv bytecheck (`access_unchecked` + `deserialize`). Returns `None` if no
+    /// codec is registered for the type.
+    ///
+    /// # Safety
+    /// `bytes` MUST be a valid rkyv archive of the type identified by `type_id` —
+    /// i.e. produced by this binary's codec for that type and not since mutated.
+    /// `CrcProof` proves only byte INTEGRITY (the bytes are unchanged since the
+    /// writer emitted them); it does NOT prove the writer emitted a structurally
+    /// valid archive of THIS binary's type. The caller must independently establish
+    /// well-formedness — recovery does so via the per-run decode-fingerprint gate
+    /// (`fingerprint::run_fingerprint` match) before reaching this. Calling with a
+    /// CRC-valid-but-malformed archive is undefined behavior.
+    pub unsafe fn deserialize_unchecked_by_type(
+        &self,
+        type_id: std::any::TypeId,
+        bytes: &[u8],
+        _proof: &CrcProof,
+    ) -> Option<Result<Vec<u8>, CodecError>> {
+        let codec = self.codecs.values().find(|c| c.type_id == type_id)?;
+        Some((codec.deserialize_unchecked_fn)(bytes))
+    }
+
     /// Register a component type for persistence.
     /// Requires rkyv Archive + Serialize + Deserialize bounds.
     /// Uses `std::any::type_name::<T>()` as the default stable name.
@@ -194,7 +231,8 @@ impl CodecRegistry {
                 rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
             > + Clone,
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
-            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
+            + rkyv::Portable,
     {
         let name = std::any::type_name::<T>().to_owned();
         self.register_with_name::<T>(name, world)
@@ -211,7 +249,8 @@ impl CodecRegistry {
                 rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
             > + Clone,
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
-            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
+            + rkyv::Portable,
     {
         self.register_with_name::<T>(stable_name.to_owned(), world)
     }
@@ -228,8 +267,19 @@ impl CodecRegistry {
                 rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
             > + Clone,
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
-            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
+            + rkyv::Portable,
     {
+        // Mechanical enforcement (audit N4): both decode paths realign rows into
+        // `AlignedVec::<16>`, which is only sufficient when the archived type's
+        // alignment is <= 16. Enforce per-monomorphization at COMPILE time.
+        const {
+            assert!(
+                std::mem::align_of::<T::Archived>() <= 16,
+                "T::Archived alignment exceeds the AlignedVec<16> used by decode"
+            );
+        }
+
         let comp_id = world.register_component::<T>();
 
         // Idempotent: same type re-registered with same name is a no-op.
@@ -308,6 +358,54 @@ impl CodecRegistry {
             Ok(buf)
         };
 
+        let deserialize_unchecked_fn: DeserializeFn = |bytes| {
+            // Same realignment as `deserialize_fn`: `access_unchecked` reads the
+            // archive in place and the row slice is essentially never aligned.
+            let mut aligned = rkyv::util::AlignedVec::<16>::new();
+            aligned.extend_from_slice(bytes);
+            // Defense-in-depth (audit N3): `access_unchecked` roots at the buffer
+            // tail and reads `size_of::<T::Archived>()` bytes there. The framing
+            // layer (`serialized_page::decode`) already bounds-checks each row
+            // slice against the CRC-validated page body, so a sub-root-size row is
+            // only reachable via a same-binary writer bug — but turn that into a
+            // clean error rather than an OOB read. (Bad INTERNAL structure of a
+            // correctly-sized archive is still trusted — that is the bytecheck we
+            // intentionally skip.)
+            if aligned.len() < std::mem::size_of::<T::Archived>() {
+                return Err(CodecError::Deserialize(format!(
+                    "unchecked decode: row is {} bytes but archived root needs {}",
+                    aligned.len(),
+                    std::mem::size_of::<T::Archived>()
+                )));
+            }
+            // SAFETY: the only caller, `deserialize_unchecked_by_type`, requires a
+            // `CrcProof` (unforgeable; minted only by a real CRC check), so `bytes`
+            // are integrity-verified, writer-authored archive bytes. Combined with
+            // the recovery-side fingerprint gate (only runs whose Serialized layout
+            // matches this binary reach the unchecked path), these are a valid
+            // archive of `T::Archived`; skipping bytecheck is sound. See spec §2/§2.1.
+            // The page framing (offset table → row slices) is validated by
+            // `serialized_page::decode` on BOTH the checked and unchecked paths
+            // before this runs, so the row slice is already guaranteed in-bounds of
+            // the CRC-validated page body; the ONLY validation skipped here is
+            // per-row rkyv bytecheck (internal relative-pointer / length / UTF-8
+            // checks).
+            let archived = unsafe { rkyv::access_unchecked::<T::Archived>(&aligned) };
+            let value: T = rkyv::deserialize::<T, rancor::Error>(archived)
+                .map_err(|e| CodecError::Deserialize(e.to_string()))?;
+            let layout = Layout::new::<T>();
+            let mut buf = vec![0u8; layout.size()];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &value as *const T as *const u8,
+                    buf.as_mut_ptr(),
+                    layout.size(),
+                );
+            }
+            std::mem::forget(value); // ownership transferred to buf
+            Ok(buf)
+        };
+
         let register_fn: RegisterFn = |world| world.register_component::<T>();
 
         let serialize_sparse_fn: SerializeSparseFn = |world, comp_id, _codecs| {
@@ -349,12 +447,15 @@ impl CodecRegistry {
                 layout,
                 serialize_fn,
                 deserialize_fn,
+                deserialize_unchecked_fn,
                 register_fn,
                 serialize_sparse_fn,
                 insert_sparse_fn,
                 raw_copy_size,
                 raw_copyable,
+                archived_size: std::mem::size_of::<T::Archived>(),
                 type_id: std::any::TypeId::of::<T>(),
+                type_name: std::any::type_name::<T>(),
             },
         );
         Ok(())
@@ -414,6 +515,24 @@ impl CodecRegistry {
     /// `register_as`, or `type_name` default from `register`).
     pub fn stable_name(&self, id: ComponentId) -> Option<&str> {
         self.codecs.get(&id).map(|c| c.name.as_str())
+    }
+
+    /// Archived (rkyv) size for the component whose Rust `type_name` is `type_name`
+    /// (the dense schema key). Resolves by `type_name`, NOT the codec stable name.
+    pub(crate) fn archived_size_by_type_name(&self, type_name: &str) -> Option<usize> {
+        self.codecs
+            .values()
+            .find(|c| c.type_name == type_name)
+            .map(|c| c.archived_size)
+    }
+
+    /// Native (in-memory) size and align for the component whose Rust `type_name`
+    /// is `type_name` (the dense schema key). Resolves by `type_name`.
+    pub(crate) fn native_layout_by_type_name(&self, type_name: &str) -> Option<(usize, usize)> {
+        self.codecs
+            .values()
+            .find(|c| c.type_name == type_name)
+            .map(|c| (c.layout.size(), c.layout.align()))
     }
 
     /// Resolve a stable name to its ComponentId.
@@ -545,7 +664,11 @@ impl Default for CodecRegistry {
 /// is [`CrcProof::verify`], which runs the actual checksum.
 ///
 /// Used by [`CodecRegistry::decode`] to gate the `raw_copy_size` fast path
-/// (direct memcpy, skipping rkyv bytecheck). Producers: WAL frame reader
+/// (direct memcpy, skipping rkyv bytecheck), and by
+/// [`CodecRegistry::deserialize_unchecked_by_type`] to gate the
+/// bytecheck-skipping Serialized decode path (spec §2.1). Both are
+/// soundness-critical: without a proof, the unsafe fast paths are unreachable.
+/// Producers: WAL frame reader
 /// ([`minkowski_persist::wal::read_next_frame`]), LSM page validator
 /// ([`SortedRunReader::validate_page_crc`]).
 pub struct CrcProof(());
@@ -1012,6 +1135,98 @@ mod raw_copy_tests {
         assert!(
             codecs.raw_copy_size(pod_id).is_some(),
             "raw-copyable (POD) codec keeps its raw_copy_size"
+        );
+    }
+
+    #[test]
+    fn unchecked_decode_matches_checked_for_heap() {
+        // Given CRC-proven bytes, the unchecked path must reconstruct the SAME
+        // native value as the checked path. This is the core correctness guard:
+        // access_unchecked + deserialize == from_bytes for valid bytes.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        let ty = std::any::TypeId::of::<WithHeap>();
+
+        let value = WithHeap {
+            label: "round trip me".to_owned(),
+        };
+        let mut bytes = Vec::new();
+        unsafe {
+            codecs
+                .serialize_by_type(ty, &value as *const WithHeap as *const u8, &mut bytes)
+                .unwrap()
+                .unwrap();
+        }
+
+        let checked = codecs.deserialize_by_type(ty, &bytes).unwrap().unwrap();
+        let proof = CrcProof::verify(&bytes, crc32fast::hash(&bytes)).unwrap();
+        // SAFETY: `bytes` was just serialized by this binary's codec for
+        // `WithHeap`, so it is a valid archive of that type.
+        let unchecked = unsafe { codecs.deserialize_unchecked_by_type(ty, &bytes, &proof) }
+            .expect("codec exists")
+            .expect("unchecked decode ok");
+
+        // Each buffer byte-owns a reconstructed WithHeap. Read both out
+        // unaligned (Vec<u8> is byte-aligned), compare, then forget the copies
+        // so the owning buffers free each String exactly once.
+        let a = unsafe { std::ptr::read_unaligned(checked.as_ptr() as *const WithHeap) };
+        let b = unsafe { std::ptr::read_unaligned(unchecked.as_ptr() as *const WithHeap) };
+        assert_eq!(a.label, "round trip me");
+        assert_eq!(a.label, b.label);
+        std::mem::forget(a);
+        std::mem::forget(b);
+    }
+
+    #[test]
+    fn archived_size_by_name_reports_heap_and_pod() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Plain>("plain", &mut world).unwrap();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        // POD: archived size == native size. Resolve by Rust type_name (the dense
+        // schema key), NOT the register_as alias.
+        assert_eq!(
+            codecs.archived_size_by_type_name(std::any::type_name::<Plain>()),
+            Some(std::mem::size_of::<<Plain as rkyv::Archive>::Archived>())
+        );
+        // Heap: archived size is rkyv's ArchivedString layout (differs from native).
+        assert_eq!(
+            codecs.archived_size_by_type_name(std::any::type_name::<WithHeap>()),
+            Some(std::mem::size_of::<<WithHeap as rkyv::Archive>::Archived>())
+        );
+        assert_eq!(codecs.archived_size_by_type_name("nope"), None);
+    }
+
+    #[test]
+    fn deserialize_unchecked_returns_err_for_truncated_slice() {
+        // N3 length guard: `deserialize_unchecked_by_type` must return `Err`
+        // (not panic or read OOB) when the byte slice is shorter than
+        // `size_of::<T::Archived>()`. Feed a deliberately-truncated slice with a
+        // freshly-minted `CrcProof` over those exact bytes — the proof proves
+        // integrity of the truncated slice, not of a valid archive. The result
+        // must be `Some(Err(_))`.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        let ty = std::any::TypeId::of::<WithHeap>();
+
+        // A slice of 1 byte — guaranteed shorter than ArchivedWithHeap.
+        let truncated = [0xFFu8; 1];
+        let proof = CrcProof::verify(&truncated, crc32fast::hash(&truncated)).unwrap();
+        // SAFETY: we are intentionally testing the length-guard error path with a
+        // truncated slice. The function must detect the short length and return
+        // `Err` before any archive access.
+        let result = unsafe { codecs.deserialize_unchecked_by_type(ty, &truncated, &proof) };
+        assert!(
+            matches!(result, Some(Err(_))),
+            "truncated slice must yield Some(Err(_)), got {result:?}"
         );
     }
 
