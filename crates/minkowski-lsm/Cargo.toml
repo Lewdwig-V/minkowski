@@ -6,6 +6,9 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+bench-support = []
+
 [dependencies]
 minkowski = { path = "../minkowski" }
 crc32fast = "1"
