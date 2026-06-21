@@ -519,7 +519,7 @@ impl CodecRegistry {
 
     /// Archived (rkyv) size for the component whose Rust `type_name` is `type_name`
     /// (the dense schema key). Resolves by `type_name`, NOT the codec stable name.
-    pub fn archived_size_by_type_name(&self, type_name: &str) -> Option<usize> {
+    pub(crate) fn archived_size_by_type_name(&self, type_name: &str) -> Option<usize> {
         self.codecs
             .values()
             .find(|c| c.type_name == type_name)
@@ -528,7 +528,7 @@ impl CodecRegistry {
 
     /// Native (in-memory) size and align for the component whose Rust `type_name`
     /// is `type_name` (the dense schema key). Resolves by `type_name`.
-    pub fn native_layout_by_type_name(&self, type_name: &str) -> Option<(usize, usize)> {
+    pub(crate) fn native_layout_by_type_name(&self, type_name: &str) -> Option<(usize, usize)> {
         self.codecs
             .values()
             .find(|c| c.type_name == type_name)
@@ -664,7 +664,11 @@ impl Default for CodecRegistry {
 /// is [`CrcProof::verify`], which runs the actual checksum.
 ///
 /// Used by [`CodecRegistry::decode`] to gate the `raw_copy_size` fast path
-/// (direct memcpy, skipping rkyv bytecheck). Producers: WAL frame reader
+/// (direct memcpy, skipping rkyv bytecheck), and by
+/// [`CodecRegistry::deserialize_unchecked_by_type`] to gate the
+/// bytecheck-skipping Serialized decode path (spec §2.1). Both are
+/// soundness-critical: without a proof, the unsafe fast paths are unreachable.
+/// Producers: WAL frame reader
 /// ([`minkowski_persist::wal::read_next_frame`]), LSM page validator
 /// ([`SortedRunReader::validate_page_crc`]).
 pub struct CrcProof(());
@@ -1196,6 +1200,34 @@ mod raw_copy_tests {
             Some(std::mem::size_of::<<WithHeap as rkyv::Archive>::Archived>())
         );
         assert_eq!(codecs.archived_size_by_type_name("nope"), None);
+    }
+
+    #[test]
+    fn deserialize_unchecked_returns_err_for_truncated_slice() {
+        // N3 length guard: `deserialize_unchecked_by_type` must return `Err`
+        // (not panic or read OOB) when the byte slice is shorter than
+        // `size_of::<T::Archived>()`. Feed a deliberately-truncated slice with a
+        // freshly-minted `CrcProof` over those exact bytes — the proof proves
+        // integrity of the truncated slice, not of a valid archive. The result
+        // must be `Some(Err(_))`.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<WithHeap>("with_heap", &mut world)
+            .unwrap();
+        let ty = std::any::TypeId::of::<WithHeap>();
+
+        // A slice of 1 byte — guaranteed shorter than ArchivedWithHeap.
+        let truncated = [0xFFu8; 1];
+        let proof = CrcProof::verify(&truncated, crc32fast::hash(&truncated)).unwrap();
+        // SAFETY: we are intentionally testing the length-guard error path with a
+        // truncated slice. The function must detect the short length and return
+        // `Err` before any archive access.
+        let result = unsafe { codecs.deserialize_unchecked_by_type(ty, &truncated, &proof) };
+        assert!(
+            matches!(result, Some(Err(_))),
+            "truncated slice must yield Some(Err(_)), got {result:?}"
+        );
     }
 
     #[test]

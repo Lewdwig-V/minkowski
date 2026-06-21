@@ -17,6 +17,18 @@ use crate::reader::SortedRunReader;
 use crate::sparse_page;
 use crate::types::Level;
 
+#[cfg(test)]
+thread_local! {
+    // Test-only counter: incremented once per unchecked Serialized page decode
+    // (one call to `deserialize_unchecked_by_type` per live row batch). Lets
+    // white-box tests assert the unchecked arm was actually taken (or NOT taken on
+    // fingerprint mismatch) without inspecting internals directly.
+    //
+    // Thread-local (not a global atomic) so concurrent tests on different threads
+    // do not interfere with each other's before/after delta measurements.
+    static UNCHECKED_SERIALIZED_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Result of an LSM recovery operation.
 pub struct RecoveryResult {
     /// Reconstructed world state from sorted runs (before WAL replay).
@@ -113,9 +125,9 @@ impl LsmRecovery {
             // its stamped fingerprint is present (non-zero) AND equals the layout
             // this binary would produce for the same Serialized columns. Computed
             // ONCE per run; mismatch or absent (0) ⇒ checked decode everywhere.
-            let run_allows_unchecked = reader.decode_fingerprint() != 0
-                && reader.decode_fingerprint()
-                    == crate::fingerprint::run_fingerprint(reader.schema(), codecs);
+            let stored_fp = reader.decode_fingerprint();
+            let run_allows_unchecked = stored_fp != 0
+                && stored_fp == crate::fingerprint::run_fingerprint(reader.schema(), codecs);
 
             for entry in reader.schema().entries() {
                 component_layouts
@@ -479,6 +491,12 @@ fn native_column_page(
                         // the CrcProof (integrity) establish that `slice` is a valid
                         // rkyv archive of `ty`, satisfying the method's precondition.
                         DecodeMode::Unchecked(proof) => {
+                            // Count each unchecked per-page decode call (one per live
+                            // Serialized row batch). Thread-local so concurrent tests
+                            // on different threads cannot interfere. Used by white-box
+                            // tests only.
+                            #[cfg(test)]
+                            UNCHECKED_SERIALIZED_DECODES.with(|c| c.set(c.get() + 1));
                             unsafe { codecs.deserialize_unchecked_by_type(ty, slice, proof) }
                                 .ok_or_else(|| {
                                     LsmError::Format(
@@ -2682,6 +2700,9 @@ mod tests {
     /// offset +40 (post-`_pad` layout) to a wrong value, repairs `total_crc32`
     /// (offset +32) so the file still opens, then recovers. Stays green
     /// throughout wiring: the mismatch takes the unchanged checked path.
+    ///
+    /// White-box: also asserts `UNCHECKED_SERIALIZED_DECODES` did NOT increase,
+    /// proving the checked fallback was taken (not a silent unchecked downgrade).
     #[test]
     fn recover_heap_with_mismatched_fingerprint_uses_checked_path() {
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -2742,6 +2763,10 @@ mod tests {
             f.flush().unwrap();
         }
 
+        // Snapshot the thread-local counter before recovery. Thread-local means
+        // concurrent tests on other threads cannot interfere with this delta.
+        let before = UNCHECKED_SERIALIZED_DECODES.with(std::cell::Cell::get);
+
         // Recovery must fall back to checked decode and still recover the value.
         let (mut result, _m, _l) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
         let got: Vec<String> = result
@@ -2750,12 +2775,24 @@ mod tests {
             .map(|(n,)| n.text.clone())
             .collect();
         assert_eq!(got, vec!["survives".to_owned()]);
+
+        // White-box: the mismatch forced checked decode — the counter must NOT have
+        // increased. A regression (silent unchecked take) would show delta > 0.
+        let after = UNCHECKED_SERIALIZED_DECODES.with(std::cell::Cell::get);
+        assert_eq!(
+            after, before,
+            "fingerprint mismatch must NOT take unchecked decode path"
+        );
     }
 
     /// Positive end-to-end: a fresh flush stamps this binary's fingerprint, so
     /// recovery takes the UNCHECKED (bytecheck-skipping) decode path for the
     /// Serialized `Name` column. Every value must still round-trip exactly. This
     /// is the definitive exercise of the unchecked path.
+    ///
+    /// White-box: also asserts `UNCHECKED_SERIALIZED_DECODES` INCREASED, proving
+    /// the unchecked arm executed. A silent downgrade to checked decode would pass
+    /// value assertions but fail this counter check.
     #[test]
     fn recover_heap_unchecked_path_matches_values() {
         #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
@@ -2788,6 +2825,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
+        // Snapshot the thread-local counter before recovery. Thread-local means
+        // concurrent tests on other threads cannot interfere with this delta.
+        let before = UNCHECKED_SERIALIZED_DECODES.with(std::cell::Cell::get);
+
         // Fresh flush ⇒ stored fingerprint == this binary's ⇒ unchecked path taken.
         let (mut result, _m, _l) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
         let mut got: Vec<String> = result
@@ -2799,6 +2840,14 @@ mod tests {
         let mut want: Vec<String> = (0..300u32).map(|i| format!("entity-{i}")).collect();
         want.sort();
         assert_eq!(got, want);
+
+        // White-box: the unchecked arm must have fired at least once. A silent
+        // downgrade to checked decode would keep the counter unchanged.
+        let after = UNCHECKED_SERIALIZED_DECODES.with(std::cell::Cell::get);
+        assert!(
+            after > before,
+            "unchecked decode arm must have been taken at least once (before={before}, after={after})"
+        );
     }
 
     #[test]

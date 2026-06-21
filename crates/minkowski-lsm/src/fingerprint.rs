@@ -112,6 +112,20 @@ mod tests {
     }
 
     #[test]
+    fn native_size_change_changes_hash() {
+        let a = [e("name", 24, 8, 16)];
+        let b = [e("name", 32, 8, 16)];
+        assert_ne!(decode_fingerprint(&a), decode_fingerprint(&b));
+    }
+
+    #[test]
+    fn native_align_change_changes_hash() {
+        let a = [e("name", 24, 8, 16)];
+        let b = [e("name", 24, 4, 16)];
+        assert_ne!(decode_fingerprint(&a), decode_fingerprint(&b));
+    }
+
+    #[test]
     fn epoch_is_mixed_in() {
         // Empty entry set still depends on the epoch constant (non-zero hash).
         assert_ne!(decode_fingerprint(&[]), 0);

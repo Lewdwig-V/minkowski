@@ -169,7 +169,7 @@ the machine-independent regression gate. Run:
 | `rawcopy_column_256` (POD memcpy) | 674 | ~3 |
 | `page_frame_decode_256` (offset slicing, zero-copy — NOT rkyv) | 7,471 | ~29 |
 | `page_frame_encode_256` (offset table + value concat — NOT rkyv) | 58,841 | ~230 |
-| `rkyv_decode_256` (real per-row `deserialize_by_type`) | 224,917 | ~879 |
+| `rkyv_decode_256` (real per-row `deserialize_by_type`) | 224,917 | ~879 | *(earlier run; see note)* |
 | `rkyv_encode_256` (real per-row `serialize_by_type`) | 345,510 | ~1,350 |
 
 Heap (Serialized) recovery costs **~879 instr/row vs ~3 for a RawCopy memcpy (~330×)**
@@ -178,11 +178,20 @@ the memcpy fast path, rkyv is paid only for heap columns. Note the page *framing
 (`serialized_page::encode`/`decode`) is cheap and zero-copy on decode; the cost is
 the rkyv codec, not the Arrow offset table.
 
+*Note: `rkyv_decode_256` appears with two different counts in this document
+(~879 instr/row above; ~901.6 instr/row in the "Bytecheck-skip" table below). Both
+are correct — iai-callgrind instruction counts are machine-relative and the two figures
+come from different runs on different hosts. The 901.6 figure is from the same run
+that produced the unchecked baseline (182,624 / 713.4) and is the authoritative pairing
+for the 20.9% reduction measurement in this PR.*
+
 **Optimization opportunity (deferred to the perf shakedown).** Heap recovery re-runs
 full rkyv `bytecheck` per row even though the page is CRC-validated on read. The
 RawCopy path has a `CrcProof` fast lane that skips bytecheck; Serialized columns have
 no equivalent. Given a `CrcProof`, recovery could `from_bytes_unchecked` Serialized
-rows — plausibly **~halving** the ~879 instr/row decode cost.
+rows — plausibly **~halving** the ~879 instr/row decode cost. *(Superseded: the
+unchecked path was implemented and measured at a **20.9% reduction** — see the
+"Bytecheck-skip on heap recovery" section below.)*
 
 ### Level-count / compaction sweep
 
