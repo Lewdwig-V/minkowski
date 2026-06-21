@@ -926,6 +926,93 @@ mod tests {
         );
     }
 
+    /// Dense heap-component counterpart to `reflush_recovered_world_preserves_sparse`.
+    /// A `String`-bearing dense component is flushed as a Serialized column, then
+    /// the world is recovered, mutated, and REFLUSHED from the recovered world.
+    /// `recover_world` re-registers the codec into a fresh world at a possibly
+    /// different local `ComponentId`, so reflush must resolve the Serialized
+    /// codec by component TYPE (`world.component_type_id`), not by id. An id-keyed
+    /// serialize on reflush would select the wrong codec (or none) and silently
+    /// drop the heap baseline — the id-class regression this test pins.
+    #[test]
+    fn reflush_recovered_world_preserves_heap_dense() {
+        #[derive(Clone, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        struct Name {
+            text: String,
+        }
+        // No codec, registered first → the codec registry's ids start gapped, so
+        // recovery's compacted ids diverge from the registry's.
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct Filler(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        world.register_component::<Filler>(); // id 0, no codec
+        codecs.register::<Name>(&mut world).unwrap(); // id 1
+
+        let e = world.spawn((Name {
+            text: "alice".to_owned(),
+        },));
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("baseline flush");
+
+        // Recover into a fresh world (codec re-registered with a compacted id:
+        // the recovered Name id differs from the registry's id).
+        let (result, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let mut recovered = result.world;
+        assert_eq!(
+            recovered.get::<Name>(e).map(|n| n.text.as_str()),
+            Some("alice"),
+            "baseline heap dense must recover"
+        );
+
+        // Mutate and REFLUSH the recovered world with the same codecs.
+        let e2 = recovered.spawn((Name {
+            text: "bob".to_owned(),
+        },));
+        let (mut manifest2, mut log2) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &recovered,
+            SeqRange::new(SeqNo::from(1u64), SeqNo::from(2u64)).unwrap(),
+            &mut manifest2,
+            &mut log2,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("reflush of recovered world");
+
+        // Recover once more: both heap entries must survive the reflush.
+        let (result2, _, _) = LsmRecovery::recover::<4>(&lsm_dir, &log_path, &codecs).unwrap();
+        let final_world = result2.world;
+        assert_eq!(
+            final_world.get::<Name>(e).map(|n| n.text.as_str()),
+            Some("alice"),
+            "original heap dense must survive reflush of a recovered world"
+        );
+        assert_eq!(
+            final_world.get::<Name>(e2).map(|n| n.text.as_str()),
+            Some("bob"),
+            "new heap dense must survive reflush of a recovered world"
+        );
+    }
+
     #[test]
     fn recover_restores_sparse_components() {
         #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
