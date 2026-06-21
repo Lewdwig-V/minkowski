@@ -190,17 +190,20 @@ rows — plausibly **~halving** the ~879 instr/row decode cost.
 
 | N | write-amp | total runs | recover µs |
 |---:|---:|---:|---:|
-| 3 | 0.268 | 4 | 55,209 |
-| 4 | 0.275 | 1 | 57,118 |
-| 5 | 0.275 | 1 | 52,789 |
-| 7 | 0.275 | 1 | 56,965 |
+| 3 | 0.380 | 4 | 47,137 |
+| 4 | 0.423 | 1 | 42,219 |
+| 5 | 0.423 | 1 | 41,220 |
+| 7 | 0.423 | 1 | 41,609 |
 
-**N=4 confirmed.** N=4/5/7 are identical; N=3 caps at L2 (4 uncompacted bottom runs
-vs 1). Write-amp (~0.25–0.275) is driven by the **K=4 merge ratio, not the level
-count** — deeper N only matters at ~4^N-flush extremes (far beyond the ≤100×-RAM
-regime). A *constant* workload is uninformative here (it self-supersedes to a uniform
-0.25); the sweep grows the dataset so it cascades through levels. (`recover µs` is
-wall-clock and host-relative.)
+**N=4 confirmed.** N=4/5/7 are identical. N=3 caps at L2, leaving **4 uncompacted
+bottom-level runs vs 1** — it trades ~10% lower write-amp (0.380 vs 0.423, it skips
+the final L2→L3 merge) for **~12% slower recovery** (47.1 ms vs 42.2 ms, more runs
+to merge). N=4 captures the recovery benefit; deeper N gives nothing until ~4^N-flush
+extremes (far beyond the ≤100×-RAM regime). Notes: the sweep must *grow* the dataset
+(a constant workload self-supersedes and never cascades) **and** clear the dirty-page
+tracker after each flush (`flush_and_record` takes `&World` and doesn't clear it —
+otherwise every run is a full snapshot and write-amp/recovery are meaningless).
+(`recover µs` is wall-clock and host-relative.)
 
 ### Running the benchmarks
 

@@ -166,25 +166,10 @@ pub fn grow(
     }
 }
 
-/// Mutate `ratio` (0.0..=1.0) of `BenchVel` rows deterministically so a
-/// subsequent flush is non-trivially dirty (drives dedup/merge + write-amp).
-///
-/// Iterates `BenchVel` columns in archetype order; the first `target` rows get a
-/// seeded perturbation. The perturbation is a pure function of `seed`, so repeated
-/// calls with the same `(world, ratio, seed)` produce identical mutations.
-pub fn overwrite(world: &mut World, ratio: f64, seed: u64) {
-    let total = world.query::<(&BenchVel,)>().count();
-    let target = ((total as f64) * ratio).round() as usize;
-    let mut hit = 0usize;
-    let mut s = seed;
-    world.query::<(&mut BenchVel,)>().for_each(|(v,)| {
-        if hit < target {
-            // Deterministic, non-zero perturbation derived from the seed.
-            v.dx += 1.0 + ((splitmix(&mut s) & 0xFF) as f32);
-            hit += 1;
-        }
-    });
-}
+// NOTE: there is intentionally no value-mutation helper. Raw mutation via
+// `world.query::<(&mut T,)>()` does NOT mark flush-dirty pages, so it can't drive
+// flush-based benches; use `grow` (structural spawns, which dirty) to accumulate
+// data, and clear the dirty-page tracker between flushes.
 
 /// Write amplification: output bytes ÷ input bytes over a compaction.
 #[derive(Clone, Copy, Debug, Default)]

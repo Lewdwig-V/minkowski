@@ -31,9 +31,13 @@ fi
 
 echo "=== criterion: LSM throughput / compaction (wall-clock, host-relative) ==="
 cargo bench -p minkowski-persist --bench lsm_throughput 2>&1 | tee "$OUT/lsm_throughput.txt"
-cargo bench -p minkowski-persist --bench lsm_compaction  2>&1 | tee "$OUT/lsm_compaction.txt" | grep -E "WRITEAMP|time:" || true
+# Run, then filter the saved file separately — so a cargo failure aborts (set -e
+# + pipefail) while a no-match grep stays best-effort.
+cargo bench -p minkowski-persist --bench lsm_compaction 2>&1 | tee "$OUT/lsm_compaction.txt"
+grep -E "WRITEAMP|time:" "$OUT/lsm_compaction.txt" || true
 
 echo "=== level sweep (write-amp + recovery vs N) ==="
-cargo bench -p minkowski-persist --bench lsm_level_sweep 2>&1 | tee "$OUT/lsm_level_sweep.txt" | grep SWEEP || true
+cargo bench -p minkowski-persist --bench lsm_level_sweep 2>&1 | tee "$OUT/lsm_level_sweep.txt"
+grep SWEEP "$OUT/lsm_level_sweep.txt" || true
 
 echo "baseline written to $OUT"

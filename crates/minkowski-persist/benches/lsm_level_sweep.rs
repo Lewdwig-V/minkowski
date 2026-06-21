@@ -57,6 +57,12 @@ fn sweep_run<const N: usize>(
         )
         .unwrap()
         .expect("world is dirty, flush must produce a run");
+        // `flush_and_record` takes `&World` and does NOT clear the dirty-page
+        // tracker. Without this, the next flush re-writes the entire accumulated
+        // world instead of only the newly-grown pages — making every run a full
+        // snapshot and skewing write-amp / run-count / recovery. Clear so growth
+        // is genuinely incremental.
+        world.clear_all_dirty_pages();
 
         while let Some(r) = compact_one::<N>(&mut manifest, &mut log, dir.path()).unwrap() {
             wa.input_bytes += r.input_bytes;

@@ -239,9 +239,12 @@ fn rkyv_decode_256(input: (CodecRegistry, TypeId, Vec<Vec<u8>>)) {
         // Read it out and drop it so the `String` is freed exactly once — the
         // `Vec<u8>` would otherwise leak it (a `Vec<u8>` runs no `BenchName::drop`).
         // This mirrors the ownership transfer recovery performs.
+        // `native` is a `Vec<u8>` (byte alignment only), so use `read_unaligned`:
+        // a plain `ptr::read` of a `BenchName` (pointer-aligned) would be UB if the
+        // allocator doesn't over-align the buffer.
         // SAFETY: `native` holds a valid native `BenchName` image (deserialize_by_type
         // reconstructs the value and transfers ownership into the bytes).
-        let name = unsafe { std::ptr::read(native.as_ptr().cast::<BenchName>()) };
+        let name = unsafe { std::ptr::read_unaligned(native.as_ptr().cast::<BenchName>()) };
         black_box(name.text.len());
         drop(name);
     }
