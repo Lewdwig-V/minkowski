@@ -86,15 +86,28 @@ struct StoredPage {
 /// RawCopy/POD columns are constructed with `armed: None`.
 struct DecodedColumn {
     bytes: Vec<u8>,
-    /// `Some((drop_fn, item_size))` for Serialized columns owning heap values;
+    /// `Some(HeapDrop)` for Serialized columns owning heap values;
     /// `None` for RawCopy/POD or after `disarm()`.
-    armed: Option<ColumnDrop>,
+    armed: Option<HeapDrop>,
 }
 
-/// `(drop_in_place, native item stride)` for an armed Serialized column guard.
-type ColumnDrop = (unsafe fn(*mut u8), usize);
+/// How to drop one reconstructed native value of an armed Serialized column:
+/// its element drop fn (reads the row out UNALIGNED then drops — the buffer is a
+/// plain `Vec<u8>`, align 1, so it must NOT `drop_in_place` an unaligned pointer)
+/// and the native item stride.
+struct HeapDrop {
+    /// Element drop: `|ptr| { let v = read_unaligned(ptr.cast::<T>()); drop(v); }`.
+    drop_one: unsafe fn(*mut u8),
+    /// Native stride in bytes (`rows = bytes.len() / item_size`).
+    item_size: usize,
+}
 
 impl DecodedColumn {
+    /// Wrap already-decoded native bytes with pre-resolved drop info. Infallible:
+    /// the fallible resolution happened in `column_arm` BEFORE decode.
+    fn new(bytes: Vec<u8>, armed: Option<HeapDrop>) -> Self {
+        Self { bytes, armed }
+    }
     fn as_slice(&self) -> &[u8] {
         &self.bytes
     }
@@ -107,46 +120,51 @@ impl DecodedColumn {
 
 impl Drop for DecodedColumn {
     fn drop(&mut self) {
-        if let Some((drop_fn, item_size)) = self.armed
+        if let Some(HeapDrop {
+            drop_one,
+            item_size,
+        }) = self.armed
             && item_size > 0
         {
             let rows = self.bytes.len() / item_size;
             for i in 0..rows {
                 // SAFETY: `bytes` holds `rows` contiguous byte images of this
                 // column's native type (produced by `native_column_page` for a
-                // Serialized column with this `item_size` stride). `drop_fn` reads
+                // Serialized column with this `item_size` stride). `drop_one` reads
                 // each row out *unaligned* and drops it (the buffer is a plain
                 // `Vec<u8>`, alignment 1, so the rows are not aligned to T). Each
                 // row is dropped exactly once and never read afterward.
-                unsafe { drop_fn(self.bytes.as_mut_ptr().add(i * item_size)) };
+                unsafe { drop_one(self.bytes.as_mut_ptr().add(i * item_size)) };
             }
         }
     }
 }
 
-/// Wrap a decoded column buffer in a drop guard. Serialized columns are armed
-/// with the type's `drop_fn` so heap values are freed if the guard is dropped
-/// before `import_page` takes ownership; RawCopy/POD columns are unarmed.
-fn guard_column(
-    bytes: Vec<u8>,
+/// Resolve the drop info for a column BEFORE decoding it, so the guard can be
+/// constructed infallibly afterward (a decoded heap buffer must never be handed
+/// to a fallible operation that could drop it as plain bytes → leak). Serialized
+/// columns resolve their element drop fn; RawCopy/POD columns are unarmed.
+fn column_arm(
     kind: crate::schema::StorageKind,
     type_id: Option<std::any::TypeId>,
     item_size: usize,
     codecs: &CodecRegistry,
-) -> Result<DecodedColumn, LsmError> {
-    let armed = match kind {
+) -> Result<Option<HeapDrop>, LsmError> {
+    match kind {
         crate::schema::StorageKind::Serialized => {
             let ty = type_id.ok_or_else(|| {
                 LsmError::Format("serialized column has no type for drop guard".to_owned())
             })?;
-            let drop_fn = codecs.drop_fn_by_type(ty).ok_or_else(|| {
+            let drop_one = codecs.drop_fn_by_type(ty).ok_or_else(|| {
                 LsmError::Format("no codec drop_fn for serialized column".to_owned())
             })?;
-            Some((drop_fn, item_size))
+            Ok(Some(HeapDrop {
+                drop_one,
+                item_size,
+            }))
         }
-        crate::schema::StorageKind::RawCopy => None,
-    };
-    Ok(DecodedColumn { bytes, armed })
+        crate::schema::StorageKind::RawCopy => Ok(None),
+    }
 }
 
 #[derive(Clone)]
@@ -787,6 +805,11 @@ fn materialize_world(
                         }
                         let (kind, type_id) = col_kinds[i];
                         let item_size = item_sizes[i];
+                        // Resolve the drop info (fallible) BEFORE decoding, so the
+                        // guard is constructed infallibly after — a decoded heap
+                        // buffer can never be handed to a fallible op that would
+                        // drop it as plain bytes → leak.
+                        let armed = column_arm(kind, type_id, item_size, codecs)?;
                         // All rows alive ⇒ pass `None` (no mask): every row is
                         // materialized.
                         let native = native_column_page(
@@ -813,7 +836,7 @@ fn materialize_world(
                              {row_count} * {item_size}",
                             native.len()
                         );
-                        guard_column(native, kind, type_id, item_size, codecs)
+                        Ok(DecodedColumn::new(native, armed))
                     })
                     .collect::<Result<_, _>>()?;
                     (page_entities.clone(), cols)
@@ -854,6 +877,11 @@ fn materialize_world(
                         // mask skips dead rows entirely, so they are never decoded.
                         let (kind, type_id) = col_kinds[i];
                         let item_size = item_sizes[i];
+                        // Resolve the drop info (fallible) BEFORE decoding, so the
+                        // guard is constructed infallibly after — a decoded heap
+                        // buffer can never be handed to a fallible op that would
+                        // drop it as plain bytes → leak.
+                        let armed = column_arm(kind, type_id, item_size, codecs)?;
                         let buf = native_column_page(
                             page,
                             kind,
@@ -875,7 +903,7 @@ fn materialize_world(
                          {live_count} * {item_size}",
                             buf.len()
                         );
-                        live_cols.push(guard_column(buf, kind, type_id, item_size, codecs)?);
+                        live_cols.push(DecodedColumn::new(buf, armed));
                     }
                     (live_entities, live_cols)
                 };
@@ -896,6 +924,12 @@ fn materialize_world(
                 // has a codec (the flush gate proves it). The source pages passed
                 // per-page CRC validation on read, and every entity in `entities` is
                 // alive per the allocator state restored above (dead rows filtered).
+                // The armed-drop-on-`Err` correctness relies on `World::import_page`
+                // being ALL-OR-NOTHING: it validates every entity (dead/already-placed)
+                // BEFORE any `append_bytes_unchecked`, and its byte-copy loop is
+                // infallible — so an `Err` means zero columns were transferred, and
+                // dropping the still-armed guards frees each heap value exactly once
+                // (no double free with a partially-populated archetype).
                 unsafe { world.import_page(&import_page) }
                     .map_err(|e| LsmError::Format(format!("import_page failed for {sig:?}: {e}")))
                 // col_refs + import_page dropped at block end, releasing the borrow
@@ -1616,14 +1650,16 @@ mod tests {
             .expect("deserialize ok");
         assert_eq!(native.len(), item_size, "one native row");
 
-        let guard = guard_column(
+        let guard = DecodedColumn::new(
             native,
-            crate::schema::StorageKind::Serialized,
-            Some(ty),
-            item_size,
-            &codecs,
-        )
-        .expect("guard built");
+            column_arm(
+                crate::schema::StorageKind::Serialized,
+                Some(ty),
+                item_size,
+                &codecs,
+            )
+            .unwrap(),
+        );
         assert!(guard.armed.is_some(), "serialized column must be armed");
 
         let before = DROPS.load(Ordering::SeqCst);
@@ -1676,14 +1712,16 @@ mod tests {
             .expect("codec exists")
             .expect("deserialize ok");
 
-        let mut guard = guard_column(
+        let mut guard = DecodedColumn::new(
             native,
-            crate::schema::StorageKind::Serialized,
-            Some(ty),
-            item_size,
-            &codecs,
-        )
-        .expect("guard built");
+            column_arm(
+                crate::schema::StorageKind::Serialized,
+                Some(ty),
+                item_size,
+                &codecs,
+            )
+            .unwrap(),
+        );
 
         let before = DROPS.load(Ordering::SeqCst);
         guard.disarm(); // success path: ownership transferred to a World column
@@ -1719,14 +1757,16 @@ mod tests {
         let item_size = std::mem::size_of::<Pod>();
 
         let bytes = vec![0u8; item_size];
-        let guard = guard_column(
+        let guard = DecodedColumn::new(
             bytes,
-            crate::schema::StorageKind::RawCopy,
-            Some(ty),
-            item_size,
-            &codecs,
-        )
-        .expect("guard built");
+            column_arm(
+                crate::schema::StorageKind::RawCopy,
+                Some(ty),
+                item_size,
+                &codecs,
+            )
+            .unwrap(),
+        );
         assert!(
             guard.armed.is_none(),
             "raw-copy/POD column must be unarmed (no element drop)"

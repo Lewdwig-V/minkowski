@@ -119,7 +119,9 @@ struct ComponentCodec {
     /// registration. Feeds the decode fingerprint (spec §2.1): a change here
     /// across a binary upgrade fails the gate and forces checked decode.
     archived_size: usize,
-    /// `drop_in_place` for the concrete type, used to free reconstructed native
+    /// Element drop for the concrete type (reads the row out UNALIGNED then drops —
+    /// the recovery decode buffer is a plain `Vec<u8>`, align 1, so a `drop_in_place`
+    /// on the unaligned pointer would be UB), used to free reconstructed native
     /// values (e.g. the heap of a `String`) that were decoded into a byte buffer
     /// but never transferred into a World column (the recovery import-error path).
     /// For POD types this is a no-op; it is only invoked on Serialized columns.
@@ -545,9 +547,9 @@ impl CodecRegistry {
             .map(|c| c.archived_size)
     }
 
-    /// `drop_in_place` for a registered component *type*. Recovery uses this to
-    /// free reconstructed heap values that never reach a World column on an
-    /// import-error path. Resolve by `TypeId` (the recovery decode key).
+    /// Element drop fn (unaligned-read-then-drop) for a registered component *type*.
+    /// Recovery uses this to free reconstructed heap values that never reach a World
+    /// column on an import-error path. Resolve by `TypeId` (the recovery decode key).
     pub(crate) fn drop_fn_by_type(&self, type_id: std::any::TypeId) -> Option<unsafe fn(*mut u8)> {
         self.codecs
             .values()
