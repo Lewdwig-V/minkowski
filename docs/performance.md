@@ -169,7 +169,7 @@ the machine-independent regression gate. Run:
 | `rawcopy_column_256` (POD memcpy) | 674 | ~3 |
 | `page_frame_decode_256` (offset slicing, zero-copy — NOT rkyv) | 7,471 | ~29 |
 | `page_frame_encode_256` (offset table + value concat — NOT rkyv) | 58,841 | ~230 |
-| `rkyv_decode_256` (real per-row `deserialize_by_type`) | 224,917 | ~879 |
+| `rkyv_decode_256` (real per-row `deserialize_by_type`) | 224,917 | ~879 | *(earlier run; see note)* |
 | `rkyv_encode_256` (real per-row `serialize_by_type`) | 345,510 | ~1,350 |
 
 Heap (Serialized) recovery costs **~879 instr/row vs ~3 for a RawCopy memcpy (~330×)**
@@ -178,11 +178,20 @@ the memcpy fast path, rkyv is paid only for heap columns. Note the page *framing
 (`serialized_page::encode`/`decode`) is cheap and zero-copy on decode; the cost is
 the rkyv codec, not the Arrow offset table.
 
+*Note: `rkyv_decode_256` appears with two different counts in this document
+(~879 instr/row above; ~901.6 instr/row in the "Bytecheck-skip" table below). Both
+are correct — iai-callgrind instruction counts are machine-relative and the two figures
+come from different runs on different hosts. The 901.6 figure is from the same run
+that produced the unchecked baseline (182,624 / 713.4) and is the authoritative pairing
+for the 20.9% reduction measurement in this PR.*
+
 **Optimization opportunity (deferred to the perf shakedown).** Heap recovery re-runs
 full rkyv `bytecheck` per row even though the page is CRC-validated on read. The
 RawCopy path has a `CrcProof` fast lane that skips bytecheck; Serialized columns have
 no equivalent. Given a `CrcProof`, recovery could `from_bytes_unchecked` Serialized
-rows — plausibly **~halving** the ~879 instr/row decode cost.
+rows — plausibly **~halving** the ~879 instr/row decode cost. *(Superseded: the
+unchecked path was implemented and measured at a **20.9% reduction** — see the
+"Bytecheck-skip on heap recovery" section below.)*
 
 ### Level-count / compaction sweep
 
@@ -204,6 +213,23 @@ extremes (far beyond the ≤100×-RAM regime). Notes: the sweep must *grow* the 
 tracker after each flush (`flush_and_record` takes `&World` and doesn't clear it —
 otherwise every run is a full snapshot and write-amp/recovery are meaningless).
 (`recover µs` is wall-clock and host-relative.)
+
+### Bytecheck-skip on heap recovery
+
+**Measured instruction counts** (`rkyv_decode` iai-callgrind bench, 256 rows):
+
+| Path | instr (256 rows) | instr/row |
+|---|---:|---:|
+| `rkyv_decode_256` (checked, `from_bytes`) | 230,816 | 901.6 |
+| `rkyv_decode_unchecked_256` (unchecked, `access_unchecked`) | 182,624 | 713.4 |
+
+**20.9% reduction per row** on Serialized (heap) column decode. The win applies only to heap columns — POD/RawCopy columns already use a direct memcpy and are unaffected. End-to-end recovery benefit scales with the heap-column fraction of the schema.
+
+**Gate design.** CRC proves page integrity and data provenance (the bytes are exactly what the writer produced) but does NOT prove rkyv well-formedness (the archived layout is what the current binary expects). A separate per-run `decode_fingerprint` (FNV-1a over `RKYV_DECODE_EPOCH` + each Serialized component's name, native size, native alignment, and archived size) proves layout-provenance: it is computed identically by the flush writer, compaction, and recovery via a single `run_fingerprint` function (no independent implementations that can drift). Recovery decodes unchecked only when the stored footer fingerprint is non-zero AND equals the recovering binary's freshly recomputed value AND the per-page CRC validates; any mismatch falls back to the full checked `from_bytes` path. Compaction carries the fingerprint forward when all input runs agree on the same value; if they disagree (mixed binary versions), the output fingerprint is zeroed, forcing checked decode on the next recovery. Page framing validation (offset-table bounds, `offsets[0]==0`, monotonicity, exact-consumption, in-bounds row slices) is preserved on both decode paths; bytecheck-skip trusts only each row's internal rkyv structure, not the framing or page bounds.
+
+**`RKYV_DECODE_EPOCH`** (constant in `crates/minkowski-lsm/src/fingerprint.rs`) MUST be bumped on any rkyv upgrade that changes archived layouts without changing native or archived sizes. Bumping invalidates all stored fingerprints, causing recovery to fall back to checked decode on all existing runs.
+
+**Miri coverage.** The unchecked path (`codec::raw_copy_tests::unchecked_decode_matches_checked_for_heap`) is verified UB-free for valid archive bytes under Tree Borrows with `-Zmiri-ignore-leaks` (rkyv's `Pool` deserializer leaks are in rkyv internals, not this code). Command: `MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski-lsm --lib unchecked_decode_matches_checked_for_heap` — result: clean, 1 passed. The recovery-level Miri run (`recovery::tests::recover_heap_unchecked_path_matches_values`) was attempted but is not practical under Tree Borrows: the test pulls in `World::spawn` which exercises the pool's tagged-pointer (`integer-to-pointer` cast) fast path, which Tree Borrows explicitly does not support — Miri emits the warning "Tree Borrows does not support integer-to-pointer casts, so the program is likely to go wrong when this pointer gets used" and the run is non-terminating (>10 min at 99% CPU). The unsafe seam itself (`access_unchecked`) is covered by the codec-level test; the pool's provenance model is a separate concern predating this feature. Follow-up: extend the nightly Miri job to include `minkowski-lsm` recovery tests under a mode that tolerates the pool's provenance model (Stacked Borrows rather than Tree Borrows, or strict-provenance pool refactor).
 
 ### Running the benchmarks
 

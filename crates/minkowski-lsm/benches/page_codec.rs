@@ -42,7 +42,7 @@ use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use minkowski_lsm::bench_support::{
     BenchName, BenchPos, Layout, Shape, WorkloadParams, build_world,
 };
-use minkowski_lsm::codec::CodecRegistry;
+use minkowski_lsm::codec::{CodecRegistry, CrcProof};
 use minkowski_lsm::manifest_log::ManifestLog;
 use minkowski_lsm::manifest_ops::flush_and_record;
 use minkowski_lsm::reader::SortedRunReader;
@@ -180,6 +180,24 @@ fn setup_rkyv_decode() -> (CodecRegistry, TypeId, Vec<Vec<u8>>) {
     (codecs, TypeId::of::<BenchName>(), heap_rows())
 }
 
+/// Codec + `BenchName` TypeId + `HEAP_ROWS` serialized rows + a `CrcProof` per
+/// row, for the unchecked decode bench. Proofs are minted in setup (not measured).
+fn setup_rkyv_decode_unchecked() -> (CodecRegistry, TypeId, Vec<Vec<u8>>, Vec<CrcProof>) {
+    let (_world, codecs) = build_world(&WorkloadParams {
+        entities: 1,
+        shape: Shape::Heap,
+        layout: Layout::Single,
+        sparse: false,
+        seed: SEED,
+    });
+    let rows = heap_rows();
+    let proofs = rows
+        .iter()
+        .map(|r| CrcProof::verify(r, crc32fast::hash(r)).expect("fresh crc matches"))
+        .collect();
+    (codecs, TypeId::of::<BenchName>(), rows, proofs)
+}
+
 // ── benches (only the body is measured) ─────────────────────────────────────
 
 #[library_benchmark]
@@ -251,6 +269,23 @@ fn rkyv_decode_256(input: (CodecRegistry, TypeId, Vec<Vec<u8>>)) {
 }
 
 #[library_benchmark]
+#[bench::heap(setup = setup_rkyv_decode_unchecked)]
+fn rkyv_decode_unchecked_256(input: (CodecRegistry, TypeId, Vec<Vec<u8>>, Vec<CrcProof>)) {
+    let (codecs, ty, rows, proofs) = input;
+    for (row, proof) in rows.iter().zip(proofs.iter()) {
+        // SAFETY: `row` was just serialized by this binary's codec for
+        // `BenchName`, so it is a valid archive of that type.
+        let native = unsafe { codecs.deserialize_unchecked_by_type(ty, row, proof) }
+            .expect("codec for BenchName")
+            .expect("decode ok");
+        // Same ownership dance as rkyv_decode_256: read out unaligned, drop once.
+        let name = unsafe { std::ptr::read_unaligned(native.as_ptr().cast::<BenchName>()) };
+        black_box(name.text.len());
+        drop(name);
+    }
+}
+
+#[library_benchmark]
 #[bench::pod(setup = setup_column)]
 fn rawcopy_column_256(column: Vec<u8>) {
     black_box(black_box(&column[..]).to_vec());
@@ -264,6 +299,7 @@ library_benchmark_group!(
         page_frame_decode_256,
         rkyv_encode_256,
         rkyv_decode_256,
+        rkyv_decode_unchecked_256,
         rawcopy_column_256
 );
 

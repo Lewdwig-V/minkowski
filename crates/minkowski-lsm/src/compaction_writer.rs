@@ -727,13 +727,28 @@ impl<'a> CompactionWriter<'a> {
         let bloom_filter_offset = bloom::write_bloom_section(&mut w, &index_entries, seq_lo)?;
 
         // ── 10. Write footer (CRCs patched later) ─────────────────────────────
+
+        // Carry forward the inputs' decode fingerprint when unanimous (they share
+        // the same Serialized byte layout, which compaction copies verbatim).
+        // Disagreement (mixed-version inputs) or any absent (0) ⇒ 0 ⇒ recovery
+        // uses checked decode for this run. Fails safe.
+        let decode_fingerprint = {
+            let mut it = self.inputs.iter().map(|r| r.decode_fingerprint());
+            match it.next() {
+                Some(first) if first != 0 && it.all(|f| f == first) => first,
+                _ => 0,
+            }
+        };
+
         let footer = Footer {
             sparse_index_offset,
             sparse_index_count: index_entries.len() as u64,
             schema_offset,
             bloom_filter_offset,
             total_crc32: 0,
-            reserved: [0u8; 28],
+            _pad: 0,
+            decode_fingerprint,
+            reserved: [0u8; 16],
         };
         w.write_all(footer.as_bytes())?;
         w.flush()?;
@@ -1385,6 +1400,161 @@ mod tests {
         assert!(
             (x - 2.0_f32).abs() < f32::EPSILON,
             "expected Pos.x == 2.0 from newer run, got {x}"
+        );
+    }
+
+    // ── Task 5 test: compaction carries forward unanimous decode fingerprint ──
+
+    #[test]
+    fn compaction_carries_forward_unanimous_decode_fingerprint() {
+        #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        struct Name {
+            text: String,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) =
+            crate::manifest_log::ManifestLog::recover::<4>(&log_path).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = crate::codec::CodecRegistry::new();
+        codecs.register_as::<Name>("Name", &mut world).unwrap();
+
+        // Enough flushes to trigger one compaction. Grow between flushes.
+        let mut expected_fp = 0u64;
+        for k in 0..crate::compactor::COMPACTION_TRIGGER as u64 {
+            for i in 0..50u32 {
+                world.spawn((Name {
+                    text: format!("n{k}-{i}"),
+                },));
+            }
+            let path = crate::manifest_ops::flush_and_record(
+                &world,
+                crate::types::SeqRange::new(
+                    crate::types::SeqNo::from(k * 100),
+                    crate::types::SeqNo::from((k + 1) * 100),
+                )
+                .unwrap(),
+                &mut manifest,
+                &mut log,
+                dir.path(),
+                &codecs,
+            )
+            .unwrap()
+            .unwrap();
+            world.clear_all_dirty_pages();
+            expected_fp = crate::reader::SortedRunReader::open(&path)
+                .unwrap()
+                .decode_fingerprint();
+        }
+        assert_ne!(expected_fp, 0);
+
+        let report = crate::compactor::compact_one::<4>(&mut manifest, &mut log, dir.path())
+            .unwrap()
+            .expect("compaction fires");
+        let out = crate::reader::SortedRunReader::open(&report.output_path).unwrap();
+        assert_eq!(
+            out.decode_fingerprint(),
+            expected_fp,
+            "compacted run must carry forward the unanimous input fingerprint"
+        );
+    }
+
+    // ── Task 5b test: compaction disagreement → 0 fail-safe ──────────────────
+
+    /// Compaction must zero the output `decode_fingerprint` when input runs
+    /// disagree on their stored fingerprint. This exercises the fail-safe branch
+    /// in `CompactionWriter::write` (`match it.next() { _ => 0 }`).
+    ///
+    /// Approach: flush `COMPACTION_TRIGGER` identical runs (each gets the same
+    /// fingerprint from the current binary), then byte-patch ONE input run's
+    /// on-disk `decode_fingerprint` (footer offset +40) to a different non-zero
+    /// value and repair that file's `total_crc32` (offset +32) so the file opens
+    /// cleanly. After compaction the output's `decode_fingerprint` must be 0.
+    #[test]
+    fn compaction_disagreement_zeroes_decode_fingerprint() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        struct Name {
+            text: String,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) =
+            crate::manifest_log::ManifestLog::recover::<4>(&log_path).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = crate::codec::CodecRegistry::new();
+        codecs.register_as::<Name>("Name", &mut world).unwrap();
+
+        // Flush `COMPACTION_TRIGGER` runs to guarantee one compaction fires.
+        // Collect paths so we can byte-patch one of them.
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for k in 0..crate::compactor::COMPACTION_TRIGGER as u64 {
+            for i in 0..50u32 {
+                world.spawn((Name {
+                    text: format!("d{k}-{i}"),
+                },));
+            }
+            let path = crate::manifest_ops::flush_and_record(
+                &world,
+                crate::types::SeqRange::new(
+                    crate::types::SeqNo::from(k * 100),
+                    crate::types::SeqNo::from((k + 1) * 100),
+                )
+                .unwrap(),
+                &mut manifest,
+                &mut log,
+                dir.path(),
+                &codecs,
+            )
+            .unwrap()
+            .unwrap();
+            world.clear_all_dirty_pages();
+            paths.push(path);
+        }
+
+        // Byte-patch the FIRST run's stored decode_fingerprint to a different
+        // non-zero value (0xDEAD_BEEF_DEAD_BEEFu64), then repair total_crc32
+        // so the file opens without a CRC error — we are testing the fingerprint
+        // DISAGREEMENT path, not the file-integrity path.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&paths[0])
+                .unwrap();
+            let len = f.metadata().unwrap().len();
+            let footer_start = len - 64;
+            // Overwrite decode_fingerprint at footer_start + 40.
+            f.seek(SeekFrom::Start(footer_start + 40)).unwrap();
+            f.write_all(&0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes())
+                .unwrap();
+            // Zero total_crc32 field, read whole file, recompute, write back.
+            f.seek(SeekFrom::Start(footer_start + 32)).unwrap();
+            f.write_all(&[0u8; 4]).unwrap();
+            f.flush().unwrap();
+            let mut all = Vec::new();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.read_to_end(&mut all).unwrap();
+            let crc = crc32fast::hash(&all);
+            f.seek(SeekFrom::Start(footer_start + 32)).unwrap();
+            f.write_all(&crc.to_le_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+
+        // Run compaction — the patched run disagrees with the others.
+        let report = crate::compactor::compact_one::<4>(&mut manifest, &mut log, dir.path())
+            .unwrap()
+            .expect("compaction fires");
+        let out = crate::reader::SortedRunReader::open(&report.output_path).unwrap();
+
+        // Disagreement must zero the output fingerprint (fail-safe).
+        assert_eq!(
+            out.decode_fingerprint(),
+            0,
+            "compaction with disagreeing input fingerprints must produce decode_fingerprint == 0"
         );
     }
 

@@ -604,13 +604,16 @@ pub fn flush_observed(
     let bloom_filter_offset = bloom::write_bloom_section(&mut w, &index_entries, seq_lo)?;
 
     // (f) Footer
+    let decode_fingerprint = crate::fingerprint::run_fingerprint(&schema, codecs);
     let footer = Footer {
         sparse_index_offset,
         sparse_index_count: index_entries.len() as u64,
         schema_offset,
         bloom_filter_offset,
         total_crc32: 0,
-        reserved: [0u8; 28],
+        _pad: 0,
+        decode_fingerprint,
+        reserved: [0u8; 16],
     };
     w.write_all(footer.as_bytes())?;
 
@@ -1203,5 +1206,35 @@ mod tests {
             result.is_ok(),
             "a codec resolved by type must accept a type filed under a different id: {result:?}"
         );
+    }
+
+    #[test]
+    fn flush_stamps_nonzero_decode_fingerprint_for_heap_run() {
+        use crate::fingerprint::run_fingerprint;
+        #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        struct Name {
+            text: String,
+        }
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Name>("Name", &mut world).unwrap();
+        world.spawn((Name {
+            text: "a".to_owned(),
+        },));
+        let dir = tempfile::tempdir().unwrap();
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(100u64)).unwrap(),
+            dir.path(),
+            &codecs,
+        )
+        .unwrap()
+        .unwrap();
+
+        let reader = crate::reader::SortedRunReader::open(&path).unwrap();
+        let fp = reader.decode_fingerprint();
+        assert_ne!(fp, 0, "heap run must stamp a non-zero decode fingerprint");
+        // The stamped value equals run_fingerprint(schema, codecs) by construction.
+        assert_eq!(fp, run_fingerprint(reader.schema(), &codecs));
     }
 }

@@ -6,6 +6,7 @@ pub mod codec;
 pub(crate) mod compaction_writer;
 pub mod compactor;
 pub mod error;
+pub mod fingerprint;
 pub mod format;
 pub mod manifest;
 pub mod manifest_log;
