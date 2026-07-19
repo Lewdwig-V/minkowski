@@ -117,6 +117,11 @@ struct ComponentCodec {
     /// registration. Feeds the decode fingerprint (spec §2.1): a change here
     /// across a binary upgrade fails the gate and forces checked decode.
     archived_size: usize,
+    /// `drop_in_place` for the concrete type, used to free reconstructed native
+    /// values (e.g. the heap of a `String`) that were decoded into a byte buffer
+    /// but never transferred into a World column (the recovery import-error path).
+    /// For POD types this is a no-op; it is only invoked on Serialized columns.
+    drop_fn: unsafe fn(*mut u8),
     /// `TypeId` of the concrete component type this codec was registered for.
     /// `ComponentId` is a per-world index, so the flush gate compares this to the
     /// flushed world's `component_type_id` to confirm the codec actually
@@ -439,6 +444,17 @@ impl CodecRegistry {
             Ok(())
         };
 
+        let drop_fn: unsafe fn(*mut u8) = |ptr| {
+            // SAFETY: `ptr` points to the byte image of a valid `T` owned by the
+            // caller, dropped exactly once. The recovery decode buffer is a plain
+            // `Vec<u8>` (alignment 1), so the bytes are NOT guaranteed aligned to
+            // `T`; read the value out *unaligned* into an owned, aligned local and
+            // drop that. This frees the heap exactly once without ever forming an
+            // unaligned reference (which `drop_in_place` on `ptr.cast::<T>()` would).
+            let value = unsafe { std::ptr::read_unaligned(ptr.cast::<T>()) };
+            drop(value);
+        };
+
         self.by_name.insert(stable_name.clone(), comp_id);
         self.codecs.insert(
             comp_id,
@@ -454,6 +470,7 @@ impl CodecRegistry {
                 raw_copy_size,
                 raw_copyable,
                 archived_size: std::mem::size_of::<T::Archived>(),
+                drop_fn,
                 type_id: std::any::TypeId::of::<T>(),
                 type_name: std::any::type_name::<T>(),
             },
@@ -524,6 +541,16 @@ impl CodecRegistry {
             .values()
             .find(|c| c.type_name == type_name)
             .map(|c| c.archived_size)
+    }
+
+    /// `drop_in_place` for a registered component *type*. Recovery uses this to
+    /// free reconstructed heap values that never reach a World column on an
+    /// import-error path. Resolve by `TypeId` (the recovery decode key).
+    pub(crate) fn drop_fn_by_type(&self, type_id: std::any::TypeId) -> Option<unsafe fn(*mut u8)> {
+        self.codecs
+            .values()
+            .find(|c| c.type_id == type_id)
+            .map(|c| c.drop_fn)
     }
 
     /// Native (in-memory) size and align for the component whose Rust `type_name`
