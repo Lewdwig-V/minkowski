@@ -290,14 +290,20 @@ impl SortedRunReader {
         }))
     }
 
-    /// Validate the CRC of a specific page and return a [`CrcProof`] on success.
+    /// Validate the CRC of a page and return the proven payload slice together
+    /// with a [`CrcProof`] over EXACTLY those bytes. Returning the slice (rather
+    /// than re-deriving it at the call site) binds the proof to the bytes the
+    /// caller will store/decode — they cannot drift apart.
     ///
     /// The returned token feeds into [`CodecRegistry::decode`]'s `raw_copy_size`
     /// fast path (direct memcpy, skipping rkyv bytecheck). The CRC covers exactly
     /// the page's data bytes: `row_count * item_size` for RawCopy dense pages
     /// (excluding the zero-padding tail), the whole `[offsets][values]` body for
     /// Serialized dense pages, and the raw byte chunk for sparse pages.
-    pub fn validate_page_crc(&self, page: &PageRef<'_>) -> Result<CrcProof, LsmError> {
+    pub fn validate_page_crc<'p>(
+        &self,
+        page: &PageRef<'p>,
+    ) -> Result<(&'p [u8], CrcProof), LsmError> {
         // Sparse pages store `chunk.len()` in `row_count` (byte count, not row
         // count). Serialized dense pages carry a variable-length body whose true
         // length is the whole `data()` slice (offsets + values, no padding tail) —
@@ -313,11 +319,13 @@ impl SortedRunReader {
         };
         let payload = &page.data()[..actual_len];
 
-        CrcProof::verify(payload, page.header().page_crc32).ok_or_else(|| LsmError::Crc {
-            offset: page.file_offset(),
-            expected: page.header().page_crc32,
-            actual: crc32fast::hash(payload),
-        })
+        let proof =
+            CrcProof::verify(payload, page.header().page_crc32).ok_or_else(|| LsmError::Crc {
+                offset: page.file_offset(),
+                expected: page.header().page_crc32,
+                actual: crc32fast::hash(payload),
+            })?;
+        Ok((payload, proof))
     }
 
     /// Get the schema section.
@@ -860,8 +868,6 @@ mod tests {
 
     #[test]
     fn validate_page_crc_returns_proof_token() {
-        use crate::codec::CrcProof;
-
         let (_dir, path, _world) = flush_world_with_pos(5);
         let reader = SortedRunReader::open(&path).unwrap();
 
@@ -872,7 +878,7 @@ mod tests {
             .get_page(entry.arch_id, entry.slot, entry.page_index)
             .unwrap()
             .unwrap();
-        let proof: CrcProof = reader.validate_page_crc(&page).unwrap();
+        let (_payload, proof) = reader.validate_page_crc(&page).unwrap();
         let _ = proof;
     }
 
