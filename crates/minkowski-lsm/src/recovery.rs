@@ -76,6 +76,97 @@ struct StoredPage {
     decode_mode: DecodeMode,
 }
 
+/// Owns the decoded native bytes of one column during recovery. For a Serialized
+/// column the bytes byte-own reconstructed heap values (e.g. `String`); if the
+/// guard is dropped while still `armed` (the import-error path), it runs the
+/// component's `drop_fn` on each row so those heap allocations are freed — a plain
+/// `Vec<u8>` drop would leak them. After `import_page` succeeds, ownership has
+/// transferred to the archetype column, so the caller calls `disarm()` and the
+/// guard then drops ONLY its byte buffer (no element drops → no double free).
+/// RawCopy/POD columns are constructed with `armed: None`.
+struct DecodedColumn {
+    bytes: Vec<u8>,
+    /// `Some(HeapDrop)` for Serialized columns owning heap values;
+    /// `None` for RawCopy/POD or after `disarm()`.
+    armed: Option<HeapDrop>,
+}
+
+/// How to drop one reconstructed native value of an armed Serialized column:
+/// its element drop fn (reads the row out UNALIGNED then drops — the buffer is a
+/// plain `Vec<u8>`, align 1, so it must NOT `drop_in_place` an unaligned pointer)
+/// and the native item stride.
+struct HeapDrop {
+    /// Element drop: `|ptr| { let v = read_unaligned(ptr.cast::<T>()); drop(v); }`.
+    drop_one: unsafe fn(*mut u8),
+    /// Native stride in bytes (`rows = bytes.len() / item_size`).
+    item_size: usize,
+}
+
+impl DecodedColumn {
+    /// Wrap already-decoded native bytes with pre-resolved drop info. Infallible:
+    /// the fallible resolution happened in `column_arm` BEFORE decode.
+    fn new(bytes: Vec<u8>, armed: Option<HeapDrop>) -> Self {
+        Self { bytes, armed }
+    }
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+    /// Ownership of the heap values has transferred to a World column; do not run
+    /// element drops (the byte buffer still drops normally, freeing the `u8` alloc).
+    fn disarm(&mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for DecodedColumn {
+    fn drop(&mut self) {
+        if let Some(HeapDrop {
+            drop_one,
+            item_size,
+        }) = self.armed
+            && item_size > 0
+        {
+            let rows = self.bytes.len() / item_size;
+            for i in 0..rows {
+                // SAFETY: `bytes` holds `rows` contiguous byte images of this
+                // column's native type (produced by `native_column_page` for a
+                // Serialized column with this `item_size` stride). `drop_one` reads
+                // each row out *unaligned* and drops it (the buffer is a plain
+                // `Vec<u8>`, alignment 1, so the rows are not aligned to T). Each
+                // row is dropped exactly once and never read afterward.
+                unsafe { drop_one(self.bytes.as_mut_ptr().add(i * item_size)) };
+            }
+        }
+    }
+}
+
+/// Resolve the drop info for a column BEFORE decoding it, so the guard can be
+/// constructed infallibly afterward (a decoded heap buffer must never be handed
+/// to a fallible operation that could drop it as plain bytes → leak). Serialized
+/// columns resolve their element drop fn; RawCopy/POD columns are unarmed.
+fn column_arm(
+    kind: crate::schema::StorageKind,
+    type_id: Option<std::any::TypeId>,
+    item_size: usize,
+    codecs: &CodecRegistry,
+) -> Result<Option<HeapDrop>, LsmError> {
+    match kind {
+        crate::schema::StorageKind::Serialized => {
+            let ty = type_id.ok_or_else(|| {
+                LsmError::Format("serialized column has no type for drop guard".to_owned())
+            })?;
+            let drop_one = codecs.drop_fn_by_type(ty).ok_or_else(|| {
+                LsmError::Format("no codec drop_fn for serialized column".to_owned())
+            })?;
+            Ok(Some(HeapDrop {
+                drop_one,
+                item_size,
+            }))
+        }
+        crate::schema::StorageKind::RawCopy => Ok(None),
+    }
+}
+
 #[derive(Clone)]
 struct StoredAllocator {
     seq_hi: u64,
@@ -147,9 +238,8 @@ impl LsmRecovery {
                 let mut saw_allocator = false;
                 for result in reader.slot_pages(META_ARCH_ID, ALLOCATOR_SLOT) {
                     let (_page_index, page) = result?;
-                    reader.validate_page_crc(&page)?;
-                    let payload_len = page.header().row_count as usize;
-                    alloc_blob.extend_from_slice(&page.data()[..payload_len]);
+                    let (payload, _proof) = reader.validate_page_crc(&page)?;
+                    alloc_blob.extend_from_slice(payload);
                     saw_allocator = true;
                 }
                 if saw_allocator {
@@ -169,9 +259,8 @@ impl LsmRecovery {
                     let mut blob: Vec<u8> = Vec::new();
                     for result in reader.slot_pages(SPARSE_ARCH_ID, slot) {
                         let (_page_index, page) = result?;
-                        reader.validate_page_crc(&page)?;
-                        let len = page.header().row_count as usize;
-                        blob.extend_from_slice(&page.data()[..len]);
+                        let (payload, _proof) = reader.validate_page_crc(&page)?;
+                        blob.extend_from_slice(payload);
                     }
                     if blob.is_empty() {
                         continue;
@@ -200,30 +289,21 @@ impl LsmRecovery {
                 for slot in reader.component_slots_for_arch(arch_id) {
                     // component_slots_for_arch excludes ENTITY_SLOT, so every slot
                     // here has a named schema entry.
-                    let (name, item_size, kind) = {
+                    let (name, kind) = {
                         let entry = reader.schema().entry_for_slot(slot).ok_or_else(|| {
                             LsmError::Format(format!("missing schema entry for slot {slot}"))
                         })?;
-                        (
-                            entry.name().to_owned(),
-                            entry.item_size as usize,
-                            entry.storage_kind(),
-                        )
+                        (entry.name().to_owned(), entry.storage_kind())
                     };
                     for result in reader.slot_pages(arch_id, slot) {
                         let (page_index, page) = result?;
-                        let proof = reader.validate_page_crc(&page)?;
-                        // RawCopy pages are zero-padded to the full stride, so we
-                        // slice the live `row_count * item_size` prefix. Serialized
-                        // pages are variable-length (`[offsets][values]`); the
-                        // reader sizes them exactly, so the WHOLE body is the
-                        // payload — slicing by native stride would corrupt them.
-                        let payload: &[u8] = match kind {
-                            crate::schema::StorageKind::RawCopy => {
-                                &page.data()[..page.header().row_count as usize * item_size]
-                            }
-                            crate::schema::StorageKind::Serialized => page.data(),
-                        };
+                        // The proven slice already equals the live payload:
+                        // `validate_page_crc` returns `row_count * item_size` for
+                        // RawCopy pages (the live prefix, excluding zero-padding)
+                        // and the whole `[offsets][values]` body for Serialized
+                        // pages. Binding the proof to exactly these bytes here means
+                        // `DecodeMode::Unchecked(proof)` certifies what we store.
+                        let (payload, proof) = reader.validate_page_crc(&page)?;
                         // Only Serialized pages from a fingerprint-matched run may
                         // skip bytecheck; everything else decodes checked.
                         let decode_mode = if run_allows_unchecked
@@ -246,14 +326,13 @@ impl LsmRecovery {
 
                 for result in reader.entity_pages(arch_id) {
                     let (page_index, page) = result?;
-                    reader.validate_page_crc(&page)?;
-                    let payload_len = page.header().row_count as usize * 8;
+                    let (payload, _proof) = reader.validate_page_crc(&page)?;
                     store_page(
                         &mut pages,
                         (sig.clone(), ColumnKey::Entity, page_index),
                         seq_hi,
                         page.header().row_count,
-                        &page.data()[..payload_len],
+                        payload,
                         // Entity pages are raw 8-byte IDs, never Serialized.
                         DecodeMode::Checked,
                     );
@@ -485,19 +564,19 @@ fn native_column_page(
                         // `decode_fingerprint` is non-zero and equals this binary's
                         // recomputed `run_fingerprint` (layout-provenance: the
                         // archived/native layout of `ty` matches what produced these
-                        // bytes) — AND `proof` is the per-page `CrcProof` certifying
+                        // bytes) — AND `_proof` is the per-page `CrcProof` certifying
                         // these exact bytes' integrity (unchanged since the writer
                         // emitted them). Together the fingerprint gate (layout) and
                         // the CrcProof (integrity) establish that `slice` is a valid
                         // rkyv archive of `ty`, satisfying the method's precondition.
-                        DecodeMode::Unchecked(proof) => {
+                        DecodeMode::Unchecked(_proof) => {
                             // Count each unchecked per-page decode call (one per live
                             // Serialized row batch). Thread-local so concurrent tests
                             // on different threads cannot interfere. Used by white-box
                             // tests only.
                             #[cfg(test)]
                             UNCHECKED_SERIALIZED_DECODES.with(|c| c.set(c.get() + 1));
-                            unsafe { codecs.deserialize_unchecked_by_type(ty, slice, proof) }
+                            unsafe { codecs.deserialize_unchecked_by_type(ty, slice) }
                                 .ok_or_else(|| {
                                     LsmError::Format(
                                         "no codec for serialized column type on recovery"
@@ -701,8 +780,9 @@ fn materialize_world(
 
             // Fast path: every entity on the page is alive — use the contiguous
             // column slices directly, no copy.
-            let (entities, col_slices): (Vec<Entity>, Vec<Vec<u8>>) = if live_count == row_count {
-                let cols: Vec<Vec<u8>> = comp_pairs
+            let (entities, mut col_slices): (Vec<Entity>, Vec<DecodedColumn>) =
+                if live_count == row_count {
+                    let cols: Vec<DecodedColumn> = comp_pairs
                     .iter()
                     .enumerate()
                     .map(|(i, (_, name))| {
@@ -725,6 +805,11 @@ fn materialize_world(
                         }
                         let (kind, type_id) = col_kinds[i];
                         let item_size = item_sizes[i];
+                        // Resolve the drop info (fallible) BEFORE decoding, so the
+                        // guard is constructed infallibly after — a decoded heap
+                        // buffer can never be handed to a fallible op that would
+                        // drop it as plain bytes → leak.
+                        let armed = column_arm(kind, type_id, item_size, codecs)?;
                         // All rows alive ⇒ pass `None` (no mask): every row is
                         // materialized.
                         let native = native_column_page(
@@ -751,92 +836,109 @@ fn materialize_world(
                              {row_count} * {item_size}",
                             native.len()
                         );
-                        Ok(native)
+                        Ok(DecodedColumn::new(native, armed))
                     })
                     .collect::<Result<_, _>>()?;
-                (page_entities.clone(), cols)
-            } else {
-                // Slow path: compact the page down to its live rows. Rebuild
-                // the entity Vec and each column's byte buffer with only the
-                // rows whose entity is alive, so `import_page` sees a
-                // consistent (entities, columns) pair with no dead rows.
-                let mut live_entities = Vec::with_capacity(live_count);
-                for (&e, &alive) in page_entities.iter().zip(live_mask.iter()) {
-                    if alive {
-                        live_entities.push(e);
+                    (page_entities.clone(), cols)
+                } else {
+                    // Slow path: compact the page down to its live rows. Rebuild
+                    // the entity Vec and each column's byte buffer with only the
+                    // rows whose entity is alive, so `import_page` sees a
+                    // consistent (entities, columns) pair with no dead rows.
+                    let mut live_entities = Vec::with_capacity(live_count);
+                    for (&e, &alive) in page_entities.iter().zip(live_mask.iter()) {
+                        if alive {
+                            live_entities.push(e);
+                        }
                     }
-                }
-                let mut live_cols: Vec<Vec<u8>> = Vec::with_capacity(comp_pairs.len());
-                for (i, (_, name)) in comp_pairs.iter().enumerate() {
-                    let col_pages = columns
-                        .get(&ColumnKey::Component((*name).clone()))
-                        .ok_or_else(|| {
-                            LsmError::Format(format!("archetype {sig:?} missing column {name}"))
+                    let mut live_cols: Vec<DecodedColumn> = Vec::with_capacity(comp_pairs.len());
+                    for (i, (_, name)) in comp_pairs.iter().enumerate() {
+                        let col_pages = columns
+                            .get(&ColumnKey::Component((*name).clone()))
+                            .ok_or_else(|| {
+                                LsmError::Format(format!("archetype {sig:?} missing column {name}"))
+                            })?;
+                        let page = col_pages.get(&page_index).ok_or_else(|| {
+                            LsmError::Format(format!(
+                                "archetype {sig:?} column {name} missing page {page_index}"
+                            ))
                         })?;
-                    let page = col_pages.get(&page_index).ok_or_else(|| {
-                        LsmError::Format(format!(
-                            "archetype {sig:?} column {name} missing page {page_index}"
-                        ))
-                    })?;
-                    if page.row_count as usize != row_count {
-                        return Err(LsmError::Format(format!(
-                            "archetype {sig:?} column {name} page {page_index} has {} rows, \
+                        if page.row_count as usize != row_count {
+                            return Err(LsmError::Format(format!(
+                                "archetype {sig:?} column {name} page {page_index} has {} rows, \
                              entity page has {row_count}",
-                            page.row_count
-                        )));
-                    }
-                    // Materialize ONLY the live rows' native bytes. Passing the
-                    // live mask is load-bearing: decoding a dead Serialized row
-                    // would reconstruct a heap-owning value that is never imported
-                    // into the World (so its drop_fn never runs) → a leak. The
-                    // mask skips dead rows entirely, so they are never decoded.
-                    let (kind, type_id) = col_kinds[i];
-                    let item_size = item_sizes[i];
-                    let buf = native_column_page(
-                        page,
-                        kind,
-                        type_id,
-                        codecs,
-                        item_size,
-                        Some(&live_mask),
-                        &page.decode_mode,
-                    )
-                    .map_err(|e| {
-                        LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
-                    })?;
-                    // The compacted buffer must be exactly `live_count` native
-                    // items wide, or it disagrees with the live-row layout.
-                    assert_eq!(
-                        buf.len(),
-                        live_count * item_size,
-                        "compacted column {name} page {page_index} is {} bytes, expected \
+                                page.row_count
+                            )));
+                        }
+                        // Materialize ONLY the live rows' native bytes. Passing the
+                        // live mask is load-bearing: decoding a dead Serialized row
+                        // would reconstruct a heap-owning value that is never imported
+                        // into the World (so its drop_fn never runs) → a leak. The
+                        // mask skips dead rows entirely, so they are never decoded.
+                        let (kind, type_id) = col_kinds[i];
+                        let item_size = item_sizes[i];
+                        // Resolve the drop info (fallible) BEFORE decoding, so the
+                        // guard is constructed infallibly after — a decoded heap
+                        // buffer can never be handed to a fallible op that would
+                        // drop it as plain bytes → leak.
+                        let armed = column_arm(kind, type_id, item_size, codecs)?;
+                        let buf = native_column_page(
+                            page,
+                            kind,
+                            type_id,
+                            codecs,
+                            item_size,
+                            Some(&live_mask),
+                            &page.decode_mode,
+                        )
+                        .map_err(|e| {
+                            LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
+                        })?;
+                        // The compacted buffer must be exactly `live_count` native
+                        // items wide, or it disagrees with the live-row layout.
+                        assert_eq!(
+                            buf.len(),
+                            live_count * item_size,
+                            "compacted column {name} page {page_index} is {} bytes, expected \
                          {live_count} * {item_size}",
-                        buf.len()
-                    );
-                    live_cols.push(buf);
-                }
-                (live_entities, live_cols)
-            };
+                            buf.len()
+                        );
+                        live_cols.push(DecodedColumn::new(buf, armed));
+                    }
+                    (live_entities, live_cols)
+                };
 
-            // Borrow the column bytes back as slices for `ImportPage::page`.
-            let col_refs: Vec<&[u8]> = col_slices.iter().map(Vec::as_slice).collect();
-            let import_page = target.page(&entities, &col_refs).map_err(|e| {
-                LsmError::Format(format!("import page build failed for {sig:?}: {e}"))
-            })?;
-            // SAFETY: each column slice is the native (in-memory) byte image of
-            // its component, produced by `native_column_page`: RawCopy columns
-            // are the on-disk native bytes verbatim; Serialized columns are
-            // decoded row-by-row into native values whose heap ownership rides
-            // inside the bytes and transfers into the archetype column (which
-            // holds T's drop_fn — a Serialized column always has a codec, so it
-            // was registered via the typed path, never raw). Every dense column
-            // has a codec (the flush gate proves it). The source pages passed
-            // per-page CRC validation on read, and every entity in `entities` is
-            // alive per the allocator state restored above (dead rows filtered).
-            unsafe {
-                world.import_page(&import_page).map_err(|e| {
-                    LsmError::Format(format!("import_page failed for {sig:?}: {e}"))
-                })?;
+            // Borrow the guarded column bytes as slices for `ImportPage::page`.
+            let import_result = {
+                let col_refs: Vec<&[u8]> = col_slices.iter().map(DecodedColumn::as_slice).collect();
+                let import_page = target.page(&entities, &col_refs).map_err(|e| {
+                    LsmError::Format(format!("import page build failed for {sig:?}: {e}"))
+                })?; // early return drops col_slices (armed) → heap values freed
+                // SAFETY: each column slice is the native (in-memory) byte image of
+                // its component, produced by `native_column_page`: RawCopy columns
+                // are the on-disk native bytes verbatim; Serialized columns are
+                // decoded row-by-row into native values whose heap ownership rides
+                // inside the bytes and transfers into the archetype column (which
+                // holds T's drop_fn — a Serialized column always has a codec, so it
+                // was registered via the typed path, never raw). Every dense column
+                // has a codec (the flush gate proves it). The source pages passed
+                // per-page CRC validation on read, and every entity in `entities` is
+                // alive per the allocator state restored above (dead rows filtered).
+                // The armed-drop-on-`Err` correctness relies on `World::import_page`
+                // being ALL-OR-NOTHING: it validates every entity (dead/already-placed)
+                // BEFORE any `append_bytes_unchecked`, and its byte-copy loop is
+                // infallible — so an `Err` means zero columns were transferred, and
+                // dropping the still-armed guards frees each heap value exactly once
+                // (no double free with a partially-populated archetype).
+                unsafe { world.import_page(&import_page) }
+                    .map_err(|e| LsmError::Format(format!("import_page failed for {sig:?}: {e}")))
+                // col_refs + import_page dropped at block end, releasing the borrow
+            };
+            import_result?; // on Err, col_slices (armed) drops here → heap values freed
+            // Success: ownership transferred to archetype columns; disarm so the
+            // guards drop only their byte buffers (no element drops → no double free).
+            for col in &mut col_slices {
+                col.disarm();
             }
         }
     }
@@ -1503,6 +1605,173 @@ mod tests {
             delta, 2,
             "recovered heap column must drop exactly two reconstructed values"
         );
+    }
+
+    /// N5 regression: a Serialized column guard that is dropped while still armed
+    /// (the import-error path) must run the type's `drop_fn` on every row, freeing
+    /// each reconstructed heap value. A plain `Vec<u8>` drop would leak them.
+    #[test]
+    fn decoded_column_guard_frees_heap_value_when_armed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Archive, Serialize, Deserialize)]
+        struct Heaped {
+            text: String,
+        }
+        impl Drop for Heaped {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Heaped>("heaped", &mut world).unwrap();
+        let ty = std::any::TypeId::of::<Heaped>();
+        let item_size = std::mem::size_of::<Heaped>();
+
+        // Serialize one value, then decode it into a native byte buffer (one row).
+        let value = Heaped {
+            text: "armed-heap-value".to_owned(),
+        };
+        let mut bytes = Vec::new();
+        unsafe {
+            codecs
+                .serialize_by_type(ty, std::ptr::from_ref(&value).cast::<u8>(), &mut bytes)
+                .expect("codec exists")
+                .expect("serialize ok");
+        }
+        drop(value); // serialize only read it; drop the original owner before snapshot
+
+        let native = codecs
+            .deserialize_by_type(ty, &bytes)
+            .expect("codec exists")
+            .expect("deserialize ok");
+        assert_eq!(native.len(), item_size, "one native row");
+
+        let guard = DecodedColumn::new(
+            native,
+            column_arm(
+                crate::schema::StorageKind::Serialized,
+                Some(ty),
+                item_size,
+                &codecs,
+            )
+            .unwrap(),
+        );
+        assert!(guard.armed.is_some(), "serialized column must be armed");
+
+        let before = DROPS.load(Ordering::SeqCst);
+        drop(guard); // simulated import-error path: armed guard frees the heap value
+        let delta = DROPS.load(Ordering::SeqCst) - before;
+        assert_eq!(
+            delta, 1,
+            "armed guard must drop the reconstructed value once"
+        );
+    }
+
+    /// `disarm()` (called after `import_page` transfers ownership) must prevent the
+    /// guard from also dropping the value — otherwise the column AND the guard free
+    /// the same `String` → double free. After disarm exactly one owner remains.
+    #[test]
+    fn decoded_column_guard_disarm_prevents_double_free() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Archive, Serialize, Deserialize)]
+        struct Heaped {
+            text: String,
+        }
+        impl Drop for Heaped {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Heaped>("heaped", &mut world).unwrap();
+        let ty = std::any::TypeId::of::<Heaped>();
+        let item_size = std::mem::size_of::<Heaped>();
+
+        let value = Heaped {
+            text: "disarm-heap-value".to_owned(),
+        };
+        let mut bytes = Vec::new();
+        unsafe {
+            codecs
+                .serialize_by_type(ty, std::ptr::from_ref(&value).cast::<u8>(), &mut bytes)
+                .expect("codec exists")
+                .expect("serialize ok");
+        }
+        drop(value); // serialize only read it; drop the original owner before snapshot
+
+        let native = codecs
+            .deserialize_by_type(ty, &bytes)
+            .expect("codec exists")
+            .expect("deserialize ok");
+
+        let mut guard = DecodedColumn::new(
+            native,
+            column_arm(
+                crate::schema::StorageKind::Serialized,
+                Some(ty),
+                item_size,
+                &codecs,
+            )
+            .unwrap(),
+        );
+
+        let before = DROPS.load(Ordering::SeqCst);
+        guard.disarm(); // success path: ownership transferred to a World column
+        // Simulate the column taking ownership: read the value out so exactly one
+        // owner remains (the guard's bytes are now logically moved-from).
+        // SAFETY: `guard.bytes` byte-owns a valid `Heaped`; read it out unaligned
+        // (the guard buffer isn't aligned to Heaped). After disarm the guard will
+        // NOT element-drop, so reading the value out leaves exactly one owner.
+        let owned = unsafe { std::ptr::read_unaligned(guard.as_slice().as_ptr().cast::<Heaped>()) };
+        drop(guard); // disarmed → drops only the byte buffer, no element drop
+        drop(owned); // the sole remaining owner frees the String exactly once
+        let delta = DROPS.load(Ordering::SeqCst) - before;
+        assert_eq!(
+            delta, 1,
+            "disarmed guard must not double-free: exactly one drop across the sequence"
+        );
+    }
+
+    /// RawCopy/POD columns hold no heap values, so the guard is constructed unarmed
+    /// (no element drop on the error path) — dropping it is a plain byte-buffer free.
+    #[test]
+    fn raw_copy_column_guard_is_unarmed() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        struct Pod {
+            x: u64,
+            y: u64,
+        }
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pod>("pod", &mut world).unwrap();
+        let ty = std::any::TypeId::of::<Pod>();
+        let item_size = std::mem::size_of::<Pod>();
+
+        let bytes = vec![0u8; item_size];
+        let guard = DecodedColumn::new(
+            bytes,
+            column_arm(
+                crate::schema::StorageKind::RawCopy,
+                Some(ty),
+                item_size,
+                &codecs,
+            )
+            .unwrap(),
+        );
+        assert!(
+            guard.armed.is_none(),
+            "raw-copy/POD column must be unarmed (no element drop)"
+        );
+        drop(guard); // plain byte-buffer free, no element drop
     }
 
     #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
