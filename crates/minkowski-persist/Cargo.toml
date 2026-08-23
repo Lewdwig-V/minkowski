@@ -22,7 +22,7 @@ crc32fast = "1"
 # dependency above; the feature is only active for dev/bench targets.
 minkowski-lsm = { path = "../minkowski-lsm", features = ["bench-support"] }
 tempfile = "3"
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "persist"
