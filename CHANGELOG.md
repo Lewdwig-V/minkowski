@@ -2,6 +2,10 @@
 
 ## 1.3.0
 
+### Core (`minkowski`)
+
+- **Breaking:** removed the `debounce` module and the `minkowski::HashDebounce` / `minkowski::SubscriptionDebounce` re-exports (dead code — no in-repo or downstream-verified users). Update imports: for entity-granular dedup of archetype-granular `Changed<T>` notifications, track last-seen values per entity yourself, or use `MaterializedView` with a `DebouncePolicy`. (#217)
+
 ### Persistence (`minkowski-persist`, `minkowski-lsm`)
 
 - **LSM recovery cutover** — `Snapshot` / v2 `.snap` files removed. Use `recover_world(lsm_dir, manifest_log, wal, codecs)` for crash recovery (LSM page merge + WAL tail replay). `AutoCheckpoint` flushes dirty pages via `flush_and_record` instead of full-world snapshots. **Breaking:** `acknowledge_snapshot` → `acknowledge_flush`; `WalEntry::Checkpoint { snapshot_seq }` → `{ flush_seq }`. Existing v2 snapshot files are not supported — rebuild from WAL or accept data loss.

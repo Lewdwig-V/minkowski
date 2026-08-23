@@ -1,16 +1,16 @@
 # Minkowski Scaling Roadmap: Seven Stages
 
 *Inspired by TigerBeetle's "Seven Stages of Database Scaling."*
-*Status: Minkowski is at Stage 3 (in progress). Phases 1-4 complete, Phase 5 pending. This document is the roadmap to Stage 7.*
+*Status: Minkowski has completed Stage 3 (LSM storage, as of v1.3.0). This document is the roadmap to Stage 7.*
 
 ---
 
 ## Table of Contents
 
 1. [Stage 1: The Log](#stage-1-the-log) ✅
-2. [Stage 2: Snapshots](#stage-2-snapshots) ✅ (current)
-3. [Stage 2.5: SlabPool as the Only Allocator](#stage-25-slabpool-as-the-only-allocator)
-4. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage) 🔄 (Phases 1-4 done, Phase 5 pending)
+2. [Stage 2: Snapshots](#stage-2-snapshots) ✅ (historic — v2 snapshots removed in v1.3.0, superseded by Stage 3)
+3. [Stage 2.5: SlabPool as the Only Allocator](#stage-25-slabpool-as-the-only-allocator) (deferred)
+4. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage) ✅ (v1.3.0)
 5. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
 6. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
 7. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
@@ -65,7 +65,7 @@ subsequent stage:
 
 ## Stage 2: Snapshots
 
-**Status: Complete.** (`minkowski-persist` crate, snapshot + checkpoint subsystem)
+**Status: Complete (historic).** The v2 snapshot subsystem delivered its goal and was superseded by Stage 3's incremental LSM persistence — full-world snapshots were removed in v1.3.0 (`recover_world` merges LSM pages + WAL tail). Kept here for roadmap context.
 
 The log alone means crash recovery replays *every* mutation since the beginning
 of time. Snapshots provide a baseline: checkpoint the world state to disk, then
@@ -102,7 +102,7 @@ The WAL and snapshots are properly integrated, not bolted on separately:
 
 ## Stage 2.5: SlabPool as the Only Allocator
 
-**Status: Not started. Prerequisite for Stage 3.**
+**Status: Deferred — not a prerequisite.** Stage 3 shipped without it; the LSM crate reads page data through World's existing allocator, and dirty-page tracking uses per-column bitsets rather than mmap-backed columns. Revisit only if strict zero-system-malloc becomes a requirement (Stage 6+).
 
 **Goal**: Eliminate `SystemAllocator` — all BlobVec columns must be mmap-backed
 via `SlabPool`. This is a hard prerequisite for every subsequent stage.
@@ -154,7 +154,7 @@ memory. The `SlabPool` path is opt-in, not default.
 
 ## Stage 3: LSM Tree Storage
 
-**Status: In progress. Phases 1-4 complete (sorted-run format, manifest, compaction, bloom filter). Phase 5 (LsmRecovery + Durable integration) pending.**
+**Status: Complete (v1.3.0).** All five phases shipped: sorted-run format, manifest + manifest log, compaction, bloom filter, and `LsmRecovery` + `Durable` integration with WAL tail replay. v2 full-world snapshots were removed in the cutover.
 
 **Note**: Stage 2.5 (SlabPool-only allocation) was deferred — the LSM crate operates on a separate I/O path that reads page data from World's existing allocator. Dirty page tracking uses `storage::dirty_pages` per-column bitsets without requiring mmap-backed columns.
 

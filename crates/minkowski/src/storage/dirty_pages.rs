@@ -86,9 +86,7 @@ impl DirtyPageTracker {
 
     /// Clear all dirty bits. Called after a successful flush.
     pub fn clear(&mut self) {
-        for w in &mut self.bits {
-            *w = 0;
-        }
+        self.bits.fill(0);
     }
 
     /// Convert a page index to the row range it covers: `[start, end)`.
