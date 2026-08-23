@@ -87,12 +87,6 @@ impl BlobVec {
         self.len
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     #[inline]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
@@ -271,31 +265,6 @@ impl BlobVec {
         self.len -= 1;
     }
 
-    /// Removes the element at `row` by swapping it with the last element.
-    /// The removed element is written to `ptr` instead of being dropped.
-    ///
-    /// # Safety
-    /// `row` must be in bounds. `ptr` must be valid for writes of `item_layout.size()` bytes.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub unsafe fn swap_remove_unchecked(&mut self, row: usize, ptr: *mut u8) {
-        debug_assert!(row < self.len);
-        let last = self.len - 1;
-        let size = self.item_layout.size();
-        let row_ptr = self.ptr_at(row);
-        if size > 0 {
-            // SAFETY: row_ptr is valid for size bytes; ptr is valid per caller guarantee
-            unsafe { std::ptr::copy_nonoverlapping(row_ptr, ptr, size) };
-            // Move last into the gap (if not same row)
-            if row != last {
-                let last_ptr = self.ptr_at(last);
-                // SAFETY: last_ptr and row_ptr are non-overlapping valid pointers
-                unsafe { std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size) };
-                self.dirty_pages.mark_row(row);
-            }
-        }
-        self.len -= 1;
-    }
-
     /// Removes the element at `row` by swapping with the last element.
     /// Neither drops the removed element nor copies it out.
     /// Used during archetype migration where data is moved via get_ptr + push.
@@ -423,29 +392,6 @@ impl BlobVec {
         self.capacity = new_capacity;
     }
 
-    /// Like [`push`] but returns `Err(PoolExhausted)` instead of panicking
-    /// when the pool cannot grow to accommodate the new element.
-    ///
-    /// # Safety
-    /// `ptr` must point to a valid, initialized value matching this BlobVec's layout.
-    /// Caller is responsible for not double-dropping the source value.
-    #[expect(dead_code)]
-    pub(crate) unsafe fn try_push(&mut self, ptr: *mut u8) -> Result<(), PoolExhausted> {
-        if self.len == self.capacity {
-            self.try_grow()?;
-        }
-        let row = self.len;
-        let dst = self.ptr_at(row);
-        let size = self.item_layout.size();
-        if size > 0 {
-            // SAFETY: caller guarantees ptr is valid for size bytes; dst is within allocated capacity
-            unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
-        }
-        self.len += 1;
-        self.dirty_pages.mark_row(row);
-        Ok(())
-    }
-
     /// Like [`grow`] but returns `Err(PoolExhausted)` instead of panicking
     /// when the pool cannot satisfy the allocation.
     pub(crate) fn try_grow(&mut self) -> Result<(), PoolExhausted> {
@@ -529,13 +475,9 @@ mod tests {
         unsafe { *ptr }
     }
 
-    unsafe fn drop_ptr<T>(ptr: *mut u8) {
-        unsafe { std::ptr::drop_in_place(ptr as *mut T) };
-    }
-
     fn bv_for<T>() -> BlobVec {
         let drop_fn = if std::mem::needs_drop::<T>() {
-            Some(drop_ptr::<T> as unsafe fn(*mut u8))
+            Some(crate::component::drop_ptr::<T> as unsafe fn(*mut u8))
         } else {
             None
         };
@@ -548,7 +490,6 @@ mod tests {
     fn new_is_empty() {
         let bv = BlobVec::new(Layout::new::<u32>(), None, 0, default_pool());
         assert_eq!(bv.len(), 0);
-        assert!(bv.is_empty());
     }
 
     #[test]
@@ -558,7 +499,6 @@ mod tests {
             push_val(&mut bv, 42u32);
         }
         assert_eq!(bv.len(), 1);
-        assert!(!bv.is_empty());
     }
 
     #[test]
@@ -615,20 +555,6 @@ mod tests {
         unsafe {
             assert_eq!(read_val::<u32>(&bv, 0), 30);
             assert_eq!(read_val::<u32>(&bv, 1), 20);
-        }
-    }
-
-    #[test]
-    fn swap_remove_unchecked_returns_removed() {
-        let mut bv = bv_for::<u64>();
-        unsafe {
-            push_val(&mut bv, 111u64);
-            push_val(&mut bv, 222u64);
-            let mut out: u64 = 0;
-            bv.swap_remove_unchecked(0, &mut out as *mut u64 as *mut u8);
-            assert_eq!(out, 111);
-            assert_eq!(bv.len(), 1);
-            assert_eq!(read_val::<u64>(&bv, 0), 222);
         }
     }
 

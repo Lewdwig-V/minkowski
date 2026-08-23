@@ -10,7 +10,6 @@ use crate::pool::SharedPool;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ArchetypeId(pub usize);
 
-#[allow(dead_code)]
 pub(crate) struct Archetype {
     pub id: ArchetypeId,
     /// Bitset of which ComponentIds this archetype contains.
@@ -113,7 +112,6 @@ impl Archetype {
 pub(crate) struct Archetypes {
     pub archetypes: Vec<Archetype>,
     by_components: HashMap<Vec<ComponentId>, ArchetypeId>,
-    generation: u64,
 }
 
 impl Archetypes {
@@ -121,13 +119,7 @@ impl Archetypes {
         Self {
             archetypes: Vec::new(),
             by_components: HashMap::new(),
-            generation: 0,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn generation(&self) -> u64 {
-        self.generation
     }
 
     /// Find or create an archetype for the given sorted component ID set.
@@ -144,7 +136,6 @@ impl Archetypes {
         let archetype = Archetype::new(id, sorted_ids, registry, pool);
         self.archetypes.push(archetype);
         self.by_components.insert(sorted_ids.to_vec(), id);
-        self.generation += 1;
         id
     }
 }
@@ -227,20 +218,5 @@ mod tests {
         let ids2 = vec![pos_id];
         let a3 = archetypes.get_or_create(&ids2, &reg, &default_pool());
         assert_ne!(a1, a3); // different component set = different archetype
-    }
-
-    #[test]
-    fn archetypes_generation_bumps_on_create() {
-        let mut reg = setup_registry();
-        let pos_id = reg.register::<Pos>();
-        let mut archetypes = Archetypes::new();
-
-        let gen_before = archetypes.generation();
-        archetypes.get_or_create(&[pos_id], &reg, &default_pool());
-        assert!(archetypes.generation() > gen_before);
-
-        let gen_before = archetypes.generation();
-        archetypes.get_or_create(&[pos_id], &reg, &default_pool()); // same, no new archetype
-        assert_eq!(archetypes.generation(), gen_before);
     }
 }

@@ -36,12 +36,6 @@ impl ScratchBuffer {
         self.entities.len()
     }
 
-    /// Current allocation capacity.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub(super) fn capacity(&self) -> usize {
-        self.entities.capacity()
-    }
-
     /// View the buffer contents as a slice.
     pub(super) fn as_slice(&self) -> &[Entity] {
         &self.entities

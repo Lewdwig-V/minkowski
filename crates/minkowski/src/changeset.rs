@@ -224,7 +224,6 @@ pub(crate) struct ArchetypeBatch {
 }
 
 /// A single structural mutation recorded in a ChangeSet.
-#[allow(dead_code)]
 pub(crate) enum Mutation {
     Spawn {
         entity: Entity,
@@ -534,7 +533,6 @@ impl EnumChangeSet {
 impl EnumChangeSet {
     /// Insert with a pre-resolved ComponentId. Same as `insert()` but
     /// skips `world.register_component::<T>()`. Used by typed reducer handles.
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn insert_raw<T: Component>(
         &mut self,
@@ -555,40 +553,10 @@ impl EnumChangeSet {
         }
     }
 
-    /// Sparse insert with a pre-resolved ComponentId. Same as `insert_sparse()`
-    /// but skips `world.register_component::<T>()`. Used by typed reducer handles.
-    #[allow(dead_code)]
-    pub(crate) fn insert_sparse_raw<T: Component>(
-        &mut self,
-        entity: Entity,
-        comp_id: ComponentId,
-        value: T,
-    ) {
-        let layout = Layout::new::<T>();
-        let value = std::mem::ManuallyDrop::new(value);
-        let offset =
-            self.record_sparse_insert(entity, comp_id, &*value as *const T as *const u8, layout);
-        if std::mem::needs_drop::<T>() {
-            let mutation_idx = self.mutations.len() - 1;
-            self.drop_entries.push(DropEntry {
-                offset,
-                drop_fn: crate::component::drop_ptr::<T>,
-                mutation_idx,
-            });
-        }
-    }
-
-    /// Sparse remove with a pre-resolved ComponentId.
-    #[allow(dead_code)]
-    pub(crate) fn remove_sparse_raw(&mut self, entity: Entity, comp_id: ComponentId) {
-        self.record_sparse_remove(entity, comp_id);
-    }
-
     /// Spawn a bundle with pre-resolved ComponentIds. Same as `spawn_bundle()`
     /// but takes `&ComponentRegistry` instead of `&mut World`. Used by Spawner.
     ///
     /// The caller must guarantee that `entity` is unplaced (e.g. via `reserve()`).
-    #[allow(dead_code)]
     pub(crate) fn spawn_bundle_raw<B: Bundle>(
         &mut self,
         entity: Entity,

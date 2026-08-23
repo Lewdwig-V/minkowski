@@ -43,9 +43,7 @@ impl<T: 'static + Send + Sync> Component for T {}
 /// [`World::component_id`](crate::World::component_id) to look up the ID for a type.
 pub type ComponentId = usize;
 
-#[allow(dead_code)]
 pub(crate) struct ComponentInfo {
-    pub id: ComponentId,
     pub name: &'static str,
     pub layout: Layout,
     pub drop_fn: Option<unsafe fn(*mut u8)>,
@@ -88,12 +86,11 @@ impl ComponentRegistry {
         }
         let id = self.infos.len();
         let drop_fn = if std::mem::needs_drop::<T>() {
-            Some(Self::drop_ptr::<T> as unsafe fn(*mut u8))
+            Some(drop_ptr::<T> as unsafe fn(*mut u8))
         } else {
             None
         };
         self.infos.push(ComponentInfo {
-            id,
             name: std::any::type_name::<T>(),
             layout: Layout::new::<T>(),
             drop_fn,
@@ -115,7 +112,6 @@ impl ComponentRegistry {
     pub fn register_raw(&mut self, name: &'static str, layout: Layout) -> ComponentId {
         let id = self.infos.len();
         self.infos.push(ComponentInfo {
-            id,
             name,
             layout,
             drop_fn: None,
@@ -125,7 +121,6 @@ impl ComponentRegistry {
         id
     }
 
-    #[allow(dead_code)]
     pub(crate) fn register_sparse<T: Component>(&mut self) -> ComponentId {
         let id = self.register::<T>();
         self.sparse_set.grow(id + 1);
@@ -163,11 +158,6 @@ impl ComponentRegistry {
         self.sparse_set.grow(id + 1);
         self.sparse_set.insert(id);
     }
-
-    unsafe fn drop_ptr<T>(ptr: *mut u8) {
-        // SAFETY: caller guarantees ptr is valid, aligned, and points to an initialized T
-        unsafe { std::ptr::drop_in_place(ptr as *mut T) };
-    }
 }
 
 /// Type-erased drop glue: calls `drop_in_place::<T>` on a raw pointer.
@@ -176,7 +166,6 @@ impl ComponentRegistry {
 ///
 /// # Safety
 /// The pointer must point to a valid, initialized `T`.
-#[allow(dead_code)]
 pub(crate) unsafe fn drop_ptr<T>(ptr: *mut u8) {
     // SAFETY: caller guarantees ptr is valid, aligned, and points to an initialized T
     unsafe { std::ptr::drop_in_place(ptr as *mut T) };

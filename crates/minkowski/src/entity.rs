@@ -102,7 +102,6 @@ impl EntityAllocator {
     /// Returns Entity with generation 0. Reserved entities are NOT in the
     /// generations vec yet — call `materialize_reserved()` from `&mut self`
     /// before using `alloc()` or `is_alive()` on reserved indices.
-    #[allow(dead_code)]
     pub fn reserve(&self) -> Entity {
         let index = self
             .next_reserved
