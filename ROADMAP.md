@@ -9,7 +9,7 @@
 
 1. [Stage 1: The Log](#stage-1-the-log) ✅
 2. [Stage 2: Snapshots](#stage-2-snapshots) ✅ (historic — v2 snapshots removed in v1.3.0, superseded by Stage 3)
-3. [Stage 2.5: SlabPool as the Only Allocator](#stage-25-slabpool-as-the-only-allocator) (deferred)
+3. [Stage 2.5: SlabPool as the Only Allocator](#stage-25-slabpool-as-the-only-allocator) ✅
 4. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage) ✅ (v1.3.0)
 5. [Stage 3.75: Semantic Query Language](#stage-375-semantic-query-language)
 6. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
@@ -103,7 +103,7 @@ The WAL and snapshots are properly integrated, not bolted on separately:
 
 ## Stage 2.5: SlabPool as the Only Allocator
 
-**Status: Deferred — not a prerequisite.** Stage 3 shipped without it; the LSM crate reads page data through World's existing allocator, and dirty-page tracking uses per-column bitsets rather than mmap-backed columns. Revisit only if strict zero-system-malloc becomes a requirement (Stage 6+).
+**Status: Complete.** The goal as framed was "all *component storage* is slab-backed, not all storage." `BlobVec` requires a `SharedPool` at construction, archetype column creation routes through it, sparse `dense_values` is also a pool-backed `BlobVec`, and `default_pool()` is `SlabPool` — so every component byte lives on the slab. What remains on the general-purpose allocator is indexing and bookkeeping (`PagedSparseSet::pages` directory, `EntityAllocator` generation/free Vecs, component-registry `HashMap`, `DirtyPageTracker` bitsets, scratch buffers) — metadata never read as component data. Stage 3's note about a "separate I/O path" holds and is compatible: LSM reads pages *through* the slab, not around it.
 
 **Goal**: Eliminate `SystemAllocator` — all BlobVec columns must be mmap-backed
 via `SlabPool`. This is a hard prerequisite for every subsequent stage.
@@ -157,7 +157,7 @@ memory. The `SlabPool` path is opt-in, not default.
 
 **Status: Complete (v1.3.0).** All five phases shipped: sorted-run format, manifest + manifest log, compaction, bloom filter, and `LsmRecovery` + `Durable` integration with WAL tail replay. v2 full-world snapshots were removed in the cutover.
 
-**Note**: Stage 2.5 (SlabPool-only allocation) was deferred — the LSM crate operates on a separate I/O path that reads page data from World's existing allocator. Dirty page tracking uses `storage::dirty_pages` per-column bitsets without requiring mmap-backed columns.
+**Note**: Stage 2.5 (SlabPool component storage) is complete — see that section. The LSM crate still operates on a separate file-I/O path (mmap'd sorted-run files vs in-memory slab), which does not violate the in-memory allocation invariant: LSM reads page data *through* the slab-allocated columns, not around them. Dirty page tracking uses `storage::dirty_pages` per-column bitsets without requiring mmap-backed columns.
 
 **Goal**: Incremental persistence. Only write what changed, not the entire world.
 
