@@ -27,6 +27,40 @@ pub const SPARSE_ARCH_ID: u16 = 0xFFFD;
 /// convenience so callers do not need to depend on both crates.
 pub const PAGE_SIZE: usize = minkowski::PAGE_SIZE;
 
+// ── Checked little-endian readers ─────────────────────────────────────────────
+
+/// Read a little-endian `u16`/`u32`/`u64` at `*offset` for the byte format on disk,
+/// advancing the cursor on success. Truncation is an `LsmError::Format`.
+pub(crate) fn read_u16_le(data: &[u8], offset: &mut usize) -> Result<u16, crate::error::LsmError> {
+    let end = offset.checked_add(2).filter(|&e| e <= data.len());
+    let Some(end) = end else {
+        return Err(crate::error::LsmError::Format("truncated u16".to_owned()));
+    };
+    let val = u16::from_le_bytes(data[*offset..end].try_into().expect("2B"));
+    *offset = end;
+    Ok(val)
+}
+
+pub(crate) fn read_u32_le(data: &[u8], offset: &mut usize) -> Result<u32, crate::error::LsmError> {
+    let end = offset.checked_add(4).filter(|&e| e <= data.len());
+    let Some(end) = end else {
+        return Err(crate::error::LsmError::Format("truncated u32".to_owned()));
+    };
+    let val = u32::from_le_bytes(data[*offset..end].try_into().expect("4B"));
+    *offset = end;
+    Ok(val)
+}
+
+pub(crate) fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, crate::error::LsmError> {
+    let end = offset.checked_add(8).filter(|&e| e <= data.len());
+    let Some(end) = end else {
+        return Err(crate::error::LsmError::Format("truncated u64".to_owned()));
+    };
+    let val = u64::from_le_bytes(data[*offset..end].try_into().expect("8B"));
+    *offset = end;
+    Ok(val)
+}
+
 // ── compile-time size assertions ────────────────────────────────────────────
 
 const _: () = assert!(std::mem::size_of::<Header>() == 64);

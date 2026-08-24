@@ -19,17 +19,6 @@ pub fn encode(generations: &[u32], free_list: &[u32]) -> Vec<u8> {
 /// Decode allocator metadata written by [`encode`].
 pub fn decode(bytes: &[u8]) -> Result<(Vec<u32>, Vec<u32>), LsmError> {
     let mut pos = 0;
-    let read_u64 = |bytes: &[u8], pos: &mut usize| -> Result<u64, LsmError> {
-        let end = pos
-            .checked_add(8)
-            .ok_or_else(|| LsmError::Format("allocator meta truncated".to_owned()))?;
-        if end > bytes.len() {
-            return Err(LsmError::Format("allocator meta truncated".to_owned()));
-        }
-        let val = u64::from_le_bytes(bytes[*pos..end].try_into().expect("8 bytes"));
-        *pos = end;
-        Ok(val)
-    };
     let read_u32_slice =
         |bytes: &[u8], pos: &mut usize, count: u64| -> Result<Vec<u32>, LsmError> {
             let count = usize::try_from(count).map_err(|_| {
@@ -46,17 +35,19 @@ pub fn decode(bytes: &[u8]) -> Result<(Vec<u32>, Vec<u32>), LsmError> {
             if end > bytes.len() {
                 return Err(LsmError::Format("allocator meta truncated".to_owned()));
             }
-            let mut out = Vec::with_capacity(count);
-            for chunk in bytes[*pos..end].chunks_exact(4) {
-                out.push(u32::from_le_bytes(chunk.try_into().expect("4 bytes")));
-            }
+            let out: Vec<u32> = bytes[*pos..end]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| u32::from_le_bytes(*chunk))
+                .collect();
             *pos = end;
             Ok(out)
         };
 
-    let gen_count = read_u64(bytes, &mut pos)?;
+    let gen_count = crate::format::read_u64_le(bytes, &mut pos)?;
     let generations = read_u32_slice(bytes, &mut pos, gen_count)?;
-    let free_count = read_u64(bytes, &mut pos)?;
+    let free_count = crate::format::read_u64_le(bytes, &mut pos)?;
     let free_list = read_u32_slice(bytes, &mut pos, free_count)?;
     if pos != bytes.len() {
         return Err(LsmError::Format(format!(

@@ -679,7 +679,7 @@ pub fn flush_observed(
 }
 
 /// Write `n` zero bytes to `w`.
-fn write_zeros(w: &mut impl Write, n: usize) -> Result<(), LsmError> {
+pub(crate) fn write_zeros(w: &mut impl Write, n: usize) -> Result<(), LsmError> {
     const BLOCK: [u8; 4096] = [0u8; 4096];
     let mut remaining = n;
     while remaining > 0 {

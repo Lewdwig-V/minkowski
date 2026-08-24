@@ -99,16 +99,20 @@ pub fn query_to_record_batch(
             DataType::Float32 => {
                 let values: Vec<f32> = collector
                     .bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_ne_bytes(*b))
                     .collect();
                 Arc::new(Float32Array::from(values))
             }
             DataType::UInt32 => {
                 let values: Vec<u32> = collector
                     .bytes
-                    .chunks_exact(4)
-                    .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_ne_bytes(*b))
                     .collect();
                 Arc::new(UInt32Array::from(values))
             }
@@ -116,8 +120,10 @@ pub fn query_to_record_batch(
             DataType::UInt64 => {
                 let values: Vec<u64> = collector
                     .bytes
-                    .chunks_exact(8)
-                    .map(|b| u64::from_ne_bytes(b.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| u64::from_ne_bytes(*b))
                     .collect();
                 Arc::new(UInt64Array::from(values))
             }
