@@ -20,6 +20,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::LsmError;
+use crate::format::{read_u16_le, read_u32_le, read_u64_le};
 use crate::manifest::{LsmManifest, SortedRunMeta};
 use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 
@@ -281,33 +282,6 @@ fn decode_path(data: &[u8], offset: &mut usize) -> Result<PathBuf, LsmError> {
         .map_err(|e| LsmError::Format(format!("invalid UTF-8 in path: {e}")))?;
     *offset += path_len;
     Ok(PathBuf::from(s))
-}
-
-fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, LsmError> {
-    if *offset + 8 > data.len() {
-        return Err(LsmError::Format("truncated u64".to_owned()));
-    }
-    let val = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
-    *offset += 8;
-    Ok(val)
-}
-
-fn read_u16_le(data: &[u8], offset: &mut usize) -> Result<u16, LsmError> {
-    if *offset + 2 > data.len() {
-        return Err(LsmError::Format("truncated u16".to_owned()));
-    }
-    let val = u16::from_le_bytes(data[*offset..*offset + 2].try_into().unwrap());
-    *offset += 2;
-    Ok(val)
-}
-
-fn read_u32_le(data: &[u8], offset: &mut usize) -> Result<u32, LsmError> {
-    if *offset + 4 > data.len() {
-        return Err(LsmError::Format("truncated u32".to_owned()));
-    }
-    let val = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
-    *offset += 4;
-    Ok(val)
 }
 
 /// Encode a `SortedRunMeta` payload (path, seq range, coverage, page count,

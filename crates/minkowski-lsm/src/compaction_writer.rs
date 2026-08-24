@@ -38,6 +38,7 @@ use crate::manifest::SortedRunMeta;
 use crate::reader::SortedRunReader;
 use crate::schema::SchemaSection;
 use crate::types::{PageCount, SeqRange, SizeBytes};
+use crate::writer::write_zeros;
 
 // ── Public types (shared between emit-list builder and write loop) ───────────
 
@@ -64,7 +65,6 @@ pub(crate) struct EmitRow {
 /// but possible for archetypes that first appear in a later flush).
 ///
 /// Returns `Err(LsmError::Format)` if `inputs.len() != arch_ids_per_input.len()`.
-#[allow(dead_code)]
 pub(crate) fn build_emit_list(
     inputs: &[&SortedRunReader],
     arch_ids_per_input: &[Option<u16>],
@@ -146,7 +146,6 @@ pub(crate) fn build_emit_list(
 /// component (each run is independent). `CompactionWriter` computes a
 /// per-input `(input_slot) -> output_slot` table up front from the schema
 /// section of each input, keyed on the component's stable name.
-#[allow(dead_code)]
 pub(crate) struct CompactionWriter<'a> {
     inputs: Vec<&'a SortedRunReader>,
     /// For each signature, for each input, the arch_id in that input (or None).
@@ -158,9 +157,6 @@ pub(crate) struct CompactionWriter<'a> {
     output_seq_range: SeqRange,
 }
 
-// Methods are called from the compactor (Task 3d / 4) and from cfg(test).
-// The dead_code lint fires here because no non-test caller exists yet.
-#[allow(dead_code)]
 impl<'a> CompactionWriter<'a> {
     /// Create a new `CompactionWriter`.
     ///
@@ -217,10 +213,6 @@ impl<'a> CompactionWriter<'a> {
     ///
     /// Returns `Err(LsmError::Format("cannot compact: all emit lists empty"))` if no
     /// rows survive dedup — the caller should not compact an empty set.
-    pub(crate) fn write(self) -> Result<SortedRunMeta, LsmError> {
-        self.write_observed(None)
-    }
-
     /// Like [`write`], but invokes `observer` once per entity ID written to an
     /// entity-slot page. Pass `None` for no observation (identical to [`write`]).
     ///
@@ -911,9 +903,6 @@ impl<'a> CompactionWriter<'a> {
 }
 
 /// Maps an output component slot to the corresponding input slot in one input run.
-// Only constructed inside build_slot_translations which is called by
-// CompactionWriter::write. Both are #[allow(dead_code)] until Task 3d/4 land.
-#[allow(dead_code)]
 struct SlotTranslation {
     output_slot: u16,
     input_slot: u16,
@@ -922,25 +911,9 @@ struct SlotTranslation {
 // ── File helpers ──────────────────────────────────────────────────────────────
 
 /// Build the temp-file path alongside the final output path.
-// Called by CompactionWriter::write — allow until external callers exist.
-#[allow(dead_code)]
 fn make_tmp_path(output_path: &Path, seq_lo: u64, seq_hi: u64) -> PathBuf {
     let parent = output_path.parent().unwrap_or(Path::new("."));
     parent.join(format!("{seq_lo}-{seq_hi}.run.tmp"))
-}
-
-/// Write `n` zero bytes to `w`.
-// Called by CompactionWriter::write — allow until external callers exist.
-#[allow(dead_code)]
-fn write_zeros(w: &mut impl Write, n: usize) -> Result<(), LsmError> {
-    const BLOCK: [u8; 4096] = [0u8; 4096];
-    let mut remaining = n;
-    while remaining > 0 {
-        let chunk = remaining.min(BLOCK.len());
-        w.write_all(&BLOCK[..chunk])?;
-        remaining -= chunk;
-    }
-    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1224,7 +1197,7 @@ mod tests {
         )
         .unwrap();
 
-        let meta = writer.write().unwrap();
+        let meta = writer.write_observed(None).unwrap();
 
         // ── Open and validate output ──────────────────────────────────────────
         let out_reader = SortedRunReader::open(&out_path).unwrap();
@@ -1332,7 +1305,7 @@ mod tests {
         )
         .unwrap();
 
-        writer.write().unwrap();
+        writer.write_observed(None).unwrap();
 
         // ── Open output and read entity data ──────────────────────────────────
         let out_reader = SortedRunReader::open(&out_path).unwrap();
@@ -1588,7 +1561,7 @@ mod tests {
         )
         .unwrap();
 
-        writer.write().unwrap();
+        writer.write_observed(None).unwrap();
 
         let data = std::fs::read(&out_path).unwrap();
         let footer_start = data.len() - 64;

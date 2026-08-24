@@ -9,7 +9,7 @@
 //!
 //! # Atomicity
 //!
-//! [`execute_compaction`] appends a single [`ManifestEntry::CompactionCommit`]
+//! `execute_compaction_observed` appends a single [`ManifestEntry::CompactionCommit`]
 //! frame before touching the in-memory manifest. The CRC-protected frame is
 //! the commit point: if the process crashes after append but before the
 //! in-memory update, recovery replays the frame and converges to the same
@@ -202,22 +202,6 @@ pub(crate) fn find_compaction_candidate<const N: usize>(
 }
 
 // ── Executor ──────────────────────────────────────────────────────────────────
-
-/// Execute one compaction job end-to-end.
-///
-/// Thin wrapper around [`execute_compaction_observed`] with no observer.
-/// See that function for the full step-by-step contract.
-// Tests call this directly; no production caller yet so the lib-only
-// dead_code lint fires. #[expect] would be unfulfilled under --all-targets.
-#[allow(dead_code)]
-pub(crate) fn execute_compaction<const N: usize>(
-    job: &CompactionJob,
-    manifest: &mut LsmManifest<N>,
-    log: &mut ManifestLog,
-    run_dir: &Path,
-) -> Result<CompactionReport, LsmError> {
-    execute_compaction_observed(job, manifest, log, run_dir, None)
-}
 
 /// Execute one compaction job end-to-end, invoking `observer` once per entity
 /// ID written to the output entity-slot pages.
@@ -677,7 +661,8 @@ mod tests {
             .unwrap()
             .expect("K=4 runs must trigger compaction");
 
-        let report = execute_compaction(&job, &mut manifest, &mut log, dir.path()).unwrap();
+        let report =
+            execute_compaction_observed(&job, &mut manifest, &mut log, dir.path(), None).unwrap();
 
         // ── Verify report ─────────────────────────────────────────────────────
         assert_eq!(report.from_level, Level::L0);

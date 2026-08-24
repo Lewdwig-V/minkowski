@@ -436,11 +436,6 @@ impl SortedRunReader {
         })
     }
 
-    /// Number of entries in the sparse index.
-    pub fn index_len(&self) -> usize {
-        self.index.len()
-    }
-
     /// Check if a page *might* be present in this sorted run.
     ///
     /// Returns `true` if the page might exist (could be a false positive).
@@ -476,10 +471,6 @@ impl SortedRunReader {
     /// (`ENTITY_SLOT = 0xFFFF`).
     ///
     /// Returns an empty `Vec` if the archetype is not present in the index.
-    // Used by `schema_match` (Task 2) and will be used directly by the
-    // compactor (Task 3). The dead_code lint fires on the lib target because
-    // the only current callers are in cfg(test); allow it until Task 3 lands.
-    #[allow(dead_code)]
     pub(crate) fn component_slots_for_arch(&self, arch_id: u16) -> Vec<u16> {
         let mut slots: Vec<u16> = self
             .index
@@ -646,7 +637,7 @@ mod tests {
         );
         assert_eq!(reader.schema().len(), 1); // Pos only
         assert!(reader.page_count() > 0);
-        assert!(reader.index_len() > 0);
+        assert!(!reader.archetype_ids().is_empty());
     }
 
     #[test]
@@ -655,7 +646,7 @@ mod tests {
         let reader = SortedRunReader::open(&path).unwrap();
 
         // Find the first index entry to know a valid key.
-        assert!(reader.index_len() > 0);
+        assert!(!reader.archetype_ids().is_empty());
         let entry = &reader.index[0];
         let page = reader
             .get_page(entry.arch_id, entry.slot, entry.page_index)
@@ -872,7 +863,7 @@ mod tests {
         let reader = SortedRunReader::open(&path).unwrap();
 
         // Find the first page and validate its CRC, extracting the proof.
-        assert!(reader.index_len() > 0);
+        assert!(!reader.archetype_ids().is_empty());
         let entry = &reader.index[0];
         let page = reader
             .get_page(entry.arch_id, entry.slot, entry.page_index)
