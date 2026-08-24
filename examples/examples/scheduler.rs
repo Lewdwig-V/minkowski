@@ -19,20 +19,7 @@ use minkowski::{QueryMut, QueryReducerId, QueryRef, ReducerRegistry, World};
 
 // -- Components ---------------------------------------------------------------
 
-#[derive(Clone, Copy)]
-struct Pos {
-    x: f32,
-    y: f32,
-}
-
-#[derive(Clone, Copy)]
-struct Vel {
-    dx: f32,
-    dy: f32,
-}
-
-#[derive(Clone, Copy)]
-struct Health(u32);
+use minkowski_examples::{Health, Pos, Vel};
 
 // -- Greedy batch scheduler ---------------------------------------------------
 

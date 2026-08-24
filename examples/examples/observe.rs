@@ -8,21 +8,8 @@
 use minkowski::{EnumChangeSet, World};
 use minkowski_observe::{MetricsDiff, MetricsSnapshot, PrometheusExporter};
 use minkowski_persist::{CodecRegistry, Wal, WalConfig};
-use rkyv::{Archive, Deserialize, Serialize};
 
-#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
-#[repr(C)]
-struct Pos {
-    x: f32,
-    y: f32,
-}
-
-#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
-#[repr(C)]
-struct Vel {
-    dx: f32,
-    dy: f32,
-}
+use minkowski_examples::{Pos, Vel};
 
 fn main() {
     let dir = std::env::temp_dir().join("minkowski-observe-example");

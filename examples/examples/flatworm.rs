@@ -19,62 +19,7 @@ use minkowski::{CommandBuffer, Entity, QueryMut, QueryRef, ReducerRegistry, Spat
 use std::collections::HashSet;
 use std::time::Instant;
 
-// ── Vec2 ────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Vec2 {
-    x: f32,
-    y: f32,
-}
-
-impl Vec2 {
-    const ZERO: Vec2 = Vec2 { x: 0.0, y: 0.0 };
-
-    fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
-    }
-
-    fn length_sq(self) -> f32 {
-        self.x * self.x + self.y * self.y
-    }
-}
-
-impl std::ops::Add for Vec2 {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self {
-            x: self.x + rhs.x,
-            y: self.y + rhs.y,
-        }
-    }
-}
-
-impl std::ops::AddAssign for Vec2 {
-    fn add_assign(&mut self, rhs: Self) {
-        self.x += rhs.x;
-        self.y += rhs.y;
-    }
-}
-
-impl std::ops::Sub for Vec2 {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        Self {
-            x: self.x - rhs.x,
-            y: self.y - rhs.y,
-        }
-    }
-}
-
-impl std::ops::Mul<f32> for Vec2 {
-    type Output = Self;
-    fn mul(self, rhs: f32) -> Self {
-        Self {
-            x: self.x * rhs,
-            y: self.y * rhs,
-        }
-    }
-}
+use minkowski_examples::Vec2;
 
 // ── Components ──────────────────────────────────────────────────────
 
@@ -142,61 +87,35 @@ impl Default for SimParams {
     }
 }
 
-// ── Food spatial grid ───────────────────────────────────────────────
+// ── Food spatial grid (shared torus mechanics) ───────────────────────
 
-struct FoodGrid {
-    cell_size: f32,
-    grid_w: usize,
-    cells: Vec<Vec<usize>>,
-    snapshot: Vec<(Entity, Vec2, f32)>, // entity, position, nutrition
-}
+struct FoodGrid(minkowski_examples::TorusGrid<(Vec2, f32)>);
 
 impl FoodGrid {
     fn new(cell_size: f32, world_size: f32) -> Self {
-        let grid_w = (world_size / cell_size).ceil() as usize;
-        Self {
-            cell_size,
-            grid_w,
-            cells: Vec::new(),
-            snapshot: Vec::new(),
-        }
+        Self(minkowski_examples::TorusGrid::new(cell_size, world_size))
     }
 
-    #[allow(clippy::cast_possible_wrap)]
-    fn neighbors(&self, pos: Vec2) -> impl Iterator<Item = &(Entity, Vec2, f32)> {
-        let cx = ((pos.x / self.cell_size) as usize).min(self.grid_w - 1);
-        let cy = ((pos.y / self.cell_size) as usize).min(self.grid_w - 1);
-        let grid_w = self.grid_w;
-        (-1i32..=1).flat_map(move |dy| {
-            (-1i32..=1).flat_map(move |dx| {
-                let nx = (cx as i32 + dx).rem_euclid(grid_w as i32) as usize;
-                let ny = (cy as i32 + dy).rem_euclid(grid_w as i32) as usize;
-                let cell = &self.cells[ny * grid_w + nx];
-                cell.iter().map(|&j| &self.snapshot[j])
-            })
-        })
+    fn neighbors(&self, pos: Vec2) -> impl Iterator<Item = (Entity, Vec2, f32)> + '_ {
+        self.0
+            .neighbors(pos.x, pos.y, 1)
+            .map(|(e, &(pos, nutrition), _)| (e, pos, nutrition))
     }
 }
 
 impl SpatialIndex for FoodGrid {
     fn rebuild(&mut self, world: &mut World) {
-        self.snapshot = world
+        let snapshot: Vec<(Entity, (Vec2, f32))> = world
             .query::<(Entity, &Position, &Nutrition, &Food)>()
-            .map(|(e, p, n, _)| (e, p.0, n.0))
+            .map(|(e, p, n, _)| (e, (p.0, n.0)))
             .collect();
-
-        self.cells.clear();
-        self.cells.resize(self.grid_w * self.grid_w, Vec::new());
-        for (i, &(_, pos, _)) in self.snapshot.iter().enumerate() {
-            let cx = ((pos.x / self.cell_size) as usize).min(self.grid_w - 1);
-            let cy = ((pos.y / self.cell_size) as usize).min(self.grid_w - 1);
-            self.cells[cy * self.grid_w + cx].push(i);
-        }
+        self.0.set_snapshot(snapshot, |&(pos, _)| (pos.x, pos.y));
     }
 
     fn supports(&self, _expr: &minkowski::SpatialExpr) -> Option<minkowski::SpatialCost> {
         None
     }
+
     fn query(&self, _expr: &minkowski::SpatialExpr) -> Vec<Entity> {
         Vec::new()
     }
@@ -210,25 +129,9 @@ const DT: f32 = 0.016;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn wrap(mut v: f32, size: f32) -> f32 {
-    if v >= size {
-        v -= size;
-    } else if v < 0.0 {
-        v += size;
-    }
-    v
-}
+use minkowski_examples::wrap;
 
-fn wrapped_diff(a: f32, b: f32, world_size: f32) -> f32 {
-    let d = a - b;
-    if d > world_size * 0.5 {
-        d - world_size
-    } else if d < -world_size * 0.5 {
-        d + world_size
-    } else {
-        d
-    }
-}
+use minkowski_examples::wrapped_diff;
 
 fn spawn_worm(world: &mut World, params: &SimParams) -> Entity {
     let x = fastrand::f32() * params.world_size;
@@ -367,7 +270,7 @@ fn main() {
                 let mut best_dir = Vec2::ZERO;
                 let mut best_score = 0.0_f32;
 
-                for &(_, food_pos, nutrition) in food_grid.neighbors(*pos) {
+                for (_, food_pos, nutrition) in food_grid.neighbors(*pos) {
                     let diff = Vec2::new(
                         wrapped_diff(food_pos.x, pos.x, params.world_size),
                         wrapped_diff(food_pos.y, pos.y, params.world_size),
@@ -414,7 +317,7 @@ fn main() {
             let eat_r_sq = params.eat_radius * params.eat_radius;
 
             for (worm_entity, worm_pos) in &worms {
-                for &(food_entity, food_pos, nutrition) in food_grid.neighbors(*worm_pos) {
+                for (food_entity, food_pos, nutrition) in food_grid.neighbors(*worm_pos) {
                     if eaten_set.contains(&food_entity) {
                         continue;
                     }

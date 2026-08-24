@@ -95,71 +95,35 @@ enum ReplicationEvent {
     },
 }
 
-// -- Spatial index -------------------------------------------------------------
-struct UnitGrid {
-    cell_size: f32,
-    grid_w: usize,
-    cells: Vec<Vec<usize>>,
-    snapshot: Vec<(Entity, f32, f32, u8)>, // entity, x, y, faction
-}
+// -- Spatial index (shared torus mechanics) -----------------------------
+struct UnitGrid(minkowski_examples::TorusGrid<(f32, f32, u8)>);
 
 impl UnitGrid {
     fn new(cell_size: f32) -> Self {
-        let grid_w = (MAP_SIZE / cell_size).ceil() as usize;
-        Self {
-            cell_size,
-            grid_w,
-            cells: Vec::new(),
-            snapshot: Vec::new(),
-        }
+        Self(minkowski_examples::TorusGrid::new(cell_size, MAP_SIZE))
     }
 
-    #[allow(clippy::cast_possible_wrap)]
     fn neighbors(&self, x: f32, y: f32, range: f32) -> Vec<(Entity, f32, f32, u8)> {
-        let cells_needed = (range / self.cell_size).ceil() as i32;
-        let cx = ((x / self.cell_size) as usize).min(self.grid_w.saturating_sub(1));
-        let cy = ((y / self.cell_size) as usize).min(self.grid_w.saturating_sub(1));
-        let grid_w = self.grid_w;
-        let range_sq = range * range;
-        let mut result = Vec::new();
-        for dy in -cells_needed..=cells_needed {
-            for dx in -cells_needed..=cells_needed {
-                let nx = (cx as i32 + dx).rem_euclid(grid_w as i32) as usize;
-                let ny = (cy as i32 + dy).rem_euclid(grid_w as i32) as usize;
-                for &j in &self.cells[ny * grid_w + nx] {
-                    let (e, ex, ey, f) = self.snapshot[j];
-                    let ddx = (ex - x).abs();
-                    let ddy = (ey - y).abs();
-                    let ddx = ddx.min(MAP_SIZE - ddx);
-                    let ddy = ddy.min(MAP_SIZE - ddy);
-                    if ddx * ddx + ddy * ddy <= range_sq {
-                        result.push((e, ex, ey, f));
-                    }
-                }
-            }
-        }
-        result
+        self.0
+            .in_range(x, y, range)
+            .map(|(e, &(ex, ey, f), _)| (e, ex, ey, f))
+            .collect()
     }
 }
 
 impl SpatialIndex for UnitGrid {
     fn rebuild(&mut self, world: &mut World) {
-        self.snapshot = world
+        let snapshot: Vec<(Entity, (f32, f32, u8))> = world
             .query::<(Entity, &Position, &Faction)>()
-            .map(|(e, p, f)| (e, p.0, p.1, f.0))
+            .map(|(e, p, f)| (e, (p.0, p.1, f.0)))
             .collect();
-        self.cells.clear();
-        self.cells.resize(self.grid_w * self.grid_w, Vec::new());
-        for (i, &(_, x, y, _)) in self.snapshot.iter().enumerate() {
-            let cx = ((x / self.cell_size) as usize).min(self.grid_w.saturating_sub(1));
-            let cy = ((y / self.cell_size) as usize).min(self.grid_w.saturating_sub(1));
-            self.cells[cy * self.grid_w + cx].push(i);
-        }
+        self.0.set_snapshot(snapshot, |&(x, y, _)| (x, y));
     }
 
     fn supports(&self, _expr: &minkowski::SpatialExpr) -> Option<minkowski::SpatialCost> {
         None
     }
+
     fn query(&self, _expr: &minkowski::SpatialExpr) -> Vec<Entity> {
         Vec::new()
     }
@@ -702,7 +666,7 @@ fn main() {
         // Combat: find nearby enemies and apply damage
         {
             let mut damage_list: Vec<(Entity, u32)> = Vec::new();
-            for &(entity, x, y, faction) in &unit_grid.snapshot {
+            for &(entity, (x, y, faction)) in &unit_grid.0.snapshot {
                 let nearby = unit_grid.neighbors(x, y, COMBAT_RANGE);
                 for (other_e, _, _, other_f) in nearby {
                     if other_f != faction && entity != other_e {
