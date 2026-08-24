@@ -11,10 +11,11 @@
 2. [Stage 2: Snapshots](#stage-2-snapshots) ✅ (historic — v2 snapshots removed in v1.3.0, superseded by Stage 3)
 3. [Stage 2.5: SlabPool as the Only Allocator](#stage-25-slabpool-as-the-only-allocator) (deferred)
 4. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage) ✅ (v1.3.0)
-5. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
-6. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
-7. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
-8. [Stage 7: Diagonal Scaling](#stage-7-diagonal-scaling)
+5. [Stage 3.75: Semantic Query Language](#stage-375-semantic-query-language)
+6. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
+7. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
+8. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
+9. [Stage 7: Diagonal Scaling](#stage-7-diagonal-scaling)
 
 ---
 
