@@ -12,7 +12,7 @@
 3. [Stage 2.5: SlabPool as the Only Allocator](#stage-25-slabpool-as-the-only-allocator) ✅
 4. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage) ✅ (v1.3.0)
 5. [Stage 3.75: Semantic Query Language](#stage-375-semantic-query-language)
-6. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
+6. [Stage 4: Replicated State Machine (RSM)](#stage-4-replicated-state-machine-rsm)
 7. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
 8. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
 9. [Stage 7: Diagonal Scaling](#stage-7-diagonal-scaling)
@@ -299,10 +299,7 @@ across levels. In Minkowski, the in-memory World IS the merged view.
    new one is dirty. Compaction must handle tombstones. Does the sorted run
    store tombstones explicitly, or is "page not present" sufficient?
 
-4. **Bloom filters**: ~~traditional LSMs use bloom filters to avoid reading levels
-   that don't contain a key. Our "reads never touch L1+" property may make this
-   unnecessary for normal operation, but recovery-time reads would benefit.~~
-   **Resolved**: `BlockedBloomFilter` promoted to a Stage 3 component. Recovery
+4. **Bloom filters** — **Resolved**: `BlockedBloomFilter` promoted to a Stage 3 component. Recovery
    reads (cold-start, replica catch-up) must probe L1/L2/L3 sorted runs to find
    which level holds a given page — without a filter this is one I/O per level.
    See design section below.
@@ -378,6 +375,36 @@ Short-circuit on first mismatch in the scalar fallback.
 - `Compactor` rebuilds filters when merging runs (bulk insert, no incremental)
 
 ---
+
+## Stage 3.75: Semantic Query Language
+
+**Status: Design (v1.4.0+).** Enabled by Stage 3 (the LSM schema section gives components stable, string-addressable names — the query language's handle). Scoped by decision record: **Python/notebook consumers first**; **global aggregates only** (group-by deferred); **Substrait emit-only** (no inbound consumption).
+
+**Goal**: a pipelined, PRQL-flavored text language — `from Pos | filter x > 0 | aggregate {count, avg x}` — compiled onto the existing `QueryPlanner` backend. Plans, cost model, indexes, and execution are shared with the DSL, not duplicated.
+
+### Design invariant: the parse-and-resolve boundary
+
+**The text layer is exclusively a thin parse-and-resolve boundary. Everything beyond the resolver must exist as compile-time-checked builder calls.** The parser produces a name-resolved plan through the same `ScanBuilder` / `AggregateExpr` / `SubscriptionBuilder` typestate builders the typed DSL uses — there is no runtime-only execution path, no bypass, no second engine.
+
+The corollary discipline: **if a feature requires bypassing the typestate builder to evaluate at runtime, the feature is rejected — or the typestate must be expanded.** Dual-path maintenance (fast static path vs. slow dynamic path, two engines drifted apart over years) is a database graveyard. Minkowski's only evaluation path is the one its type system already proved.
+
+### Phase plan
+
+- **Q1 (v1)**: tokenizer + PRQL-flux grammar (`from`, `filter`, `select`→component projection, `aggregate` global ops, `sort` on indexed columns, `take`); compiler lowers 1:1 to `ScanBuilder` + `AggregateExpr`; span→position diagnostics; `EXPLAIN` dumps the `PlanNode` tree. **No group-by, no joins** (each needs its own engine node + a join-vocabulary decision). **Acceptance criterion (one plan path)**: for a standardized corpus, `parse(text).explain()` is byte-equal to the equivalent typed `QueryPlanner` DSL's `explain()`. Drift between the two is a stop-the-line bug, not a feature.
+- **Q2**: Substrait emitter — language AST → Substrait logical `Rel` tree → `pyo3-arrow` bridge so DuckDB/Polars/Trino consumers can plug in.
+- **Q3**: name-registry hardening — duplicate `type_name` collisions, `stable_name` aliasing, diagnostics identifying which struct a name resolves to.
+
+### Explicit non-goals (v1)
+
+- Substrait *in* (consuming plans from other engines).
+- Malloy-style semantic layer / declared measures (needs a shared model host first).
+- LLM-facing plan IR (if it materializes, Critic-agent dry-run is a `validate()` shim over `explain()` + registry, not a subsystem).
+
+### Prerequisites shipped
+
+- Stage 3 LSM (stable string schema)
+- QueryPlanner + subscription builders + materialized views
+- `pyo3-arrow` bridge at 0.19 (arrow 59, pyo3 0.29)
 
 ## Stage 4: Replicated State Machine (RSM)
 
