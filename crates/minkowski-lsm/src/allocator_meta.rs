@@ -35,10 +35,12 @@ pub fn decode(bytes: &[u8]) -> Result<(Vec<u32>, Vec<u32>), LsmError> {
             if end > bytes.len() {
                 return Err(LsmError::Format("allocator meta truncated".to_owned()));
             }
-            let mut out = Vec::with_capacity(count);
-            for chunk in bytes[*pos..end].chunks_exact(4) {
-                out.push(u32::from_le_bytes(chunk.try_into().expect("4 bytes")));
-            }
+            let out: Vec<u32> = bytes[*pos..end]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| u32::from_le_bytes(*chunk))
+                .collect();
             *pos = end;
             Ok(out)
         };
