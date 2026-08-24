@@ -21,111 +21,11 @@
 use minkowski::{CommandBuffer, Entity, QueryMut, ReducerRegistry, SpatialIndex, World};
 use std::time::Instant;
 
-// ── Vec2 ────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Vec2 {
-    x: f32,
-    y: f32,
-}
-
-impl Vec2 {
-    const ZERO: Vec2 = Vec2 { x: 0.0, y: 0.0 };
-
-    fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
-    }
-
-    fn length(self) -> f32 {
-        (self.x * self.x + self.y * self.y).sqrt()
-    }
-
-    fn length_sq(self) -> f32 {
-        self.x * self.x + self.y * self.y
-    }
-
-    fn normalized(self) -> Self {
-        let len = self.length();
-        if len < 1e-8 {
-            Self::ZERO
-        } else {
-            Self {
-                x: self.x / len,
-                y: self.y / len,
-            }
-        }
-    }
-}
-
-impl std::ops::Add for Vec2 {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self {
-            x: self.x + rhs.x,
-            y: self.y + rhs.y,
-        }
-    }
-}
-
-impl std::ops::AddAssign for Vec2 {
-    fn add_assign(&mut self, rhs: Self) {
-        self.x += rhs.x;
-        self.y += rhs.y;
-    }
-}
-
-impl std::ops::Sub for Vec2 {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        Self {
-            x: self.x - rhs.x,
-            y: self.y - rhs.y,
-        }
-    }
-}
-
-impl std::ops::Mul<f32> for Vec2 {
-    type Output = Self;
-    fn mul(self, rhs: f32) -> Self {
-        Self {
-            x: self.x * rhs,
-            y: self.y * rhs,
-        }
-    }
-}
-
-impl std::ops::Div<f32> for Vec2 {
-    type Output = Self;
-    fn div(self, rhs: f32) -> Self {
-        Self {
-            x: self.x / rhs,
-            y: self.y / rhs,
-        }
-    }
-}
+use minkowski_examples::Vec2;
 
 // ── Toroidal helpers ─────────────────────────────────────────────────
 
-/// Minimum-image signed difference on a toroidal domain of size `world_size`.
-/// Returns the shortest path from `b` to `a` wrapping at boundaries.
-fn wrapped_diff(a: f32, b: f32, world_size: f32) -> f32 {
-    let d = a - b;
-    if d > world_size * 0.5 {
-        d - world_size
-    } else if d < -world_size * 0.5 {
-        d + world_size
-    } else {
-        d
-    }
-}
-
-/// Minimum-image vector from `from` to `to` on a toroidal world.
-fn wrapped_offset(to: Vec2, from: Vec2, world_size: f32) -> Vec2 {
-    Vec2::new(
-        wrapped_diff(to.x, from.x, world_size),
-        wrapped_diff(to.y, from.y, world_size),
-    )
-}
+use minkowski_examples::wrapped_offset;
 
 // ── Rect (axis-aligned bounding box) ────────────────────────────────
 

@@ -38,97 +38,7 @@
 use minkowski::{CommandBuffer, Entity, QueryMut, ReducerRegistry, SpatialIndex, World};
 use std::time::Instant;
 
-// ── Vec2 ────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Vec2 {
-    x: f32,
-    y: f32,
-}
-
-impl Vec2 {
-    const ZERO: Vec2 = Vec2 { x: 0.0, y: 0.0 };
-
-    fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
-    }
-
-    fn length(self) -> f32 {
-        (self.x * self.x + self.y * self.y).sqrt()
-    }
-
-    fn length_sq(self) -> f32 {
-        self.x * self.x + self.y * self.y
-    }
-
-    fn normalized(self) -> Self {
-        let len = self.length();
-        if len < 1e-8 {
-            Self::ZERO
-        } else {
-            Self {
-                x: self.x / len,
-                y: self.y / len,
-            }
-        }
-    }
-
-    fn clamped(self, max_len: f32) -> Self {
-        let len_sq = self.length_sq();
-        if len_sq > max_len * max_len {
-            self.normalized() * max_len
-        } else {
-            self
-        }
-    }
-}
-
-impl std::ops::Add for Vec2 {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self {
-            x: self.x + rhs.x,
-            y: self.y + rhs.y,
-        }
-    }
-}
-
-impl std::ops::AddAssign for Vec2 {
-    fn add_assign(&mut self, rhs: Self) {
-        self.x += rhs.x;
-        self.y += rhs.y;
-    }
-}
-
-impl std::ops::Sub for Vec2 {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        Self {
-            x: self.x - rhs.x,
-            y: self.y - rhs.y,
-        }
-    }
-}
-
-impl std::ops::Mul<f32> for Vec2 {
-    type Output = Self;
-    fn mul(self, rhs: f32) -> Self {
-        Self {
-            x: self.x * rhs,
-            y: self.y * rhs,
-        }
-    }
-}
-
-impl std::ops::Div<f32> for Vec2 {
-    type Output = Self;
-    fn div(self, rhs: f32) -> Self {
-        Self {
-            x: self.x / rhs,
-            y: self.y / rhs,
-        }
-    }
-}
+use minkowski_examples::Vec2;
 
 // ── Components ──────────────────────────────────────────────────────
 //
@@ -172,62 +82,39 @@ impl Default for BoidParams {
     }
 }
 
-// ── SpatialGrid ────────────────────────────────────────────────────
+// ── SpatialGrid (shared torus mechanics) ─────────────────────────────
 
-struct SpatialGrid {
-    cell_size: f32,
-    grid_w: usize,
-    cells: Vec<Vec<usize>>,
-    pub snapshot: Vec<(Entity, Vec2, Vec2)>,
-}
+struct SpatialGrid(minkowski_examples::TorusGrid<(Vec2, Vec2)>);
 
 impl SpatialGrid {
     fn new(cell_size: f32, world_size: f32) -> Self {
-        let grid_w = (world_size / cell_size).ceil() as usize;
-        Self {
-            cell_size,
-            grid_w,
-            cells: Vec::new(),
-            snapshot: Vec::new(),
-        }
+        Self(minkowski_examples::TorusGrid::new(cell_size, world_size))
     }
 
-    #[allow(clippy::cast_possible_wrap)]
-    fn neighbors(&self, pos: Vec2) -> impl Iterator<Item = &(Entity, Vec2, Vec2)> {
-        let cx = ((pos.x / self.cell_size) as usize).min(self.grid_w - 1);
-        let cy = ((pos.y / self.cell_size) as usize).min(self.grid_w - 1);
-        let grid_w = self.grid_w;
-        (-1i32..=1).flat_map(move |dy| {
-            (-1i32..=1).flat_map(move |dx| {
-                let nx = (cx as i32 + dx).rem_euclid(grid_w as i32) as usize;
-                let ny = (cy as i32 + dy).rem_euclid(grid_w as i32) as usize;
-                // SAFETY: nx < grid_w and ny < grid_w guaranteed by rem_euclid
-                let cell = &self.cells[ny * grid_w + nx];
-                cell.iter().map(|&j| &self.snapshot[j])
-            })
-        })
+    fn neighbors(&self, pos: Vec2) -> impl Iterator<Item = (Entity, Vec2, Vec2)> + '_ {
+        self.0
+            .neighbors(pos.x, pos.y, 1)
+            .map(|(e, &(p, v), _)| (e, p, v))
+    }
+
+    fn snapshot(&self) -> impl Iterator<Item = (Entity, Vec2, Vec2)> + '_ {
+        self.0.snapshot.iter().map(|&(e, (p, v))| (e, p, v))
     }
 }
 
 impl SpatialIndex for SpatialGrid {
     fn rebuild(&mut self, world: &mut World) {
-        self.snapshot = world
+        let snapshot = world
             .query::<(Entity, &Position, &Velocity)>()
-            .map(|(e, p, v)| (e, p.0, v.0))
+            .map(|(e, p, v)| (e, (p.0, v.0)))
             .collect();
-
-        self.cells.clear();
-        self.cells.resize(self.grid_w * self.grid_w, Vec::new());
-        for (i, &(_, pos, _)) in self.snapshot.iter().enumerate() {
-            let cx = ((pos.x / self.cell_size) as usize).min(self.grid_w - 1);
-            let cy = ((pos.y / self.cell_size) as usize).min(self.grid_w - 1);
-            self.cells[cy * self.grid_w + cx].push(i);
-        }
+        self.0.set_snapshot(snapshot, |&(pos, _)| (pos.x, pos.y));
     }
 
     fn supports(&self, _expr: &minkowski::SpatialExpr) -> Option<minkowski::SpatialCost> {
         None
     }
+
     fn query(&self, _expr: &minkowski::SpatialExpr) -> Vec<Entity> {
         Vec::new()
     }
@@ -255,18 +142,7 @@ fn spawn_boid(world: &mut World, params: &BoidParams) -> Entity {
     ))
 }
 
-/// Minimum-image distance on a toroidal world.
-/// Returns the shortest signed difference between `a` and `b` wrapping at `world_size`.
-fn wrapped_diff(a: f32, b: f32, world_size: f32) -> f32 {
-    let d = a - b;
-    if d > world_size * 0.5 {
-        d - world_size
-    } else if d < -world_size * 0.5 {
-        d + world_size
-    } else {
-        d
-    }
-}
+use minkowski_examples::wrapped_diff;
 
 // ── Main ────────────────────────────────────────────────────────────
 
@@ -348,9 +224,7 @@ fn main() {
         // Step 3: Compute boid forces from snapshot (sequential)
         // The grid snapshot contains (Entity, Position, Velocity) for all boids.
         // We iterate the snapshot, compute forces, and apply them directly.
-        for idx in 0..grid.snapshot.len() {
-            let (entity, pos, vel) = grid.snapshot[idx];
-
+        for (entity, pos, vel) in grid.snapshot() {
             let mut sep = Vec2::ZERO;
             let mut ali = Vec2::ZERO;
             let mut coh = Vec2::ZERO;
@@ -358,7 +232,7 @@ fn main() {
             let mut ali_count = 0u32;
             let mut coh_count = 0u32;
 
-            for &(_, other_pos, other_vel) in grid.neighbors(pos) {
+            for (_, other_pos, other_vel) in grid.neighbors(pos) {
                 let diff = Vec2::new(
                     wrapped_diff(other_pos.x, pos.x, params.world_size),
                     wrapped_diff(other_pos.y, pos.y, params.world_size),

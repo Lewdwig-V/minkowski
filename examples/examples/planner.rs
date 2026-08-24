@@ -29,18 +29,7 @@ struct Score(u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Team(u32);
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Pos {
-    x: f32,
-    y: f32,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[expect(dead_code)]
-struct Vel {
-    dx: f32,
-    dy: f32,
-}
+use minkowski_examples::{Pos, Vel};
 
 fn main() {
     let mut world = World::new();
