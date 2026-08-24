@@ -12,6 +12,7 @@
 //! (self-describing, trailing-byte-checked).
 
 use crate::error::LsmError;
+use crate::format::{read_u32_le as read_u32, read_u64_le as read_u64};
 
 /// A decoded sparse blob: the component's stable name and its
 /// `(entity_bits, value_bytes)` entries.
@@ -91,24 +92,6 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedSparse, LsmError> {
         )));
     }
     Ok((name, entries))
-}
-
-fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, LsmError> {
-    let end = *pos + 4;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or_else(|| LsmError::Format("sparse_page: truncated u32".to_owned()))?;
-    *pos = end;
-    Ok(u32::from_le_bytes(slice.try_into().expect("4 bytes")))
-}
-
-fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, LsmError> {
-    let end = *pos + 8;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or_else(|| LsmError::Format("sparse_page: truncated u64".to_owned()))?;
-    *pos = end;
-    Ok(u64::from_le_bytes(slice.try_into().expect("8 bytes")))
 }
 
 #[cfg(test)]

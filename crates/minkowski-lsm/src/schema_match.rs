@@ -14,10 +14,6 @@ use crate::reader::SortedRunReader;
 ///
 /// `components` must be sorted lexicographically. The caller is responsible
 /// for sorting before calling this function.
-// Used by tests now and by the compactor in Task 3. The dead_code lint fires
-// on the lib target because the only current callers are in cfg(test); allow
-// it until Task 3 lands.
-#[allow(dead_code)]
 pub(crate) fn find_archetype_by_components(
     reader: &SortedRunReader,
     components: &[&str],

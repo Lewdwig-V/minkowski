@@ -477,10 +477,14 @@ fn build_allocator_state(
         for columns in by_sig.values() {
             if let Some(entity_pages) = columns.get(&ColumnKey::Entity) {
                 for page in entity_pages.values() {
-                    for chunk in page.data.chunks_exact(8).take(page.row_count as usize) {
-                        let entity = Entity::from_bits(u64::from_le_bytes(
-                            chunk.try_into().expect("8 bytes"),
-                        ));
+                    for chunk in page
+                        .data
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .take(page.row_count as usize)
+                    {
+                        let entity = Entity::from_bits(u64::from_le_bytes(*chunk));
                         let idx = entity.index() as usize;
                         if generations.len() <= idx {
                             generations.resize(idx + 1, 0);
@@ -740,10 +744,8 @@ fn materialize_world(
 
             // Read the raw entity handles for this page.
             let mut page_entities: Vec<Entity> = Vec::with_capacity(row_count);
-            for chunk in entity_page.data.chunks_exact(8).take(row_count) {
-                page_entities.push(Entity::from_bits(u64::from_le_bytes(
-                    chunk.try_into().expect("8 bytes"),
-                )));
+            for chunk in entity_page.data.as_chunks::<8>().0.iter().take(row_count) {
+                page_entities.push(Entity::from_bits(u64::from_le_bytes(*chunk)));
             }
 
             // Dead-row filter: the persisted allocator is authoritative for
