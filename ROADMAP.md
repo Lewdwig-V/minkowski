@@ -231,12 +231,12 @@ The `minkowski-lsm` crate implements Phases 1-4 of the Stage 3 implementation pl
 | `BloomView` | 4 | ✅ Zero-copy bloom filter reads from mmap'd sorted runs |
 | `write_bloom_section` | 4 | ✅ Shared bloom filter serialization with alignment padding |
 
-### What's missing (Phase 5)
+### Phase 5 — shipped in v1.3.0
 
-- **LsmRecovery**: restore World from L2/L3 baseline + L1 delta + WAL tail. This is the read-path integration that makes sorted runs useful for crash recovery.
-- **Durable<S> integration**: flush dirty pages instead of (or in addition to) full snapshots. `AutoCheckpoint` should default to LSM flush.
-- **Migration path**: support loading old v2 snapshots for upgrade from Stage 2 → Stage 3.
-- **Background compaction**: currently compaction is on-demand via `compact_one`. A background thread or cooperative polling mode is needed for production use.
+- **LsmRecovery** (`recovery.rs`, `recover_world`) — restores the world by merging sorted runs L3→L0 with WAL tail replay, materializing via `import_page` bulk column reconstruction.
+- **Durable integration** — `AutoCheckpoint` triggers `flush_and_record` (dirty pages only) when WAL growth exceeds the threshold; `Durable<S>` wraps any `Transact` strategy.
+- **v2 snapshots removed** — `Snapshot`/v2 `.snap` files purged in the Stage 3 cutover; `WalEntry::Checkpoint` now records `flush_seq` rather than `snapshot_seq`.
+- **Background compaction** — still open. `compact_one` runs on-demand (currently when L0 run count hits `COMPACTION_TRIGGER` inside `AutoCheckpoint`); a cooperative or background-thread scheduler remains future work.
 
 ### Key design decisions
 
