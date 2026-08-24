@@ -566,9 +566,7 @@ fn print_ascii_waveform(waveform: &WaveformData, probe_idx: usize, window_secs: 
     let zero_row = ((0.0 - v_min) / v_range * (height - 1) as f64) as i32;
     if (0..height as i32).contains(&zero_row) {
         let row = (height - 1) - zero_row as usize;
-        for col in &mut grid[row] {
-            *col = '·';
-        }
+        grid[row].fill('·');
     }
 
     // Plot samples

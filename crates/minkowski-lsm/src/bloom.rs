@@ -221,8 +221,12 @@ impl BloomView {
                 _owned: None,
             })
         } else {
+            // ponytail: BLOCK_BYTES is 64 (a full cache line); chunks_exact
+            // batch counts in BLOCK_BYTES units, so each chunk is one block.
             let owned: Vec<Block> = buf[blocks_offset..blocks_end]
-                .chunks_exact(BLOCK_BYTES)
+                .as_chunks::<BLOCK_BYTES>()
+                .0
+                .iter()
                 .map(|chunk| {
                     let mut block = Block::ZERO;
                     for i in 0..WORDS_PER_BLOCK {
