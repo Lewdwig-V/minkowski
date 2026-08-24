@@ -60,7 +60,7 @@ plan.execute_stream(&mut world, |entity| {
 **Subscription queries** guarantee at compile time that every predicate is index-backed via `Indexed<T>` witnesses. Combined with `Changed<T>`, subscriptions skip archetypes whose indexed column has not been written since the last call — no delta tracking, caching, or event sourcing needed. (`Changed<T>` is archetype-granular: mutating one entity marks the entire column, so unchanged siblings in the same archetype may also pass.)
 
 ```rust
-use minkowski::{Changed, HashDebounce, Indexed, Predicate, SubscriptionDebounce};
+use minkowski::{Changed, Indexed, Predicate};
 
 let witness = Indexed::btree(&score_index);
 let mut sub = planner
@@ -68,18 +68,12 @@ let mut sub = planner
     .where_eq(witness, Predicate::eq(Score(42)))
     .build()?;
 
-// HashDebounce filters false positives from archetype-granular Changed<T>.
-let mut debounce = HashDebounce::<Score>::new();
-
 sub.execute_stream(&mut world, |entity| {
-    let score = world.get::<Score>(entity).unwrap();
-    if debounce.is_changed(entity, score) {
-        // genuinely changed — react
-    }
+    // Changed<T> filtered at archetype granularity — react
 })?;
 ```
 
-`HashDebounce<T>` is the default in-memory debounce filter. Implement `SubscriptionDebounce<T>` on your own type for external-backed deduplication.
+For entity-granular deduplication on top of archetype-granular `Changed<T>`, track last-seen values per entity in application code (a `HashMap<Entity, T>` is sufficient). For frame-level caching of subscription results, use [`MaterializedView`](#materialized-views) with a `DebouncePolicy`.
 
 ## ER Joins (Entity-Reference Joins)
 

@@ -53,7 +53,6 @@ pub enum HugePages {
 /// Implementations must return properly aligned, non-overlapping memory
 /// regions. `deallocate` must only be called with pointers returned by
 /// a prior call to `allocate` with the same `Layout`.
-#[allow(dead_code)]
 pub unsafe trait PoolAllocator: Send + Sync {
     /// Allocate a block satisfying `layout`.
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, PoolExhausted>;
@@ -112,11 +111,9 @@ pub(crate) const DEFAULT_POOL_BUDGET: usize = 256 * 1024 * 1024;
 ///
 /// Under `cfg(loom)`, uses `Arc<Box<dyn PoolAllocator>>` because loom's `Arc`
 /// does not support direct trait-object coercion.
-#[allow(dead_code)]
 #[cfg(not(loom))]
 pub(crate) type SharedPool = Arc<dyn PoolAllocator>;
 
-#[allow(dead_code)]
 #[cfg(loom)]
 pub(crate) type SharedPool = Arc<Box<dyn PoolAllocator>>;
 
@@ -124,7 +121,6 @@ pub(crate) type SharedPool = Arc<Box<dyn PoolAllocator>>;
 ///
 /// Returns `Err(PoolExhausted)` if the mmap allocation fails (e.g., restricted
 /// container environment).
-#[allow(dead_code)]
 pub(crate) fn try_default_pool(hugepages: HugePages) -> Result<SharedPool, PoolExhausted> {
     let pool = SlabPool::new(DEFAULT_POOL_BUDGET, hugepages, false)?;
     Ok(into_shared(pool))
@@ -134,7 +130,6 @@ pub(crate) fn try_default_pool(hugepages: HugePages) -> Result<SharedPool, PoolE
 ///
 /// Panics if the mmap allocation fails. Prefer [`try_default_pool`] when the
 /// caller can handle the error (e.g., `WorldBuilder::build()`).
-#[allow(dead_code)]
 pub(crate) fn default_pool() -> SharedPool {
     try_default_pool(HugePages::default())
         .expect("failed to allocate default 256 MiB memory pool via mmap")
@@ -184,8 +179,6 @@ pub(crate) fn try_mlockall() -> bool {
 /// the first access to each page triggers a soft fault.
 struct MmapRegion {
     mmap: memmap2::MmapMut,
-    #[allow(dead_code)]
-    huge: bool,
 }
 
 impl MmapRegion {
@@ -214,7 +207,7 @@ impl MmapRegion {
                 .map_anon();
 
             match result {
-                Ok(mmap) => return Ok(Self { mmap, huge: true }),
+                Ok(mmap) => return Ok(Self { mmap }),
                 Err(_) if matches!(hugepages, HugePages::Try) => {
                     // Fall through to regular pages.
                 }
@@ -229,7 +222,7 @@ impl MmapRegion {
                 .len(size)
                 .map_anon()
                 .map_err(|_| PoolExhausted { requested: layout })?;
-            return Ok(Self { mmap, huge: false });
+            return Ok(Self { mmap });
         }
 
         // Regular pages — pre-fault via fallback chain.
@@ -266,7 +259,7 @@ impl MmapRegion {
             Self::prefault_manual(&mut mmap);
         }
 
-        Ok(Self { mmap, huge: false })
+        Ok(Self { mmap })
     }
 
     /// Miri-compatible path: plain `MAP_PRIVATE|MAP_ANONYMOUS` only.
@@ -278,7 +271,7 @@ impl MmapRegion {
             .len(size)
             .map_anon()
             .map_err(|_| PoolExhausted { requested: layout })?;
-        Ok(Self { mmap, huge: false })
+        Ok(Self { mmap })
     }
 
     /// Write one byte per page to force the kernel to back the mapping

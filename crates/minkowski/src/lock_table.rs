@@ -11,39 +11,27 @@ use crate::storage::archetype::Archetype;
 /// and exclusive writers follow standard read-write lock semantics.
 /// This is not an OS mutex — it's a bookkeeping structure for cooperative
 /// transaction isolation.
-#[allow(dead_code)]
 pub(crate) struct ColumnLockTable {
     locks: HashMap<(usize, ComponentId), ColumnLock>,
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 struct ColumnLock {
     readers: u32,
     writer: bool,
 }
 
 /// A set of acquired column locks. Releases all locks on drop.
-#[allow(dead_code)]
 pub(crate) struct ColumnLockSet {
     held: Vec<(usize, ComponentId, LockMode)>,
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 enum LockMode {
     Shared,
     Exclusive,
 }
 
-/// Error returned when a lock cannot be acquired.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) struct LockConflict {
-    pub component_ids: FixedBitSet,
-}
-
-#[allow(dead_code)]
 impl ColumnLockTable {
     pub fn new() -> Self {
         Self {
@@ -55,14 +43,14 @@ impl ColumnLockTable {
     /// Read components get shared locks, write components get exclusive locks.
     /// Locks are acquired in deterministic order to prevent deadlock.
     ///
-    /// Returns a LockSet on success, or LockConflict listing which
-    /// components couldn't be locked.
+    /// Returns a LockSet on success, or `None` if any lock was contended
+    /// (all partially acquired locks are rolled back).
     pub fn acquire(
         &mut self,
         archetypes: &[Archetype],
         reads: &FixedBitSet,
         writes: &FixedBitSet,
-    ) -> Result<ColumnLockSet, LockConflict> {
+    ) -> Option<ColumnLockSet> {
         // PERF: Vec allocation runs once at transaction begin, not per-entity.
         // Typical size is archetypes × accessed components (< 100 entries).
         let mut requests: Vec<(usize, ComponentId, LockMode)> = Vec::new();
@@ -94,7 +82,7 @@ impl ColumnLockTable {
 
         // Try to acquire all locks
         let mut acquired = Vec::new();
-        let mut conflicts = FixedBitSet::new();
+        let mut failed = false;
 
         for &(arch_id, comp_id, mode) in &requests {
             let lock = self.locks.entry((arch_id, comp_id)).or_default();
@@ -109,22 +97,19 @@ impl ColumnLockTable {
                 }
                 acquired.push((arch_id, comp_id, mode));
             } else {
-                conflicts.grow(comp_id + 1);
-                conflicts.insert(comp_id);
+                failed = true;
             }
         }
 
-        if !conflicts.is_empty() {
+        if failed {
             // Roll back acquired locks
             for &(arch_id, comp_id, mode) in &acquired {
                 self.release_one(arch_id, comp_id, mode);
             }
-            return Err(LockConflict {
-                component_ids: conflicts,
-            });
+            return None;
         }
 
-        Ok(ColumnLockSet { held: acquired })
+        Some(ColumnLockSet { held: acquired })
     }
 
     /// Release all locks in a lock set.
@@ -184,9 +169,9 @@ mod tests {
         let writes = FixedBitSet::new();
 
         let lock1 = table.acquire(&archs, &reads, &writes);
-        assert!(lock1.is_ok());
+        assert!(lock1.is_some());
         let lock2 = table.acquire(&archs, &reads, &writes);
-        assert!(lock2.is_ok());
+        assert!(lock2.is_some());
 
         table.release(lock1.unwrap());
         table.release(lock2.unwrap());
@@ -204,11 +189,11 @@ mod tests {
 
         let shared = table.acquire(&archs, &reads, &empty).unwrap();
         let exclusive = table.acquire(&archs, &empty, &writes);
-        assert!(exclusive.is_err());
+        assert!(exclusive.is_none());
 
         table.release(shared);
         let exclusive = table.acquire(&archs, &empty, &writes);
-        assert!(exclusive.is_ok());
+        assert!(exclusive.is_some());
         table.release(exclusive.unwrap());
     }
 
@@ -222,7 +207,7 @@ mod tests {
 
         let lock1 = table.acquire(&archs, &empty, &writes).unwrap();
         let lock2 = table.acquire(&archs, &empty, &writes);
-        assert!(lock2.is_err());
+        assert!(lock2.is_none());
 
         table.release(lock1);
     }
@@ -239,7 +224,7 @@ mod tests {
 
         let lock1 = table.acquire(&archs, &empty, &w1).unwrap();
         let lock2 = table.acquire(&archs, &empty, &w2);
-        assert!(lock2.is_ok());
+        assert!(lock2.is_some());
 
         table.release(lock1);
         table.release(lock2.unwrap());
@@ -261,13 +246,13 @@ mod tests {
         w_both.insert(pos_id);
         w_both.insert(vel_id);
         let result = table.acquire(&archs, &empty, &w_both);
-        assert!(result.is_err());
+        assert!(result.is_none());
 
         // pos should NOT be locked (rolled back)
         let mut w_pos = FixedBitSet::with_capacity(pos_id + 1);
         w_pos.insert(pos_id);
         let pos_lock = table.acquire(&archs, &empty, &w_pos);
-        assert!(pos_lock.is_ok());
+        assert!(pos_lock.is_some());
 
         table.release(vel_lock);
         table.release(pos_lock.unwrap());
@@ -291,17 +276,17 @@ mod tests {
         // Transaction 2: tries to write pos — must be blocked
         let empty = FixedBitSet::new();
         let lock2 = table.acquire(&archs, &empty, &writes);
-        assert!(lock2.is_err(), "concurrent writer must be blocked");
+        assert!(lock2.is_none(), "concurrent writer must be blocked");
 
         // Transaction 3: tries to read pos — must also be blocked (exclusive held)
         let lock3 = table.acquire(&archs, &reads, &empty);
-        assert!(lock3.is_err(), "concurrent reader must be blocked");
+        assert!(lock3.is_none(), "concurrent reader must be blocked");
 
         table.release(lock1);
 
         // After release, both should succeed
         let lock4 = table.acquire(&archs, &empty, &writes);
-        assert!(lock4.is_ok());
+        assert!(lock4.is_some());
         table.release(lock4.unwrap());
     }
 }
@@ -356,7 +341,7 @@ mod loom_tests {
                     let mut tbl = t1.lock();
                     tbl.acquire(&archs, &empty, &writes)
                 };
-                if let Ok(lock_set) = lock_set {
+                if let Some(lock_set) = lock_set {
                     wh.store(true, Ordering::SeqCst);
                     assert!(
                         !rh1.load(Ordering::SeqCst),
@@ -380,7 +365,7 @@ mod loom_tests {
                     let mut tbl = t2.lock();
                     tbl.acquire(&archs, &reads, &empty)
                 };
-                if let Ok(lock_set) = lock_set {
+                if let Some(lock_set) = lock_set {
                     rh.store(true, Ordering::SeqCst);
                     assert!(
                         !wh2.load(Ordering::SeqCst),
@@ -422,7 +407,7 @@ mod loom_tests {
                     let mut tbl = t1.lock();
                     tbl.acquire(&archs, &reads, &writes)
                 };
-                if let Ok(lock_set) = lock_set {
+                if let Some(lock_set) = lock_set {
                     wh.store(true, Ordering::SeqCst);
                     assert!(
                         !rh1.load(Ordering::SeqCst),
@@ -447,7 +432,7 @@ mod loom_tests {
                     let mut tbl = t2.lock();
                     tbl.acquire(&archs, &reads, &empty)
                 };
-                if let Ok(lock_set) = lock_set {
+                if let Some(lock_set) = lock_set {
                     rh.store(true, Ordering::SeqCst);
                     assert!(
                         !wh2.load(Ordering::SeqCst),
@@ -482,7 +467,7 @@ mod loom_tests {
                 // Retry loop (models Pessimistic::begin's retry)
                 loop {
                     let result = t1.lock().acquire(&archs, &empty, &writes);
-                    if let Ok(lock_set) = result {
+                    if let Some(lock_set) = result {
                         t1.lock().release(lock_set);
                         break;
                     }
@@ -500,7 +485,7 @@ mod loom_tests {
 
                 loop {
                     let result = t2.lock().acquire(&archs, &empty, &writes);
-                    if let Ok(lock_set) = result {
+                    if let Some(lock_set) = result {
                         t2.lock().release(lock_set);
                         break;
                     }

@@ -40,7 +40,6 @@ pub(crate) struct PagedSparseSet {
     pub(crate) dense_values: BlobVec,
 }
 
-#[allow(dead_code)]
 impl PagedSparseSet {
     /// Creates a new empty `PagedSparseSet` for components with the given layout.
     pub fn new(item_layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>, pool: SharedPool) -> Self {
@@ -55,13 +54,6 @@ impl PagedSparseSet {
     #[inline]
     pub fn len(&self) -> usize {
         self.dense_entities.len()
-    }
-
-    /// Whether the set is empty.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.dense_entities.is_empty()
     }
 
     /// Returns `true` if the entity is present (index in range, page allocated,
@@ -132,61 +124,10 @@ impl PagedSparseSet {
         }
     }
 
-    /// Inserts a value, overwriting any existing value WITHOUT dropping the old
-    /// one. Returns `true` if an overwrite occurred (caller owns the old bytes).
-    ///
-    /// # Safety
-    /// Same as [`insert`]. If this returns `true`, the caller is responsible for
-    /// ensuring the old value's destructor runs (e.g., via a `DropEntry` in the
-    /// reverse changeset).
-    pub unsafe fn insert_no_drop(&mut self, entity: Entity, ptr: *const u8) -> bool {
-        if let Some(dense) = self.dense_index(entity) {
-            // Overwrite: copy new bytes WITHOUT dropping old.
-            // SAFETY: `dense` is a valid index returned by `dense_index`.
-            let dst = unsafe { self.dense_values.get_ptr(dense) };
-            let size = self.dense_values.item_layout.size();
-            if size > 0 {
-                // SAFETY: `ptr` is valid per caller contract; `dst` points to
-                // the existing slot. No overlap (external source vs BlobVec).
-                unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
-            }
-            true
-        } else {
-            // New entry — same as insert.
-            debug_assert!(
-                self.dense_entities.len() < EMPTY as usize,
-                "PagedSparseSet overflow: {} entries exceeds u32 index space",
-                self.dense_entities.len()
-            );
-            let dense = self.dense_entities.len() as u32;
-            let idx = entity.index() as usize;
-            let page_idx = idx / PAGE_SIZE;
-            let slot = idx % PAGE_SIZE;
-
-            if page_idx >= self.pages.len() {
-                self.pages.resize_with(page_idx + 1, || None);
-            }
-            let page = self.pages[page_idx].get_or_insert_with(|| Box::new([EMPTY; PAGE_SIZE]));
-            page[slot] = dense;
-
-            self.dense_entities.push(entity);
-            // SAFETY: `ptr` points to a valid value matching this set's layout
-            // per caller contract.
-            unsafe { self.dense_values.push(ptr as *mut u8) };
-            false
-        }
-    }
-
     /// Removes the entity's value, dropping it. Returns `true` if the entity
     /// was present.
     pub fn remove(&mut self, entity: Entity) -> bool {
-        self.remove_internal(entity, true)
-    }
-
-    /// Removes the entity's value without dropping it. Returns `true` if the
-    /// entity was present. Used when the caller has already extracted the value.
-    pub fn remove_no_drop(&mut self, entity: Entity) -> bool {
-        self.remove_internal(entity, false)
+        self.remove_internal(entity)
     }
 
     /// Iterates over all (entity, value_ptr) pairs.
@@ -219,8 +160,8 @@ impl PagedSparseSet {
         }
     }
 
-    /// Shared remove logic. If `do_drop` is true, the removed value is dropped.
-    fn remove_internal(&mut self, entity: Entity, do_drop: bool) -> bool {
+    /// Shared remove logic. The removed value is dropped.
+    fn remove_internal(&mut self, entity: Entity) -> bool {
         let Some(dense) = self.dense_index(entity) else {
             return false;
         };
@@ -247,11 +188,7 @@ impl PagedSparseSet {
 
         // Remove from dense arrays.
         self.dense_entities.swap_remove(dense);
-        if do_drop {
-            unsafe { self.dense_values.swap_remove(dense) };
-        } else {
-            unsafe { self.dense_values.swap_remove_no_drop(dense) };
-        }
+        unsafe { self.dense_values.swap_remove(dense) };
 
         true
     }
@@ -264,10 +201,7 @@ use std::mem::ManuallyDrop;
 
 use crate::component::{Component, ComponentId};
 
-unsafe fn drop_ptr<T>(ptr: *mut u8) {
-    // SAFETY: Caller guarantees `ptr` points to a live, aligned `T`.
-    unsafe { std::ptr::drop_in_place(ptr as *mut T) };
-}
+use crate::component::drop_ptr;
 
 /// Typed sparse component storage backed by `PagedSparseSet`.
 /// Each `ComponentId` maps to a `PagedSparseSet` with the correct layout
@@ -277,7 +211,6 @@ pub(crate) struct SparseStorage {
     pool: SharedPool,
 }
 
-#[allow(dead_code)]
 impl SparseStorage {
     pub fn new(pool: SharedPool) -> Self {
         Self {
@@ -334,19 +267,6 @@ impl SparseStorage {
             .is_some_and(|set| set.contains(entity))
     }
 
-    pub fn remove<T: Component>(&mut self, comp_id: ComponentId, entity: Entity) -> Option<T> {
-        let set = self.storages.get_mut(&comp_id)?;
-        debug_assert_eq!(
-            set.dense_values.item_layout,
-            Layout::new::<T>(),
-            "SparseStorage type mismatch for ComponentId {comp_id}"
-        );
-        let ptr = set.get(entity)?;
-        let value = unsafe { std::ptr::read(ptr as *const T) };
-        set.remove_no_drop(entity);
-        Some(value)
-    }
-
     /// Returns the ComponentIds that have sparse storage allocated.
     pub fn component_ids(&self) -> Vec<ComponentId> {
         self.storages.keys().copied().collect()
@@ -397,54 +317,11 @@ impl SparseStorage {
         unsafe { set.insert(entity, ptr) };
     }
 
-    /// Like [`insert_raw`](Self::insert_raw), but does NOT drop the old value
-    /// on overwrite. Returns `true` if an overwrite occurred. The caller is
-    /// responsible for the old value's destructor (e.g., via a `DropEntry`).
-    ///
-    /// # Safety
-    /// Same as `insert_raw`.
-    pub unsafe fn insert_raw_no_drop(
-        &mut self,
-        comp_id: ComponentId,
-        entity: Entity,
-        ptr: *const u8,
-        layout: Layout,
-        drop_fn: Option<unsafe fn(*mut u8)>,
-    ) -> bool {
-        let pool = self.pool.clone();
-        let set = self
-            .storages
-            .entry(comp_id)
-            .or_insert_with(|| PagedSparseSet::new(layout, drop_fn, pool));
-        debug_assert_eq!(
-            set.dense_values.item_layout, layout,
-            "insert_raw_no_drop layout mismatch for ComponentId {comp_id}"
-        );
-        // SAFETY: Caller guarantees `ptr` is valid and matches `layout`.
-        unsafe { set.insert_no_drop(entity, ptr) }
-    }
-
-    /// Raw read: returns a pointer to the sparse component data, or `None`.
-    pub fn get_raw(&self, comp_id: ComponentId, entity: Entity) -> Option<*const u8> {
-        let set = self.storages.get(&comp_id)?;
-        set.get(entity).map(|p| p as *const u8)
-    }
-
     /// Raw remove: removes and drops the sparse component. Returns `true`
     /// if the entity had the component.
     pub fn remove_raw(&mut self, comp_id: ComponentId, entity: Entity) -> bool {
         match self.storages.get_mut(&comp_id) {
             Some(set) => set.remove(entity),
-            None => false,
-        }
-    }
-
-    /// Like [`remove_raw`](Self::remove_raw), but does NOT drop the old value.
-    /// Returns `true` if the entity had the component. The caller is
-    /// responsible for the old value's destructor (e.g., via a `DropEntry`).
-    pub fn remove_raw_no_drop(&mut self, comp_id: ComponentId, entity: Entity) -> bool {
-        match self.storages.get_mut(&comp_id) {
-            Some(set) => set.remove_no_drop(entity),
             None => false,
         }
     }
@@ -497,7 +374,6 @@ mod tests {
     fn empty_set() {
         let set = make_set::<u32>();
         assert_eq!(set.len(), 0);
-        assert!(set.is_empty());
         let e = Entity::new(0, 0);
         assert!(!set.contains(e));
         assert!(set.get(e).is_none());
@@ -655,8 +531,7 @@ mod tests {
         let mut storage = SparseStorage::new(default_pool());
         let e = Entity::new(0, 0);
         storage.insert::<Marker>(0, e, Marker(42));
-        let removed = storage.remove::<Marker>(0, e);
-        assert_eq!(removed, Some(Marker(42)));
+        assert!(storage.remove_raw(0, e));
         assert_eq!(storage.get::<Marker>(0, e), None);
     }
 

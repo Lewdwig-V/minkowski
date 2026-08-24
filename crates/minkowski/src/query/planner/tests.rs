@@ -2198,7 +2198,7 @@ fn execute_multi_join_intersects_all() {
 fn scratch_buffer_starts_empty() {
     let buf = ScratchBuffer::new(100);
     assert_eq!(buf.len(), 0);
-    assert!(buf.capacity() >= 100);
+    assert!(buf.entities.capacity() >= 100);
 }
 
 #[test]
@@ -2210,10 +2210,10 @@ fn scratch_buffer_push_and_clear() {
     buf.push(e1);
     assert_eq!(buf.as_slice(), &[e0, e1]);
 
-    let cap_before = buf.capacity();
+    let cap_before = buf.entities.capacity();
     buf.clear();
     assert_eq!(buf.len(), 0);
-    assert_eq!(buf.capacity(), cap_before);
+    assert_eq!(buf.entities.capacity(), cap_before);
 }
 
 #[test]
@@ -2222,12 +2222,12 @@ fn scratch_buffer_reuse_does_not_realloc() {
     for i in 0..50 {
         buf.push(Entity::new(i, 0));
     }
-    let cap = buf.capacity();
+    let cap = buf.entities.capacity();
     buf.clear();
     for i in 0..50 {
         buf.push(Entity::new(100 + i, 0));
     }
-    assert_eq!(buf.capacity(), cap);
+    assert_eq!(buf.entities.capacity(), cap);
 }
 
 #[test]

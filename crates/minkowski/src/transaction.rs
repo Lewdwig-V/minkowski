@@ -56,13 +56,13 @@
 //! world A being used with world B, which would push aborted entity IDs into
 //! the wrong orphan queue and corrupt unrelated live entities.
 
-use crate::sync::{AtomicU64, Mutex};
+use crate::sync::Mutex;
 
 use fixedbitset::FixedBitSet;
 
 use crate::access::Access;
 use crate::changeset::EnumChangeSet;
-use crate::component::{Component, ComponentId};
+use crate::component::Component;
 use crate::entity::Entity;
 use crate::lock_table::{ColumnLockSet, ColumnLockTable};
 use crate::query::fetch::{ReadOnlyWorldQuery, WorldQuery};
@@ -220,12 +220,6 @@ pub(crate) trait TxCleanup {
         None
     }
 
-    /// Check whether locks were acquired without consuming them.
-    /// Only `PessimisticCleanup` overrides this; others return `false`.
-    fn has_locks(&self) -> bool {
-        false
-    }
-
     /// Whether the transaction is ready to execute the closure.
     /// Returns `true` for optimistic (validation at commit) and `false`
     /// for pessimistic when lock acquisition failed. Callers should skip
@@ -233,14 +227,6 @@ pub(crate) trait TxCleanup {
     fn is_ready(&self) -> bool {
         true
     }
-}
-
-/// No-op cleanup for strategies that have nothing to release on abort.
-#[allow(dead_code)]
-pub(crate) struct NoopCleanup;
-
-impl TxCleanup for NoopCleanup {
-    fn abort(&mut self) {}
 }
 
 /// Cleanup for [`Optimistic`] transactions via the [`Transact`] trait.
@@ -281,10 +267,6 @@ impl TxCleanup for PessimisticCleanup<'_> {
         self.locks.take()
     }
 
-    fn has_locks(&self) -> bool {
-        self.locks.is_some()
-    }
-
     fn is_ready(&self) -> bool {
         self.locks.is_some()
     }
@@ -316,7 +298,6 @@ pub struct Tx<'a> {
 impl<'a> Tx<'a> {
     /// Create a new transaction with the given archetype snapshot size,
     /// orphan queue handle, and strategy-specific cleanup.
-    #[allow(dead_code)]
     pub(crate) fn new(
         archetype_count: usize,
         orphan_queue: crate::world::OrphanQueue,
@@ -381,27 +362,12 @@ impl<'a> Tx<'a> {
         entity
     }
 
-    /// Check whether column locks were acquired at begin time.
-    ///
-    /// Only meaningful for [`Pessimistic`] transactions — returns `true`
-    /// if locks were successfully acquired, `false` otherwise. For
-    /// [`Optimistic`] transactions this always returns `false`.
-    pub fn has_locks(&self) -> bool {
-        self.cleanup.has_locks()
-    }
-
     /// Whether the transaction is ready to execute the closure.
     /// Returns `false` for pessimistic transactions that failed to acquire
     /// locks — the closure should be skipped and the transaction retried.
     /// Always returns `true` for optimistic transactions.
     pub fn is_ready(&self) -> bool {
         self.cleanup.is_ready()
-    }
-
-    /// Track an externally-allocated entity ID for orphan reclamation on abort.
-    #[allow(dead_code)]
-    pub(crate) fn track_allocated(&mut self, entity: Entity) {
-        self.allocated.push(entity);
     }
 
     /// Mark this transaction as committed, preventing abort cleanup on drop.
@@ -414,89 +380,16 @@ impl<'a> Tx<'a> {
         self.committed = true;
     }
 
-    /// Borrow the internal changeset.
-    #[allow(dead_code)]
-    pub(crate) fn changeset(&self) -> &EnumChangeSet {
-        &self.changeset
-    }
-
     /// Take ownership of the internal changeset, leaving an empty one in place.
     pub fn take_changeset(&mut self) -> EnumChangeSet {
         std::mem::take(&mut self.changeset)
     }
 
-    /// Mutable borrow of the internal changeset. Used by typed reducer
-    /// handles that buffer writes directly into the changeset.
-    #[allow(dead_code)]
-    pub(crate) fn changeset_mut(&mut self) -> &mut EnumChangeSet {
-        &mut self.changeset
-    }
-
-    /// Mutable borrow of the allocated entity tracking list. Used by
-    /// Spawner to register entity IDs for orphan reclamation on abort.
-    #[allow(dead_code)]
-    pub(crate) fn allocated_mut(&mut self) -> &mut Vec<Entity> {
-        &mut self.allocated
-    }
-
     /// Split borrow: returns mutable refs to both changeset and allocated
     /// list simultaneously. Needed by reducer adapters that construct both
     /// EntityMut (changeset) and Spawner (allocated) handles.
-    #[allow(dead_code)]
     pub(crate) fn reducer_parts(&mut self) -> (&mut EnumChangeSet, &mut Vec<Entity>) {
         (&mut self.changeset, &mut self.allocated)
-    }
-
-    // ── Pre-resolved raw methods (pub(crate)) ────────────────────
-
-    /// Write a component using a pre-resolved ComponentId.
-    /// No registration, no `&mut World`.
-    #[allow(dead_code)]
-    pub(crate) fn write_raw<T: Component>(
-        &mut self,
-        entity: Entity,
-        comp_id: ComponentId,
-        value: T,
-    ) {
-        self.changeset.insert_raw(entity, comp_id, value);
-    }
-
-    /// Remove a component using a pre-resolved ComponentId.
-    #[allow(dead_code)]
-    pub(crate) fn remove_raw(&mut self, entity: Entity, comp_id: ComponentId) {
-        self.changeset.record_remove(entity, comp_id);
-    }
-
-    /// Sparse write with a pre-resolved ComponentId.
-    #[allow(dead_code)]
-    pub(crate) fn write_sparse_raw<T: Component>(
-        &mut self,
-        entity: Entity,
-        comp_id: ComponentId,
-        value: T,
-    ) {
-        self.changeset.insert_sparse_raw(entity, comp_id, value);
-    }
-
-    /// Sparse remove with a pre-resolved ComponentId.
-    #[allow(dead_code)]
-    pub(crate) fn remove_sparse_raw(&mut self, entity: Entity, comp_id: ComponentId) {
-        self.changeset.remove_sparse_raw(entity, comp_id);
-    }
-
-    /// Spawn an entity with a bundle using pre-resolved ComponentIds.
-    /// Atomically reserves an entity ID via `EntityAllocator::reserve()`.
-    #[allow(dead_code)]
-    pub(crate) fn spawn_raw<B: crate::bundle::Bundle>(
-        &mut self,
-        world: &World,
-        bundle: B,
-    ) -> Entity {
-        let entity = world.entities.reserve();
-        self.track_allocated(entity);
-        self.changeset
-            .spawn_bundle_raw(entity, &world.components, bundle);
-        entity
     }
 }
 
@@ -689,8 +582,6 @@ impl SequentialTx {
 /// Best for read-heavy workloads where conflicts are rare.
 pub struct Optimistic {
     world_id: WorldId,
-    #[allow(dead_code)]
-    next_tx_id: AtomicU64,
     orphan_queue: crate::world::OrphanQueue,
     max_retries: usize,
 }
@@ -703,7 +594,6 @@ impl Optimistic {
     pub fn with_retries(world: &World, max_retries: usize) -> Self {
         Self {
             world_id: world.world_id(),
-            next_tx_id: AtomicU64::new(1),
             orphan_queue: world.orphan_queue(),
             max_retries,
         }
@@ -726,8 +616,6 @@ impl Optimistic {
 pub struct Pessimistic {
     world_id: WorldId,
     lock_table: Mutex<ColumnLockTable>,
-    #[allow(dead_code)]
-    next_tx_id: AtomicU64,
     orphan_queue: crate::world::OrphanQueue,
     max_retries: usize,
 }
@@ -741,7 +629,6 @@ impl Pessimistic {
         Self {
             world_id: world.world_id(),
             lock_table: Mutex::new(ColumnLockTable::new()),
-            next_tx_id: AtomicU64::new(1),
             orphan_queue: world.orphan_queue(),
             max_retries,
         }
@@ -990,12 +877,11 @@ impl Transact for Pessimistic {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()));
         }
-        let lock_result = self.lock_table.lock().acquire(
+        let locks = self.lock_table.lock().acquire(
             &world.archetypes.archetypes,
             access.reads(),
             access.writes(),
         );
-        let locks = lock_result.ok();
         let archetype_count = world.archetypes.archetypes.len();
         Ok(Tx::new(
             archetype_count,
@@ -1237,7 +1123,11 @@ mod tests {
         let archetype_count = world.archetypes.archetypes.len();
         let orphan_queue = world.orphan_queue();
 
-        let tx = Tx::new(archetype_count, orphan_queue, Box::new(NoopCleanup));
+        let tx = Tx::new(
+            archetype_count,
+            orphan_queue,
+            Box::new(OptimisticCleanup { read_ticks: None }),
+        );
         let count = tx.query::<(&Pos,)>(&world).count();
         assert_eq!(count, 1);
     }
@@ -1249,12 +1139,16 @@ mod tests {
         let archetype_count = world.archetypes.archetypes.len();
         let orphan_queue = world.orphan_queue();
 
-        let mut tx = Tx::new(archetype_count, orphan_queue, Box::new(NoopCleanup));
+        let mut tx = Tx::new(
+            archetype_count,
+            orphan_queue,
+            Box::new(OptimisticCleanup { read_ticks: None }),
+        );
         tx.write::<Pos>(&mut world, e, Pos(99.0));
         // The write is buffered — world still has old value
         assert_eq!(world.get::<Pos>(e).unwrap().0, 1.0);
         // Changeset is non-empty
-        assert!(tx.changeset().iter_mutations().count() > 0);
+        assert!(tx.changeset.iter_mutations().count() > 0);
         tx.mark_committed();
     }
 
@@ -1266,7 +1160,11 @@ mod tests {
 
         let spawned;
         {
-            let mut tx = Tx::new(archetype_count, orphan_queue, Box::new(NoopCleanup));
+            let mut tx = Tx::new(
+                archetype_count,
+                orphan_queue,
+                Box::new(OptimisticCleanup { read_ticks: None }),
+            );
             spawned = tx.spawn(&mut world, (Pos(1.0),));
             // drop without mark_committed — entity goes to orphan queue
         }
@@ -1285,7 +1183,11 @@ mod tests {
 
         let spawned;
         {
-            let mut tx = Tx::new(archetype_count, orphan_queue, Box::new(NoopCleanup));
+            let mut tx = Tx::new(
+                archetype_count,
+                orphan_queue,
+                Box::new(OptimisticCleanup { read_ticks: None }),
+            );
             spawned = tx.spawn(&mut world, (Pos(1.0),));
             tx.mark_committed();
             // drop after mark_committed — entity NOT pushed to orphan queue
@@ -1518,26 +1420,14 @@ mod tests {
     }
 
     #[test]
-    fn tx_has_locks_false_for_optimistic() {
-        let mut world = World::new();
-        let access = Access::of::<(&Pos,)>(&mut world);
-        let strategy = Optimistic::new(&world);
-        strategy
-            .transact(&mut world, &access, |tx, _world| {
-                assert!(!tx.has_locks());
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn tx_has_locks_true_for_pessimistic() {
+    fn tx_pessimistic_locks_acquired_makes_tx_ready() {
         let mut world = World::new();
         world.spawn((Pos(1.0),));
         let access = Access::of::<(&mut Pos,)>(&mut world);
         let strategy = Pessimistic::new(&world);
         strategy
             .transact(&mut world, &access, |tx, _world| {
-                assert!(tx.has_locks());
+                assert!(tx.is_ready());
             })
             .unwrap();
     }
@@ -1596,7 +1486,7 @@ mod tests {
 
         // Hold locks via begin(), then try to transact — should exhaust retries
         let tx = strategy.begin(&mut world, &access).unwrap();
-        assert!(tx.has_locks());
+        assert!(tx.is_ready());
 
         let result = strategy.transact(&mut world, &access, |_tx, _world| {});
         assert!(result.is_err(), "should fail with locks held");
