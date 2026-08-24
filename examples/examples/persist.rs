@@ -12,23 +12,7 @@ use minkowski_persist::{
 };
 use rkyv::{Archive, Deserialize, Serialize};
 
-#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
-#[repr(C)]
-struct Pos {
-    x: f32,
-    y: f32,
-}
-
-#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
-#[repr(C)]
-struct Vel {
-    dx: f32,
-    dy: f32,
-}
-
-#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
-#[repr(C)]
-struct Health(u32);
+use minkowski_examples::{Health, Pos, Vel};
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize,

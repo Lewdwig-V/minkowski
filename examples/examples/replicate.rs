@@ -11,22 +11,9 @@ use minkowski_lsm::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 use minkowski_persist::{
     CodecRegistry, ReplicationBatch, Wal, WalConfig, WalCursor, apply_batch, recover_world,
 };
-use rkyv::{Archive, Deserialize, Serialize};
 use std::sync::mpsc;
 
-#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
-#[repr(C)]
-struct Pos {
-    x: f32,
-    y: f32,
-}
-
-#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
-#[repr(C)]
-struct Vel {
-    dx: f32,
-    dy: f32,
-}
+use minkowski_examples::{Pos, Vel};
 
 enum WireMessage {
     /// LSM baseline: sorted run bytes + WAL sequence covered by the flush.

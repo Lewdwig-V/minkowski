@@ -25,8 +25,7 @@ use std::time::Instant;
 
 // ── Components ──────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
-struct Health(u32);
+use minkowski_examples::Health;
 
 #[derive(Clone, Copy)]
 struct Team(u8);
