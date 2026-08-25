@@ -241,28 +241,47 @@ impl BlobVec {
     /// Removes the element at `row` by swapping it with the last element,
     /// then dropping the removed element.
     ///
+    /// # Panic safety
+    /// Structural mutation (byte-copy + length decrement) is committed by a
+    /// drop guard REGARDLESS of whether the removed value's destructor panics.
+    /// A panicking `Drop` therefore costs at most a leak of the partially
+    /// dropped value — never a double-free, never a dangling slot readable
+    /// through `0..len`. (Std `Vec` drain-guard pattern, type-erased.)
+    ///
     /// # Safety
     /// `row` must be in bounds (`row < len`).
     pub unsafe fn swap_remove(&mut self, row: usize) {
         debug_assert!(row < self.len);
-        let last = self.len - 1;
-        let size = self.item_layout.size();
-        if row != last && size > 0 {
-            let row_ptr = self.ptr_at(row);
-            if let Some(drop_fn) = self.drop_fn {
-                // SAFETY: row_ptr is valid; drop_fn was set at construction for this type
-                unsafe { drop_fn(row_ptr) };
-            }
-            let last_ptr = self.ptr_at(last);
-            // SAFETY: last_ptr and row_ptr are non-overlapping valid pointers within allocation
-            unsafe { std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size) };
-            // The destination page now contains different data.
-            self.dirty_pages.mark_row(row);
-        } else if let Some(drop_fn) = self.drop_fn {
-            // SAFETY: ptr_at returns valid pointer; drop_fn was set at construction for this type
-            unsafe { drop_fn(self.ptr_at(row)) };
+        let row_ptr = self.ptr_at(row);
+        let drop_fn = self.drop_fn;
+        // Committed on all exits (including unwind): overwrite row with the
+        // tail element and shrink the logical length. Runs before this frame
+        // unwinds past `self`, so BlobVec::drop and any later accessor see a
+        // fully consistent column.
+        struct RemoveGuard<'a> {
+            bv: &'a mut BlobVec,
+            row: usize,
         }
-        self.len -= 1;
+        impl Drop for RemoveGuard<'_> {
+            fn drop(&mut self) {
+                let last = self.bv.len - 1;
+                let size = self.bv.item_layout.size();
+                if self.row != last && size > 0 {
+                    let row_ptr = self.bv.ptr_at(self.row);
+                    let last_ptr = self.bv.ptr_at(last);
+                    // SAFETY: row_ptr/last_ptr are in-allocation, non-overlapping.
+                    unsafe { std::ptr::copy_nonoverlapping(last_ptr, row_ptr, size) };
+                    self.bv.dirty_pages.mark_row(self.row);
+                }
+                self.bv.len -= 1;
+            }
+        }
+        let _guard = RemoveGuard { bv: self, row };
+        if let Some(drop_fn) = drop_fn {
+            // SAFETY: drop_fn matches this BlobVec's component type; row_ptr is
+            // the only live copy of the removed value at this point.
+            unsafe { drop_fn(row_ptr) };
+        }
     }
 
     /// Removes the element at `row` by swapping with the last element.
@@ -283,6 +302,73 @@ impl BlobVec {
             self.dirty_pages.mark_row(row);
         }
         self.len -= 1;
+    }
+
+    /// Overwrite the value at `row` with the bytes at `src`, dropping the old
+    /// value. Panic-safe ordering for droppable types:
+    ///
+    /// 1. Steal the OLD value's bytes into a pool-allocated scratch slot,
+    /// 2. write the NEW value into the live slot (structural commit),
+    /// 3. run `drop_fn` on the stolen bytes and release the scratch.
+    ///
+    /// If the component's `Drop` panics, the live slot holds the new (valid)
+    /// value and the leaked worst case is half-dropped scratch bytes — never
+    /// freed bytes readable through `get`/query.
+    ///
+    /// Returns `Err(PoolExhausted)` if the scratch slot cannot be allocated;
+    /// on error the column is UNCHANGED.
+    ///
+    /// # Safety
+    /// `row` must be in bounds. `src` must point to a valid initialized value
+    /// of this BlobVec's layout; caller must not double-drop the source value.
+    pub(crate) unsafe fn replace_protected(
+        &mut self,
+        row: usize,
+        src: *const u8,
+    ) -> Result<(), PoolExhausted> {
+        debug_assert!(row < self.len);
+        let size = self.item_layout.size();
+        // Note: does NOT touch changed_tick or dirty pages — callers mark at
+        // their own granularity (world insert marks via get_ptr_mut(row, tick),
+        // changeset apply marks per batch).
+        // Get a raw row pointer without marking.
+        let dst = self.ptr_at(row);
+        let Some(drop_fn) = self.drop_fn else {
+            // POD: overwrite directly — no drop to panic in.
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, size) };
+            return Ok(());
+        };
+
+        // 1. Steal slot BEFORE touching anything — on pool failure nothing moved.
+        let layout = Layout::from_size_align(size, self.item_layout.align())
+            .expect("valid layout from component layout");
+        let scratch = self.pool.allocate(layout)?;
+        // 2. Structural commit: evacuated old bytes to scratch, then new bytes into slot.
+        unsafe {
+            std::ptr::copy_nonoverlapping(dst, scratch.as_ptr(), size);
+            std::ptr::copy_nonoverlapping(src, dst, size);
+        }
+        // 3. Drop (may panic — worst case: scratch's heap internals leak; the
+        // live slot is already the new value). Dealloc scratch in a guard so
+        // the scratch slot itself returns to the pool even on unwind.
+        struct ScratchGuard {
+            pool: SharedPool,
+            ptr: NonNull<u8>,
+            layout: Layout,
+        }
+        impl Drop for ScratchGuard {
+            fn drop(&mut self) {
+                unsafe { self.pool.deallocate(self.ptr, self.layout) };
+            }
+        }
+        let _guard = ScratchGuard {
+            pool: self.pool.clone(),
+            ptr: scratch,
+            layout,
+        };
+        // SAFETY: scratch holds the only moved-out copy of the old value.
+        unsafe { drop_fn(scratch.as_ptr()) };
+        Ok(())
     }
 
     /// Drop the element at `row` in place without moving anything.
@@ -410,7 +496,20 @@ impl BlobVec {
         )
         .expect("invalid layout");
 
-        let new_data = self.pool.allocate(new_layout)?;
+        let new_data = match self.pool.allocate(new_layout) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "DEBUG try_grow fail: item={} rows={} cap={} -> newcap={} layout={:?}",
+                    self.item_layout.size(),
+                    self.len,
+                    self.capacity,
+                    new_capacity,
+                    new_layout,
+                );
+                return Err(e);
+            }
+        };
         if self.capacity > 0 {
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -728,6 +827,102 @@ mod tests {
             bv.set_len(2);
         }
         // BlobVec::drop will now drop 2 remaining Tracked values
+    }
+
+    /// #180 regression: a panicking component `Drop` during swap_remove must
+    /// leave the column structurally consistent — no double-drop on teardown,
+    /// no dangling slot readable through `0..len`, the swapped tail element
+    /// still alive. std Vec drain-guard discipline, type-erased.
+    #[test]
+    fn swap_remove_panicking_drop_stays_consistent() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static PANIC_ON_DROP: AtomicBool = AtomicBool::new(false);
+        static DROP_COUNT_PANIC: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug, Clone)]
+        struct PanickyDrop(u32);
+        impl Drop for PanickyDrop {
+            fn drop(&mut self) {
+                DROP_COUNT_PANIC.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    !PANIC_ON_DROP.load(Ordering::SeqCst),
+                    "component drop panics"
+                );
+            }
+        }
+
+        PANIC_ON_DROP.store(true, Ordering::SeqCst);
+        DROP_COUNT_PANIC.store(0, Ordering::SeqCst);
+        let mut bv = bv_for::<PanickyDrop>();
+        unsafe {
+            push_val(&mut bv, PanickyDrop(1));
+            push_val(&mut bv, PanickyDrop(2));
+            push_val(&mut bv, PanickyDrop(3));
+        }
+
+        let first = catch_unwind(AssertUnwindSafe(|| unsafe {
+            bv.swap_remove(0);
+        }));
+        assert!(first.is_err(), "drop must have panicked");
+        // Structural commit happened anyway: len shrunk, tail moved into row 0.
+        assert_eq!(bv.len(), 2);
+        assert_eq!(DROP_COUNT_PANIC.load(Ordering::SeqCst), 1);
+        {
+            let p = unsafe { bv.get_ptr(0) } as *const PanickyDrop;
+            assert_eq!(unsafe { &*p }.0, 3);
+        }
+
+        // Teardown must not re-drop the slot — drops remaining values only.
+        PANIC_ON_DROP.store(false, Ordering::SeqCst);
+        DROP_COUNT_PANIC.store(0, Ordering::SeqCst);
+        drop(bv);
+        assert_eq!(DROP_COUNT_PANIC.load(Ordering::SeqCst), 2);
+    }
+
+    /// #180 regression: `replace_protected` on a droppable component: the new
+    /// value is committed BEFORE the old value's destructor runs — a panicking
+    /// drop leaves the new value live, not freed bytes in the slot.
+    #[test]
+    fn replace_protected_commits_new_value_before_dropping_old() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static PANIC_ON_DROP2: AtomicBool = AtomicBool::new(false);
+        static DROP_COUNT2: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug, Clone)]
+        struct PanickyDrop2(String);
+        impl Drop for PanickyDrop2 {
+            fn drop(&mut self) {
+                DROP_COUNT2.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    !PANIC_ON_DROP2.load(Ordering::SeqCst),
+                    "component drop panics"
+                );
+            }
+        }
+
+        PANIC_ON_DROP2.store(true, Ordering::SeqCst);
+        DROP_COUNT2.store(0, Ordering::SeqCst);
+        let mut bv = bv_for::<PanickyDrop2>();
+        unsafe {
+            push_val(&mut bv, PanickyDrop2("old".to_owned()));
+        }
+
+        let mut new_val = std::mem::ManuallyDrop::new(PanickyDrop2("new".to_owned()));
+        let res = catch_unwind(AssertUnwindSafe(|| unsafe {
+            bv.replace_protected(0, &mut *new_val as *mut _ as *const u8)
+        }));
+        assert!(res.is_err(), "drop of old value must have panicked");
+        // New value still lives in the slot — readable, not freed bytes.
+        {
+            let p = unsafe { bv.get_ptr(0) } as *const PanickyDrop2;
+            assert_eq!(unsafe { &*p }.0.as_str(), "new");
+        }
+        assert_eq!(DROP_COUNT2.load(Ordering::SeqCst), 1);
+
+        PANIC_ON_DROP2.store(false, Ordering::SeqCst);
+        drop(bv);
     }
 
     // ── Dirty page tracking ──────────────────────────────────────

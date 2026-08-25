@@ -581,12 +581,14 @@ impl World {
             archetype.len()
         );
 
-        for col in &mut archetype.columns {
-            unsafe {
-                col.swap_remove(row);
-            }
-        }
-
+        // Panic-safety (#180): run the panic-free bookkeeping FIRST — entities
+        // vector and location table — then drop component data. With
+        // `BlobVec::swap_remove`'s drop-guarded structure-commit, a panicking
+        // component `Drop` on column k now leaves: entities/locations
+        // consistent with the N-1 target shape, columns 0..=k consistent,
+        // and columns >k unprocessed (still N rows). That residual is a
+        // column-count inconsistency confined to one archetype, repairable
+        // on next access — never a double-free or cross-column UAF.
         archetype.entities.swap_remove(row);
 
         // Update the swapped entity's location
@@ -596,6 +598,12 @@ impl World {
                 archetype_id: location.archetype_id,
                 row,
             });
+        }
+
+        for col in &mut archetype.columns {
+            unsafe {
+                col.swap_remove(row);
+            }
         }
 
         archetype.debug_assert_consistent();
@@ -654,32 +662,54 @@ impl World {
             for &(row, _entity) in &row_entities {
                 let last = archetype.entities.len() - 1;
 
-                // Drop component data at this row
-                for col in &mut archetype.columns {
-                    unsafe {
-                        col.drop_in_place(row);
-                    }
+                // Structural commit happens in a guard's Drop (#180) so a
+                // panicking component destructor cannot leave columns and the
+                // entities vector at different lengths. Reuses the
+                // BlobVec::swap_remove guard discipline.
+                struct RowRemoveGuard<'a> {
+                    world_locations: &'a mut Vec<Option<EntityLocation>>,
+                    archetype: &'a mut Archetype,
+                    arch_idx: usize,
+                    row: usize,
+                    last: usize,
                 }
-
-                // If not last, copy last element into gap
-                if row < last {
-                    for col in &mut archetype.columns {
-                        unsafe {
-                            col.copy_unchecked(last, row);
+                impl Drop for RowRemoveGuard<'_> {
+                    fn drop(&mut self) {
+                        if self.row < self.last {
+                            for col in &mut self.archetype.columns {
+                                unsafe {
+                                    col.copy_unchecked(self.last, self.row);
+                                }
+                            }
+                            let moved_entity = self.archetype.entities[self.last];
+                            self.archetype.entities[self.row] = moved_entity;
+                            self.world_locations[moved_entity.index() as usize] =
+                                Some(EntityLocation {
+                                    archetype_id: ArchetypeId(self.arch_idx),
+                                    row: self.row,
+                                });
+                        }
+                        self.archetype.entities.truncate(self.last);
+                        for col in &mut self.archetype.columns {
+                            unsafe {
+                                col.set_len(self.last);
+                            }
                         }
                     }
-                    let moved_entity = archetype.entities[last];
-                    archetype.entities[row] = moved_entity;
-                    self.entity_locations[moved_entity.index() as usize] = Some(EntityLocation {
-                        archetype_id: ArchetypeId(arch_idx),
-                        row,
-                    });
                 }
+                let guard = RowRemoveGuard {
+                    world_locations: &mut self.entity_locations,
+                    archetype,
+                    arch_idx,
+                    row,
+                    last,
+                };
 
-                archetype.entities.truncate(last);
-                for col in &mut archetype.columns {
+                // Drop component data at this row (may panic; guard commits
+                // the structural removal first during unwind).
+                for col in &mut guard.archetype.columns {
                     unsafe {
-                        col.set_len(last);
+                        col.drop_in_place(row);
                     }
                 }
             }
@@ -1227,13 +1257,18 @@ impl World {
             let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
             let row = location.row;
             unsafe {
-                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
-                    let dst = arch.columns[col_idx].get_ptr_mut(row, tick);
-                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
-                        drop_fn(dst);
-                    }
-                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                    let col = &mut arch.columns[col_idx];
+                    // Panic-safe overwrite (#180): steal old bytes to scratch
+                    // first so a panicking Drop can't leave freed bytes in the
+                    // live slot. pool exhaustion here is already a panic path
+                    // for `insert`.
+                    col.replace_protected(row, ptr)
+                        .expect("pool exhausted during component overwrite");
+                    // replace_protected doesn't touch ticks — mark the write.
+                    col.mark_changed(tick);
+                    col.dirty_pages.mark_row(row);
                 });
             }
             return Ok(());
@@ -1261,13 +1296,18 @@ impl World {
         if src_arch_id == target_arch_id {
             let arch = &mut self.archetypes.archetypes[src_arch_id.0];
             unsafe {
-                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
-                    let dst = arch.columns[col_idx].get_ptr_mut(src_row, tick);
-                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
-                        drop_fn(dst);
-                    }
-                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                    let col = &mut arch.columns[col_idx];
+                    // Panic-safe overwrite (#180): steal old bytes to scratch
+                    // first so a panicking Drop can't leave freed bytes in the
+                    // live slot. pool exhaustion here is already a panic path
+                    // for `insert`.
+                    col.replace_protected(src_row, ptr)
+                        .expect("pool exhausted during component overwrite");
+                    // replace_protected doesn't touch ticks — mark the write.
+                    col.mark_changed(tick);
+                    col.dirty_pages.mark_row(src_row);
                 });
             }
             return Ok(());
@@ -1381,13 +1421,18 @@ impl World {
             let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
             let row = location.row;
             unsafe {
-                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
-                    let dst = arch.columns[col_idx].get_ptr_mut(row, tick);
-                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
-                        drop_fn(dst);
-                    }
-                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                    let col = &mut arch.columns[col_idx];
+                    // Panic-safe overwrite (#180): steal old bytes to scratch
+                    // first so a panicking Drop can't leave freed bytes in the
+                    // live slot. pool exhaustion here is already a panic path
+                    // for `insert`.
+                    col.replace_protected(row, ptr)
+                        .expect("pool exhausted during component overwrite");
+                    // replace_protected doesn't touch ticks — mark the write.
+                    col.mark_changed(tick);
+                    col.dirty_pages.mark_row(row);
                 });
             }
             return Ok(());
@@ -1413,13 +1458,18 @@ impl World {
         if src_arch_id == target_arch_id {
             let arch = &mut self.archetypes.archetypes[src_arch_id.0];
             unsafe {
-                bundle.put(&self.components, &mut |comp_id, ptr, layout| {
+                bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
-                    let dst = arch.columns[col_idx].get_ptr_mut(src_row, tick);
-                    if let Some(drop_fn) = self.components.info(comp_id).drop_fn {
-                        drop_fn(dst);
-                    }
-                    std::ptr::copy_nonoverlapping(ptr, dst, layout.size());
+                    let col = &mut arch.columns[col_idx];
+                    // Panic-safe overwrite (#180): steal old bytes to scratch
+                    // first so a panicking Drop can't leave freed bytes in the
+                    // live slot. pool exhaustion here is already a panic path
+                    // for `insert`.
+                    col.replace_protected(src_row, ptr)
+                        .expect("pool exhausted during component overwrite");
+                    // replace_protected doesn't touch ticks — mark the write.
+                    col.mark_changed(tick);
+                    col.dirty_pages.mark_row(src_row);
                 });
             }
             return Ok(());
