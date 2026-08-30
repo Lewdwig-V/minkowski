@@ -581,14 +581,36 @@ impl World {
             archetype.len()
         );
 
-        // Panic-safety (#180): run the panic-free bookkeeping FIRST — entities
-        // vector and location table — then drop component data. With
-        // `BlobVec::swap_remove`'s drop-guarded structure-commit, a panicking
-        // component `Drop` on column k now leaves: entities/locations
-        // consistent with the N-1 target shape, columns 0..=k consistent,
-        // and columns >k unprocessed (still N rows). That residual is a
-        // column-count inconsistency confined to one archetype, repairable
-        // on next access — never a double-free or cross-column UAF.
+        // Panic-safety (#180, codex review): three ordered phases.
+        //
+        // Phase A — extract every removed value into pool scratch (the only
+        // fallible step; on exhaustion nothing has been touched yet).
+        // Phase B — commit ALL structure: entity vector, location table,
+        // every column's tail-copy + shrink, sparse cleanup, dealloc. Zero
+        // fallible operations, zero component destructors.
+        // Phase C — run the extracted values' destructors (may panic; the
+        // world is already fully consistent at N-1, worst case is leaked
+        // component internals).
+        //
+        // A caught panic therefore leaves a valid despawned world — never
+        // half-swapped columns or a location table pointing at stale rows.
+        let mut extracted: Vec<crate::storage::blob_vec::ExtractedSlot> =
+            Vec::with_capacity(archetype.columns.len());
+        for col in &mut archetype.columns {
+            // Pool exhaustion during despawn is a hard operational failure
+            // (despawn has no error channel); abort loudly with state intact.
+            match col.begin_extract_swap(row) {
+                Ok(slot) => extracted.push(slot),
+                Err(e) => panic!("pool exhausted during despawn: {e}"),
+            }
+        }
+
+        for col in &mut archetype.columns {
+            unsafe {
+                col.commit_extracted_swap(row);
+            }
+        }
+
         archetype.entities.swap_remove(row);
 
         // Update the swapped entity's location
@@ -600,12 +622,6 @@ impl World {
             });
         }
 
-        for col in &mut archetype.columns {
-            unsafe {
-                col.swap_remove(row);
-            }
-        }
-
         archetype.debug_assert_consistent();
 
         // Clean sparse storage before dealloc bumps the generation
@@ -613,6 +629,11 @@ impl World {
 
         self.entity_locations[index] = None;
         self.entities.dealloc(entity);
+
+        // Phase C: destructors run last. May panic — state above is final.
+        for slot in &mut extracted {
+            slot.drop_value();
+        }
         true
     }
 
@@ -662,55 +683,43 @@ impl World {
             for &(row, _entity) in &row_entities {
                 let last = archetype.entities.len() - 1;
 
-                // Structural commit happens in a guard's Drop (#180) so a
-                // panicking component destructor cannot leave columns and the
-                // entities vector at different lengths. Reuses the
-                // BlobVec::swap_remove guard discipline.
-                struct RowRemoveGuard<'a> {
-                    world_locations: &'a mut Vec<Option<EntityLocation>>,
-                    archetype: &'a mut Archetype,
-                    arch_idx: usize,
-                    row: usize,
-                    last: usize,
-                }
-                impl Drop for RowRemoveGuard<'_> {
-                    fn drop(&mut self) {
-                        if self.row < self.last {
-                            for col in &mut self.archetype.columns {
-                                unsafe {
-                                    col.copy_unchecked(self.last, self.row);
-                                }
-                            }
-                            let moved_entity = self.archetype.entities[self.last];
-                            self.archetype.entities[self.row] = moved_entity;
-                            self.world_locations[moved_entity.index() as usize] =
-                                Some(EntityLocation {
-                                    archetype_id: ArchetypeId(self.arch_idx),
-                                    row: self.row,
-                                });
-                        }
-                        self.archetype.entities.truncate(self.last);
-                        for col in &mut self.archetype.columns {
-                            unsafe {
-                                col.set_len(self.last);
-                            }
-                        }
+                // Panic-safety (#180, codex review): extract-then-commit —
+                // same three-phase discipline as `despawn`. Extraction is the
+                // only fallible step (pool scratch; aborts with state
+                // intact); structural commit is infallible; destructors run
+                // last.
+                let mut extracted: Vec<crate::storage::blob_vec::ExtractedSlot> =
+                    Vec::with_capacity(archetype.columns.len());
+                for col in &mut archetype.columns {
+                    match col.begin_extract_swap(row) {
+                        Ok(slot) => extracted.push(slot),
+                        Err(e) => panic!("pool exhausted during despawn_batch: {e}"),
                     }
                 }
-                let guard = RowRemoveGuard {
-                    world_locations: &mut self.entity_locations,
-                    archetype,
-                    arch_idx,
-                    row,
-                    last,
-                };
 
-                // Drop component data at this row (may panic; guard commits
-                // the structural removal first during unwind).
-                for col in &mut guard.archetype.columns {
-                    unsafe {
-                        col.drop_in_place(row);
+                if row < last {
+                    for col in &mut archetype.columns {
+                        unsafe {
+                            col.copy_unchecked(last, row);
+                        }
                     }
+                    let moved_entity = archetype.entities[last];
+                    archetype.entities[row] = moved_entity;
+                    self.entity_locations[moved_entity.index() as usize] = Some(EntityLocation {
+                        archetype_id: ArchetypeId(arch_idx),
+                        row,
+                    });
+                }
+                archetype.entities.truncate(last);
+                for col in &mut archetype.columns {
+                    unsafe {
+                        col.set_len(last);
+                    }
+                }
+
+                // Destructors last — world state already final.
+                for slot in &mut extracted {
+                    slot.drop_value();
                 }
             }
             archetype.debug_assert_consistent();
@@ -1257,16 +1266,34 @@ impl World {
             let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
             let row = location.row;
             unsafe {
+                // Preflight scratch for every overwritten droppable column so
+                // pool exhaustion surfaces as Err(PoolExhausted) BEFORE any
+                // column is touched (try_insert's unchanged-state contract).
+                let mut scratches: Vec<crate::storage::blob_vec::PoolScratch> =
+                    Vec::with_capacity(new_ids.len());
+                for &id in &new_ids {
+                    if self.components.info(id).drop_fn.is_some() {
+                        let col_idx = arch.column_index(id).unwrap();
+                        scratches.push(
+                            arch.columns[col_idx]
+                                .alloc_scratch()
+                                .expect("pool exhausted during component overwrite"),
+                        );
+                    }
+                }
+                let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
                     let col = &mut arch.columns[col_idx];
-                    // Panic-safe overwrite (#180): steal old bytes to scratch
-                    // first so a panicking Drop can't leave freed bytes in the
-                    // live slot. pool exhaustion here is already a panic path
-                    // for `insert`.
-                    col.replace_protected(row, ptr)
-                        .expect("pool exhausted during component overwrite");
-                    // replace_protected doesn't touch ticks — mark the write.
+                    // Panic-safe overwrite (#180) — scratch was preflighted.
+                    // SAFETY: row in bounds; ptr valid; scratch sized for layout.
+                    match scratch_iter.next() {
+                        Some(scratch) => col.replace_protected_with(row, ptr, scratch),
+                        None => col
+                            .replace_protected(row, ptr)
+                            .expect("pool exhausted during component overwrite"),
+                    }
+                    // replace_protected* don't touch ticks — mark the write.
                     col.mark_changed(tick);
                     col.dirty_pages.mark_row(row);
                 });
@@ -1296,16 +1323,33 @@ impl World {
         if src_arch_id == target_arch_id {
             let arch = &mut self.archetypes.archetypes[src_arch_id.0];
             unsafe {
+                // Preflight scratch for every overwritten droppable column so
+                // pool exhaustion surfaces BEFORE any column is touched.
+                let mut scratches: Vec<crate::storage::blob_vec::PoolScratch> =
+                    Vec::with_capacity(new_ids.len());
+                for &id in &new_ids {
+                    if self.components.info(id).drop_fn.is_some() {
+                        let col_idx = arch.column_index(id).unwrap();
+                        scratches.push(
+                            arch.columns[col_idx]
+                                .alloc_scratch()
+                                .expect("pool exhausted during component overwrite"),
+                        );
+                    }
+                }
+                let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
                     let col = &mut arch.columns[col_idx];
-                    // Panic-safe overwrite (#180): steal old bytes to scratch
-                    // first so a panicking Drop can't leave freed bytes in the
-                    // live slot. pool exhaustion here is already a panic path
-                    // for `insert`.
-                    col.replace_protected(src_row, ptr)
-                        .expect("pool exhausted during component overwrite");
-                    // replace_protected doesn't touch ticks — mark the write.
+                    // Panic-safe overwrite (#180) — scratch was preflighted.
+                    // SAFETY: row in bounds; ptr valid; scratch sized for layout.
+                    match scratch_iter.next() {
+                        Some(scratch) => col.replace_protected_with(src_row, ptr, scratch),
+                        None => col
+                            .replace_protected(src_row, ptr)
+                            .expect("pool exhausted during component overwrite"),
+                    }
+                    // replace_protected* don't touch ticks — mark the write.
                     col.mark_changed(tick);
                     col.dirty_pages.mark_row(src_row);
                 });
@@ -1421,16 +1465,30 @@ impl World {
             let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
             let row = location.row;
             unsafe {
+                // Preflight scratch for every overwritten droppable column so
+                // pool exhaustion surfaces as Err(PoolExhausted) BEFORE any
+                // column is touched (try_insert's unchanged-state contract).
+                let mut scratches: Vec<crate::storage::blob_vec::PoolScratch> =
+                    Vec::with_capacity(new_ids.len());
+                for &id in &new_ids {
+                    if self.components.info(id).drop_fn.is_some() {
+                        let col_idx = arch.column_index(id).unwrap();
+                        scratches.push(arch.columns[col_idx].alloc_scratch()?);
+                    }
+                }
+                let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
                     let col = &mut arch.columns[col_idx];
-                    // Panic-safe overwrite (#180): steal old bytes to scratch
-                    // first so a panicking Drop can't leave freed bytes in the
-                    // live slot. pool exhaustion here is already a panic path
-                    // for `insert`.
-                    col.replace_protected(row, ptr)
-                        .expect("pool exhausted during component overwrite");
-                    // replace_protected doesn't touch ticks — mark the write.
+                    // Panic-safe overwrite (#180) — scratch was preflighted.
+                    // SAFETY: row in bounds; ptr valid; scratch sized for layout.
+                    match scratch_iter.next() {
+                        Some(scratch) => col.replace_protected_with(row, ptr, scratch),
+                        None => col
+                            .replace_protected(row, ptr)
+                            .expect("pool exhausted during component overwrite"),
+                    }
+                    // replace_protected* don't touch ticks — mark the write.
                     col.mark_changed(tick);
                     col.dirty_pages.mark_row(row);
                 });
@@ -1458,16 +1516,29 @@ impl World {
         if src_arch_id == target_arch_id {
             let arch = &mut self.archetypes.archetypes[src_arch_id.0];
             unsafe {
+                // Preflight scratch for every overwritten droppable column so
+                // pool exhaustion surfaces BEFORE any column is touched.
+                let mut scratches: Vec<crate::storage::blob_vec::PoolScratch> =
+                    Vec::with_capacity(new_ids.len());
+                for &id in &new_ids {
+                    if self.components.info(id).drop_fn.is_some() {
+                        let col_idx = arch.column_index(id).unwrap();
+                        scratches.push(arch.columns[col_idx].alloc_scratch()?);
+                    }
+                }
+                let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
                     let col = &mut arch.columns[col_idx];
-                    // Panic-safe overwrite (#180): steal old bytes to scratch
-                    // first so a panicking Drop can't leave freed bytes in the
-                    // live slot. pool exhaustion here is already a panic path
-                    // for `insert`.
-                    col.replace_protected(src_row, ptr)
-                        .expect("pool exhausted during component overwrite");
-                    // replace_protected doesn't touch ticks — mark the write.
+                    // Panic-safe overwrite (#180) — scratch was preflighted.
+                    // SAFETY: row in bounds; ptr valid; scratch sized for layout.
+                    match scratch_iter.next() {
+                        Some(scratch) => col.replace_protected_with(src_row, ptr, scratch),
+                        None => col
+                            .replace_protected(src_row, ptr)
+                            .expect("pool exhausted during component overwrite"),
+                    }
+                    // replace_protected* don't touch ticks — mark the write.
                     col.mark_changed(tick);
                     col.dirty_pages.mark_row(src_row);
                 });
@@ -2218,6 +2289,52 @@ impl Default for WorldBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #180 + codex review regression: a panicking `Drop` on the SECOND
+    /// column of a three-component archetype must leave a fully consistent
+    /// despawned world — the moved entity's remaining component readable,
+    /// the despawned entity dead, location table final. The old
+    /// entities-first ordering published the move before columns committed.
+    #[test]
+    fn despawn_panicking_drop_mid_columns_leaves_consistent_world() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug, Clone)]
+        struct Panicky(#[expect(dead_code)] u32);
+        impl Drop for Panicky {
+            fn drop(&mut self) {
+                // Panic only when the world asks this column to drop.
+                assert!(
+                    !PANICKY_DROP.load(Ordering::SeqCst),
+                    "component drop panics"
+                );
+            }
+        }
+        static PANICKY_DROP: AtomicBool = AtomicBool::new(false);
+
+        let mut world = World::new();
+        world.register_component::<Pos>();
+        world.register_component::<Panicky>();
+        let e_moved = world.spawn((Pos { x: 1.0, y: 1.0 }, Panicky(0)));
+        let e_dying = world.spawn((Pos { x: 2.0, y: 2.0 }, Panicky(7)));
+
+        PANICKY_DROP.store(true, Ordering::SeqCst);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            world.despawn(e_dying);
+        }));
+        assert!(result.is_err(), "drop must have panicked");
+        PANICKY_DROP.store(false, Ordering::SeqCst);
+
+        // World must be fully consistent at N-1 despite the mid-column panic:
+        // both entities' locations valid, moved entity's Pos intact, and
+        // dropping the world now (with panics disabled) must not double-free.
+        assert!(world.is_alive(e_moved));
+        assert!(!world.is_alive(e_dying));
+        let pos = world.get::<Pos>(e_moved).unwrap();
+        assert_eq!((pos.x, pos.y), (1.0, 1.0));
+        let _ = world.query::<(&Pos, &Panicky)>().count();
+    }
 
     #[derive(Debug, PartialEq, Clone, Copy)]
     struct Pos {
