@@ -1,6 +1,7 @@
 pub mod blob;
 pub mod checkpoint;
 pub mod durable;
+pub mod fingerprint;
 pub mod index;
 pub mod record;
 pub mod recover;
@@ -10,6 +11,7 @@ pub mod wal;
 pub use blob::{BlobRef, BlobStore};
 pub use checkpoint::{AutoCheckpoint, CheckpointHandler};
 pub use durable::Durable;
+pub use fingerprint::world_fingerprint;
 pub use index::{IndexPersistError, PersistentIndex, load_btree_index, load_hash_index};
 pub use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 pub use record::*;

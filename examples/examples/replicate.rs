@@ -86,7 +86,7 @@ fn source_side(tx: &mpsc::Sender<WireMessage>) {
             ),
         )
         .unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
     }
 

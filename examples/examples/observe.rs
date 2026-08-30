@@ -40,7 +40,7 @@ fn main() {
             ),
         )
         .unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).expect("observe apply");
     }
 
@@ -70,7 +70,7 @@ fn main() {
             },),
         )
         .unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).expect("observe apply");
     }
 

@@ -107,7 +107,7 @@ mod tests {
         let e = world.alloc_entity();
         let mut cs = minkowski::EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Health(42),)).unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
 
         let mut wal2 = Wal::open(&wal_dir, &codecs, crate::wal::WalConfig::default()).unwrap();
@@ -181,7 +181,7 @@ mod tests {
         cs.spawn_bundle(&mut world, e_tail, (Pos7e { x: 2.0, y: 0.0 },))
             .unwrap();
         cs.insert_sparse::<TailTag7e>(&mut world, e_tail, TailTag7e(200));
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
 
         // Open a second WAL handle (simulates crash-reopen) and recover.

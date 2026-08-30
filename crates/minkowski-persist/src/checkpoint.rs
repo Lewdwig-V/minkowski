@@ -170,7 +170,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
 
@@ -226,7 +226,7 @@ mod tests {
         let mut cs = minkowski::EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
             .unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
 
         // Attach a sparse component directly to the world (not via WAL, so it
@@ -247,7 +247,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs2, &codecs).unwrap();
+            wal.append(&cs2, &codecs, world.current_tick()).unwrap();
             cs2.apply(&mut world).unwrap();
         }
 
@@ -306,7 +306,7 @@ mod tests {
         let mut cs = minkowski::EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
             .unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
         world.insert_sparse::<TagR>(e, TagR(7));
 
@@ -321,7 +321,7 @@ mod tests {
         world.clear_all_dirty_pages();
         let mut cs2 = minkowski::EnumChangeSet::new();
         cs2.remove_sparse::<TagR>(&mut world, e);
-        wal.append(&cs2, &codecs).unwrap();
+        wal.append(&cs2, &codecs, world.current_tick()).unwrap();
         cs2.apply(&mut world).unwrap();
 
         // Checkpoint 2: flush finds nothing to persist (no dirty pages, no sparse
@@ -405,7 +405,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
 

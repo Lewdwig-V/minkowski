@@ -43,6 +43,11 @@ pub enum SerializedMutation {
 pub struct WalRecord {
     pub seq: u64,
     pub mutations: Vec<SerializedMutation>,
+    /// The leader's world tick at commit start (pre-apply). Replay sets the
+    /// world tick from this value per record (stage 4.0 substrate, INV-1:
+    /// commit = tick). A record whose `tick_after` is below the world's
+    /// current tick indicates a foreign or corrupt log.
+    pub tick_after: u64,
 }
 
 /// Schema preamble: maps sender-local IDs to stable names.
@@ -102,6 +107,8 @@ mod tests {
         assert!(matches!(schema, WalEntry::Schema(_)));
 
         let mutations = WalEntry::Mutations(WalRecord {
+            tick_after: 0,
+
             seq: 0,
             mutations: vec![],
         });

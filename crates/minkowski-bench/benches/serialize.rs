@@ -80,7 +80,7 @@ fn serialize(c: &mut Criterion) {
                     z: 3.0,
                 },
             );
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, 0).unwrap();
         });
     });
 
@@ -119,7 +119,7 @@ fn serialize(c: &mut Criterion) {
                     z: 7.0,
                 },
             );
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, 0).unwrap();
         }
         drop(wal);
 

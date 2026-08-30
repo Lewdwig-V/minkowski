@@ -3,6 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64 as StdAtomicU64;
 
 use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 
@@ -25,7 +26,7 @@ use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 // truncated or reinterpreted.
 
 /// Frame header size: 4 bytes length + 4 bytes CRC32.
-const FRAME_HEADER_SIZE: u64 = 8;
+const FRAME_HEADER_SIZE: u64 = 16; // [len: u32 LE][crc32: u32 LE][view: u64 LE]
 
 /// Segment file magic identifying v2 format with CRC32 checksums.
 const SEGMENT_MAGIC: [u8; 4] = *b"MKW2";
@@ -42,6 +43,14 @@ fn read_exact_at(file: &File, pos: u64, buf: &mut [u8]) -> io::Result<()> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
+    #[error(
+        "tick regression at seq {seq}: record tick {record_tick} is below world tick {world_tick}"
+    )]
+    TickRegression {
+        seq: u64,
+        record_tick: u64,
+        world_tick: u64,
+    },
     #[error("WAL I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("WAL codec error: {0}")]
@@ -152,8 +161,8 @@ fn write_segment_magic(writer: &mut BufWriter<&File>) -> Result<u64, WalError> {
 pub(crate) fn read_next_frame(
     file: &File,
     pos: u64,
-) -> Result<Option<(WalEntry, u64, CrcProof)>, WalError> {
-    // Read 8-byte header: [len: u32 LE][crc32: u32 LE]
+) -> Result<Option<(WalEntry, u64, CrcProof, u64)>, WalError> {
+    // Read 16-byte header: [len: u32 LE][crc32: u32 LE][view: u64 LE]
     let mut header_buf = [0u8; FRAME_HEADER_SIZE as usize];
     match read_exact_at(file, pos, &mut header_buf) {
         Ok(()) => {}
@@ -164,6 +173,16 @@ pub(crate) fn read_next_frame(
         u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]) as usize;
     let stored_crc =
         u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+    let view = u64::from_le_bytes([
+        header_buf[8],
+        header_buf[9],
+        header_buf[10],
+        header_buf[11],
+        header_buf[12],
+        header_buf[13],
+        header_buf[14],
+        header_buf[15],
+    ]);
     if len > MAX_FRAME_SIZE {
         return Err(WalError::Format(format!(
             "WAL frame at offset {pos} claims {len} bytes, exceeding maximum {MAX_FRAME_SIZE}"
@@ -182,12 +201,17 @@ pub(crate) fn read_next_frame(
     })?;
     let entry = rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&payload)
         .map_err(|e| WalError::Format(format!("corrupt WAL entry at byte offset {pos}: {e}")))?;
-    Ok(Some((entry, pos + FRAME_HEADER_SIZE + len as u64, proof)))
+    Ok(Some((
+        entry,
+        pos + FRAME_HEADER_SIZE + len as u64,
+        proof,
+        view,
+    )))
 }
 
-/// Write a single WAL frame: `[len: u32 LE][crc32: u32 LE][payload]`.
+/// Write a single WAL frame: `[len: u32 LE][crc32: u32 LE][view: u64 LE][payload]`.
 /// Returns the total bytes written (header + payload).
-fn write_frame(writer: &mut BufWriter<&File>, payload: &[u8]) -> Result<u64, WalError> {
+fn write_frame(writer: &mut BufWriter<&File>, payload: &[u8], view: u64) -> Result<u64, WalError> {
     let len: u32 = payload.len().try_into().map_err(|_| {
         WalError::Format(format!(
             "WAL frame too large: {} bytes exceeds u32 max",
@@ -197,6 +221,7 @@ fn write_frame(writer: &mut BufWriter<&File>, payload: &[u8]) -> Result<u64, Wal
     let crc = crc32fast::hash(payload);
     writer.write_all(&len.to_le_bytes())?;
     writer.write_all(&crc.to_le_bytes())?;
+    writer.write_all(&view.to_le_bytes())?;
     writer.write_all(payload)?;
     writer.flush()?;
     Ok(FRAME_HEADER_SIZE + payload.len() as u64)
@@ -457,6 +482,33 @@ pub struct WalStats {
     pub roll_failures: u64,
 }
 
+/// Monotonic view counter for frame stamping (stage 4.0 substrate, INV-2).
+/// Starts at 0. Real view installation (quorum certificates) comes with 4.1;
+/// today the counter only moves forward via [`Views::bump`].
+pub struct Views {
+    current: StdAtomicU64,
+}
+
+impl Views {
+    fn new() -> Self {
+        Self {
+            current: StdAtomicU64::new(0),
+        }
+    }
+
+    /// Current view. Frames are stamped with this value on write.
+    pub fn current(&self) -> u64 {
+        self.current.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Advance to the next view. Returns the new view.
+    pub fn bump(&self) -> u64 {
+        self.current
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1
+    }
+}
+
 /// Segmented append-only write-ahead log. Each segment is an rkyv-serialized
 /// stream of `WalEntry` frames with a schema preamble. Segments roll over
 /// when they exceed `WalConfig::max_segment_bytes`.
@@ -471,6 +523,8 @@ pub struct Wal {
     last_checkpoint_seq: Option<u64>,
     bytes_since_checkpoint: u64,
     roll_failures: u64,
+    /// View counter for frame stamping (INV-2).
+    pub views: Views,
 }
 
 impl Wal {
@@ -495,6 +549,7 @@ impl Wal {
             last_checkpoint_seq: None,
             bytes_since_checkpoint: 0,
             roll_failures: 0,
+            views: Views::new(),
         };
         wal.active_bytes = wal.write_segment_header()?;
         Ok(wal)
@@ -542,6 +597,7 @@ impl Wal {
             last_checkpoint_seq: None,
             bytes_since_checkpoint: 0,
             roll_failures: 0,
+            views: Views::new(),
         };
 
         // Crash recovery: scan the active segment, truncating torn/corrupt tail.
@@ -565,7 +621,8 @@ impl Wal {
                 let mut pos: u64 = SEGMENT_MAGIC_SIZE;
                 let mut seg_last = 0u64;
                 let mut seg_has = false;
-                while let Some((entry, next_pos, _proof)) = read_next_frame(&seg_file, pos)? {
+                while let Some((entry, next_pos, _proof, _view)) = read_next_frame(&seg_file, pos)?
+                {
                     match entry {
                         WalEntry::Mutations(record) => {
                             seg_last = record.seq;
@@ -600,7 +657,8 @@ impl Wal {
                 let mut pos: u64 = SEGMENT_MAGIC_SIZE;
                 let mut seg_mutation_bytes: u64 = 0;
                 let mut found = false;
-                while let Some((entry, next_pos, _proof)) = read_next_frame(&seg_file, pos)? {
+                while let Some((entry, next_pos, _proof, _view)) = read_next_frame(&seg_file, pos)?
+                {
                     let frame_bytes = next_pos - pos;
                     match entry {
                         WalEntry::Checkpoint { flush_seq } => {
@@ -677,7 +735,7 @@ impl Wal {
 
         let frame_bytes = {
             let mut writer = BufWriter::new(&self.active_file);
-            write_frame(&mut writer, &payload)?
+            write_frame(&mut writer, &payload, self.views.current())?
         };
 
         self.active_bytes += frame_bytes;
@@ -697,16 +755,17 @@ impl Wal {
         &mut self,
         changeset: &EnumChangeSet,
         codecs: &CodecRegistry,
+        tick_after: u64,
     ) -> Result<u64, WalError> {
         let seq = self.next_seq;
-        let record = Self::changeset_to_record(seq, changeset, codecs)?;
+        let record = Self::changeset_to_record(seq, changeset, codecs, tick_after)?;
         let entry = WalEntry::Mutations(record);
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
             .map_err(|e| WalError::Format(e.to_string()))?;
 
         let frame_bytes = {
             let mut writer = BufWriter::new(&self.active_file);
-            write_frame(&mut writer, &payload)?
+            write_frame(&mut writer, &payload, self.views.current())?
         };
 
         // Advance in-memory state *before* fsync.  Once bytes have been
@@ -779,6 +838,13 @@ impl Wal {
 
         // Phase 1: Read all matching records with their proofs and remaps.
         let mut pending: Vec<CollectedRecord> = Vec::new();
+        // INV-2 (view fencing): frames stamped with a view older than the
+        // newest view already seen in the log are from a superseded view and
+        // are dropped. A deposed leader's late writes never replay.
+        let mut max_view_seen: u64 = 0;
+        // INV-1 (commit = tick): record ticks must be non-decreasing in log
+        // order. A regression means a foreign or corrupt log.
+        let mut prev_tick: Option<u64> = None;
 
         for (_, seg_path) in &segments {
             let seg_file = File::open(seg_path)?;
@@ -787,13 +853,29 @@ impl Wal {
             // Each segment has its own schema preamble; remap is scoped per segment.
             let mut remap: Option<Arc<HashMap<ComponentId, ComponentId>>> = None;
 
-            while let Some((entry, next_pos, proof)) = read_next_frame(&seg_file, pos)? {
+            while let Some((entry, next_pos, proof, view)) = read_next_frame(&seg_file, pos)? {
+                if view < max_view_seen {
+                    // Stale-view frame: written by a deposed leader. Drop it.
+                    pos = next_pos;
+                    continue;
+                }
+                max_view_seen = max_view_seen.max(view);
                 match entry {
                     WalEntry::Schema(schema) => {
                         remap = Some(Arc::new(codecs.build_remap(&schema.components)?));
                     }
                     WalEntry::Mutations(record) => {
                         if record.seq >= from_seq {
+                            if let Some(prev) = prev_tick
+                                && record.tick_after < prev
+                            {
+                                return Err(WalError::TickRegression {
+                                    seq: record.seq,
+                                    record_tick: record.tick_after,
+                                    world_tick: prev,
+                                });
+                            }
+                            prev_tick = Some(record.tick_after);
                             last_seq = record.seq;
                             pending.push((record, proof, remap.clone()));
                         }
@@ -810,6 +892,15 @@ impl Wal {
 
         // Phase 2: Decode all mutations in WAL order and apply as one changeset.
         apply_records_batched(&pending, world, codecs)?;
+
+        // INV-1: restore the world tick to the last committed record's
+        // commit-boundary tick. The batched apply already advanced the tick
+        // naturally; take the max so a recovered baseline that is already
+        // ahead is never regressed.
+        let last_tick = pending.last().map_or(0, |(r, _, _)| r.tick_after);
+        if last_tick > world.current_tick() {
+            world.set_current_tick(last_tick);
+        }
 
         Ok(last_seq)
     }
@@ -863,7 +954,7 @@ impl Wal {
             .map_err(|e| WalError::Format(e.to_string()))?;
         let mut writer = BufWriter::new(&self.active_file);
         let magic_bytes = write_segment_magic(&mut writer)?;
-        let frame_bytes = write_frame(&mut writer, &payload)?;
+        let frame_bytes = write_frame(&mut writer, &payload, self.views.current())?;
         Ok(magic_bytes + frame_bytes)
     }
 
@@ -885,7 +976,7 @@ impl Wal {
         let preamble_bytes = {
             let mut writer = BufWriter::new(&file);
             let magic_bytes = write_segment_magic(&mut writer)?;
-            let frame_bytes = write_frame(&mut writer, &payload)?;
+            let frame_bytes = write_frame(&mut writer, &payload, self.views.current())?;
             magic_bytes + frame_bytes
         };
 
@@ -901,7 +992,7 @@ impl Wal {
     /// (crash recovery) and returns `Ok(None)`.
     fn read_next_entry(&mut self, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
         match read_next_frame(&self.active_file, pos) {
-            Ok(Some((entry, next_pos, _proof))) => Ok(Some((entry, next_pos))),
+            Ok(Some((entry, next_pos, _proof, _view))) => Ok(Some((entry, next_pos))),
             Ok(None) | Err(WalError::Format(_) | WalError::ChecksumMismatch { .. }) => {
                 self.active_file.set_len(pos)?;
                 Ok(None)
@@ -946,12 +1037,17 @@ impl Wal {
         seq: u64,
         changeset: &EnumChangeSet,
         codecs: &CodecRegistry,
+        tick_after: u64,
     ) -> Result<crate::record::WalRecord, WalError> {
         let mut mutations = Vec::new();
         for m in changeset.iter_mutations() {
             mutations.push(Self::serialize_mutation(&m, codecs)?);
         }
-        Ok(crate::record::WalRecord { seq, mutations })
+        Ok(crate::record::WalRecord {
+            seq,
+            mutations,
+            tick_after,
+        })
     }
 
     fn serialize_mutation(
@@ -1075,17 +1171,17 @@ impl WalCursor {
         // Scan forward to from_seq
         loop {
             match read_next_frame(&file, pos)? {
-                Some((WalEntry::Schema(s), next_pos, _proof)) => {
+                Some((WalEntry::Schema(s), next_pos, _proof, _view)) => {
                     schema = Some(s);
                     pos = next_pos;
                 }
-                Some((WalEntry::Mutations(record), next_pos, _proof)) => {
+                Some((WalEntry::Mutations(record), next_pos, _proof, _view)) => {
                     if record.seq >= from_seq {
                         break; // Don't advance past this record
                     }
                     pos = next_pos;
                 }
-                Some((WalEntry::Checkpoint { .. }, next_pos, _proof)) => {
+                Some((WalEntry::Checkpoint { .. }, next_pos, _proof, _view)) => {
                     pos = next_pos;
                 }
                 None => break,
@@ -1111,16 +1207,16 @@ impl WalCursor {
 
         while records.len() < limit {
             match read_next_frame(&self.file, self.pos)? {
-                Some((WalEntry::Schema(s), next_pos, _proof)) => {
+                Some((WalEntry::Schema(s), next_pos, _proof, _view)) => {
                     self.schema = Some(s);
                     self.pos = next_pos;
                 }
-                Some((WalEntry::Mutations(record), next_pos, _proof)) => {
+                Some((WalEntry::Mutations(record), next_pos, _proof, _view)) => {
                     self.next_seq = record.seq + 1;
                     records.push(record);
                     self.pos = next_pos;
                 }
-                Some((WalEntry::Checkpoint { .. }, next_pos, _proof)) => {
+                Some((WalEntry::Checkpoint { .. }, next_pos, _proof, _view)) => {
                     self.pos = next_pos;
                 }
                 None => {
@@ -1153,7 +1249,7 @@ impl WalCursor {
                 self.pos = SEGMENT_MAGIC_SIZE;
                 self.current_segment_start_seq = *start_seq;
                 // Parse schema preamble of new segment
-                if let Some((WalEntry::Schema(s), next_pos, _proof)) =
+                if let Some((WalEntry::Schema(s), next_pos, _proof, _view)) =
                     read_next_frame(&self.file, SEGMENT_MAGIC_SIZE)?
                 {
                     self.schema = Some(s);
@@ -1207,7 +1303,7 @@ mod tests {
             .unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-        let seq = wal.append(&cs, &codecs).unwrap();
+        let seq = wal.append(&cs, &codecs, world.current_tick()).unwrap();
         assert_eq!(seq, 0);
         assert_eq!(wal.next_seq(), 1);
 
@@ -1228,7 +1324,7 @@ mod tests {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
             for _ in 0..3 {
                 let cs = EnumChangeSet::new();
-                wal.append(&cs, &codecs).unwrap();
+                wal.append(&cs, &codecs, world.current_tick()).unwrap();
             }
         }
 
@@ -1249,7 +1345,7 @@ mod tests {
 
         for _ in 0..3 {
             let cs = EnumChangeSet::new();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
         }
 
         let mut world2 = World::new();
@@ -1281,8 +1377,8 @@ mod tests {
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
-            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs, 0).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs, 0).unwrap();
         }
 
         // Append garbage to the active segment
@@ -1315,7 +1411,7 @@ mod tests {
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs, 0).unwrap();
         }
 
         // Append torn entry to the active segment
@@ -1344,8 +1440,8 @@ mod tests {
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
-            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs, 0).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs, 0).unwrap();
         }
 
         let seg_path = wal_dir.join(segment_filename(0));
@@ -1379,7 +1475,7 @@ mod tests {
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs, 0).unwrap();
         }
 
         let seg_path = wal_dir.join(segment_filename(0));
@@ -1434,7 +1530,7 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 }, Health(100)))
             .unwrap();
-        wal.append(&cs, &codecs_a).unwrap();
+        wal.append(&cs, &codecs_a, world_a.current_tick()).unwrap();
         cs.apply(&mut world_a).unwrap();
 
         drop(wal);
@@ -1524,13 +1620,13 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 },))
             .unwrap();
-        wal.append(&cs, &codecs_a).unwrap();
+        wal.append(&cs, &codecs_a, world_a.current_tick()).unwrap();
         cs.apply(&mut world_a).unwrap();
 
         let mut cs2 = EnumChangeSet::new();
         cs2.insert::<Health>(&mut world_a, e, Health(50));
         cs2.remove::<Pos>(&mut world_a, e);
-        wal.append(&cs2, &codecs_a).unwrap();
+        wal.append(&cs2, &codecs_a, world_a.current_tick()).unwrap();
         cs2.apply(&mut world_a).unwrap();
 
         drop(wal);
@@ -1602,7 +1698,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
 
@@ -1617,7 +1713,8 @@ mod tests {
         for (_, seg_path) in &segments {
             let file = File::open(seg_path).unwrap();
             // First frame starts after the 4-byte segment magic.
-            let (entry, _, _proof) = read_next_frame(&file, SEGMENT_MAGIC_SIZE).unwrap().unwrap();
+            let (entry, _, _proof, _view) =
+                read_next_frame(&file, SEGMENT_MAGIC_SIZE).unwrap().unwrap();
             assert!(matches!(entry, WalEntry::Schema(_)));
         }
     }
@@ -1645,7 +1742,7 @@ mod tests {
                     },),
                 )
                 .unwrap();
-                wal.append(&cs, &codecs).unwrap();
+                wal.append(&cs, &codecs, world.current_tick()).unwrap();
                 cs.apply(&mut world).unwrap();
             }
         }
@@ -1677,7 +1774,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
 
@@ -1711,7 +1808,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
 
@@ -1759,7 +1856,7 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
             .unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
 
         let s1 = wal.stats();
@@ -1810,7 +1907,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
 
@@ -1844,7 +1941,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
         assert!(wal.checkpoint_needed());
@@ -1876,7 +1973,7 @@ mod tests {
             let mut cs = EnumChangeSet::new();
             cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
                 .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
 
             wal.acknowledge_flush(wal.next_seq()).unwrap();
@@ -1917,7 +2014,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
         let ckpt_seq = wal.next_seq();
@@ -1937,7 +2034,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
         assert!(wal.stats().segment_count > 1, "must have rolled over");
@@ -1981,7 +2078,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
         wal.acknowledge_flush(wal.next_seq()).unwrap();
@@ -1997,7 +2094,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
 
@@ -2031,7 +2128,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
 
@@ -2043,7 +2140,7 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 99.0, y: 99.0 },))
             .unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
     }
 
     #[test]
@@ -2072,7 +2169,7 @@ mod tests {
                     },),
                 )
                 .unwrap();
-                wal.append(&cs, &codecs).unwrap();
+                wal.append(&cs, &codecs, world.current_tick()).unwrap();
                 cs.apply(&mut world).unwrap();
             }
             assert!(wal.stats().segment_count > 1);
@@ -2117,7 +2214,7 @@ mod tests {
                     },),
                 )
                 .unwrap();
-                wal.append(&cs, &codecs).unwrap();
+                wal.append(&cs, &codecs, world.current_tick()).unwrap();
                 cs.apply(&mut world).unwrap();
             }
             assert!(wal.stats().segment_count > 1);
@@ -2138,7 +2235,7 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 99.0, y: 99.0 },))
             .unwrap();
-        wal2.append(&cs, &codecs).unwrap();
+        wal2.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
         drop(wal2);
 
@@ -2182,7 +2279,7 @@ mod tests {
         cs.insert_sparse::<Health>(&mut world, e, Health(100));
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-        let seq = wal.append(&cs, &codecs).unwrap();
+        let seq = wal.append(&cs, &codecs, world.current_tick()).unwrap();
         assert_eq!(seq, 0);
         cs.apply(&mut world).unwrap();
 
@@ -2225,7 +2322,7 @@ mod tests {
         cs.remove_sparse::<Health>(&mut world, e);
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Health>(e), None);
 
@@ -2266,7 +2363,7 @@ mod tests {
         cs.insert_sparse::<Health>(&mut world, e, Health(999));
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Health>(e), Some(&Health(999)));
 
@@ -2321,7 +2418,7 @@ mod tests {
         .unwrap();
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-        let seq = wal.append(&cs, &codecs).unwrap();
+        let seq = wal.append(&cs, &codecs, world.current_tick()).unwrap();
         assert_eq!(seq, 0);
         cs.apply(&mut world).unwrap();
         assert_eq!(
@@ -2367,7 +2464,7 @@ mod tests {
         cs.insert_sparse::<Health>(&mut world, e, Health(42));
 
         let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
 
         // Replay into fresh world — Health registered via codecs.register
@@ -2409,8 +2506,8 @@ mod tests {
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
-            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs, 0).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs, 0).unwrap();
         }
 
         let seg_path = wal_dir.join(segment_filename(0));
@@ -2453,7 +2550,7 @@ mod tests {
 
         {
             let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
-            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs, 0).unwrap();
         }
 
         let seg_path = wal_dir.join(segment_filename(0));
@@ -2504,7 +2601,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
 
@@ -2517,8 +2614,79 @@ mod tests {
     }
 
     #[test]
-    fn frame_header_size_is_eight() {
-        assert_eq!(FRAME_HEADER_SIZE, 8);
+    fn stale_view_frames_dropped_by_replay() {
+        // INV-2 fence: a frame stamped with a view older than the newest
+        // view already seen in the log is from a deposed leader and must
+        // never replay.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("fence.wal");
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        assert_eq!(wal.views.current(), 0);
+
+        // Record A at view 0.
+        let ea = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, ea, (Pos { x: 1.0, y: 1.0 },))
+            .unwrap();
+        let _seq_a = wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+
+        // Leader loses leadership: view bumps to 1. Record B at view 1.
+        assert_eq!(wal.views.bump(), 1);
+        let eb = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, eb, (Pos { x: 2.0, y: 2.0 },))
+            .unwrap();
+        let seq_b = wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+
+        // The deposed leader's late write: a valid record, but stamped with
+        // the old view. Hand-write it at the current end of the segment.
+        let ec = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, ec, (Pos { x: 3.0, y: 3.0 },))
+            .unwrap();
+        let record =
+            Wal::changeset_to_record(seq_b + 1, &cs, &codecs, world.current_tick()).unwrap();
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&WalEntry::Mutations(record))
+            .map_err(|e| WalError::Format(e.to_string()))
+            .unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write as IoWrite};
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(wal_dir.join(segment_filename(0)))
+                .unwrap();
+            f.seek(SeekFrom::End(0)).unwrap();
+            let mut writer = std::io::BufWriter::new(&f);
+            write_frame(&mut writer, &payload, 0).unwrap();
+            writer.flush().unwrap();
+        }
+
+        // Replay: A and B apply; the late view-0 frame is dropped.
+        drop(wal);
+        let mut recovered = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register_as::<Pos>("pos", &mut recovered).unwrap();
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        let last = wal2.replay_from(0, &mut recovered, &codecs2).unwrap();
+        assert_eq!(last, seq_b, "late stale-view record must not extend replay");
+        assert!(recovered.is_alive(ea));
+        assert!(recovered.is_alive(eb));
+        assert!(
+            !recovered.is_alive(ec),
+            "deposed leader's spawn must be dropped"
+        );
+    }
+
+    #[test]
+    fn frame_header_size_is_sixteen() {
+        // [len: u32][crc32: u32][view: u64] — stage 4.0 INV-2 stamping.
+        assert_eq!(FRAME_HEADER_SIZE, 16);
     }
 
     // ── Legacy v1 format detection tests ─────────────────────────────
@@ -2578,7 +2746,7 @@ mod tests {
                 },),
             )
             .unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
         assert!(wal.stats().segment_count > 1);
@@ -2668,14 +2836,14 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
             .unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
 
         // Record 2: insert Health then despawn in the same record
         let mut cs2 = EnumChangeSet::new();
         cs2.insert::<Health>(&mut world, e, Health(99));
         cs2.record_despawn(e);
-        wal.append(&cs2, &codecs).unwrap();
+        wal.append(&cs2, &codecs, world.current_tick()).unwrap();
         cs2.apply(&mut world).unwrap();
 
         assert!(!world.is_alive(e));
@@ -2722,14 +2890,14 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 }, Health(10)))
             .unwrap();
-        wal.append(&cs, &codecs).unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
         cs.apply(&mut world).unwrap();
 
         // Record 2: overwrite Health, then remove it
         let mut cs2 = EnumChangeSet::new();
         cs2.insert::<Health>(&mut world, e, Health(99));
         cs2.remove::<Health>(&mut world, e);
-        wal.append(&cs2, &codecs).unwrap();
+        wal.append(&cs2, &codecs, world.current_tick()).unwrap();
         cs2.apply(&mut world).unwrap();
 
         assert!(world.is_alive(e));

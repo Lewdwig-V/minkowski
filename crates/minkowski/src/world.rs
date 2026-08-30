@@ -305,6 +305,20 @@ impl World {
         crate::tick::ChangeTick(self.current_tick)
     }
 
+    /// Raw current tick, for WAL replay and replica plumbing (`minkowski-persist`).
+    pub fn current_tick(&self) -> u64 {
+        self.current_tick.raw()
+    }
+
+    /// Set the raw current tick. Intended for WAL replay and follower apply
+    /// (`minkowski-persist`): a replica's tick must track the leader's
+    /// commit-boundary ticks so `Changed<T>` stays monotonic across failover.
+    /// Callers must guard against regression — never set a tick below the
+    /// current one in a live world.
+    pub fn set_current_tick(&mut self, tick: u64) {
+        self.current_tick = crate::tick::Tick::new(tick);
+    }
+
     /// Returns `(Entity, T)` pairs (cloned) from archetypes whose `T` column
     /// was mutably accessed after `since`.
     ///
