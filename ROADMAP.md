@@ -378,7 +378,7 @@ Short-circuit on first mismatch in the scalar fallback.
 
 ## Stage 3.75: Semantic Query Language
 
-**Status: Design (v1.4.0+).** Enabled by Stage 3 (the LSM schema section gives components stable, string-addressable names — the query language's handle). Scoped by decision record: **Python/notebook consumers first**; **global aggregates only** (group-by deferred); **Substrait emit-only** (no inbound consumption).
+**Status: Design (v1.4.0+).** Enabled by Stage 3 (the LSM schema section gives components stable, string-addressable names — the query language's handle). Scoped by decision record: **Python/notebook consumers first**; **global aggregates only** (group-by deferred); **Substrait emit-only** (no inbound consumption). Delivery surface: **`minkowski-py` is the primary interaction route** (decision record, #226) — the text layer ships as a Python-facing API on the existing PyO3 bindings, which promotes that crate from "generic bindings, maybe cut" to load-bearing surface. Prerequisite when Stage 3.75 starts: give it the CI it lacked (maturin build + smoke test), unify its version strings, and delete its duplicate example-simulator copies (`src/circuit.rs`, `src/reducers.rs` demo physics) rather than maintaining them.
 
 **Goal**: a pipelined, PRQL-flavored text language — `from Pos | filter x > 0 | aggregate {count, avg x}` — compiled onto the existing `QueryPlanner` backend. Plans, cost model, indexes, and execution are shared with the DSL, not duplicated.
 
