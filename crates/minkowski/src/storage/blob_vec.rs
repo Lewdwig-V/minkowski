@@ -1,7 +1,9 @@
 use std::alloc::Layout;
 use std::ptr::NonNull;
 
-use crate::pool::{PoolExhausted, SharedPool};
+use crate::sync::Arc;
+
+use crate::pool::{PoolExhausted, SlabPool};
 use crate::storage::dirty_pages::DirtyPageTracker;
 use crate::tick::Tick;
 
@@ -15,7 +17,7 @@ pub(crate) struct BlobVec {
     capacity: usize,
     pub(crate) changed_tick: Tick,
     pub(crate) dirty_pages: DirtyPageTracker,
-    pool: SharedPool,
+    pool: Arc<SlabPool>,
 }
 
 // Safety: BlobVec stores Component data which requires Send + Sync.
@@ -27,7 +29,7 @@ unsafe impl Sync for BlobVec {}
 /// demand before mutating anything) and guarantees the slot returns to the
 /// pool on every exit path, including a panicking component `Drop`.
 pub(crate) struct PoolScratch {
-    pool: SharedPool,
+    pool: Arc<SlabPool>,
     ptr: Option<NonNull<u8>>,
     layout: Layout,
 }
@@ -63,7 +65,7 @@ impl Drop for PoolScratch {
 
 // Placeholder so `PoolScratch::zst()` needs no pool handle; ZST scratches are
 // never deallocated (ptr is None).
-fn default_pool_shim() -> SharedPool {
+fn default_pool_shim() -> Arc<SlabPool> {
     crate::pool::default_pool()
 }
 
@@ -71,7 +73,7 @@ fn default_pool_shim() -> SharedPool {
 /// [`BlobVec::begin_extract_swap`] and consumed by
 /// [`BlobVec::commit_extracted_swap`] + [`ExtractedSlot::drop_value`].
 pub(crate) struct ExtractedSlot {
-    pool: SharedPool,
+    pool: Arc<SlabPool>,
     ptr: Option<NonNull<u8>>,
     layout: Layout,
     drop_fn: Option<unsafe fn(*mut u8)>,
@@ -128,7 +130,7 @@ impl BlobVec {
         item_layout: Layout,
         drop_fn: Option<unsafe fn(*mut u8)>,
         capacity: usize,
-        pool: SharedPool,
+        pool: Arc<SlabPool>,
     ) -> Self {
         let (data, capacity) = if item_layout.size() == 0 {
             (NonNull::dangling(), usize::MAX)

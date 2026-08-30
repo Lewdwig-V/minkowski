@@ -22,7 +22,7 @@ pub struct MetricsDiff {
     pub archetype_delta: i64,
     pub largest_archetypes: Vec<ArchetypeSize>,
     /// Pool usage delta in bytes. `None` when neither snapshot uses a pool.
-    pub pool_used_delta: Option<i64>,
+    pub pool_used_delta: i64,
 }
 
 impl MetricsDiff {
@@ -72,10 +72,7 @@ impl MetricsDiff {
         sorted.sort_by_key(|b| std::cmp::Reverse(b.entity_count));
         sorted.truncate(5);
 
-        let pool_used_delta = match (before.world.pool_used, after.world.pool_used) {
-            (Some(b), Some(a)) => Some(a as i64 - b as i64),
-            _ => None,
-        };
+        let pool_used_delta = after.world.pool_used as i64 - before.world.pool_used as i64;
 
         Self {
             elapsed,
@@ -103,9 +100,7 @@ impl std::fmt::Display for MetricsDiff {
             None => writeln!(f, "  tick delta: {}  WAL: n/a", self.tick_delta)?,
         }
         writeln!(f, "  archetype delta: {:+}", self.archetype_delta)?;
-        if let Some(pool_delta) = self.pool_used_delta {
-            writeln!(f, "  pool used delta: {:+} bytes", pool_delta)?;
-        }
+        writeln!(f, "  pool used delta: {:+} bytes", self.pool_used_delta)?;
 
         if !self.largest_archetypes.is_empty() {
             writeln!(f, "  largest archetypes:")?;
@@ -226,33 +221,11 @@ mod tests {
 
         let diff = MetricsDiff::compute(&before, &after);
         assert!(
-            diff.pool_used_delta.is_some(),
-            "pool_used_delta should be present with pooled world"
-        );
-        assert!(
-            diff.pool_used_delta.unwrap() > 0,
+            diff.pool_used_delta > 0,
             "pool usage should increase after spawning entities"
         );
 
         let output = format!("{diff}");
         assert!(output.contains("pool used delta:"));
-    }
-
-    #[test]
-    fn diff_no_pool_omits_delta() {
-        // Every World carries a default SlabPool, so null out pool stats to
-        // exercise the no-pool diff branch: with either side lacking pool_used,
-        // the delta is absent and the line is omitted.
-        let mut world = World::new();
-        let mut before = MetricsSnapshot::capture(&world, None);
-        world.spawn((Pos { x: 1.0, y: 2.0 },));
-        let mut after = MetricsSnapshot::capture(&world, None);
-        before.world.pool_used = None;
-        after.world.pool_used = None;
-
-        let diff = MetricsDiff::compute(&before, &after);
-        assert!(diff.pool_used_delta.is_none());
-        let output = format!("{diff}");
-        assert!(!output.contains("pool used delta:"));
     }
 }

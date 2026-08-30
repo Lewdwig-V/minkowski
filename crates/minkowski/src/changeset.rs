@@ -4,7 +4,9 @@ use std::ptr::NonNull;
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
-use crate::pool::{SharedPool, default_pool};
+use crate::sync::Arc;
+
+use crate::pool::{SlabPool, default_pool};
 use crate::tick::Tick;
 use crate::world::{EntityLocation, World, get_pair_mut};
 
@@ -82,11 +84,11 @@ pub(crate) struct Arena {
     data: NonNull<u8>,
     len: usize,
     capacity: usize,
-    pool: SharedPool,
+    pool: Arc<SlabPool>,
 }
 
 impl Arena {
-    pub fn new(pool: SharedPool) -> Self {
+    pub fn new(pool: Arc<SlabPool>) -> Self {
         Self {
             data: NonNull::dangling(),
             len: 0,
@@ -311,7 +313,7 @@ impl EnumChangeSet {
         }
     }
 
-    pub(crate) fn new_in(pool: SharedPool) -> Self {
+    pub(crate) fn new_in(pool: Arc<SlabPool>) -> Self {
         Self {
             mutations: Vec::new(),
             arena: Arena::new(pool),

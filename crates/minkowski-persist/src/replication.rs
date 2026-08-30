@@ -191,9 +191,9 @@ mod tests {
         assert_eq!(batch.records[0].seq, 0);
         assert_eq!(batch.records[1].seq, 1);
         assert_eq!(batch.records[2].seq, 2);
-        assert_eq!(cursor.next_seq(), 3);
+        // Cursor advanced past the last record: nothing left to read.
+        assert!(cursor.next_batch(100).unwrap().records.is_empty());
 
-        assert!(cursor.schema().is_some());
         assert_eq!(batch.schema.components.len(), 1);
         assert_eq!(batch.schema.components[0].name, "pos");
     }
@@ -209,7 +209,8 @@ mod tests {
         assert_eq!(batch.records.len(), 2);
         assert_eq!(batch.records[0].seq, 3);
         assert_eq!(batch.records[1].seq, 4);
-        assert_eq!(cursor.next_seq(), 5);
+        // Cursor at end: nothing left to read.
+        assert!(cursor.next_batch(100).unwrap().records.is_empty());
     }
 
     #[test]
@@ -564,7 +565,7 @@ mod tests {
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
-        assert!(wal.segment_count() > 1);
+        assert!(wal.stats().segment_count > 1);
         drop(wal);
 
         let mut cursor = WalCursor::open(&wal_dir, 0).unwrap();
@@ -572,7 +573,8 @@ mod tests {
         assert_eq!(batch.records.len(), 20);
         assert_eq!(batch.records[0].seq, 0);
         assert_eq!(batch.records[19].seq, 19);
-        assert_eq!(cursor.next_seq(), 20);
+        // Cursor at end: nothing left to read.
+        assert!(cursor.next_batch(100).unwrap().records.is_empty());
     }
 
     #[test]
@@ -605,7 +607,7 @@ mod tests {
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
-        assert!(wal.segment_count() > 2);
+        assert!(wal.stats().segment_count > 2);
         wal.delete_segments_before(15).unwrap();
         drop(wal);
 

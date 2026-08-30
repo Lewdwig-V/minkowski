@@ -5,7 +5,9 @@ use fixedbitset::FixedBitSet;
 use super::blob_vec::BlobVec;
 use crate::component::{ComponentId, ComponentRegistry};
 use crate::entity::Entity;
-use crate::pool::SharedPool;
+use crate::sync::Arc;
+
+use crate::pool::SlabPool;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ArchetypeId(pub usize);
@@ -33,7 +35,7 @@ impl Archetype {
         id: ArchetypeId,
         sorted_component_ids: &[ComponentId],
         registry: &ComponentRegistry,
-        pool: &SharedPool,
+        pool: &Arc<SlabPool>,
     ) -> Self {
         let max_id = sorted_component_ids.iter().copied().max().unwrap_or(0);
         let mut bitset = FixedBitSet::with_capacity(max_id + 1);
@@ -127,7 +129,7 @@ impl Archetypes {
         &mut self,
         sorted_ids: &[ComponentId],
         registry: &ComponentRegistry,
-        pool: &SharedPool,
+        pool: &Arc<SlabPool>,
     ) -> ArchetypeId {
         if let Some(&id) = self.by_components.get(sorted_ids) {
             return id;
