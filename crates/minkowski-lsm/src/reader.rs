@@ -236,6 +236,16 @@ impl SortedRunReader {
         page_index: u16,
     ) -> Result<Option<PageRef<'_>>, LsmError> {
         let key = (arch_id, slot, page_index);
+
+        // Bloom prefilter: a definite miss skips the sparse-index binary
+        // search entirely. `contains_page` has no false negatives (bloom keys
+        // are built from the same index entries this search would scan), and
+        // false positives fall through to the authoritative search below.
+        // Old files without a filter return `true` here, unchanged behavior.
+        if !self.contains_page(arch_id, slot, page_index) {
+            return Ok(None);
+        }
+
         let Ok(pos) = self
             .index
             .binary_search_by_key(&key, |e| (e.arch_id, e.slot, e.page_index))
@@ -1156,6 +1166,43 @@ mod tests {
             .collect();
         lens.sort_unstable();
         assert_eq!(lens, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn get_page_bloom_prefilter_hit_and_definite_miss() {
+        let (_dir, path, _world) = flush_world_with_pos(5);
+        let reader = SortedRunReader::open(&path).unwrap();
+        let entry = reader.index[0];
+
+        // Hit: bloom returns maybe-present, binary search finds the page.
+        let hit = reader
+            .get_page(entry.arch_id, entry.slot, entry.page_index)
+            .unwrap();
+        assert!(
+            hit.is_some(),
+            "indexed page must be returned through the prefilter"
+        );
+
+        // Definite miss: bloom rejects, get_page returns None without error.
+        let missing = reader
+            .get_page(entry.arch_id.wrapping_add(200), entry.slot, 7)
+            .unwrap();
+        assert!(
+            missing.is_none(),
+            "definite bloom miss must short-circuit to None"
+        );
+    }
+
+    #[test]
+    fn get_page_without_bloom_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_sparse_entity_page_file(dir.path());
+        let reader = SortedRunReader::open(&path).unwrap();
+
+        // Old file without a filter: prefilter is pass-through.
+        let page = reader.get_page(0, ENTITY_SLOT, 0).unwrap();
+        assert!(page.is_some());
+        assert!(reader.get_page(0, ENTITY_SLOT, 9).unwrap().is_none());
     }
 
     #[test]

@@ -114,25 +114,6 @@ impl BlockedBloomFilter {
         true
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.num_blocks == 0
-    }
-
-    pub fn byte_size(&self) -> usize {
-        if self.num_blocks == 0 {
-            return 0;
-        }
-        16 + (self.num_blocks as usize) * BLOCK_BYTES
-    }
-
-    pub fn num_blocks(&self) -> u32 {
-        self.num_blocks
-    }
-
-    pub fn seed(&self) -> u64 {
-        self.seed
-    }
-
     pub fn write_to(&self, w: &mut impl Write) -> Result<(), LsmError> {
         if self.num_blocks == 0 {
             return Err(LsmError::Format(
@@ -318,7 +299,6 @@ mod tests {
     #[test]
     fn empty_filter_returns_true_for_all_probes() {
         let filter = BlockedBloomFilter::new(0, 42);
-        assert!(filter.is_empty());
         assert!(filter.contains(0), "empty filter must return true");
         assert!(filter.contains(u64::MAX), "empty filter must return true");
     }
