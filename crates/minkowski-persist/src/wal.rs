@@ -651,9 +651,11 @@ impl Wal {
     /// Snapshot of WAL statistics for observability.
     pub fn stats(&self) -> WalStats {
         WalStats {
-            next_seq: self.next_seq(),
-            segment_count: self.segment_count(),
-            oldest_seq: self.oldest_seq(),
+            next_seq: self.next_seq,
+            segment_count: list_segments(&self.dir).map_or(0, |s| s.len()),
+            oldest_seq: list_segments(&self.dir)
+                .ok()
+                .and_then(|s| s.first().map(|(seq, _)| *seq)),
             bytes_since_checkpoint: self.bytes_since_checkpoint,
             last_checkpoint_seq: self.last_checkpoint_seq(),
             checkpoint_needed: self.checkpoint_needed(),
@@ -834,18 +836,6 @@ impl Wal {
         }
 
         Ok(deleted)
-    }
-
-    /// Number of segment files in the WAL directory.
-    pub fn segment_count(&self) -> usize {
-        list_segments(&self.dir).map_or(0, |s| s.len())
-    }
-
-    /// Start-seq of the oldest remaining segment, or `None` if no segments exist.
-    pub fn oldest_seq(&self) -> Option<u64> {
-        list_segments(&self.dir)
-            .ok()
-            .and_then(|s| s.first().map(|(seq, _)| *seq))
     }
 
     // ── Internal helpers ─────────────────────────────────────────────
@@ -1173,16 +1163,6 @@ impl WalCursor {
             }
             None => Ok(false),
         }
-    }
-
-    /// The schema parsed from the WAL preamble, if present.
-    pub fn schema(&self) -> Option<&WalSchema> {
-        self.schema.as_ref()
-    }
-
-    /// Next expected sequence number. Useful for persisting cursor position.
-    pub fn next_seq(&self) -> u64 {
-        self.next_seq
     }
 }
 
@@ -1583,9 +1563,9 @@ mod tests {
 
         let wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
         assert_eq!(wal.next_seq(), 0);
-        assert_eq!(wal.segment_count(), 1);
+        assert_eq!(wal.stats().segment_count, 1);
         assert!(wal_dir.is_dir());
-        assert_eq!(wal.oldest_seq(), Some(0));
+        assert_eq!(wal.stats().oldest_seq, Some(0));
     }
 
     #[test]
@@ -1628,7 +1608,7 @@ mod tests {
 
         assert_eq!(wal.next_seq(), 20);
         assert!(
-            wal.segment_count() > 1,
+            wal.stats().segment_count > 1,
             "should have rolled to multiple segments"
         );
 
@@ -1735,13 +1715,13 @@ mod tests {
             cs.apply(&mut world).unwrap();
         }
 
-        let before = wal.segment_count();
+        let before = wal.stats().segment_count;
         assert!(before > 2);
 
         let deleted = wal.delete_segments_before(10).unwrap();
         assert!(deleted > 0);
-        assert_eq!(wal.segment_count(), before - deleted);
-        assert!(wal.oldest_seq().is_some());
+        assert_eq!(wal.stats().segment_count, before - deleted);
+        assert!(wal.stats().oldest_seq.is_some());
     }
 
     // ── Checkpoint tests ──────────────────────────────────────────
@@ -1960,7 +1940,7 @@ mod tests {
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
-        assert!(wal.segment_count() > 1, "must have rolled over");
+        assert!(wal.stats().segment_count > 1, "must have rolled over");
         drop(wal);
 
         // Reopen — checkpoint was in an earlier sealed segment
@@ -2056,7 +2036,7 @@ mod tests {
         }
 
         wal.delete_segments_before(u64::MAX).unwrap();
-        assert!(wal.segment_count() >= 1);
+        assert!(wal.stats().segment_count >= 1);
 
         // WAL should still be appendable
         let e = world.alloc_entity();
@@ -2095,7 +2075,7 @@ mod tests {
                 wal.append(&cs, &codecs).unwrap();
                 cs.apply(&mut world).unwrap();
             }
-            assert!(wal.segment_count() > 1);
+            assert!(wal.stats().segment_count > 1);
 
             // Delete all old segments, leaving only the active one
             wal.delete_segments_before(u64::MAX).unwrap();
@@ -2140,7 +2120,7 @@ mod tests {
                 wal.append(&cs, &codecs).unwrap();
                 cs.apply(&mut world).unwrap();
             }
-            assert!(wal.segment_count() > 1);
+            assert!(wal.stats().segment_count > 1);
         }
 
         // Simulate a crash that tore the active segment's schema preamble:
@@ -2601,7 +2581,7 @@ mod tests {
             wal.append(&cs, &codecs).unwrap();
             cs.apply(&mut world).unwrap();
         }
-        assert!(wal.segment_count() > 1);
+        assert!(wal.stats().segment_count > 1);
 
         // Overwrite the first segment's magic with garbage to simulate v1.
         let segments = list_segments(&wal_dir).unwrap();

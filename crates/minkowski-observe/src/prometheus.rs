@@ -175,9 +175,8 @@ impl PrometheusExporter {
             .set(snapshot.world.total_despawns as i64);
 
         self.pool_capacity_bytes
-            .set(snapshot.world.pool_capacity.unwrap_or(0) as i64);
-        self.pool_used_bytes
-            .set(snapshot.world.pool_used.unwrap_or(0) as i64);
+            .set(snapshot.world.pool_capacity as i64);
+        self.pool_used_bytes.set(snapshot.world.pool_used as i64);
 
         if let Some(ref wal) = snapshot.wal {
             self.wal_seq.set(wal.next_seq as i64);

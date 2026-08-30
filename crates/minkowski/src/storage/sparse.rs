@@ -1,7 +1,9 @@
 use std::alloc::Layout;
 
 use crate::entity::Entity;
-use crate::pool::SharedPool;
+use crate::sync::Arc;
+
+use crate::pool::SlabPool;
 use crate::storage::blob_vec::BlobVec;
 
 const PAGE_SIZE: usize = 4096;
@@ -42,7 +44,11 @@ pub(crate) struct PagedSparseSet {
 
 impl PagedSparseSet {
     /// Creates a new empty `PagedSparseSet` for components with the given layout.
-    pub fn new(item_layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>, pool: SharedPool) -> Self {
+    pub fn new(
+        item_layout: Layout,
+        drop_fn: Option<unsafe fn(*mut u8)>,
+        pool: Arc<SlabPool>,
+    ) -> Self {
         Self {
             pages: Vec::new(),
             dense_entities: Vec::new(),
@@ -203,11 +209,11 @@ use crate::component::drop_ptr;
 /// and drop function. No `dyn Any`, no `Box<HashMap>`.
 pub(crate) struct SparseStorage {
     storages: HashMap<ComponentId, PagedSparseSet>,
-    pool: SharedPool,
+    pool: Arc<SlabPool>,
 }
 
 impl SparseStorage {
-    pub fn new(pool: SharedPool) -> Self {
+    pub fn new(pool: Arc<SlabPool>) -> Self {
         Self {
             storages: HashMap::new(),
             pool,

@@ -19,8 +19,8 @@ fn main() {
     let stats = world.stats();
     println!(
         "Pool: {:.1} MB capacity, {:.1} KB used",
-        stats.pool_capacity.unwrap() as f64 / 1_048_576.0,
-        stats.pool_used.unwrap() as f64 / 1024.0,
+        stats.pool_capacity as f64 / 1_048_576.0,
+        stats.pool_used as f64 / 1024.0,
     );
 
     // Spawn entities until pool is exhausted
@@ -38,8 +38,8 @@ fn main() {
             let s = world.stats();
             println!(
                 "  {count} entities, {:.1} KB used / {:.1} MB total",
-                s.pool_used.unwrap() as f64 / 1024.0,
-                s.pool_capacity.unwrap() as f64 / 1_048_576.0,
+                s.pool_used as f64 / 1024.0,
+                s.pool_capacity as f64 / 1_048_576.0,
             );
         }
     }
@@ -48,8 +48,8 @@ fn main() {
     println!(
         "\nFinal: {} entities, {:.1} MB used / {:.1} MB total",
         stats.entity_count,
-        stats.pool_used.unwrap() as f64 / 1_048_576.0,
-        stats.pool_capacity.unwrap() as f64 / 1_048_576.0,
+        stats.pool_used as f64 / 1_048_576.0,
+        stats.pool_capacity as f64 / 1_048_576.0,
     );
 
     // Despawn half the entities to show pool memory recovery
@@ -67,8 +67,8 @@ fn main() {
     println!(
         "After despawn: {} entities, {:.1} MB used / {:.1} MB total",
         stats.entity_count,
-        stats.pool_used.unwrap() as f64 / 1_048_576.0,
-        stats.pool_capacity.unwrap() as f64 / 1_048_576.0,
+        stats.pool_used as f64 / 1_048_576.0,
+        stats.pool_capacity as f64 / 1_048_576.0,
     );
 
     // Default World uses 256 MiB demand-paged SlabPool
@@ -77,8 +77,8 @@ fn main() {
     let ds = default_world.stats();
     println!(
         "Pool: {:.1} MB capacity, {:.1} KB used",
-        ds.pool_capacity.unwrap() as f64 / 1_048_576.0,
-        ds.pool_used.unwrap() as f64 / 1024.0,
+        ds.pool_capacity as f64 / 1_048_576.0,
+        ds.pool_used as f64 / 1024.0,
     );
 
     println!("\nDone.");

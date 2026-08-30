@@ -1,7 +1,8 @@
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::{Entity, EntityAllocator};
-use crate::pool::{PoolExhausted, SharedPool, SlabPool, default_pool};
+
+use crate::pool::{PoolExhausted, SlabPool, default_pool};
 use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
@@ -171,16 +172,15 @@ pub struct WorldStats {
     pub current_tick: u64,
     pub total_spawns: u64,
     pub total_despawns: u64,
-    /// Total capacity of the backing memory pool, if bounded.
-    pub pool_capacity: Option<usize>,
-    /// Bytes currently allocated from the pool, if tracked.
-    pub pool_used: Option<usize>,
+    /// Total capacity of the backing memory pool.
+    pub pool_capacity: usize,
+    /// Bytes currently allocated from the pool.
+    pub pool_used: usize,
     /// Per-class count of blocks currently serving overflow allocations.
-    /// `None` for system-allocator worlds. Array indices match size classes:
-    /// [64B, 256B, 1KB, 4KB, 64KB, 1MB].
-    pub pool_overflow_active: Option<[u64; 6]>,
+    /// Array indices match size classes: [64B, 256B, 1KB, 4KB, 64KB, 1MB].
+    pub pool_overflow_active: [u64; 6],
     /// Per-class cumulative count of overflow allocations.
-    pub pool_overflow_total: Option<[u64; 6]>,
+    pub pool_overflow_total: [u64; 6],
 }
 
 /// Debug information about the tick state of a cached query type.
@@ -227,7 +227,7 @@ pub struct World {
     pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry, crate::component::TypeIdBuildHasher>,
     pub(crate) current_tick: Tick,
     pub(crate) orphan_queue: OrphanQueue,
-    pub(crate) pool: SharedPool,
+    pub(crate) pool: Arc<SlabPool>,
 }
 
 impl World {
@@ -235,7 +235,7 @@ impl World {
         Self::new_with_pool(default_pool())
     }
 
-    pub(crate) fn new_with_pool(pool: SharedPool) -> Self {
+    pub(crate) fn new_with_pool(pool: Arc<SlabPool>) -> Self {
         Self {
             id: WorldId::next(),
             entities: EntityAllocator::new(),
@@ -2211,7 +2211,7 @@ use crate::pool::HugePages;
 ///
 /// let world = WorldBuilder::new().build().unwrap();
 /// let stats = world.stats();
-/// assert!(stats.pool_capacity.is_some()); // default 256 MiB SlabPool
+/// assert!(stats.pool_capacity > 0); // default 256 MiB SlabPool
 /// ```
 pub struct WorldBuilder {
     memory_budget: Option<usize>,
@@ -2269,11 +2269,8 @@ impl WorldBuilder {
             // pre-fault fallback (mlock + manual touch) still applies.
             let _ = crate::pool::try_mlockall();
         }
-        let pool: SharedPool = match self.memory_budget {
-            Some(bytes) => {
-                let slab = SlabPool::new(bytes, self.hugepages, true)?;
-                crate::pool::into_shared(slab)
-            }
+        let pool: Arc<SlabPool> = match self.memory_budget {
+            Some(bytes) => Arc::new(SlabPool::new(bytes, self.hugepages, true)?),
             None => crate::pool::try_default_pool(self.hugepages)?,
         };
         Ok(World::new_with_pool(pool))
@@ -3855,16 +3852,16 @@ mod tests {
     fn world_builder_default_uses_slab_pool() {
         let world = World::builder().build().unwrap();
         let stats = world.stats();
-        assert_eq!(stats.pool_capacity, Some(crate::pool::DEFAULT_POOL_BUDGET));
-        assert_eq!(stats.pool_used, Some(0));
+        assert_eq!(stats.pool_capacity, crate::pool::DEFAULT_POOL_BUDGET);
+        assert_eq!(stats.pool_used, 0);
     }
 
     #[test]
     fn world_new_uses_slab_pool() {
         let world = World::new();
         let stats = world.stats();
-        assert_eq!(stats.pool_capacity, Some(crate::pool::DEFAULT_POOL_BUDGET));
-        assert_eq!(stats.pool_used, Some(0));
+        assert_eq!(stats.pool_capacity, crate::pool::DEFAULT_POOL_BUDGET);
+        assert_eq!(stats.pool_used, 0);
     }
 
     #[test]
@@ -3875,8 +3872,8 @@ mod tests {
             .build()
             .unwrap();
         let stats = world.stats();
-        assert_eq!(stats.pool_capacity, Some(64 * 1024 * 1024));
-        assert_eq!(stats.pool_used, Some(0));
+        assert_eq!(stats.pool_capacity, 64 * 1024 * 1024);
+        assert_eq!(stats.pool_used, 0);
     }
 
     #[test]
@@ -3910,8 +3907,8 @@ mod tests {
 
         let stats = world.stats();
         assert_eq!(stats.entity_count, 100);
-        assert!(stats.pool_capacity.is_some());
-        assert!(stats.pool_used.unwrap() > 0);
+        assert!(stats.pool_capacity > 0);
+        assert!(stats.pool_used > 0);
     }
 
     // ── try_spawn / try_insert tests ────────────────────────────────

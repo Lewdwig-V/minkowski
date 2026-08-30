@@ -3,7 +3,9 @@ use std::collections::HashMap;
 
 use crate::bundle::Bundle;
 use crate::component::{ComponentId, ComponentRegistry};
+use crate::pool::SlabPool;
 use crate::storage::archetype::{ArchetypeId, Archetypes};
+use crate::sync::Arc;
 
 /// Cached column layout for a Table type. Resolved once on first use.
 pub struct TableDescriptor {
@@ -66,7 +68,7 @@ impl TableCache {
         &mut self,
         components: &mut ComponentRegistry,
         archetypes: &mut Archetypes,
-        pool: &crate::pool::SharedPool,
+        pool: &Arc<SlabPool>,
     ) -> &TableDescriptor {
         let type_id = TypeId::of::<T>();
         self.descriptors.entry(type_id).or_insert_with(|| {
