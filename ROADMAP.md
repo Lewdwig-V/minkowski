@@ -408,7 +408,7 @@ The corollary discipline: **if a feature requires bypassing the typestate builde
 
 ## Stage 4: Replicated State Machine (RSM)
 
-**Status: In design — Stage 4.0 substrate spec approved** (`docs/superpowers/specs/2026-08-30-stage-4.0-rsm-substrate-design.md`). Decision record: RSM is **external composition** (a `Replicated<S>` beside `Durable<S>`), not internals surgery — the roadmap's earlier assumption that RSM would necessitate unforeseen core changes is narrowed to four additive invariants (commit=tick, view-stamped frame headers, World replica mode, `read_at(applied_seq)`). **Stage 3.75 may proceed in parallel after the 4.0 substrate** — the query language hooks `read_at` and nothing else.
+**Status: In design — Stage 4.0 substrate spec approved** (`docs/rsm-substrate-design.md`). Decision record: RSM is **external composition** (a `Replicated<S>` beside `Durable<S>`), not internals surgery — the roadmap's earlier assumption that RSM would necessitate unforeseen core changes is narrowed to four additive invariants (commit=tick, view-stamped frame headers, World replica mode, `read_at(applied_seq)`). **Stage 3.75 may proceed in parallel after the 4.0 substrate** — the query language hooks `read_at` and nothing else.
 
 **Goal**: Fault tolerance. The world survives machine failure.
 
