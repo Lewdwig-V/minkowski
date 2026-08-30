@@ -1,15 +1,63 @@
 # Changelog
 
-## 1.3.0
+## 1.4.0
 
 ### Core (`minkowski`)
 
-- **Breaking:** removed the `debounce` module and the `minkowski::HashDebounce` / `minkowski::SubscriptionDebounce` re-exports (dead code — no in-repo or downstream-verified users). Update imports: for entity-granular dedup of archetype-granular `Changed<T>` notifications, track last-seen values per entity yourself, or use `MaterializedView` with a `DebouncePolicy`. (#217)
+- **SlabPool is the only allocator** — `SystemAllocator` removed (#155). `World::new()` uses a default 256 MiB demand-paged SlabPool; `WorldBuilder` configures `memory_budget()`, `hugepages()`, `lock_all_memory()` (#155, #118).
+- **Breaking:** removed the `debounce` module and the `minkowski::HashDebounce` / `minkowski::SubscriptionDebounce` re-exports (dead code — no in-repo or downstream-verified users). For entity-granular dedup of archetype-granular `Changed<T>` notifications, track last-seen values per entity yourself, or use `MaterializedView` with a `DebouncePolicy`. (#217)
+- **Breaking: single-impl pool trait collapsed** — `PoolAllocator`, `SharedPool`, and `into_shared` removed; call sites take `Arc<SlabPool>` directly. `SlabPool::capacity()`/`used()`/`overflow_*` return plain values (the `Option` wrapper existed only for the trait's "None for unbounded" contract), and `WorldStats.pool_*` fields follow. Every `World` carries a SlabPool, so `minkowski-observe`'s no-pool branches were removed with it. (#244, #230)
+- **Panic-safe structural mutations** — `World::despawn`/`despawn_batch` use extract-then-commit ordering: removed values move to pool scratch first, all structure commits infallibly, destructors run last. `BlobVec::swap_remove` gets a drop-guard; `try_insert` overwrite paths preflight pool scratch and return `Err(InsertError::PoolExhausted)` instead of panicking mid-overwrite. Fixes the panicking-`Drop` use-after-free (#180). Regression tests spawn components whose `Drop` panics mid-column. (#235)
+- **`DirtyPageTracker`** — per-column page-level dirty bitsets wired into all `BlobVec` mutation paths; O(delta) flush granularity for LSM persistence. (#156)
 
 ### Persistence (`minkowski-persist`, `minkowski-lsm`)
 
-- **LSM recovery cutover** — `Snapshot` / v2 `.snap` files removed. Use `recover_world(lsm_dir, manifest_log, wal, codecs)` for crash recovery (LSM page merge + WAL tail replay). `AutoCheckpoint` flushes dirty pages via `flush_and_record` instead of full-world snapshots. **Breaking:** `acknowledge_snapshot` → `acknowledge_flush`; `WalEntry::Checkpoint { snapshot_seq }` → `{ flush_seq }`. Existing v2 snapshot files are not supported — rebuild from WAL or accept data loss.
-- **`LsmRecovery`** — merges sorted runs (L3→L0, latest sequence wins), restores allocator metadata pages, materializes `World` for WAL replay.
+- **LSM Stage 3 complete: sorted-run storage, manifest, compaction, bloom filters, recovery** — phased (#159–#174):
+  - Phase 1: `SortedRun` format, `FlushWriter`, `SortedRunReader` (#159).
+  - Phase 2: `LsmManifest`, `ManifestLog` (append-only, CRC32 frames), `flush_and_record` (#160).
+  - Phase 3: compactor merge kernel, `CompactionCommit` atomic manifest entry, public `compact_one` API, observer hook (#163–#170).
+  - Phase 4: `BlockedBloomFilter` (cache-line-blocked, enhanced double hashing) written per sorted run (#174, #158).
+- **LSM recovery cutover (Stage 3 final)** — `Snapshot` / v2 `.snap` files removed. Use `recover_world(lsm_dir, manifest_log, wal, codecs)` for crash recovery (LSM page merge + WAL tail replay). `AutoCheckpoint` flushes dirty pages via `flush_and_record` instead of full-world snapshots. **Breaking:** `acknowledge_snapshot` → `acknowledge_flush`; `WalEntry::Checkpoint { snapshot_seq }` → `{ flush_seq }`. Existing v2 snapshot files are not supported — rebuild from WAL or accept data loss. `LsmRecovery` merges sorted runs (L3→L0, latest sequence wins), restores allocator metadata pages, materializes `World` for WAL replay. (#198)
+- **Hybrid dense component persistence** — heap-backed components (String/Vec/BlobRef) persist via per-row rkyv (`Serialized` storage kind); POD components flush as native bytes (`RawCopy`). Codec required for every dense component at flush — the soundness gate is now hard-enforced. (#204)
+- **LSM soundness fixes** — dense raw-copy requires a registered codec at flush (#201); `raw_copy_size` gated to raw-copyable codecs (#205); sparse flush resolves codecs by `TypeId` instead of per-world `ComponentId`, and wrong-shape id-keyed codec APIs removed (#203); recovery import-error drop-safety with decode proof bound to its bytes (#211).
+- **Compaction input reclamation** — merged input `.run` files are deleted after the compaction commit records in the manifest log; `cleanup_orphans` handles crash windows (#235, fixes #184).
+- **`WalStats.roll_failures`** — counter for failed segment rollovers; a rising value means appends land in an over-budget segment (#235, fixes #185).
+- **Bloom filter read path wired** — `SortedRunReader::get_page` probes `contains_page` before the sparse-index binary search (definite misses skip the search; no false negatives; old files without a filter pass through). `entity_pages` unchanged. Dead `BlockedBloomFilter` accessors (`is_empty`/`byte_size`/`num_blocks`/`seed`) removed. (#241, #228)
+- **Wal getter surface cut** — `Wal::segment_count()`/`oldest_seq()` and `WalCursor::schema()`/`next_seq()` removed (test-only or zero callers); use `wal.stats()` → `WalStats`. (#244, #231)
+
+### Performance (`minkowski`)
+
+- **Fingerprint-gated unchecked rkyv decode for heap recovery** — skips bytecheck validation when a layout fingerprint matches, with the decode proof bound to its bytes. (#207)
+
+### Bug Fixes
+
+- Critical audit findings C1–C4: crash safety, panic, partial-apply paths. (#188)
+- `minkowski-observe` stale pool/archetype tests repaired; full workspace gated in CI. (#194)
+- `pyo3-arrow` 0.17 → 0.19 for pyo3 0.29 compatibility; `Cargo.lock` now tracked. (#222)
+
+### CI & Infrastructure
+
+- Least-privilege token scopes on CI and Miri workflows. (#242, #245)
+- Miri runs via nextest on a nightly schedule + release tags. (#150)
+- TigerStyle soundness-audit enforcement agent-team. (#208)
+- LSM microbenchmark foundation (page codec, WAL append) with regression audit. (#206)
+
+### Documentation
+
+- LSM crate documentation overhaul (Phases 1–4). (#175)
+- ROADMAP: Stage 3.75 semantic query language (PRQL-shaped, Substrait emit-only, parse-and-resolve boundary invariant, Python/notebook-first) added; Stage 2.5 marked complete; stale Phase 5 list replaced with shipped status; `minkowski-py` recorded as the primary Stage 3.75 surface. (#232, #233, #234, #243)
+- io_uring + view-change design notes in the scaling roadmap. (#151, #152)
+
+### Cleanup
+
+- Dead code sweeps: core (#217), LSM/persist wrappers and stale allows with LE-reader dedup (#223), examples shared-component dedup (#224), repo hygiene — dead config, duplicate tooling, stale docs (#225).
+
+### Dependencies
+
+- `rkyv` 0.8.18, `libc` 0.2.189, `crc32fast` 1.5.1, `proc-macro2` 1.0.107, `syn` 3.0.4, `prometheus-client` 0.25, `criterion` 0.8, `pyo3` 0.29. (#218–#221, #236–#240)
+
+
+## 1.3.0
 
 ### Query Planner (`minkowski`)
 
@@ -131,7 +179,7 @@
 
 - **TigerBeetle-style slab pool allocator** — `WorldBuilder` creates a World backed by a single mmap region with a fixed memory budget. Six size classes (64 B to 1 MB) with mutex-serialized free lists. Pre-fault fallback chain: `MAP_POPULATE` → `mlock` → manual page touch. Optional 2 MiB hugepage support via `HugePages::Try` / `HugePages::Require`.
 - **`try_spawn<B>()` / `try_insert<B>()`** — fallible spawn and insert that return `Err(PoolExhausted)` instead of crashing on pool exhaustion. Pre-check all column capacities before committing any state changes.
-- **`WorldBuilder`** — builder pattern for pool configuration: `memory_budget()`, `hugepages()`, `lock_all_memory()`. `World::new()` uses a default 256 MiB demand-paged SlabPool.
+- **`WorldBuilder`** — builder pattern for pool configuration: `memory_budget()`, `hugepages()`, `lock_all_memory()`. `World::new()` unchanged (system allocator, no budget).
 - **`try_mlockall()`** — opt-in `mlockall(MCL_CURRENT | MCL_FUTURE)` for dedicated database processes. Non-fatal on failure.
 - **Pool observability** — `WorldStats` gains `pool_capacity: Option<usize>` and `pool_used: Option<usize>`.
 - **Miri compatibility** — pool tests pass under Miri with Tree Borrows. Mmap region uses plain `MAP_PRIVATE|MAP_ANONYMOUS` under `cfg(miri)`, skipping unsupported syscalls (`MAP_POPULATE`, `mlock`).

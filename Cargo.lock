@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "minkowski"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "atomic",
  "fixedbitset",
@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "minkowski-derive"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "minkowski-examples"
-version = "1.2.0"
+version = "1.4.0"
 dependencies = [
  "fastrand",
  "minkowski",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "minkowski-lsm"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "crc32fast",
  "iai-callgrind",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "minkowski-observe"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "minkowski",
  "minkowski-persist",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "minkowski-persist"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "crc32fast",
  "criterion",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "minkowski-py"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "arrow",
  "minkowski",
