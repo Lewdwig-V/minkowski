@@ -83,19 +83,14 @@ impl PagedSparseSet {
     /// Caller must not double-drop the source value.
     pub unsafe fn insert(&mut self, entity: Entity, ptr: *const u8) {
         if let Some(dense) = self.dense_index(entity) {
-            // Overwrite: drop old, copy new
-            // SAFETY: `dense` is a valid index returned by `dense_index`.
-            let dst = unsafe { self.dense_values.get_ptr(dense) };
-            if let Some(drop_fn) = self.dense_values.drop_fn {
-                // SAFETY: `dst` points to a live value of the stored type.
-                unsafe { drop_fn(dst) };
-            }
-            let size = self.dense_values.item_layout.size();
-            if size > 0 {
-                // SAFETY: `ptr` is valid per caller contract; `dst` was just
-                // cleared by drop (or is trivially copyable). Regions do not
-                // overlap because `ptr` is external and `dst` is in our BlobVec.
-                unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size) };
+            // Overwrite: panic-safe replacement (#180) — the new value is
+            // committed to the slot before the old value's destructor runs.
+            // SAFETY: `dense` is a valid index; `ptr` is valid per caller
+            // contract and does not alias our BlobVec.
+            unsafe {
+                self.dense_values
+                    .replace_protected(dense, ptr)
+                    .expect("pool exhausted during sparse overwrite");
             }
         } else {
             // New entry

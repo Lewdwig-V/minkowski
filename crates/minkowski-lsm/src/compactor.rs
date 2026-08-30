@@ -354,6 +354,24 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
             });
     }
 
+    // ── 9. Reclaim input run files ──────────────────────────────────────────
+    // The commit is durable: inputs are no longer referenced by the manifest
+    // or the log, so delete them now rather than waiting for the next
+    // `cleanup_orphans` sweep (#184 — long-running processes would otherwise
+    // accumulate compacted-away `.run` files until restart). Deletion failure
+    // is non-fatal: the files remain untracked and a later orphan sweep
+    // reclaims them.
+    for input_path in &job.input_paths {
+        if let Err(e) = std::fs::remove_file(input_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "warning: failed to remove compacted input {}: {e}",
+                input_path.display()
+            );
+        }
+    }
+
     Ok(CompactionReport {
         from_level: job.from_level,
         to_level: job.to_level,
@@ -687,6 +705,15 @@ mod tests {
             output_path.exists(),
             "output run file must exist on disk: {output_path:?}"
         );
+
+        // ── Verify input files were reclaimed (#184) ──────────────────────────
+        for path in &job.input_paths {
+            assert!(
+                !path.exists(),
+                "compacted-away input run must be deleted at commit: {}",
+                path.display()
+            );
+        }
         let out_reader = SortedRunReader::open(output_path).unwrap();
         // Total entities = n_runs × entities_per_run.
         let expected_entity_count = n_runs * entities_per_run;

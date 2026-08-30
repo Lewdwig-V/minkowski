@@ -450,6 +450,11 @@ pub struct WalStats {
     pub bytes_since_checkpoint: u64,
     pub last_checkpoint_seq: Option<u64>,
     pub checkpoint_needed: bool,
+    /// Failed segment-rollover attempts since WAL creation. A rising value
+    /// means appends are going to an over-budget segment (data is safe — the
+    /// frame is durable before the roll attempt — but the segment grows past
+    /// `max_segment_bytes` until a roll succeeds).
+    pub roll_failures: u64,
 }
 
 /// Segmented append-only write-ahead log. Each segment is an rkyv-serialized
@@ -465,6 +470,7 @@ pub struct Wal {
     schema: WalSchema,
     last_checkpoint_seq: Option<u64>,
     bytes_since_checkpoint: u64,
+    roll_failures: u64,
 }
 
 impl Wal {
@@ -488,6 +494,7 @@ impl Wal {
             schema,
             last_checkpoint_seq: None,
             bytes_since_checkpoint: 0,
+            roll_failures: 0,
         };
         wal.active_bytes = wal.write_segment_header()?;
         Ok(wal)
@@ -534,6 +541,7 @@ impl Wal {
             schema,
             last_checkpoint_seq: None,
             bytes_since_checkpoint: 0,
+            roll_failures: 0,
         };
 
         // Crash recovery: scan the active segment, truncating torn/corrupt tail.
@@ -649,6 +657,7 @@ impl Wal {
             bytes_since_checkpoint: self.bytes_since_checkpoint,
             last_checkpoint_seq: self.last_checkpoint_seq(),
             checkpoint_needed: self.checkpoint_needed(),
+            roll_failures: self.roll_failures,
         }
     }
 
@@ -722,8 +731,12 @@ impl Wal {
         // Roll to new segment if threshold exceeded. Failure is non-fatal:
         // the mutation is already persisted and the oversized segment is
         // still valid. The next append will retry.
-        if self.active_bytes >= self.config.max_segment_bytes as u64 {
-            let _ = self.roll_segment();
+        if self.active_bytes >= self.config.max_segment_bytes as u64 && self.roll_segment().is_err()
+        {
+            // Non-fatal (frame already durable; retry on next append) but
+            // observable: operators can watch this counter for a segment
+            // stuck over budget.
+            self.roll_failures += 1;
         }
 
         Ok(seq)

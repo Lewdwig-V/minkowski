@@ -206,7 +206,6 @@ pub(crate) struct BatchEntry {
 pub(crate) struct ColumnBatch {
     pub(crate) comp_id: ComponentId,
     pub(crate) col_idx: usize,
-    pub(crate) drop_fn: Option<unsafe fn(*mut u8)>,
     pub(crate) layout: Layout,
     /// Overwrite entries. Offsets, not pointers — the arena may
     /// reallocate during recording. Resolved at apply time.
@@ -824,7 +823,6 @@ impl EnumChangeSet {
                 }
                 let col = &mut arch.columns[col_batch.col_idx];
                 col.mark_changed(tick);
-                let size = col_batch.layout.size();
                 for entry in &col_batch.entries {
                     debug_assert_eq!(
                         arch.entities[entry.row], entry.entity,
@@ -841,11 +839,9 @@ impl EnumChangeSet {
                     // avoids redundant per-row tick marking.
                     unsafe {
                         let src = self.arena.get(entry.arena_offset);
-                        let dst = col.get_ptr(entry.row);
-                        if let Some(drop_fn) = col_batch.drop_fn {
-                            drop_fn(dst);
-                        }
-                        std::ptr::copy_nonoverlapping(src, dst, size);
+                        // Panic-safe overwrite (#180) — new value committed before drop.
+                        col.replace_protected(entry.row, src)
+                            .expect("pool exhausted during changeset apply");
                     }
                     col.mark_row_dirty(entry.row);
                 }
@@ -905,12 +901,10 @@ impl EnumChangeSet {
                 if arch.component_ids.contains(*component_id) {
                     // New batch — archetype has component, resolve column once.
                     let col_idx = arch.column_index(*component_id).unwrap();
-                    let info = world.components.info(*component_id);
                     let new_batch = InsertBatch {
                         arch_idx: location.archetype_id.0,
                         comp_id: *component_id,
                         col_idx,
-                        drop_fn: info.drop_fn,
                         layout: *layout,
                         entries: Vec::new(),
                     };
@@ -924,7 +918,7 @@ impl EnumChangeSet {
                 // Component not in archetype — migration path (sequential).
                 flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
                 let data_ptr = self.arena.get(*offset);
-                changeset_insert_raw(world, *entity, *component_id, data_ptr, *layout, tick)
+                changeset_insert_raw(world, *entity, *component_id, data_ptr, tick)
                     .map_err(map_err)?;
                 continue;
             }
@@ -1049,7 +1043,6 @@ struct InsertBatch {
     arch_idx: usize,
     comp_id: ComponentId,
     col_idx: usize,
-    drop_fn: Option<unsafe fn(*mut u8)>,
     layout: Layout,
     entries: Vec<(usize, *const u8)>,
 }
@@ -1068,14 +1061,12 @@ fn flush_insert_batch(
     }
     let col = &mut archetypes[b.arch_idx].columns[b.col_idx];
     col.mark_changed(tick);
-    let size = b.layout.size();
     for &(row, src) in &b.entries {
         unsafe {
-            let dst = col.get_ptr(row);
-            if let Some(drop_fn) = b.drop_fn {
-                drop_fn(dst);
-            }
-            std::ptr::copy_nonoverlapping(src, dst, size);
+            let src2 = src;
+            // Panic-safe overwrite (#180) — new value committed before drop.
+            col.replace_protected(row, src2)
+                .expect("pool exhausted during changeset apply");
         }
         col.mark_row_dirty(row);
     }
@@ -1102,7 +1093,6 @@ pub(crate) fn open_archetype_batch(
             ColumnBatch {
                 comp_id,
                 col_idx,
-                drop_fn: info.drop_fn,
                 layout: info.layout,
                 entries: Vec::new(),
             }
@@ -1119,7 +1109,6 @@ fn changeset_insert_raw(
     entity: Entity,
     comp_id: ComponentId,
     data_ptr: *const u8,
-    layout: Layout,
     tick: Tick,
 ) -> Result<(), ApplyError> {
     if !world.is_alive(entity) {
@@ -1139,13 +1128,12 @@ fn changeset_insert_raw(
 
         // Overwrite with new data (write path — marks column changed).
         let src_arch = &mut world.archetypes.archetypes[location.archetype_id.0];
+        // Panic-safe overwrite (#180) — new value committed before drop.
+        // SAFETY: replacement is protected; row in bounds per pre-check above.
         unsafe {
-            let dst = src_arch.columns[col_idx].get_ptr_mut(location.row, tick);
-            let info = world.components.info(comp_id);
-            if let Some(drop_fn) = info.drop_fn {
-                drop_fn(dst);
-            }
-            std::ptr::copy_nonoverlapping(data_ptr, dst, layout.size());
+            src_arch.columns[col_idx]
+                .replace_protected(location.row, data_ptr)
+                .expect("pool exhausted during changeset apply");
         }
     } else {
         // Archetype migration: source components + new component.
@@ -2275,7 +2263,6 @@ mod tests {
         cs.archetype_batches[0].columns.push(ColumnBatch {
             comp_id: 0,
             col_idx: 0,
-            drop_fn: None,
             layout: Layout::new::<Pos>(),
             entries: vec![
                 BatchEntry {
@@ -2329,7 +2316,6 @@ mod tests {
             columns: vec![ColumnBatch {
                 comp_id: pos_id,
                 col_idx,
-                drop_fn: None,
                 layout: Layout::new::<Pos>(),
                 entries: vec![
                     BatchEntry {
@@ -2392,7 +2378,6 @@ mod tests {
                 ColumnBatch {
                     comp_id: pos_id,
                     col_idx: pos_col,
-                    drop_fn: None,
                     layout: Layout::new::<Pos>(),
                     entries: vec![
                         BatchEntry {
@@ -2410,7 +2395,6 @@ mod tests {
                 ColumnBatch {
                     comp_id: vel_id,
                     col_idx: vel_col,
-                    drop_fn: None,
                     layout: Layout::new::<Vel>(),
                     entries: vec![
                         BatchEntry {
@@ -2470,7 +2454,6 @@ mod tests {
             columns: vec![ColumnBatch {
                 comp_id: pos_id,
                 col_idx: col_idx_of(&world, arch1, pos_id),
-                drop_fn: None,
                 layout: Layout::new::<Pos>(),
                 entries: vec![BatchEntry {
                     row: row1,
@@ -2484,7 +2467,6 @@ mod tests {
             columns: vec![ColumnBatch {
                 comp_id: vel_id,
                 col_idx: col_idx_of(&world, arch2, vel_id),
-                drop_fn: None,
                 layout: Layout::new::<Vel>(),
                 entries: vec![BatchEntry {
                     row: row2,
@@ -2498,7 +2480,6 @@ mod tests {
             columns: vec![ColumnBatch {
                 comp_id: pos_id,
                 col_idx: col_idx_of(&world, arch3, pos_id),
-                drop_fn: None,
                 layout: Layout::new::<Pos>(),
                 entries: vec![BatchEntry {
                     row: row3,
@@ -2520,9 +2501,8 @@ mod tests {
     fn fast_lane_drop_on_abort() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut world = World::new();
-        // We need a world with registered Tracked to get the right drop_fn.
-        let tracked_id = world.register_component::<Tracked>();
-        let drop_fn = world.components.info(tracked_id).drop_fn;
+        // We need a world with registered Tracked so drop glue is wired.
+        let _tracked_id = world.register_component::<Tracked>();
 
         {
             let mut cs = EnumChangeSet::new();
@@ -2535,7 +2515,7 @@ mod tests {
             // Register drop entry with mutation_idx = usize::MAX (fast-lane sentinel).
             cs.drop_entries.push(DropEntry {
                 offset,
-                drop_fn: drop_fn.unwrap(),
+                drop_fn: crate::component::drop_ptr::<Tracked>,
                 mutation_idx: usize::MAX,
             });
             // Drop without apply — destructor should run via Drop impl.
@@ -2557,7 +2537,6 @@ mod tests {
         world.despawn(dead);
 
         let tracked_id = world.register_component::<Tracked>();
-        let drop_fn = world.components.info(tracked_id).drop_fn;
         let pos_id = world.register_component::<Pos>();
 
         let (arch_idx, row) = entity_location(&world, e);
@@ -2575,7 +2554,6 @@ mod tests {
             columns: vec![ColumnBatch {
                 comp_id: pos_id,
                 col_idx: pos_col,
-                drop_fn: None,
                 layout: Layout::new::<Pos>(),
                 entries: vec![BatchEntry {
                     row,
@@ -2600,7 +2578,7 @@ mod tests {
         });
         cs.drop_entries.push(DropEntry {
             offset: off_tracked,
-            drop_fn: drop_fn.unwrap(),
+            drop_fn: crate::component::drop_ptr::<Tracked>,
             mutation_idx: 0,
         });
 
@@ -2697,7 +2675,6 @@ mod tests {
             columns: vec![ColumnBatch {
                 comp_id: pos_id,
                 col_idx,
-                drop_fn: None,
                 layout: Layout::new::<Pos>(),
                 entries: Vec::new(), // empty!
             }],
@@ -2720,7 +2697,6 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut world = World::new();
         let tracked_id = world.register_component::<Tracked>();
-        let drop_fn = world.components.info(tracked_id).drop_fn;
 
         // Spawn entity with an initial Tracked value.
         let e = world.spawn((Tracked::new(1, &drops),));
@@ -2742,7 +2718,6 @@ mod tests {
             columns: vec![ColumnBatch {
                 comp_id: tracked_id,
                 col_idx,
-                drop_fn,
                 layout: Layout::new::<Tracked>(),
                 entries: vec![BatchEntry {
                     row,
@@ -2754,7 +2729,7 @@ mod tests {
         // Register drop entry for the new value (fast-lane sentinel).
         cs.drop_entries.push(DropEntry {
             offset,
-            drop_fn: drop_fn.unwrap(),
+            drop_fn: crate::component::drop_ptr::<Tracked>,
             mutation_idx: usize::MAX,
         });
 
@@ -2813,7 +2788,6 @@ mod tests {
             columns: vec![ColumnBatch {
                 comp_id: tracked_id,
                 col_idx: 0,
-                drop_fn: Some(drop_fn),
                 layout: Layout::new::<Tracked>(),
                 entries: vec![BatchEntry {
                     row: 0,
@@ -2882,11 +2856,9 @@ mod tests {
         let pos_col = batch.columns.iter().find(|c| c.comp_id == pos_id).unwrap();
         assert_eq!(pos_col.col_idx, col_idx_of(&world, arch_idx, pos_id));
         assert_eq!(pos_col.layout, Layout::new::<Pos>());
-        assert!(pos_col.drop_fn.is_none()); // Pos is Copy, no drop
 
         let vel_col = batch.columns.iter().find(|c| c.comp_id == vel_id).unwrap();
         assert_eq!(vel_col.col_idx, col_idx_of(&world, arch_idx, vel_id));
         assert_eq!(vel_col.layout, Layout::new::<Vel>());
-        assert!(vel_col.drop_fn.is_none()); // Vel is Copy, no drop
     }
 }
