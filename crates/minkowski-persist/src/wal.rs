@@ -158,6 +158,45 @@ fn write_segment_magic(writer: &mut BufWriter<&File>) -> Result<u64, WalError> {
 /// (torn write). Returns `Err` on corrupt payload, checksum mismatch,
 /// or oversized frame. Does NOT truncate the file — callers decide how
 /// to handle errors.
+/// Highest frame view stamped anywhere in the WAL directory. Reads only the
+/// 16-byte frame headers (view lives in the header; payloads are skipped via
+/// the length field). Sealed and active segments both count — the live view
+/// counter must resume at or above every view the log has ever carried.
+fn scan_max_view(segments: &[(u64, PathBuf)]) -> Result<u64, WalError> {
+    let mut max_view: u64 = 0;
+    for (_, seg_path) in segments {
+        let file = File::open(seg_path)?;
+        let mut pos: u64 = SEGMENT_MAGIC_SIZE;
+        loop {
+            let mut header_buf = [0u8; FRAME_HEADER_SIZE as usize];
+            match read_exact_at(&file, pos, &mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+            let len =
+                u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]])
+                    as u64;
+            if len > MAX_FRAME_SIZE as u64 {
+                break; // torn tail; scan_active_segment handles truncation
+            }
+            let view = u64::from_le_bytes([
+                header_buf[8],
+                header_buf[9],
+                header_buf[10],
+                header_buf[11],
+                header_buf[12],
+                header_buf[13],
+                header_buf[14],
+                header_buf[15],
+            ]);
+            max_view = max_view.max(view);
+            pos += FRAME_HEADER_SIZE + len;
+        }
+    }
+    Ok(max_view)
+}
+
 pub(crate) fn read_next_frame(
     file: &File,
     pos: u64,
@@ -477,8 +516,7 @@ impl Wal {
 
         // Crash recovery: scan the active segment, truncating torn/corrupt tail.
         // Frame scanning starts after the segment magic header.
-        let (active_last_seq, active_has, active_max_view) = wal.scan_active_segment()?;
-        let mut max_view_seen = active_max_view;
+        let (active_last_seq, active_has) = wal.scan_active_segment()?;
         wal.active_bytes = wal.active_file.metadata()?.len();
 
         // If crash recovery truncated the segment to empty (or below magic
@@ -497,8 +535,8 @@ impl Wal {
                 let mut pos: u64 = SEGMENT_MAGIC_SIZE;
                 let mut seg_last = 0u64;
                 let mut seg_has = false;
-                while let Some((entry, next_pos, _proof, view)) = read_next_frame(&seg_file, pos)? {
-                    max_view_seen = max_view_seen.max(view);
+                while let Some((entry, next_pos, _proof, _view)) = read_next_frame(&seg_file, pos)?
+                {
                     match entry {
                         WalEntry::Mutations(record) => {
                             seg_last = record.seq;
@@ -526,7 +564,7 @@ impl Wal {
         // INV-2: the live view counter must resume at the highest view the
         // log has ever stamped, or post-restart appends would carry a stale
         // view and replay would drop them.
-        wal.views = Views::with_current(max_view_seen);
+        wal.views = Views::with_current(scan_max_view(&segments)?);
 
         // If scan_active_segment did not find a checkpoint, scan sealed
         // segments in reverse to recover the most recent one. Accumulate
@@ -884,7 +922,12 @@ impl Wal {
     // PERF: Full scan on open is required for crash recovery — the WAL has no
     // index or footer, so the only way to find the last valid record is linear
     // scan. This runs once at startup, not per-frame.
-    fn scan_active_segment(&mut self) -> Result<(u64, bool, u64), WalError> {
+    /// Scan the active segment for crash recovery. Truncates torn/corrupt
+    /// tail. A frame stamped with a view older than the segment's newest
+    /// view is a deposed leader's late write — the tail is truncated at it
+    /// so the stale bytes cannot collide with new-leader writes at the same
+    /// offsets. Returns `(last_seq, has_mutations)`.
+    fn scan_active_segment(&mut self) -> Result<(u64, bool), WalError> {
         let mut last_seq = 0u64;
         let mut has_mutations = false;
         let mut max_view: u64 = 0;
@@ -893,6 +936,12 @@ impl Wal {
 
         while let Some((entry, next_pos, view)) = self.read_next_entry(pos)? {
             let frame_bytes = next_pos - pos;
+            if view < max_view {
+                // Stale-view tail: deposed leader's late write. Truncate it
+                // and everything after; new-leader records reuse the space.
+                self.active_file.set_len(pos)?;
+                break;
+            }
             max_view = max_view.max(view);
             match entry {
                 WalEntry::Mutations(record) => {
@@ -910,7 +959,7 @@ impl Wal {
         }
 
         self.bytes_since_checkpoint = bytes_after_checkpoint;
-        Ok((last_seq, has_mutations, max_view))
+        Ok((last_seq, has_mutations))
     }
 
     fn changeset_to_record(
@@ -1051,14 +1100,19 @@ impl WalCursor {
         let mut pos: u64 = SEGMENT_MAGIC_SIZE;
         let mut schema = None;
 
-        // Scan forward to from_seq
+        // Scan forward to from_seq. Seeded view state matters: frames skipped
+        // here still establish the segment's newest view, so a later stale
+        // frame cannot slip through.
+        let mut max_view_seen = 0u64;
         loop {
             match read_next_frame(&file, pos)? {
-                Some((WalEntry::Schema(s), next_pos, _proof, _view)) => {
+                Some((WalEntry::Schema(s), next_pos, _proof, view)) => {
+                    max_view_seen = max_view_seen.max(view);
                     schema = Some(s);
                     pos = next_pos;
                 }
-                Some((WalEntry::Mutations(record), next_pos, _proof, _view)) => {
+                Some((WalEntry::Mutations(record), next_pos, _proof, view)) => {
+                    max_view_seen = max_view_seen.max(view);
                     if record.seq >= from_seq {
                         break; // Don't advance past this record
                     }
@@ -1075,7 +1129,7 @@ impl WalCursor {
             dir: dir.to_path_buf(),
             file,
             pos,
-            max_view_seen: 0,
+            max_view_seen,
             next_seq: from_seq,
             schema,
             current_segment_start_seq: *start_seq,
@@ -2535,6 +2589,201 @@ mod tests {
             wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
         }
+    }
+
+    #[test]
+    fn open_resumes_view_across_segments() {
+        // The highest view may live in a sealed segment while the active
+        // segment is older — open must resume from the true max.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("views.wal");
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        let config = WalConfig {
+            max_segment_bytes: 256, // roll on nearly every append
+            ..default_config()
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+        let ea = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, ea, (Pos { x: 1.0, y: 1.0 },))
+            .unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        assert_eq!(wal.views.bump(), 1);
+        let eb = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, eb, (Pos { x: 2.0, y: 2.0 },))
+            .unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        drop(wal);
+
+        // Reopen: the live view must resume at 1, not 0.
+        let mut wal = Wal::open(&wal_dir, &codecs, default_config()).unwrap();
+        assert_eq!(wal.views.current(), 1, "view must resume from the log max");
+
+        // A post-restart append stamps view 1 and replays.
+        let ec = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, ec, (Pos { x: 3.0, y: 3.0 },))
+            .unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        drop(wal);
+
+        let mut recovered = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register_as::<Pos>("pos", &mut recovered).unwrap();
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay_from(0, &mut recovered, &codecs2).unwrap();
+        assert!(recovered.is_alive(ea));
+        assert!(recovered.is_alive(eb));
+        assert!(
+            recovered.is_alive(ec),
+            "post-restart append must not be fenced out"
+        );
+    }
+
+    #[test]
+    fn open_truncates_stale_view_tail_in_active_segment() {
+        // A deposed leader's late write in the ACTIVE segment is truncated
+        // at reopen: next_seq resumes past it and cursors never see it.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("tail.wal");
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        let ea = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, ea, (Pos { x: 1.0, y: 1.0 },))
+            .unwrap();
+        let seq_a = wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        assert_eq!(wal.views.bump(), 1);
+        let eb = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, eb, (Pos { x: 2.0, y: 2.0 },))
+            .unwrap();
+        let seq_b = wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+
+        // Late view-0 write lands at the end of the active segment.
+        let mut cs_late = EnumChangeSet::new();
+        let ec = world.alloc_entity();
+        cs_late
+            .spawn_bundle(&mut world, ec, (Pos { x: 3.0, y: 3.0 },))
+            .unwrap();
+        let record =
+            Wal::changeset_to_record(seq_b + 1, &cs_late, &codecs, world.current_tick()).unwrap();
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&WalEntry::Mutations(record))
+            .map_err(|e| WalError::Format(e.to_string()))
+            .unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write as IoWrite};
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(wal_dir.join(segment_filename(0)))
+                .unwrap();
+            f.seek(SeekFrom::End(0)).unwrap();
+            let mut writer = std::io::BufWriter::new(&f);
+            write_frame(&mut writer, &payload, 0).unwrap();
+            writer.flush().unwrap();
+        }
+        drop(wal);
+
+        // Reopen truncates the stale tail.
+        let mut wal = Wal::open(&wal_dir, &codecs, default_config()).unwrap();
+        let ec = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, ec, (Pos { x: 3.0, y: 3.0 },))
+            .unwrap();
+        let seq_d = wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        assert_eq!(
+            seq_d,
+            seq_b + 1,
+            "post-truncation append must reuse the stale record's sequence"
+        );
+        drop(wal);
+
+        let mut cursor = WalCursor::open(&wal_dir, 0).unwrap();
+        let mut seen: Vec<u64> = Vec::new();
+        loop {
+            let batch = cursor.next_batch(10).unwrap();
+            if batch.records.is_empty() {
+                break;
+            }
+            seen.extend(batch.records.iter().map(|r| r.seq));
+        }
+        assert_eq!(
+            seen,
+            vec![seq_a, seq_b, seq_d],
+            "stale record must never ship"
+        );
+    }
+
+    #[test]
+    fn cursor_seeks_seed_view_state() {
+        // A cursor opened mid-log must seed max_view_seen from the frames it
+        // skips, or a stale frame after the seek point would ship.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("seed.wal");
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        let ea = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, ea, (Pos { x: 1.0, y: 1.0 },))
+            .unwrap();
+        let seq_a = wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        assert_eq!(wal.views.bump(), 1);
+        let eb = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, eb, (Pos { x: 2.0, y: 2.0 },))
+            .unwrap();
+        let seq_b = wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+
+        // Stale view-0 write AFTER the newest view, in the same segment.
+        let mut cs_late = EnumChangeSet::new();
+        let ec = world.alloc_entity();
+        cs_late
+            .spawn_bundle(&mut world, ec, (Pos { x: 3.0, y: 3.0 },))
+            .unwrap();
+        let record =
+            Wal::changeset_to_record(seq_b + 1, &cs_late, &codecs, world.current_tick()).unwrap();
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&WalEntry::Mutations(record))
+            .map_err(|e| WalError::Format(e.to_string()))
+            .unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write as IoWrite};
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(wal_dir.join(segment_filename(0)))
+                .unwrap();
+            f.seek(SeekFrom::End(0)).unwrap();
+            let mut writer = std::io::BufWriter::new(&f);
+            write_frame(&mut writer, &payload, 0).unwrap();
+            writer.flush().unwrap();
+        }
+        drop(wal);
+
+        // Cursor opened at seq_a + 1: the seek loop passes B (view 1) and
+        // must fence the late view-0 frame it encounters.
+        let mut cursor = WalCursor::open(&wal_dir, seq_a + 1).unwrap();
+        let batch = cursor.next_batch(10).unwrap();
+        let seqs: Vec<u64> = batch.records.iter().map(|r| r.seq).collect();
+        assert!(
+            !seqs.contains(&(seq_b + 1)),
+            "stale frame after seek must not ship: {seqs:?}"
+        );
     }
 
     #[test]
