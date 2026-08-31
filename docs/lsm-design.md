@@ -51,8 +51,8 @@ One sorted run = one immutable `.run` file:
 | Orphan cleanup | files not tracked by the manifest are crash garbage; `cleanup_orphans` removes them | `manifest_ops::cleanup_orphans` |
 | Latest sequence wins | recovery orders runs by sequence, not by level: `LsmRecovery` sorts all runs by `sequence_range().lo()` and overwrites a page when the incoming run's `seq_hi` is greater or equal | `LsmRecovery::recover` sort + `store_page` overwrite rule |
 | Replay floor | WAL tail replays records with `seq >= seq_hi` of the newest run — inclusive, so a removal that straddles the flush boundary is not lost | `recover.rs` replay-floor invariant comment + tests |
-| Dirty-page discipline | every `BlobVec` mutation marks its page dirty; flush writes exactly the dirty pages | `storage::dirty_pages` wired into all mutation paths |
-| Output determinism | equal world states produce equal flush outputs (fingerprint-comparable) | `world_fingerprint` (minkowski-persist) keys by type, not numeric id |
+| Dirty-page discipline | row-level `BlobVec` writes mark their page dirty; batch entry points that hand out raw or mutable row access (`World::query` with `&mut T`, `query_table_mut`, `query_table_raw`) mark whole columns dirty, because per-row attribution is impossible ahead of iteration; flush writes exactly the dirty pages | `storage::dirty_pages` wired into `BlobVec` write paths; `mark_all_pages_dirty` at the batch entry points; `batch_mutation_entry_points_mark_pages_dirty` |
+| State-comparison determinism | equal world states compare equal via `world_fingerprint` — but flush **byte output** is not required to be identical across worlds: page keys use per-world numeric `arch_idx`, so archetype creation order changes file layout | `world_fingerprint` (minkowski-persist) keys by type, never numeric id |
 
 ### 3.1 The invariant matrix: recovery × storage kind
 

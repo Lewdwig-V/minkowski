@@ -125,6 +125,22 @@ impl BlobVec {
         self.dirty_pages.mark_row(row);
     }
 
+    /// Mark every page covering the live rows dirty.
+    ///
+    /// For batch entry points that hand out mutable slices without per-row
+    /// knowledge (`World::query` with `&mut T`, `query_table_mut`): which rows
+    /// the caller writes is unknowable ahead of iteration, so dirty marking
+    /// is pessimistic over the whole column — the same trade-off the tick
+    /// marking already makes.
+    pub(crate) fn mark_all_pages_dirty(&mut self) {
+        if self.len > 0 {
+            let pages = self.len.div_ceil(crate::storage::dirty_pages::PAGE_SIZE);
+            for page in 0..pages {
+                self.dirty_pages.mark_page(page);
+            }
+        }
+    }
+
     /// Creates a new `BlobVec` for items with the given layout and optional drop function.
     pub fn new(
         item_layout: Layout,

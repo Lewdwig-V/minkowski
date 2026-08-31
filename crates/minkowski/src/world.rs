@@ -1133,14 +1133,18 @@ impl World {
             }
             filtered_ids.push(aid);
         }
-        // Mark mutable columns changed (each gets a fresh tick)
+        // Mark mutable columns changed (each gets a fresh tick). Pages go
+        // dirty too: the iterator hands out raw row pointers, so which rows
+        // the caller writes is unknowable ahead of iteration.
         if !mutable.is_empty() {
             let tick = self.next_tick();
             for &aid in &filtered_ids {
                 for comp_id in mutable.ones() {
-                    let arch = &self.archetypes.archetypes[aid.0];
+                    let arch = &mut self.archetypes.archetypes[aid.0];
                     if let Some(col_idx) = arch.column_index(comp_id) {
-                        self.archetypes.archetypes[aid.0].columns[col_idx].mark_changed(tick);
+                        let col = &mut arch.columns[col_idx];
+                        col.mark_changed(tick);
+                        col.mark_all_pages_dirty();
                     }
                 }
             }
@@ -1202,6 +1206,7 @@ impl World {
     pub fn query_table_raw<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
         self.drain_orphans();
         self.mark_table_columns_changed::<T>();
+        self.mark_table_columns_dirty::<T>();
         let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
         crate::table::TableIter::new(col_ptrs, len)
     }
@@ -1221,8 +1226,22 @@ impl World {
         &mut self,
     ) -> crate::table::TableTypedIter<'_, T::Mut<'_>> {
         self.mark_table_columns_changed::<T>();
+        self.mark_table_columns_dirty::<T>();
         let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
         crate::table::TableTypedIter::new(col_ptrs, len)
+    }
+
+    /// Mark all columns in a table's archetype's pages dirty: raw/mutable
+    /// row access makes per-row attribution impossible ahead of iteration.
+    fn mark_table_columns_dirty<T: crate::table::Table>(&mut self) {
+        let pool = self.pool.clone();
+        let desc =
+            self.table_cache
+                .get_or_create::<T>(&mut self.components, &mut self.archetypes, &pool);
+        let archetype = &mut self.archetypes.archetypes[desc.archetype_id.0];
+        for col in &mut archetype.columns {
+            col.mark_all_pages_dirty();
+        }
     }
 
     /// Mark all columns in a table's archetype as changed.
@@ -2300,6 +2319,74 @@ impl Default for WorldBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dirty-page audit: batch entry points that hand out raw or mutable row
+    /// access must mark pages dirty — LSM flush only ships dirty pages, so a
+    /// silent gap here is data loss on recovery. Regression for the query /
+    /// query_table_mut / query_table_raw marking gap.
+    #[derive(Clone, Copy, Debug, PartialEq, minkowski_derive::Table)]
+    struct TestRow {
+        a: Pos,
+        b: Vel,
+    }
+
+    #[test]
+    fn batch_mutation_entry_points_mark_pages_dirty() {
+        let mut world = World::new();
+        world.register_component::<Pos>();
+        world.register_component::<Vel>();
+        let entities: Vec<Entity> = (0..300)
+            .map(|i| {
+                world.spawn((
+                    Pos {
+                        x: i as f32,
+                        y: 0.0,
+                    },
+                    Vel { dx: 1.0, dy: 1.0 },
+                ))
+            })
+            .collect();
+
+        // Baseline: a clean world after an explicit clear.
+        world.clear_all_dirty_pages();
+        assert!(!(0..world.archetype_count()).any(|i| world.archetype_any_dirty(i)));
+
+        // query::<&mut T> dirties the iterated columns.
+        for (pos, vel) in world.query::<(&mut Pos, &Vel)>() {
+            pos.x += vel.dx;
+        }
+        assert!(
+            (0..world.archetype_count()).any(|i| world.archetype_any_dirty(i)),
+            "query::<&mut T> must mark pages dirty"
+        );
+        world.clear_all_dirty_pages();
+
+        // query_table_mut dirties the table archetype's columns.
+        let _ = world.query_table_mut::<TestRow>();
+        assert!(
+            (0..world.archetype_count()).any(|i| world.archetype_any_dirty(i)),
+            "query_table_mut must mark pages dirty"
+        );
+        world.clear_all_dirty_pages();
+
+        // query_table_raw (raw pointers, arbitrary writes) as well.
+        let _ = world.query_table_raw::<TestRow>();
+        assert!(
+            (0..world.archetype_count()).any(|i| world.archetype_any_dirty(i)),
+            "query_table_raw must mark pages dirty"
+        );
+        world.clear_all_dirty_pages();
+
+        // Read-only paths do not dirty.
+        let _ = world.query::<(&Pos,)>().count();
+        let _ = world.query_table::<TestRow>().count();
+        assert!(
+            !(0..world.archetype_count()).any(|i| world.archetype_any_dirty(i)),
+            "read-only iteration must not mark pages dirty"
+        );
+
+        let _ = entities;
+    }
 
     /// #180 + codex review regression: a panicking `Drop` on the SECOND
     /// column of a three-component archetype must leave a fully consistent
