@@ -129,8 +129,18 @@ impl Default for Follower {
 
 impl Follower {
     pub fn new() -> Self {
+        Self::with_baseline(0)
+    }
+
+    /// A follower resuming onto a world bootstrapped from a storage baseline
+    /// (LSM sorted runs via `recover_world`). `baseline_seq` is the first
+    /// sequence NOT covered by the baseline: records below it are already in
+    /// the restored world, so the first expected log record is
+    /// `baseline_seq`. For a manifest whose runs cover through `seq_hi`,
+    /// pass the replay floor the recovery used.
+    pub fn with_baseline(baseline_seq: u64) -> Self {
         Self {
-            high_water: StdAtomicU64::new(0),
+            high_water: StdAtomicU64::new(baseline_seq),
             poisoned: StdAtomicBool::new(false),
         }
     }
@@ -1184,5 +1194,46 @@ mod tests {
             })
         ));
         assert!(follower.is_poisoned());
+    }
+
+    #[test]
+    fn follower_baseline_seeds_high_water() {
+        // A replica bootstrapped from an LSM baseline holds records below
+        // the baseline seq; its first shipped record is seq == baseline.
+        let mut replica = World::new();
+        let mut reg = CodecRegistry::new();
+        reg.register_as::<Pos>("pos", &mut replica).unwrap();
+        let batch = ReplicationBatch {
+            schema: test_schema(),
+            records: vec![WalRecord {
+                tick_after: 9,
+                seq: 7, // == baseline: no gap
+                mutations: vec![SerializedMutation::Spawn {
+                    entity: 0,
+                    components: vec![(
+                        0usize,
+                        rkyv::to_bytes::<rkyv::rancor::Error>(&Pos { x: 1.0, y: 2.0 })
+                            .unwrap()
+                            .to_vec(),
+                    )],
+                }],
+            }],
+        };
+        let follower = Follower::with_baseline(7);
+        follower.advance(&batch, &mut replica, &reg).unwrap();
+        assert_eq!(follower.applied_seq(), 8);
+        assert!(replica.is_alive(minkowski::Entity::from_bits(0)));
+
+        // A record below the baseline is skipped, not gap-poisoned.
+        let old = ReplicationBatch {
+            schema: test_schema(),
+            records: vec![WalRecord {
+                tick_after: 3,
+                seq: 5,
+                mutations: vec![SerializedMutation::Despawn { entity: 0 }],
+            }],
+        };
+        follower.advance(&old, &mut replica, &reg).unwrap();
+        assert!(replica.is_alive(minkowski::Entity::from_bits(0)));
     }
 }

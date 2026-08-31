@@ -161,8 +161,10 @@ fn replica_side(rx: &mpsc::Receiver<WireMessage>) -> World {
     };
     let batch = ReplicationBatch::from_bytes(&batch_bytes).unwrap();
     // Follower carries the replica invariants: position idempotency, gap
-    // rejection, per-record tick set, poison-on-failure.
-    let follower = Follower::new();
+    // rejection, per-record tick set, poison-on-failure. The baseline
+    // installed above covers records below flush_seq, so the follower
+    // resumes there.
+    let follower = Follower::with_baseline(flush_seq);
     follower.advance(&batch, &mut world, &codecs).unwrap();
 
     let _ = std::fs::remove_dir_all(&dir);

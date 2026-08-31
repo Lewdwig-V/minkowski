@@ -1141,7 +1141,8 @@ impl WalCursor {
                     }
                     pos = next_pos;
                 }
-                Some((WalEntry::Checkpoint { .. }, next_pos, _proof, _view)) => {
+                Some((WalEntry::Checkpoint { .. }, next_pos, _proof, view)) => {
+                    max_view_seen = max_view_seen.max(view);
                     pos = next_pos;
                 }
                 None => break,
@@ -1186,7 +1187,8 @@ impl WalCursor {
                     records.push(record);
                     self.pos = next_pos;
                 }
-                Some((WalEntry::Checkpoint { .. }, next_pos, _proof, _view)) => {
+                Some((WalEntry::Checkpoint { .. }, next_pos, _proof, view)) => {
+                    self.max_view_seen = self.max_view_seen.max(view);
                     self.pos = next_pos;
                 }
                 None => {
@@ -2808,6 +2810,61 @@ mod tests {
         assert!(
             !seqs.contains(&(seq_b + 1)),
             "stale frame after seek must not ship: {seqs:?}"
+        );
+    }
+
+    #[test]
+    fn cursor_checkpoint_frames_raise_view_fence() {
+        // Checkpoints are stamped with the current view; a cursor must count
+        // them toward max_view_seen or a later stale mutation ships.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("ckpt.wal");
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        let ea = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, ea, (Pos { x: 1.0, y: 1.0 },))
+            .unwrap();
+        let seq_a = wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        assert_eq!(wal.views.bump(), 1);
+        wal.acknowledge_flush(seq_a + 1).unwrap(); // checkpoint stamped view 1
+        drop(wal);
+
+        // Deposed leader's late write at view 0.
+        let mut cs_late = EnumChangeSet::new();
+        let ec = world.alloc_entity();
+        cs_late
+            .spawn_bundle(&mut world, ec, (Pos { x: 3.0, y: 3.0 },))
+            .unwrap();
+        let record =
+            Wal::changeset_to_record(seq_a + 2, &cs_late, &codecs, world.current_tick()).unwrap();
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&WalEntry::Mutations(record))
+            .map_err(|e| WalError::Format(e.to_string()))
+            .unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write as IoWrite};
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(wal_dir.join(segment_filename(0)))
+                .unwrap();
+            f.seek(SeekFrom::End(0)).unwrap();
+            let mut writer = std::io::BufWriter::new(&f);
+            write_frame(&mut writer, &payload, 0).unwrap();
+            writer.flush().unwrap();
+        }
+
+        // Cursor from seq_a + 1: seek passes the view-1 checkpoint; the
+        // stale view-0 mutation after it must not ship.
+        let mut cursor = WalCursor::open(&wal_dir, seq_a + 1).unwrap();
+        let batch = cursor.next_batch(10).unwrap();
+        let seqs: Vec<u64> = batch.records.iter().map(|r| r.seq).collect();
+        assert!(
+            !seqs.contains(&(seq_a + 2)),
+            "stale mutation after checkpoint must not ship: {seqs:?}"
         );
     }
 
