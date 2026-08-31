@@ -197,6 +197,16 @@ impl CodecRegistry {
     /// responsibility passes to whatever takes ownership of the bytes (on
     /// recovery, the archetype column, which holds T's drop_fn). Returns `None`
     /// if no codec is registered for the type.
+    /// Stable name for a component type. Lookup by `TypeId`, never by the
+    /// world-local `ComponentId` — a recovered world may assign different
+    /// numeric ids than the registry that wrote it.
+    pub fn stable_name_by_type(&self, type_id: std::any::TypeId) -> Option<&str> {
+        self.codecs
+            .values()
+            .find(|c| c.type_id == type_id)
+            .map(|c| c.name.as_str())
+    }
+
     pub fn deserialize_by_type(
         &self,
         type_id: std::any::TypeId,

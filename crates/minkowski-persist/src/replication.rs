@@ -116,6 +116,8 @@ pub enum FollowerError {
         record_tick: u64,
         world_tick: u64,
     },
+    #[error("gap in log: expected seq {expected}, got {got}")]
+    Gap { expected: u64, got: u64 },
     #[error("apply failed: {0}")]
     Apply(#[from] WalError),
 }
@@ -187,6 +189,16 @@ impl Follower {
         for record in &batch.records {
             if record.seq < last {
                 continue; // already-applied prefix: no-op by position
+            }
+            if record.seq > last {
+                // Gap: the transport skipped a record. Applying forward
+                // would accept reads over a mutation that never ran —
+                // poison, the replica must rejoin.
+                self.poison();
+                return Err(FollowerError::Gap {
+                    expected: last,
+                    got: record.seq,
+                });
             }
             if record.tick_after < world.current_tick() {
                 self.poison();
@@ -1039,7 +1051,7 @@ mod tests {
             records: vec![
                 WalRecord {
                     tick_after: 1,
-                    seq: 1,
+                    seq: 0,
                     mutations: vec![SerializedMutation::Spawn {
                         entity: 0,
                         components: vec![(
@@ -1052,10 +1064,8 @@ mod tests {
                 },
                 WalRecord {
                     tick_after: 2,
-                    seq: 2,
-                    mutations: vec![SerializedMutation::Despawn {
-                        entity: 99u64 << 32,
-                    }],
+                    seq: 1,
+                    mutations: vec![SerializedMutation::Despawn { entity: 99 }],
                 },
             ],
         };
@@ -1094,7 +1104,7 @@ mod tests {
             schema: test_schema(),
             records: vec![WalRecord {
                 tick_after: 10, // below the world's current tick 50
-                seq: 1,
+                seq: 0,
                 mutations: vec![SerializedMutation::Despawn { entity: 5u64 << 32 }],
             }],
         };
@@ -1151,5 +1161,29 @@ mod tests {
                 applied_seq: 1
             })
         ));
+    }
+
+    #[test]
+    fn follower_gap_poisons() {
+        let mut replica = World::new();
+        let mut reg = CodecRegistry::new();
+        reg.register_as::<Pos>("pos", &mut replica).unwrap();
+        let batch = ReplicationBatch {
+            schema: test_schema(),
+            records: vec![WalRecord {
+                tick_after: 1,
+                seq: 3, // applied_seq is 0 — this is a gap, not the next record
+                mutations: vec![SerializedMutation::Despawn { entity: 0 }],
+            }],
+        };
+        let follower = Follower::new();
+        assert!(matches!(
+            follower.advance(&batch, &mut replica, &reg),
+            Err(FollowerError::Gap {
+                expected: 0,
+                got: 3
+            })
+        ));
+        assert!(follower.is_poisoned());
     }
 }

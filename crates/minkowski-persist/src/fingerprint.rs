@@ -28,6 +28,23 @@ use minkowski_lsm::codec::CodecRegistry;
 /// `arch_key -> entity bits -> component name -> value hash`.
 type ArchetypeMap = BTreeMap<String, BTreeMap<u64, BTreeMap<String, u64>>>;
 
+/// Resolve a component's stable name via its `TypeId` so the fingerprint is
+/// independent of per-world numeric component ids (recovered worlds re-register
+/// types and may compact ids).
+fn name_by_type(
+    world: &World,
+    codecs: &CodecRegistry,
+    comp_id: ComponentId,
+) -> Result<String, String> {
+    let type_id = world
+        .component_type_id(comp_id)
+        .ok_or_else(|| format!("unregistered component {comp_id:?}"))?;
+    codecs
+        .stable_name_by_type(type_id)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("no codec for component {comp_id:?}"))
+}
+
 /// Compute the world fingerprint. Every dense component in the world must
 /// have a registered codec (the same gate flush enforces).
 pub fn world_fingerprint(world: &World, codecs: &CodecRegistry) -> Result<u64, String> {
@@ -37,12 +54,7 @@ pub fn world_fingerprint(world: &World, codecs: &CodecRegistry) -> Result<u64, S
         let comp_ids: Vec<ComponentId> = world.archetype_component_ids(arch_idx).to_vec();
         let mut names: Vec<String> = Vec::with_capacity(comp_ids.len());
         for id in &comp_ids {
-            names.push(
-                codecs
-                    .stable_name(*id)
-                    .ok_or_else(|| format!("no stable name for component {id:?}"))?
-                    .to_owned(),
-            );
+            names.push(name_by_type(world, codecs, *id)?);
         }
         names.sort();
         let arch_key = names.join("\u{1}");
@@ -52,9 +64,7 @@ pub fn world_fingerprint(world: &World, codecs: &CodecRegistry) -> Result<u64, S
         for (row, entity) in entities.iter().enumerate() {
             let values = entry.entry(entity.to_bits()).or_default();
             for &comp_id in &comp_ids {
-                let name = codecs
-                    .stable_name(comp_id)
-                    .ok_or_else(|| format!("no stable name for component {comp_id:?}"))?;
+                let name = name_by_type(world, codecs, comp_id)?;
                 let type_id = world
                     .component_type_id(comp_id)
                     .ok_or_else(|| format!("unregistered component {comp_id:?}"))?;
@@ -71,7 +81,7 @@ pub fn world_fingerprint(world: &World, codecs: &CodecRegistry) -> Result<u64, S
                     Some(Err(e)) => return Err(format!("codec serialize failed: {e}")),
                     None => return Err("no codec for fingerprinted component".to_owned()),
                 }
-                values.insert(name.to_owned(), hasher.finish());
+                values.insert(name.clone(), hasher.finish());
             }
         }
     }

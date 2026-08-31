@@ -11,7 +11,7 @@ use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 
 // WAL segment format (v2):
-//   [segment_magic: 4 bytes "MKW2"]
+//   [segment_magic: 4 bytes "MKW3"]
 //   [frame0: len+crc+payload]          — schema preamble
 //   [frame1: len+crc+payload]          — data / checkpoint
 //   ...
@@ -29,7 +29,7 @@ use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 const FRAME_HEADER_SIZE: u64 = 16; // [len: u32 LE][crc32: u32 LE][view: u64 LE]
 
 /// Segment file magic identifying v2 format with CRC32 checksums.
-const SEGMENT_MAGIC: [u8; 4] = *b"MKW2";
+const SEGMENT_MAGIC: [u8; 4] = *b"MKW3";
 
 /// Size of the segment magic header in bytes.
 const SEGMENT_MAGIC_SIZE: u64 = 4;
@@ -334,137 +334,6 @@ type CollectedRecord = (
     Option<Arc<HashMap<ComponentId, ComponentId>>>,
 );
 
-/// Apply all collected WAL records as a single batched changeset.
-/// All mutations are kept in WAL order to preserve replay semantics:
-/// insert-then-despawn and insert-then-remove sequences must apply in
-/// the same order they were originally recorded.
-///
-/// # Error Recovery
-///
-/// If replay fails (codec error, dead entity, corrupt frame), the World
-/// may be in a partially-applied state. Callers should discard the World
-/// and rebuild from the last known-good snapshot. This matches the WAL
-/// error classification: replay failure is fatal, not operational.
-fn apply_records_batched(
-    records: &[CollectedRecord],
-    world: &mut World,
-    codecs: &CodecRegistry,
-) -> Result<(), WalError> {
-    let mut changeset = EnumChangeSet::new();
-
-    /// Wrap an error with record sequence number and mutation index context.
-    #[expect(clippy::needless_pass_by_value)]
-    fn wrap_err(seq: u64, mut_idx: usize, e: WalError) -> WalError {
-        WalError::Format(format!("record seq={seq}, mutation {mut_idx}: {e}"))
-    }
-
-    for (record, proof, remap) in records {
-        let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
-            match remap.as_deref() {
-                None => Ok(id),
-                Some(r) => r
-                    .get(&id)
-                    .copied()
-                    .ok_or(WalError::Codec(CodecError::UnregisteredComponent(id))),
-            }
-        };
-
-        for (mut_idx, mutation) in record.mutations.iter().enumerate() {
-            match mutation {
-                SerializedMutation::Spawn { entity, components } => {
-                    let entity = Entity::from_bits(*entity);
-                    world.alloc_entity();
-                    let mut raw_components: Vec<(ComponentId, Vec<u8>, std::alloc::Layout)> =
-                        Vec::new();
-                    for (comp_id, data) in components {
-                        let local_id =
-                            remap_id(*comp_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?;
-                        let raw = codecs
-                            .decode(local_id, data, Some(proof))
-                            .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
-                        let layout = codecs
-                            .layout(local_id)
-                            .ok_or(CodecError::UnregisteredComponent(local_id))
-                            .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
-                        raw_components.push((local_id, raw, layout));
-                    }
-                    let ptrs: Vec<_> = raw_components
-                        .iter()
-                        .map(|(id, raw, layout)| (*id, raw.as_ptr(), *layout))
-                        .collect();
-                    changeset.record_spawn(entity, &ptrs);
-                }
-                SerializedMutation::Despawn { entity } => {
-                    changeset.record_despawn(Entity::from_bits(*entity));
-                }
-                SerializedMutation::Insert {
-                    entity,
-                    component_id,
-                    data,
-                } => {
-                    let local_id =
-                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?;
-                    let raw = codecs
-                        .decode(local_id, data, Some(proof))
-                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
-                    let layout = codecs
-                        .layout(local_id)
-                        .ok_or(CodecError::UnregisteredComponent(local_id))
-                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
-                    changeset.record_insert(
-                        Entity::from_bits(*entity),
-                        local_id,
-                        raw.as_ptr(),
-                        layout,
-                    );
-                }
-                SerializedMutation::Remove {
-                    entity,
-                    component_id,
-                } => {
-                    changeset.record_remove(
-                        Entity::from_bits(*entity),
-                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?,
-                    );
-                }
-                SerializedMutation::SparseInsert {
-                    entity,
-                    component_id,
-                    data,
-                } => {
-                    let local_id =
-                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?;
-                    let raw = codecs
-                        .decode(local_id, data, Some(proof))
-                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
-                    let layout = codecs
-                        .layout(local_id)
-                        .ok_or(CodecError::UnregisteredComponent(local_id))
-                        .map_err(|e| wrap_err(record.seq, mut_idx, e.into()))?;
-                    changeset.record_sparse_insert(
-                        Entity::from_bits(*entity),
-                        local_id,
-                        raw.as_ptr(),
-                        layout,
-                    );
-                }
-                SerializedMutation::SparseRemove {
-                    entity,
-                    component_id,
-                } => {
-                    changeset.record_sparse_remove(
-                        Entity::from_bits(*entity),
-                        remap_id(*component_id).map_err(|e| wrap_err(record.seq, mut_idx, e))?,
-                    );
-                }
-            }
-        }
-    }
-
-    changeset.apply(world).map_err(WalError::Apply)?;
-    Ok(())
-}
-
 /// Read-only snapshot of WAL statistics. Plain data struct — no references
 /// to internal state.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -493,6 +362,12 @@ impl Views {
     fn new() -> Self {
         Self {
             current: StdAtomicU64::new(0),
+        }
+    }
+
+    fn with_current(value: u64) -> Self {
+        Self {
+            current: StdAtomicU64::new(value),
         }
     }
 
@@ -602,7 +477,8 @@ impl Wal {
 
         // Crash recovery: scan the active segment, truncating torn/corrupt tail.
         // Frame scanning starts after the segment magic header.
-        let (active_last_seq, active_has) = wal.scan_active_segment()?;
+        let (active_last_seq, active_has, active_max_view) = wal.scan_active_segment()?;
+        let mut max_view_seen = active_max_view;
         wal.active_bytes = wal.active_file.metadata()?.len();
 
         // If crash recovery truncated the segment to empty (or below magic
@@ -621,8 +497,8 @@ impl Wal {
                 let mut pos: u64 = SEGMENT_MAGIC_SIZE;
                 let mut seg_last = 0u64;
                 let mut seg_has = false;
-                while let Some((entry, next_pos, _proof, _view)) = read_next_frame(&seg_file, pos)?
-                {
+                while let Some((entry, next_pos, _proof, view)) = read_next_frame(&seg_file, pos)? {
+                    max_view_seen = max_view_seen.max(view);
                     match entry {
                         WalEntry::Mutations(record) => {
                             seg_last = record.seq;
@@ -646,6 +522,11 @@ impl Wal {
                 wal.next_seq = wal.active_start_seq;
             }
         }
+
+        // INV-2: the live view counter must resume at the highest view the
+        // log has ever stamped, or post-restart appends would carry a stale
+        // view and replay would drop them.
+        wal.views = Views::with_current(max_view_seen);
 
         // If scan_active_segment did not find a checkpoint, scan sealed
         // segments in reverse to recover the most recent one. Accumulate
@@ -890,16 +771,13 @@ impl Wal {
             return Ok(last_seq);
         }
 
-        // Phase 2: Decode all mutations in WAL order and apply as one changeset.
-        apply_records_batched(&pending, world, codecs)?;
-
-        // INV-1: restore the world tick to the last committed record's
-        // commit-boundary tick. The batched apply already advanced the tick
-        // naturally; take the max so a recovered baseline that is already
-        // ahead is never regressed.
-        let last_tick = pending.last().map_or(0, |(r, _, _)| r.tick_after);
-        if last_tick > world.current_tick() {
-            world.set_current_tick(last_tick);
+        // Phase 2: Apply per record in WAL order (INV-1: commit = tick).
+        // Each record replays at its own commit-boundary tick so the world's
+        // tick history matches the leader's exactly. Decode is still batched
+        // per record inside `apply_record`.
+        for (record, proof, remap) in &pending {
+            world.set_current_tick(record.tick_after);
+            apply_record(record, world, codecs, remap.as_deref(), Some(proof))?;
         }
 
         Ok(last_seq)
@@ -990,9 +868,9 @@ impl Wal {
     /// Try to read the next entry from the active segment.
     /// On EOF, partial frame, or corrupt data, truncates the file to `pos`
     /// (crash recovery) and returns `Ok(None)`.
-    fn read_next_entry(&mut self, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
+    fn read_next_entry(&mut self, pos: u64) -> Result<Option<(WalEntry, u64, u64)>, WalError> {
         match read_next_frame(&self.active_file, pos) {
-            Ok(Some((entry, next_pos, _proof, _view))) => Ok(Some((entry, next_pos))),
+            Ok(Some((entry, next_pos, _proof, view))) => Ok(Some((entry, next_pos, view))),
             Ok(None) | Err(WalError::Format(_) | WalError::ChecksumMismatch { .. }) => {
                 self.active_file.set_len(pos)?;
                 Ok(None)
@@ -1006,14 +884,16 @@ impl Wal {
     // PERF: Full scan on open is required for crash recovery — the WAL has no
     // index or footer, so the only way to find the last valid record is linear
     // scan. This runs once at startup, not per-frame.
-    fn scan_active_segment(&mut self) -> Result<(u64, bool), WalError> {
+    fn scan_active_segment(&mut self) -> Result<(u64, bool, u64), WalError> {
         let mut last_seq = 0u64;
         let mut has_mutations = false;
+        let mut max_view: u64 = 0;
         let mut pos: u64 = SEGMENT_MAGIC_SIZE;
         let mut bytes_after_checkpoint: u64 = 0;
 
-        while let Some((entry, next_pos)) = self.read_next_entry(pos)? {
+        while let Some((entry, next_pos, view)) = self.read_next_entry(pos)? {
             let frame_bytes = next_pos - pos;
+            max_view = max_view.max(view);
             match entry {
                 WalEntry::Mutations(record) => {
                     last_seq = record.seq;
@@ -1030,7 +910,7 @@ impl Wal {
         }
 
         self.bytes_since_checkpoint = bytes_after_checkpoint;
-        Ok((last_seq, has_mutations))
+        Ok((last_seq, has_mutations, max_view))
     }
 
     fn changeset_to_record(
@@ -1141,6 +1021,9 @@ pub struct WalCursor {
     next_seq: u64,
     schema: Option<WalSchema>,
     current_segment_start_seq: u64,
+    /// Highest frame view seen so far. Frames stamped with an older view
+    /// are from a deposed leader and are dropped, matching `replay_from`.
+    max_view_seen: u64,
 }
 
 impl WalCursor {
@@ -1192,6 +1075,7 @@ impl WalCursor {
             dir: dir.to_path_buf(),
             file,
             pos,
+            max_view_seen: 0,
             next_seq: from_seq,
             schema,
             current_segment_start_seq: *start_seq,
@@ -1207,11 +1091,20 @@ impl WalCursor {
 
         while records.len() < limit {
             match read_next_frame(&self.file, self.pos)? {
-                Some((WalEntry::Schema(s), next_pos, _proof, _view)) => {
+                Some((WalEntry::Schema(s), next_pos, _proof, view)) => {
+                    self.max_view_seen = self.max_view_seen.max(view);
                     self.schema = Some(s);
                     self.pos = next_pos;
                 }
-                Some((WalEntry::Mutations(record), next_pos, _proof, _view)) => {
+                Some((WalEntry::Mutations(record), next_pos, _proof, view)) => {
+                    if view < self.max_view_seen {
+                        // Stale-view frame: deposed leader's late write. The
+                        // follower must never see it (P1: fence through
+                        // replication, not just local replay).
+                        self.pos = next_pos;
+                        continue;
+                    }
+                    self.max_view_seen = self.max_view_seen.max(view);
                     self.next_seq = record.seq + 1;
                     records.push(record);
                     self.pos = next_pos;
@@ -2614,6 +2507,37 @@ mod tests {
     }
 
     #[test]
+    fn rollover_many_appends_does_not_collide() {
+        // Reproduces the wal_append bench panic: rolls must always pick a
+        // fresh segment filename.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("roll.wal");
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        let config = WalConfig {
+            max_segment_bytes: 512,
+            ..default_config()
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+        for i in 0..64 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            )
+            .unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
+            cs.apply(&mut world).unwrap();
+        }
+    }
+
+    #[test]
     fn stale_view_frames_dropped_by_replay() {
         // INV-2 fence: a frame stamped with a view older than the newest
         // view already seen in the log is from a deposed leader and must
@@ -2698,7 +2622,7 @@ mod tests {
         let wal_dir = dir.path().join("legacy.wal");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // Write a fake v1 segment: starts with a u32 length (no "MKW2" magic).
+        // Write a fake v1 segment: starts with a u32 length (no "MKW3" magic).
         let seg_path = wal_dir.join(segment_filename(0));
         {
             use std::io::Write;
@@ -2813,7 +2737,7 @@ mod tests {
         let seg_path = wal_dir.join(segment_filename(0));
         let data = std::fs::read(&seg_path).unwrap();
         assert!(data.len() >= 4);
-        assert_eq!(&data[0..4], b"MKW2", "segment must start with v2 magic");
+        assert_eq!(&data[0..4], b"MKW3", "segment must start with v2 magic");
     }
 
     #[test]
