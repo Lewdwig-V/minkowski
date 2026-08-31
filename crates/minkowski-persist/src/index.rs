@@ -522,7 +522,7 @@ mod tests {
                 let e = world.alloc_entity();
                 let mut cs = minkowski::EnumChangeSet::new();
                 cs.spawn_bundle(&mut world, e, (Score(i),)).unwrap();
-                wal.append(&cs, &codecs).unwrap();
+                wal.append(&cs, &codecs, world.current_tick()).unwrap();
                 cs.apply(&mut world).unwrap();
             }
 
@@ -547,13 +547,13 @@ mod tests {
             let e = world.alloc_entity();
             let mut cs = minkowski::EnumChangeSet::new();
             cs.spawn_bundle(&mut world, e, (Score(99),)).unwrap();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
             cs.apply(&mut world).unwrap();
 
             let e2 = world.alloc_entity();
             let mut cs2 = minkowski::EnumChangeSet::new();
             cs2.spawn_bundle(&mut world, e2, (Score(88),)).unwrap();
-            wal.append(&cs2, &codecs).unwrap();
+            wal.append(&cs2, &codecs, world.current_tick()).unwrap();
             cs2.apply(&mut world).unwrap();
         }
 

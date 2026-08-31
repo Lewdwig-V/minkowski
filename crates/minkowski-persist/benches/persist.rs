@@ -91,11 +91,11 @@ fn bench_wal_append(c: &mut Criterion) {
     let mut codecs = CodecRegistry::new();
     codecs.register::<Pos>(&mut world).unwrap();
 
+    let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
     c.bench_function("persist/wal_append", |b| {
-        let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
         b.iter(|| {
             let cs = minkowski::EnumChangeSet::new();
-            wal.append(&cs, &codecs).unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
         });
     });
 }

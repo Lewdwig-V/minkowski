@@ -94,7 +94,7 @@ impl<S: Transact> Transact for Durable<S> {
                     // WAL write BEFORE apply — durable commit point
                     self.wal
                         .lock()
-                        .append(&forward, &self.codecs)
+                        .append(&forward, &self.codecs, world.current_tick())
                         .expect("WAL write failed — durable commit impossible");
                     forward
                         .apply(world)
