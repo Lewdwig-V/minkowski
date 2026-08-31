@@ -88,7 +88,7 @@ The unsafe precondition — page bytes are a valid native image of the component
 
 | Area | Coverage |
 |---|---|
-| Format | 246 lib tests and 38 integration tests: frame CRC, magic validation, legacy-format rejection |
+| Format | 250 lib tests (246 in the default build; 4 behind the `bench-support` feature) and 38 integration tests: frame CRC, magic validation, legacy-format rejection |
 | Bloom | probe false-negative tests (`bloom_filter_matches_index`, `bloom_filter_rejects_absent_pages`), read-path wiring (`get_page` prefilter hit/miss, no-filter pass-through) |
 | Compaction | end-to-end `compact_one` with input-file deletion asserted; `CompactionCommit` atomicity; orphan cleanup |
 | Recovery | `recover_world` tail replay, replay-floor edge (removal straddling the flush), sparse restoration ordering, allocator metadata restoration |
