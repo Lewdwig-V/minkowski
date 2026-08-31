@@ -89,8 +89,13 @@ pub(crate) fn merge_entity_images(
     }
 
     let mut entity_winners: HashMap<u64, (usize, usize, usize)> = HashMap::new(); // entity -> (input_idx, sig_idx, row)
-    for (sig_idx, per_input) in arch_ids_per_signature_per_input.iter().enumerate() {
-        for (input_idx, input) in inputs.iter().enumerate() {
+    // Inputs outermost: `or_insert` then keeps the lowest input index (the
+    // newest run that actually contains the entity), because every candidate
+    // from input k is seen before any candidate from input k+1. A
+    // signature-outer loop lets the first signature claim an entity whose
+    // newer image sits in a later-visited input.
+    for (input_idx, input) in inputs.iter().enumerate() {
+        for (sig_idx, per_input) in arch_ids_per_signature_per_input.iter().enumerate() {
             let Some(arch_id) = per_input[input_idx] else {
                 continue;
             };
@@ -923,6 +928,15 @@ fn make_tmp_path(output_path: &Path, seq_lo: u64, seq_hi: u64) -> PathBuf {
 #[cfg(test)]
 mod tests {
 
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq, Debug)]
+    #[repr(C)]
+    struct A(u32);
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq, Debug)]
+    #[repr(C)]
+    struct B(u32);
+
+    crate::impl_raw_copy_certified!(A, B);
+
     crate::impl_raw_copy_certified!(Pos);
     use super::*;
     use crate::schema_match::find_archetype_by_components;
@@ -954,6 +968,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut codecs = crate::codec::CodecRegistry::new();
         codecs.register_raw_copy_as::<Pos>("pos", world).unwrap();
+        codecs.register_raw_copy_as::<A>("a", world).unwrap();
+        codecs.register_raw_copy_as::<B>("b", world).unwrap();
         let path = flush(
             world,
             SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap(),
