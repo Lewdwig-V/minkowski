@@ -666,7 +666,35 @@ fn materialize_world(
     let (generations, free_list) = build_allocator_state(&by_sig, allocator);
     world.restore_allocator_state(generations, free_list);
 
-    for (sig, columns) in &by_sig {
+    // Archetype processing order: newest state image first. Runs are merged
+    // per page key, so an archetype migration (remove a component from the
+    // last row → the entity's new archetype page is dirty, the source
+    // archetype's pages stay clean) leaves the stale source page as the
+    // winner of its own key. Processing signatures by descending page
+    // `seq_hi` lets the newer placement claim the entity and the stale page
+    // skip it via the already-placed filter. Ascending order would let the
+    // stale source page place the entity with the removed component still
+    // attached, and the newer page would be skipped as already-placed.
+    // Within a signature, page_index ascending stays correct: swap_remove
+    // moves survivors to lower-or-equal rows, so newer placements sit at
+    // page indices the ascending scan reaches first.
+    type SignaturePages<'a> = (
+        &'a ArchetypeSig,
+        &'a BTreeMap<ColumnKey, BTreeMap<u16, StoredPage>>,
+    );
+    let mut sig_order: Vec<SignaturePages<'_>> = by_sig.iter().collect();
+    sig_order.sort_by_key(|(_, columns)| {
+        std::cmp::Reverse(
+            columns
+                .values()
+                .flat_map(|pages| pages.values())
+                .map(|p| p.seq_hi)
+                .max()
+                .unwrap_or(0),
+        )
+    });
+
+    for (sig, columns) in sig_order {
         // Resolve (comp_id, name) and sort by comp_id — the canonical archetype
         // key and the order import_page expects its columns in.
         let mut comp_pairs: Vec<(ComponentId, &String)> = sig
