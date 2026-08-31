@@ -1013,21 +1013,10 @@ mod tests {
         let fp_replica = crate::fingerprint::world_fingerprint(&replica, &reg).unwrap();
         assert_eq!(fp_leader, fp_replica, "replica state diverged from leader");
 
-        // The replica tick tracks the leader's last commit-boundary tick.
-        let mut cursor2 = WalCursor::open(&wal_dir, 0).unwrap();
-        let mut last_tick = 0u64;
-        while let Ok(batch) = cursor2.next_batch(1000) {
-            if batch.records.is_empty() {
-                break;
-            }
-            if let Some(r) = batch.records.last() {
-                last_tick = r.tick_after;
-            }
-        }
-        assert_eq!(
-            replica.current_tick(),
-            last_tick.max(replica.current_tick())
-        );
+        // The replica's tick equals the leader's post-commit tick: with no
+        // interleaved leader mutations, apply advances deterministically
+        // from each record's commit-boundary tick.
+        assert_eq!(replica.current_tick(), leader.current_tick());
     }
 
     #[test]
