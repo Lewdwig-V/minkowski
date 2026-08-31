@@ -7,6 +7,8 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::codec::CodecRegistry;
 
+crate::impl_raw_copy_certified!(BenchPos, BenchVel);
+
 #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
 #[repr(C)]
 pub struct BenchPos {

@@ -86,6 +86,8 @@ pub fn spawn_world(n: usize) -> minkowski::World {
     world
 }
 
+minkowski_lsm::impl_raw_copy_certified!(Transform, Position, Rotation, Velocity);
+
 /// Register all 4 component types with the codec registry.
 pub fn register_codecs(
     codecs: &mut minkowski_persist::CodecRegistry,

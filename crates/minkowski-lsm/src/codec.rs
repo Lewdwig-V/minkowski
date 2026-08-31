@@ -86,6 +86,49 @@ pub enum CodecError {
     },
 }
 
+/// Certification that the rkyv archived byte image of `T` equals its native
+/// byte image for every value, and that `T` owns no heap resource.
+///
+/// # Safety
+///
+/// The implementor guarantees, for every value of `T`:
+/// - `size_of::<T>() == size_of::<T::Archived>()` and the bytes are identical
+///   (no custom `Archive` impl or `rkyv(with = ...)` transform that permutes,
+///   widens, or re-encodes fields), and
+/// - `T` does not own heap memory (no `Drop`); its bytes may be copied
+///   verbatim into a fresh process and dropped there as plain bytes.
+///
+/// This licenses both raw-copy directions: native bytes are imported as
+/// archived bytes on recovery, and archived bytes (WAL replay payloads) are
+/// imported as native bytes through `decode`'s memcpy branch.
+pub unsafe trait RawCopyCertified: Copy {}
+
+unsafe impl RawCopyCertified for u8 {}
+unsafe impl RawCopyCertified for u16 {}
+unsafe impl RawCopyCertified for u32 {}
+unsafe impl RawCopyCertified for u64 {}
+unsafe impl RawCopyCertified for usize {}
+unsafe impl RawCopyCertified for i8 {}
+unsafe impl RawCopyCertified for i16 {}
+unsafe impl RawCopyCertified for i32 {}
+unsafe impl RawCopyCertified for i64 {}
+unsafe impl RawCopyCertified for isize {}
+unsafe impl RawCopyCertified for f32 {}
+unsafe impl RawCopyCertified for f64 {}
+unsafe impl RawCopyCertified for bool {}
+
+/// Implement [`RawCopyCertified`] for `#[repr(C)]` `Copy` structs whose
+/// `#[derive(Archive)]` produces a byte-identical archived form (no
+/// `rkyv(with = ...)` attributes, no generics that change representation).
+#[macro_export]
+macro_rules! impl_raw_copy_certified {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            unsafe impl $crate::codec::RawCopyCertified for $t {}
+        )+
+    };
+}
+
 struct ComponentCodec {
     name: String,
     layout: Layout,
@@ -278,20 +321,24 @@ impl CodecRegistry {
     ///
     /// # Soundness contract
     ///
-    /// `T: Copy` excludes `Drop`, hence any owned heap resource — the only
-    /// way verbatim native-byte round-trips can be unsound. Size equality
-    /// with the archived form is additionally required (the archived image
-    /// must be a valid native image). Components that own heap memory
-    /// (`String`, `Vec`, `Box`) cannot implement `Copy` and are excluded by
-    /// construction; non-`Copy` POD types fall back to `Serialized`.
+    /// [`RawCopyCertified`] requires the native byte image of every value to
+    /// equal its rkyv archived byte image, and `T: Copy` (implied by the
+    /// supertrait) excludes `Drop` and any owned heap resource. Both are
+    /// necessary: native bytes are flushed verbatim and re-imported verbatim
+    /// on recovery, and `decode` memcpys rkyv-produced (archived) payloads
+    /// for these types during WAL replay. A custom `Archive` impl or
+    /// `rkyv(with = ...)` transform that changes bytes breaks the contract
+    /// and must not be certified. Size equality with the archived form is
+    /// additionally required here. Heap-owning components (`String`, `Vec`,
+    /// `Box`) cannot implement `Copy` and are excluded by construction.
     pub fn register_raw_copy_as<T>(
         &mut self,
         stable_name: &str,
         world: &mut World,
     ) -> Result<(), CodecError>
     where
-        T: Component
-            + Copy
+        T: RawCopyCertified
+            + Component
             + Archive
             + for<'a> RkyvSerialize<
                 rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
@@ -763,6 +810,7 @@ impl CrcProof {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use rkyv::{Archive, Deserialize, Serialize};
 
@@ -1017,6 +1065,8 @@ mod tests {
 
 #[cfg(test)]
 mod raw_copy_tests {
+
+    crate::impl_raw_copy_certified!(Plain, ZstTag);
     use super::*;
     use minkowski::World;
     use rkyv::{Archive, Deserialize, Serialize};

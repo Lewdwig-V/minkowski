@@ -920,6 +920,8 @@ fn make_tmp_path(output_path: &Path, seq_lo: u64, seq_hi: u64) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    crate::impl_raw_copy_certified!(Pos);
     use super::*;
     use crate::schema_match::find_archetype_by_components;
     use crate::types::{SeqNo, SeqRange};
