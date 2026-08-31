@@ -5,7 +5,7 @@ Date: 2026-08-30. Status: **delivered** (Stages 1–3 complete; recovery cutover
 ## 1. Architecture summary
 
 ```
-World  ──dirty pages──▶  FlushWriter ──▶ L1 sorted run (.run file)
+World  ──dirty pages──▶  FlushWriter ──▶ L0 sorted run (.run file)
                               │                 │
                     manifest_ops::flush_and_record        │
                               ▼                           ▼
@@ -93,7 +93,7 @@ The unsafe precondition — page bytes are a valid native image of the component
 | Compaction | end-to-end `compact_one` with input-file deletion asserted; `CompactionCommit` atomicity; orphan cleanup |
 | Recovery | `recover_world` tail replay, replay-floor edge (removal straddling the flush), sparse restoration ordering, allocator metadata restoration |
 | Soundness | decode-fingerprint gate for unchecked rkyv (`deserialize_unchecked_by_type` requires the per-run layout fingerprint plus per-page `CrcProof`); recovery import-error drop-safety; raw-copy gate to raw-copyable codecs |
-| Fuzz | `fuzz_lsm_recovery` (malformed run/manifest input, pre-release) |
+| Fuzz | `fuzz_lsm_recovery` (flush + recover round-trip over statistically varied world states, f32 bit-pattern preservation). **Gap**: malformed run/manifest bytes are not fuzzed — `fuzz_lsm_recovery` builds valid inputs only. `fuzz_wal_replay` mode 0 feeds raw malformed bytes as a WAL file; no equivalent exists for `.run` files |
 
 ## 7. Known constraints
 

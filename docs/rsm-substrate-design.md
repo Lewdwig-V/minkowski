@@ -134,4 +134,4 @@ Deferred to 4.1 and later, unchanged: VR consensus core, leader election, io_uri
 | `frame_header_size_is_sixteen` | 16-byte header format pin |
 | `rollover_many_appends_does_not_collide` | segment rollover under the new header |
 
-Pending, listed so the gaps stay visible: loom coverage for `Follower` high-water/poison races, `fuzz_lsm_recovery` corpus entries with view-stamped frames (stale views included), and failpoint hooks in the outbound pump for the 4.1 simulator.
+Pending, listed so the gaps stay visible: loom coverage for `Follower` high-water/poison races, `fuzz_wal_replay` corpus entries with view-stamped frames (stale views included — its mode 0 already feeds raw bytes at replay), and failpoint hooks in the outbound pump for the 4.1 simulator.
