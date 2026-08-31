@@ -949,7 +949,7 @@ mod tests {
     ) -> (tempfile::TempDir, SortedRunReader) {
         let dir = tempfile::tempdir().unwrap();
         let mut codecs = crate::codec::CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", world).unwrap();
+        codecs.register_raw_copy_as::<Pos>("pos", world).unwrap();
         let path = flush(
             world,
             SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap(),

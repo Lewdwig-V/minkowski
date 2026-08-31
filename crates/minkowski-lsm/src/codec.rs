@@ -1062,8 +1062,12 @@ mod raw_copy_tests {
     fn raw_copyable_and_zst_classify_raw_copy() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Plain>("plain", &mut world).unwrap();
-        codecs.register_as::<ZstTag>("zst", &mut world).unwrap();
+        codecs
+            .register_raw_copy_as::<Plain>("plain", &mut world)
+            .unwrap();
+        codecs
+            .register_raw_copy_as::<ZstTag>("zst", &mut world)
+            .unwrap();
         assert_eq!(
             codecs.storage_kind_for_type(std::any::TypeId::of::<Plain>()),
             Some(crate::schema::StorageKind::RawCopy)
@@ -1207,7 +1211,9 @@ mod raw_copy_tests {
         );
 
         // POD types keep their raw_copy_size — the fast path stays enabled.
-        codecs.register_as::<Plain>("plain", &mut world).unwrap();
+        codecs
+            .register_raw_copy_as::<Plain>("plain", &mut world)
+            .unwrap();
         let pod_id = world.component_id::<Plain>().unwrap();
         assert!(
             codecs.raw_copy_size(pod_id).is_some(),
@@ -1339,7 +1345,9 @@ mod raw_copy_tests {
         codecs
             .register_as::<Box<u64>>("boxed_u64", &mut world)
             .unwrap();
-        codecs.register_as::<u64>("plain_u64", &mut world).unwrap();
+        codecs
+            .register_raw_copy_as::<u64>("plain_u64", &mut world)
+            .unwrap();
 
         assert!(
             matches!(
