@@ -629,4 +629,98 @@ mod tests {
         let tag0 = recovered.get::<Tag>(e0).unwrap();
         assert_eq!(tag0.0, 10);
     }
+
+    #[test]
+    fn migration_survives_compaction_between_checkpoints() {
+        // Compaction dedup must be global across signatures: a migrated
+        // entity appears under its stale source signature (old runs) and its
+        // newer target signature; if compaction emits both, every output page
+        // carries one sequence_hi and recovery's per-entity ordering ties,
+        // falling back to signature order — which can resurrect the removed
+        // component. The shared seen-set keeps only the newest image.
+        use crate::recover::recover_world;
+        use crate::wal::WalConfig;
+
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("migr-c.wal");
+        let lsm_dir = dir.path().join("lsm");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        codecs.register_as::<Tag>("tag", &mut world).unwrap();
+
+        let config = WalConfig {
+            max_bytes_between_checkpoints: Some(usize::MAX),
+            ..WalConfig::default()
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+        let mut checkpoint = AutoCheckpoint::new(&lsm_dir);
+
+        let e0 = world.alloc_entity();
+        let mut cs = minkowski::EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e0, (Pos { x: 1.0, y: 1.0 }, Tag(10)))
+            .unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        let e1 = world.alloc_entity();
+        let mut cs = minkowski::EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e1, (Pos { x: 2.0, y: 2.0 }, Tag(20)))
+            .unwrap();
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        checkpoint
+            .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+            .unwrap();
+
+        // Migrate e1: {pos,tag} -> {tag}, then force a compaction via more
+        // checkpoints (AutoCheckpoint compacts at COMPACTION_TRIGGER L0 runs).
+        let mut cs = minkowski::EnumChangeSet::new();
+        cs.remove::<Pos>(&mut world, e1);
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        checkpoint
+            .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+            .unwrap();
+
+        // Generate enough no-op-ish mutations to roll L0 past the trigger —
+        // each checkpoint flushes a run; the 4th triggers compact_one.
+        for i in 0..40 {
+            let e = world.alloc_entity();
+            let mut cs = minkowski::EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (
+                    Pos {
+                        x: i as f32,
+                        y: 9.0,
+                    },
+                    Tag(i),
+                ),
+            )
+            .unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
+            cs.apply(&mut world).unwrap();
+            checkpoint
+                .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+                .unwrap();
+        }
+
+        let mut wal2 = Wal::open(&wal_dir, &codecs, WalConfig::default()).unwrap();
+        let recovered =
+            recover_world(&lsm_dir, &lsm_dir.join("manifest.log"), &mut wal2, &codecs).unwrap();
+
+        assert!(recovered.is_alive(e1));
+        assert!(
+            recovered.get::<Pos>(e1).is_none(),
+            "removed component must not resurrect after compaction"
+        );
+        assert_eq!(recovered.get::<Tag>(e1).unwrap().0, 20);
+        assert!(recovered.is_alive(e0));
+    }
 }

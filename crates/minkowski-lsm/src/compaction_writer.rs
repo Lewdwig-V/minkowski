@@ -56,9 +56,13 @@ pub(crate) struct EmitRow {
 
 // ── Core function ─────────────────────────────────────────────────────────────
 
-/// Build the emit list for a compaction job. Iterates input readers in order
+/// Build the emit list for one signature. Iterates input readers in order
 /// (caller must pass newest-first); emits each `entity_id` the first time it
-/// is seen. Duplicates in older runs are silently skipped — newest wins.
+/// is seen — **across signatures**, via the shared `seen` set. A migrated
+/// entity (component removed → different archetype) can appear under its old
+/// signature in older runs and its new signature in a newer run; the shared
+/// set keeps only the newest image. Duplicates in older runs are silently
+/// skipped — newest wins.
 ///
 /// `arch_ids_per_input[i]` is the `arch_id` within `inputs[i]` for the target
 /// archetype, or `None` if the archetype doesn't exist in that input (rare
@@ -68,6 +72,7 @@ pub(crate) struct EmitRow {
 pub(crate) fn build_emit_list(
     inputs: &[&SortedRunReader],
     arch_ids_per_input: &[Option<u16>],
+    seen: &mut HashSet<u64>,
 ) -> Result<Vec<EmitRow>, LsmError> {
     if inputs.len() != arch_ids_per_input.len() {
         return Err(LsmError::Format(format!(
@@ -77,7 +82,6 @@ pub(crate) fn build_emit_list(
         )));
     }
 
-    let mut seen: HashSet<u64> = HashSet::new();
     let mut emit_list: Vec<EmitRow> = Vec::new();
 
     for (input_idx, input) in inputs.iter().enumerate() {
@@ -224,17 +228,37 @@ impl<'a> CompactionWriter<'a> {
         mut observer: Option<&mut dyn FnMut(crate::writer::EntityKey)>,
     ) -> Result<SortedRunMeta, LsmError> {
         // ── 1. Build and sort emit lists for each archetype ──────────────────
-        let emit_lists: Vec<Vec<EmitRow>> = self
-            .all_signatures
-            .iter()
-            .enumerate()
-            .map(|(sig_idx, _)| {
-                build_emit_list(
-                    self.inputs.as_slice(),
-                    &self.arch_ids_per_signature_per_input[sig_idx],
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // One shared `seen` set across signatures: a migrated entity (component
+        // removed → new archetype) appears under both its stale source
+        // signature and its newer target signature in the inputs. The newest
+        // image must win globally, or recovery's per-entity ordering sees the
+        // entity in both output signatures with tied sequence_hi and the stale
+        // image can win by signature sort order.
+        //
+        // Signature processing order: by the newest input index containing the
+        // signature, descending (lower input_idx = newer run). Within each
+        // signature, build_emit_list walks inputs newest-first, so the first
+        // sighting of an entity is its newest image.
+        let mut sig_order: Vec<usize> = (0..self.all_signatures.len()).collect();
+        sig_order.sort_by_key(|&sig_idx| {
+            std::cmp::Reverse(
+                self.arch_ids_per_signature_per_input[sig_idx]
+                    .iter()
+                    .position(Option::is_some)
+                    .unwrap_or(usize::MAX),
+            )
+        });
+
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut emit_lists: Vec<Vec<EmitRow>> = vec![Vec::new(); self.all_signatures.len()];
+        for &sig_idx in &sig_order {
+            let list = build_emit_list(
+                self.inputs.as_slice(),
+                &self.arch_ids_per_signature_per_input[sig_idx],
+                &mut seen,
+            )?;
+            emit_lists[sig_idx] = list;
+        }
 
         if emit_lists.iter().all(Vec::is_empty) {
             return Err(LsmError::Format(
@@ -242,7 +266,6 @@ impl<'a> CompactionWriter<'a> {
             ));
         }
 
-        let mut emit_lists = emit_lists;
         for list in &mut emit_lists {
             list.sort_by_key(|r| r.entity_id);
         }
@@ -1004,7 +1027,7 @@ mod tests {
         let inputs = [&reader_new, &reader_old];
         let arch_ids = [Some(new_arch), Some(old_arch)];
 
-        let emit = build_emit_list(&inputs, &arch_ids).unwrap();
+        let emit = build_emit_list(&inputs, &arch_ids, &mut HashSet::new()).unwrap();
 
         // Entity appears in both runs — must be emitted once, from input 0 (newest).
         let entity_bits = e.to_bits();
@@ -1053,7 +1076,7 @@ mod tests {
         let inputs = [&reader_new, &reader_old];
         let arch_ids = [Some(new_arch), Some(old_arch)];
 
-        let emit = build_emit_list(&inputs, &arch_ids).unwrap();
+        let emit = build_emit_list(&inputs, &arch_ids, &mut HashSet::new()).unwrap();
 
         // All three entities must appear.
         let ids: HashSet<u64> = emit.iter().map(|r| r.entity_id).collect();
@@ -1088,7 +1111,7 @@ mod tests {
         let inputs = [&reader, &reader, &reader];
         let arch_ids = [None, Some(arch), None];
 
-        let emit = build_emit_list(&inputs, &arch_ids).unwrap();
+        let emit = build_emit_list(&inputs, &arch_ids, &mut HashSet::new()).unwrap();
 
         assert_eq!(emit.len(), 1, "exactly one entity must be emitted");
         assert_eq!(emit[0].entity_id, e.to_bits());
@@ -1110,7 +1133,7 @@ mod tests {
         let inputs = [&reader, &reader]; // len 2
         let arch_ids = [Some(0u16)]; // len 1 — mismatch
 
-        let result = build_emit_list(&inputs, &arch_ids);
+        let result = build_emit_list(&inputs, &arch_ids, &mut HashSet::new());
         assert!(
             matches!(result, Err(LsmError::Format(_))),
             "expected LsmError::Format for length mismatch, got: {result:?}"
