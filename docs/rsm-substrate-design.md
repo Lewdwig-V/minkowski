@@ -27,7 +27,8 @@ Four invariants carry the substrate. Three are delivered; one (replica mode) is 
 
 - `tick_after: u64` is a field of `WalRecord`. The leader stamps it at WAL-write time with the pre-apply world tick (`Durable` calls `world.current_tick()`).
 - `apply_record` owns the tick semantics: it rejects a record whose `tick_after` is below the world's current tick (`WalError::TickRegression`), then sets the world tick to `record.tick_after`, then applies the mutations. Every apply path routes through `apply_record` — there is no bypass.
-- Consequence for `Changed<T>`: a replica's column marks carry the leader's commit-boundary ticks, and the world tick tracks the leader exactly when no interleaved leader mutations exist between commits.
+- Mark precision: `apply_record` sets the world tick to `tick_after` (the pre-apply value the leader stamped). `EnumChangeSet::apply` then advances the tick once and marks columns at the advanced value. The leader runs the identical sequence, so leader and replica column marks match exactly — one tick above the record's stamped boundary.
+- Consequence for `Changed<T>`: the replica's tick tracks the leader's post-apply tick when no interleaved leader mutations exist between commits.
 - The tick is a lattice, not a scalar: per-reader `Changed<T>` watermarks are process-local and do not survive failover. The documented failover contract: the first `Changed<T>` query after failover can see everything or nothing as changed. Readers re-read once. See section 4.1 of the test strategy in the docs for `QueryCacheEntry` details.
 
 Convention sheet (INV-1 and INV-2 position semantics):
@@ -95,7 +96,7 @@ The substrate invariant is a test (`convergence_100_transactions_leader_replica`
 
 - `world_fingerprint(leader) == world_fingerprint(replica)`.
 - Replica tick == leader tick (the leader runs no interleaved mutations).
-- `applied_seq` == last shipped sequence, follower not poisoned.
+- `applied_seq` == high-water == last shipped sequence + 1, follower not poisoned.
 
 `world_fingerprint` properties:
 
@@ -133,4 +134,4 @@ Deferred to 4.1 and later, unchanged: VR consensus core, leader election, io_uri
 | `frame_header_size_is_sixteen` | 16-byte header format pin |
 | `rollover_many_appends_does_not_collide` | segment rollover under the new header |
 
-Pending, listed so the gaps stay visible: loom coverage for `Follower` high-water/poison races, `fuzz_wal_replay` corpus entries with stale-view frames, and failpoint hooks in the outbound pump for the 4.1 simulator.
+Pending, listed so the gaps stay visible: loom coverage for `Follower` high-water/poison races, `fuzz_lsm_recovery` corpus entries with view-stamped frames (stale views included), and failpoint hooks in the outbound pump for the 4.1 simulator.

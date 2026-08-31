@@ -51,8 +51,7 @@ RUSTFLAGS="--cfg loom" cargo test -p minkowski --lib --features loom -- loom_tes
 
 cargo +nightly fuzz run fuzz_world_ops -- -max_total_time=60     # fuzz: random World operations
 cargo +nightly fuzz run fuzz_reducers -- -max_total_time=60      # fuzz: query iteration paths
-cargo +nightly fuzz run fuzz_snapshot_load -- -max_total_time=60 -max_len=65536  # fuzz: snapshot deserialization
-cargo +nightly fuzz run fuzz_wal_replay -- -max_total_time=60 -max_len=65536    # fuzz: WAL replay
+cargo +nightly fuzz run fuzz_lsm_recovery -- -max_total_time=60 -max_len=65536   # fuzz: LSM recovery (runs + manifest)
 ```
 
 Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows. Runs the full test suite via nextest (parallel execution). Exclusions defined in `.config/nextest.toml` (`[profile.default-miri]`, auto-activated under Miri): `par_for_each` (rayon unsupported by Miri, covered by TSan), concurrent/contention pool tests (too slow, covered by TSan + Loom). To list selected tests: `cargo nextest list -p minkowski --lib --profile default-miri`.
@@ -355,9 +354,9 @@ The `minkowski-lsm` crate implements incremental persistence via an LSM tree ove
 
 **Compaction semantics**: `CompactionCommit` manifest log entry records input run paths and the output level atomically — either all input runs are removed and the output is added, or none are. `manifest_ops::cleanup_orphans` removes sorted-run files not tracked by the manifest (crash safety: partial flush produces an orphan file, not referenced by the manifest).
 
-**Dirty page tracking** (in core crate): `storage::dirty_pages` provides per-column page-level dirty bitsets (256 rows/page). Wired into all BlobVec mutation paths. `flush_and_record` (in `manifest_ops`) reads dirty pages, calls `flush_observed`, records the new run in the manifest, and clears the dirty bits.
+**Dirty page tracking** (in core crate): `storage::dirty_pages` provides per-column page-level dirty bitsets (256 rows/page). Wired into all BlobVec mutation paths. `flush_and_record` (in `manifest_ops`) reads dirty pages, calls `flush_observed`, and records the new run in the manifest — it takes `&World` and does not clear dirty bits; the caller clears via `World::clear_all_dirty_pages(&mut self)`, and `AutoCheckpoint` does so after each successful flush (without the clear, every checkpoint rewrites all previously dirty pages).
 
-**Stage 3 complete** — incremental persistence with O(delta) flush/recovery via `LsmRecovery`, `recover_world`, and `AutoCheckpoint` (LSM flush + optional compaction). v2 snapshot save/load removed; WAL tail replay starts from the manifest's exclusive sequence upper bound.
+**Stage 3 complete** — incremental persistence with O(delta) flush/recovery via `LsmRecovery`, `recover_world`, and `AutoCheckpoint` (LSM flush + optional compaction). `LsmRecovery` orders runs by sequence (sorted by `sequence_range().lo()`; a page is overwritten when the incoming run's `seq_hi` is ≥), not by level. v2 snapshot save/load removed; WAL tail replay starts from the manifest's exclusive sequence upper bound.
 
 **Recovery is import-driven and hybrid dense persistence** (the invariant that governs flush/recover correctness):
 - **Hybrid dense storage kind.** Dense component persistence is *hybrid*, derived from the codec and recorded per column in the run schema (`StorageKind::{RawCopy, Serialized}`):

@@ -103,6 +103,12 @@ impl CheckpointHandler for AutoCheckpoint {
 
         flush_result?;
 
+        // The flush captured exactly the dirty pages at this moment. Clear
+        // the bits so the next checkpoint flushes only new mutations —
+        // without this, every checkpoint rewrites all previously dirty
+        // pages and persistence stops being incremental.
+        world.clear_all_dirty_pages();
+
         // Best-effort compaction when L0 is over threshold.
         while manifest
             .runs_at_level(minkowski_lsm::types::Level::L0)
@@ -430,5 +436,51 @@ mod tests {
         let loaded = load_btree_index::<Score>(&idx_path, world.change_tick()).unwrap();
         assert_eq!(loaded.get(&Score(100)).len(), 1);
         assert_eq!(loaded.get(&Score(200)).len(), 1);
+    }
+
+    #[test]
+    fn checkpoint_clears_dirty_pages() {
+        // Incremental persistence contract: after a successful checkpoint
+        // flush, no page remains dirty. Without the clear, every checkpoint
+        // rewrites all previously dirty pages.
+        use crate::wal::WalConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("dirty.wal");
+        let lsm_dir = dir.path().join("lsm");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
+        let mut checkpoint = AutoCheckpoint::new(&lsm_dir);
+
+        for i in 0..4 {
+            let e = world.alloc_entity();
+            let mut cs = minkowski::EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            )
+            .unwrap();
+            wal.append(&cs, &codecs, world.current_tick()).unwrap();
+            cs.apply(&mut world).unwrap();
+        }
+        let any_dirty_before = (0..world.archetype_count()).any(|i| world.archetype_any_dirty(i));
+        assert!(any_dirty_before, "setup must leave dirty pages");
+
+        checkpoint
+            .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+            .unwrap();
+        let any_dirty_after = (0..world.archetype_count()).any(|i| world.archetype_any_dirty(i));
+        assert!(
+            !any_dirty_after,
+            "checkpoint must clear dirty pages or persistence is not incremental"
+        );
     }
 }

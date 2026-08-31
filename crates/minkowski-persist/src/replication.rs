@@ -209,20 +209,23 @@ impl Follower {
                     got: record.seq,
                 });
             }
-            if record.tick_after < world.current_tick() {
-                self.poison();
-                return Err(FollowerError::TickRegression {
-                    seq: record.seq,
-                    record_tick: record.tick_after,
-                    world_tick: world.current_tick(),
-                });
-            }
-            world.set_current_tick(record.tick_after);
             if let Err(e) = apply_record(record, world, codecs, remap_ref, None) {
                 // Mid-batch failure: state is the applied prefix. Poison —
-                // the replica diverged from the log.
+                // the replica diverged from the log. The tick guard lives in
+                // apply_record; its regression error is re-surfaced typed.
                 self.poison();
-                return Err(FollowerError::Apply(e));
+                return Err(match e {
+                    WalError::TickRegression {
+                        seq,
+                        record_tick,
+                        world_tick,
+                    } => FollowerError::TickRegression {
+                        seq,
+                        record_tick,
+                        world_tick,
+                    },
+                    other => FollowerError::Apply(other),
+                });
             }
             last = record.seq + 1;
             self.high_water
