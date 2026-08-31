@@ -16,5 +16,5 @@ pub use index::{IndexPersistError, PersistentIndex, load_btree_index, load_hash_
 pub use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 pub use record::*;
 pub use recover::{RecoverError, recover_world};
-pub use replication::{ReplicationError, apply_batch};
+pub use replication::{Follower, FollowerError, ReplicationError, apply_batch};
 pub use wal::{Wal, WalConfig, WalCursor, WalError, WalStats};

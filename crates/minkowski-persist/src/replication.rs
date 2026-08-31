@@ -55,15 +55,14 @@ impl ReplicationBatch {
     }
 }
 
-/// Apply a `ReplicationBatch` to a target World.
+/// Apply a replication batch record-by-record in log order.
 ///
-/// Builds a component ID remap from the batch schema, then applies each
-/// record atomically (one `EnumChangeSet` per record). Returns the last
-/// applied seq, or `None` if the batch is empty.
-///
-/// Each record is applied as its own `EnumChangeSet` — per-record atomicity,
-/// not per-batch. On error, previously applied records are NOT rolled back;
-/// the caller can use the cursor's `next_seq()` to determine recovery position.
+/// Stateless primitive: no position tracking, no poison, no retry. Each
+/// record replays at its own commit-boundary tick (INV-1); a record tick
+/// below the world's current tick errors with
+/// [`WalError::TickRegression`]. For replica ingestion use
+/// [`Follower::advance`], which adds position-based idempotency, gap
+/// rejection, and poison-on-failure.
 pub fn apply_batch(
     batch: &ReplicationBatch,
     world: &mut World,

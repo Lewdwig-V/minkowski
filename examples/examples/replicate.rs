@@ -9,7 +9,7 @@ use minkowski_lsm::manifest_ops::flush_and_record;
 use minkowski_lsm::reader::SortedRunReader;
 use minkowski_lsm::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 use minkowski_persist::{
-    CodecRegistry, ReplicationBatch, Wal, WalConfig, WalCursor, apply_batch, recover_world,
+    CodecRegistry, Follower, ReplicationBatch, Wal, WalConfig, WalCursor, recover_world,
 };
 use std::sync::mpsc;
 
@@ -160,7 +160,10 @@ fn replica_side(rx: &mpsc::Receiver<WireMessage>) -> World {
         panic!("expected WAL batch");
     };
     let batch = ReplicationBatch::from_bytes(&batch_bytes).unwrap();
-    apply_batch(&batch, &mut world, &codecs).unwrap();
+    // Follower carries the replica invariants: position idempotency, gap
+    // rejection, per-record tick set, poison-on-failure.
+    let follower = Follower::new();
+    follower.advance(&batch, &mut world, &codecs).unwrap();
 
     let _ = std::fs::remove_dir_all(&dir);
     world

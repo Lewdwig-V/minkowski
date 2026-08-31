@@ -274,6 +274,19 @@ pub(crate) fn apply_record(
     remap: Option<&HashMap<ComponentId, ComponentId>>,
     proof: Option<&CrcProof>,
 ) -> Result<(), WalError> {
+    // INV-1 (commit = tick): the record replays at its commit-boundary tick.
+    // A record tick below the world's current tick is a foreign or corrupt
+    // log. Every apply path routes through here, so all of them carry the
+    // tick semantics.
+    if record.tick_after < world.current_tick() {
+        return Err(WalError::TickRegression {
+            seq: record.seq,
+            record_tick: record.tick_after,
+            world_tick: world.current_tick(),
+        });
+    }
+    world.set_current_tick(record.tick_after);
+
     // When no remap is provided, use identity mapping (same-process replay).
     // When a schema-derived remap exists, unmapped IDs are an error — the
     // sender wrote a mutation for a component not in its own preamble.
@@ -814,7 +827,6 @@ impl Wal {
         // tick history matches the leader's exactly. Decode is still batched
         // per record inside `apply_record`.
         for (record, proof, remap) in &pending {
-            world.set_current_tick(record.tick_after);
             apply_record(record, world, codecs, remap.as_deref(), Some(proof))?;
         }
 
