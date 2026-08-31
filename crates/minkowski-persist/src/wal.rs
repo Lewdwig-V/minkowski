@@ -162,7 +162,10 @@ fn write_segment_magic(writer: &mut BufWriter<&File>) -> Result<u64, WalError> {
 /// 16-byte frame headers (view lives in the header; payloads are skipped via
 /// the length field). Sealed and active segments both count — the live view
 /// counter must resume at or above every view the log has ever carried.
-fn scan_max_view(segments: &[(u64, PathBuf)]) -> Result<u64, WalError> {
+fn scan_max_view<'a, I>(segments: I) -> Result<u64, WalError>
+where
+    I: IntoIterator<Item = &'a (u64, PathBuf)>,
+{
     let mut max_view: u64 = 0;
     for (_, seg_path) in segments {
         let file = File::open(seg_path)?;
@@ -527,9 +530,16 @@ impl Wal {
             views: Views::new(),
         };
 
-        // Crash recovery: scan the active segment, truncating torn/corrupt tail.
-        // Frame scanning starts after the segment magic header.
-        let (active_last_seq, active_has) = wal.scan_active_segment()?;
+        // Crash recovery: scan the active segment, truncating torn/corrupt
+        // tail. Frame scanning starts after the segment magic header.
+        let sealed_max_view = scan_max_view(segments.iter().rev().skip(1))?;
+        let (active_last_seq, active_has) = wal.scan_active_segment(sealed_max_view)?;
+
+        // INV-2: the live view counter must resume at the highest view the
+        // log has ever stamped — before any header rewrite, so a rewritten
+        // preamble stamps the recovered view, not 0.
+        wal.views = Views::with_current(scan_max_view(&segments)?);
+
         wal.active_bytes = wal.active_file.metadata()?.len();
 
         // If crash recovery truncated the segment to empty (or below magic
@@ -573,11 +583,6 @@ impl Wal {
                 wal.next_seq = wal.active_start_seq;
             }
         }
-
-        // INV-2: the live view counter must resume at the highest view the
-        // log has ever stamped, or post-restart appends would carry a stale
-        // view and replay would drop them.
-        wal.views = Views::with_current(scan_max_view(&segments)?);
 
         // If scan_active_segment did not find a checkpoint, scan sealed
         // segments in reverse to recover the most recent one. Accumulate
@@ -786,17 +791,22 @@ impl Wal {
             let mut remap: Option<Arc<HashMap<ComponentId, ComponentId>>> = None;
 
             while let Some((entry, next_pos, proof, view)) = read_next_frame(&seg_file, pos)? {
-                if view < max_view_seen {
-                    // Stale-view frame: written by a deposed leader. Drop it.
-                    pos = next_pos;
-                    continue;
-                }
+                let is_stale = view < max_view_seen;
                 max_view_seen = max_view_seen.max(view);
                 match entry {
+                    // Schema preambles are processed even when their frame
+                    // view is stale: a rewritten segment header can carry an
+                    // older view while its data frames are current, and the
+                    // records after it need their remap built.
                     WalEntry::Schema(schema) => {
                         remap = Some(Arc::new(codecs.build_remap(&schema.components)?));
                     }
                     WalEntry::Mutations(record) => {
+                        if is_stale {
+                            // Stale-view frame: written by a deposed leader.
+                            pos = next_pos;
+                            continue;
+                        }
                         if record.seq >= from_seq {
                             if let Some(prev) = prev_tick
                                 && record.tick_after < prev
@@ -935,14 +945,15 @@ impl Wal {
     // index or footer, so the only way to find the last valid record is linear
     // scan. This runs once at startup, not per-frame.
     /// Scan the active segment for crash recovery. Truncates torn/corrupt
-    /// tail. A frame stamped with a view older than the segment's newest
-    /// view is a deposed leader's late write — the tail is truncated at it
-    /// so the stale bytes cannot collide with new-leader writes at the same
-    /// offsets. Returns `(last_seq, has_mutations)`.
-    fn scan_active_segment(&mut self) -> Result<(u64, bool), WalError> {
+    /// tail. A frame stamped with a view older than the newest view known
+    /// for the directory (sealed views seeded via `sealed_max_view`, plus
+    /// the segment's own newer frames) is a deposed leader's late write —
+    /// the tail is truncated at it so the stale bytes cannot collide with
+    /// new-leader writes at the same offsets. Returns `(last_seq, has)`.
+    fn scan_active_segment(&mut self, sealed_max_view: u64) -> Result<(u64, bool), WalError> {
         let mut last_seq = 0u64;
         let mut has_mutations = false;
-        let mut max_view: u64 = 0;
+        let mut max_view: u64 = sealed_max_view;
         let mut pos: u64 = SEGMENT_MAGIC_SIZE;
         let mut bytes_after_checkpoint: u64 = 0;
 
@@ -1207,10 +1218,12 @@ impl WalCursor {
                 validate_segment_magic(&self.file, path)?;
                 self.pos = SEGMENT_MAGIC_SIZE;
                 self.current_segment_start_seq = *start_seq;
-                // Parse schema preamble of new segment
-                if let Some((WalEntry::Schema(s), next_pos, _proof, _view)) =
+                // Parse schema preamble of new segment; its view seeds the
+                // fence for the segment's data frames.
+                if let Some((WalEntry::Schema(s), next_pos, _proof, view)) =
                     read_next_frame(&self.file, SEGMENT_MAGIC_SIZE)?
                 {
+                    self.max_view_seen = self.max_view_seen.max(view);
                     self.schema = Some(s);
                     self.pos = next_pos;
                 }
