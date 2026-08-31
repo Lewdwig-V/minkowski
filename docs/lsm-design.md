@@ -51,7 +51,7 @@ One sorted run = one immutable `.run` file:
 | Orphan cleanup | files not tracked by the manifest are crash garbage; `cleanup_orphans` removes them | `manifest_ops::cleanup_orphans` |
 | Latest sequence wins | recovery orders runs by sequence, not by level: `LsmRecovery` sorts all runs by `sequence_range().lo()` and overwrites a page when the incoming run's `seq_hi` is greater or equal | `LsmRecovery::recover` sort + `store_page` overwrite rule |
 | Replay floor | WAL tail replays records with `seq >= seq_hi` of the newest run — inclusive, so a removal that straddles the flush boundary is not lost | `recover.rs` replay-floor invariant comment + tests |
-| Dirty-page discipline | row-level `BlobVec` writes mark their page dirty; batch entry points that hand out raw or mutable row access (`World::query` with `&mut T`, `query_table_mut`, `query_table_raw`) mark whole columns dirty, because per-row attribution is impossible ahead of iteration; flush writes exactly the dirty pages | `storage::dirty_pages` wired into `BlobVec` write paths; `mark_all_pages_dirty` at the batch entry points; `batch_mutation_entry_points_mark_pages_dirty` |
+| Dirty-page discipline | row-level `BlobVec` writes mark their page dirty; batch entry points that hand out raw or mutable row access (`World::query` with `&mut T`, `query_table_mut`, `query_table_raw`, and the planner's `execute_stream_batched`/`execute_stream_join_chunk` for mutable queries) mark whole columns dirty, because per-row attribution is impossible ahead of iteration; flush writes exactly the dirty pages | `storage::dirty_pages` wired into `BlobVec` write paths; `mark_all_pages_dirty` at the batch entry points; `batch_mutation_entry_points_mark_pages_dirty` |
 | State-comparison determinism | equal world states compare equal via `world_fingerprint` — but flush **byte output** is not required to be identical across worlds: page keys use per-world numeric `arch_idx`, so archetype creation order changes file layout | `world_fingerprint` (minkowski-persist) keys by type, never numeric id |
 
 ### 3.1 The invariant matrix: recovery × storage kind
@@ -93,7 +93,7 @@ The unsafe precondition — page bytes are a valid native image of the component
 | Compaction | end-to-end `compact_one` with input-file deletion asserted; `CompactionCommit` atomicity; orphan cleanup |
 | Recovery | `recover_world` tail replay, replay-floor edge (removal straddling the flush), sparse restoration ordering, allocator metadata restoration |
 | Soundness | decode-fingerprint gate for unchecked rkyv (`deserialize_unchecked_by_type` requires the per-run layout fingerprint plus per-page `CrcProof`); recovery import-error drop-safety; raw-copy gate to raw-copyable codecs |
-| Fuzz | `fuzz_lsm_recovery` (flush + recover round-trip over statistically varied world states, f32 bit-pattern preservation). **Gap**: malformed run/manifest bytes are not fuzzed — `fuzz_lsm_recovery` builds valid inputs only. `fuzz_wal_replay` mode 0 feeds raw malformed bytes as a WAL file; no equivalent exists for `.run` files |
+| Fuzz | `fuzz_lsm_recovery` (flush + recover round-trip over statistically varied world states, f32 bit-pattern preservation). **Gap**: malformed run/manifest bytes are not fuzzed — `fuzz_lsm_recovery` builds valid inputs only. `fuzz_wal_replay` mode 0 feeds raw malformed bytes as a discoverable WAL segment; no equivalent exists for `.run` files |
 
 ## 7. Known constraints
 

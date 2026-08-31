@@ -41,11 +41,13 @@ fuzz_target!(|data: &[u8]| {
     let dir = tempfile::tempdir().unwrap();
 
     match mode {
-        // Mode 0: write raw bytes as a WAL file, try to open + replay
+        // Mode 0: write raw bytes as a WAL segment, try to open + replay.
+        // The filename must match the wal-seq*.seg discovery pattern or
+        // Wal::open never reads it.
         0 => {
             let wal_dir = dir.path().join("raw");
             std::fs::create_dir_all(&wal_dir).unwrap();
-            let seg_path = wal_dir.join("00000000.wal");
+            let seg_path = wal_dir.join("wal-seq000000.seg");
             std::fs::write(&seg_path, rest).unwrap();
 
             let mut world = World::new();
@@ -80,7 +82,7 @@ fuzz_target!(|data: &[u8]| {
                         // alloc_entity() guarantees unplaced entity — spawn_bundle can only fail
                         // on AlreadyPlaced, which is structurally unreachable here.
                         let _ = cs.spawn_bundle(&mut world, e, (*a,));
-                        wal.append(&cs, &codecs).unwrap();
+                        wal.append(&cs, &codecs, world.current_tick()).unwrap();
                         cs.apply(&mut world).unwrap();
                         live.push(e);
                     }
@@ -89,7 +91,7 @@ fuzz_target!(|data: &[u8]| {
                         // alloc_entity() guarantees unplaced entity — spawn_bundle can only fail
                         // on AlreadyPlaced, which is structurally unreachable here.
                         let _ = cs.spawn_bundle(&mut world, e, (*a, *b));
-                        wal.append(&cs, &codecs).unwrap();
+                        wal.append(&cs, &codecs, world.current_tick()).unwrap();
                         cs.apply(&mut world).unwrap();
                         live.push(e);
                     }
@@ -98,7 +100,7 @@ fuzz_target!(|data: &[u8]| {
                             let i = *idx as usize % live.len();
                             let e = live[i];
                             cs.insert::<B>(&mut world, e, *b);
-                            wal.append(&cs, &codecs).unwrap();
+                            wal.append(&cs, &codecs, world.current_tick()).unwrap();
                             cs.apply(&mut world).unwrap();
                         }
                     }
@@ -107,7 +109,7 @@ fuzz_target!(|data: &[u8]| {
                             let i = *idx as usize % live.len();
                             let e = live[i];
                             cs.insert::<D>(&mut world, e, *d);
-                            wal.append(&cs, &codecs).unwrap();
+                            wal.append(&cs, &codecs, world.current_tick()).unwrap();
                             cs.apply(&mut world).unwrap();
                         }
                     }
