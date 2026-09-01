@@ -2,11 +2,11 @@
 //!
 //! # Overview
 //!
-//! [`build_emit_list`] (Task 3a) is a pure-logic computation that decides,
+//! The emit decision (which rows a compaction carries forward) decides,
 //! for each unique entity, which source run and row to copy. No file I/O.
 //!
 //! [`CompactionWriter`] (Tasks 3b + 3c) drives the full compaction pipeline:
-//! 1. Call `build_emit_list` to determine which rows to emit.
+//! 1. Determine which rows to emit (global per-entity newest-image merge).
 //! 2. Write those rows into a new sorted-run file whose format is byte-compatible
 //!    with `SortedRunReader::open` (same header / page / index / footer layout as
 //!    `FlushWriter`).
@@ -23,7 +23,7 @@
 //! - Footer (64 bytes) at end of file
 //! - Header CRC32 and total CRC32 patched in-place after write
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -56,71 +56,86 @@ pub(crate) struct EmitRow {
 
 // ── Core function ─────────────────────────────────────────────────────────────
 
-/// Build the emit list for a compaction job. Iterates input readers in order
-/// (caller must pass newest-first); emits each `entity_id` the first time it
-/// is seen. Duplicates in older runs are silently skipped — newest wins.
+/// Globally merge entity-page candidates across signatures and inputs.
 ///
-/// `arch_ids_per_input[i]` is the `arch_id` within `inputs[i]` for the target
-/// archetype, or `None` if the archetype doesn't exist in that input (rare
-/// but possible for archetypes that first appear in a later flush).
+/// For each entity, the winning image is the one from the lowest input index
+/// (newest run — callers supply inputs newest-first). This is correct even
+/// when a newer run touches an unrelated component page of a source
+/// signature after an entity migrated away: the entity's own page in that
+/// run either exists (it really was updated — the update wins) or does not
+/// (the candidate for that signature comes from an older input, which loses
+/// to the migrated image's newer input).
 ///
-/// Returns `Err(LsmError::Format)` if `inputs.len() != arch_ids_per_input.len()`.
-pub(crate) fn build_emit_list(
+/// Returns one emit list per signature, each sorted by entity id.
+pub(crate) fn merge_entity_images(
     inputs: &[&SortedRunReader],
-    arch_ids_per_input: &[Option<u16>],
-) -> Result<Vec<EmitRow>, LsmError> {
-    if inputs.len() != arch_ids_per_input.len() {
+    arch_ids_per_signature_per_input: &[Vec<Option<u16>>],
+) -> Result<Vec<Vec<EmitRow>>, LsmError> {
+    if inputs.len() != arch_ids_per_signature_per_input.first().map_or(0, Vec::len) {
         return Err(LsmError::Format(format!(
-            "build_emit_list: inputs length {} != arch_ids_per_input length {}",
+            "merge_entity_images: inputs length {} != per-signature arch-id vectors length {}",
             inputs.len(),
-            arch_ids_per_input.len(),
+            arch_ids_per_signature_per_input.first().map_or(0, Vec::len),
         )));
     }
+    for per_input in arch_ids_per_signature_per_input {
+        if per_input.len() != inputs.len() {
+            return Err(LsmError::Format(format!(
+                "merge_entity_images: signature has {} arch_ids but {} inputs",
+                per_input.len(),
+                inputs.len(),
+            )));
+        }
+    }
 
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut emit_list: Vec<EmitRow> = Vec::new();
-
+    let mut entity_winners: HashMap<u64, (usize, usize, usize)> = HashMap::new(); // entity -> (input_idx, sig_idx, row)
+    // Inputs outermost: `or_insert` then keeps the lowest input index (the
+    // newest run that actually contains the entity), because every candidate
+    // from input k is seen before any candidate from input k+1. A
+    // signature-outer loop lets the first signature claim an entity whose
+    // newer image sits in a later-visited input.
     for (input_idx, input) in inputs.iter().enumerate() {
-        let Some(arch_id) = arch_ids_per_input[input_idx] else {
-            continue;
-        };
-
-        // Walk entity-slot pages for this archetype via the sparse index.
-        // Using entity_pages (not sequential get_page probing) correctly
-        // handles non-contiguous page indices — e.g. pages 0 and 5 flushed
-        // with gaps in between. Sequential probing would break at the first
-        // gap and silently drop entities in higher pages.
-        for result in input.entity_pages(arch_id) {
-            let (page_index, page) = result?;
-
-            let row_count = page.header().row_count as usize;
-            let data = page.data();
-
-            for row_within_page in 0..row_count {
-                let byte_offset = row_within_page * 8;
-                // SAFETY (invariant): entity_pages guarantees data.len() ==
-                // PAGE_SIZE * item_size (8 for ENTITY_SLOT), so any row index
-                // < row_count is within bounds.
-                let entity_id = u64::from_le_bytes(
-                    data[byte_offset..byte_offset + 8]
-                        .try_into()
-                        .expect("8 bytes"),
-                );
-
-                let row_in_arch = page_index as usize * PAGE_SIZE + row_within_page;
-
-                if seen.insert(entity_id) {
-                    emit_list.push(EmitRow {
-                        entity_id,
-                        source_input_idx: input_idx,
-                        source_row: row_in_arch,
-                    });
+        for (sig_idx, per_input) in arch_ids_per_signature_per_input.iter().enumerate() {
+            let Some(arch_id) = per_input[input_idx] else {
+                continue;
+            };
+            for result in input.entity_pages(arch_id) {
+                let (page_index, page) = result?;
+                let row_count = page.header().row_count as usize;
+                let data = page.data();
+                for row_within_page in 0..row_count {
+                    let byte_offset = row_within_page * 8;
+                    // SAFETY (invariant): entity_pages guarantees
+                    // data.len() == PAGE_SIZE * item_size (8 for
+                    // ENTITY_SLOT), so any row index < row_count is in
+                    // bounds.
+                    let entity_id = u64::from_le_bytes(
+                        data[byte_offset..byte_offset + 8]
+                            .try_into()
+                            .expect("8 bytes"),
+                    );
+                    let row_in_arch = page_index as usize * PAGE_SIZE + row_within_page;
+                    entity_winners
+                        .entry(entity_id)
+                        .or_insert((input_idx, sig_idx, row_in_arch));
                 }
             }
         }
     }
 
-    Ok(emit_list)
+    let mut emit_lists: Vec<Vec<EmitRow>> =
+        vec![Vec::new(); arch_ids_per_signature_per_input.len()];
+    for (entity_id, (input_idx, sig_idx, source_row)) in entity_winners {
+        emit_lists[sig_idx].push(EmitRow {
+            entity_id,
+            source_input_idx: input_idx,
+            source_row,
+        });
+    }
+    for list in &mut emit_lists {
+        list.sort_by_key(|r| r.entity_id);
+    }
+    Ok(emit_lists)
 }
 
 // ── CompactionWriter ─────────────────────────────────────────────────────────
@@ -224,17 +239,10 @@ impl<'a> CompactionWriter<'a> {
         mut observer: Option<&mut dyn FnMut(crate::writer::EntityKey)>,
     ) -> Result<SortedRunMeta, LsmError> {
         // ── 1. Build and sort emit lists for each archetype ──────────────────
-        let emit_lists: Vec<Vec<EmitRow>> = self
-            .all_signatures
-            .iter()
-            .enumerate()
-            .map(|(sig_idx, _)| {
-                build_emit_list(
-                    self.inputs.as_slice(),
-                    &self.arch_ids_per_signature_per_input[sig_idx],
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut emit_lists = merge_entity_images(
+            self.inputs.as_slice(),
+            &self.arch_ids_per_signature_per_input,
+        )?;
 
         if emit_lists.iter().all(Vec::is_empty) {
             return Err(LsmError::Format(
@@ -242,7 +250,6 @@ impl<'a> CompactionWriter<'a> {
             ));
         }
 
-        let mut emit_lists = emit_lists;
         for list in &mut emit_lists {
             list.sort_by_key(|r| r.entity_id);
         }
@@ -920,6 +927,17 @@ fn make_tmp_path(output_path: &Path, seq_lo: u64, seq_hi: u64) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq, Debug)]
+    #[repr(C)]
+    struct A(u32);
+    #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq, Debug)]
+    #[repr(C)]
+    struct B(u32);
+
+    crate::impl_raw_copy_certified!(A, B);
+
+    crate::impl_raw_copy_certified!(Pos);
     use super::*;
     use crate::schema_match::find_archetype_by_components;
     use crate::types::{SeqNo, SeqRange};
@@ -949,7 +967,9 @@ mod tests {
     ) -> (tempfile::TempDir, SortedRunReader) {
         let dir = tempfile::tempdir().unwrap();
         let mut codecs = crate::codec::CodecRegistry::new();
-        codecs.register_as::<Pos>("pos", world).unwrap();
+        codecs.register_raw_copy_as::<Pos>("pos", world).unwrap();
+        codecs.register_raw_copy_as::<A>("a", world).unwrap();
+        codecs.register_raw_copy_as::<B>("b", world).unwrap();
         let path = flush(
             world,
             SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap(),
@@ -1002,7 +1022,9 @@ mod tests {
         let inputs = [&reader_new, &reader_old];
         let arch_ids = [Some(new_arch), Some(old_arch)];
 
-        let emit = build_emit_list(&inputs, &arch_ids).unwrap();
+        let emit = merge_entity_images(&inputs, &[arch_ids.to_vec()])
+            .unwrap()
+            .remove(0);
 
         // Entity appears in both runs — must be emitted once, from input 0 (newest).
         let entity_bits = e.to_bits();
@@ -1051,7 +1073,9 @@ mod tests {
         let inputs = [&reader_new, &reader_old];
         let arch_ids = [Some(new_arch), Some(old_arch)];
 
-        let emit = build_emit_list(&inputs, &arch_ids).unwrap();
+        let emit = merge_entity_images(&inputs, &[arch_ids.to_vec()])
+            .unwrap()
+            .remove(0);
 
         // All three entities must appear.
         let ids: HashSet<u64> = emit.iter().map(|r| r.entity_id).collect();
@@ -1086,7 +1110,9 @@ mod tests {
         let inputs = [&reader, &reader, &reader];
         let arch_ids = [None, Some(arch), None];
 
-        let emit = build_emit_list(&inputs, &arch_ids).unwrap();
+        let emit = merge_entity_images(&inputs, &[arch_ids.to_vec()])
+            .unwrap()
+            .remove(0);
 
         assert_eq!(emit.len(), 1, "exactly one entity must be emitted");
         assert_eq!(emit[0].entity_id, e.to_bits());
@@ -1108,7 +1134,7 @@ mod tests {
         let inputs = [&reader, &reader]; // len 2
         let arch_ids = [Some(0u16)]; // len 1 — mismatch
 
-        let result = build_emit_list(&inputs, &arch_ids);
+        let result = merge_entity_images(&inputs, &[arch_ids.to_vec()]).map(|mut v| v.remove(0));
         assert!(
             matches!(result, Err(LsmError::Format(_))),
             "expected LsmError::Format for length mismatch, got: {result:?}"

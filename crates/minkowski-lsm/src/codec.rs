@@ -86,6 +86,49 @@ pub enum CodecError {
     },
 }
 
+/// Certification that the rkyv archived byte image of `T` equals its native
+/// byte image for every value, and that `T` owns no heap resource.
+///
+/// # Safety
+///
+/// The implementor guarantees, for every value of `T`:
+/// - `size_of::<T>() == size_of::<T::Archived>()` and the bytes are identical
+///   (no custom `Archive` impl or `rkyv(with = ...)` transform that permutes,
+///   widens, or re-encodes fields), and
+/// - `T` does not own heap memory (no `Drop`); its bytes may be copied
+///   verbatim into a fresh process and dropped there as plain bytes.
+///
+/// This licenses both raw-copy directions: native bytes are imported as
+/// archived bytes on recovery, and archived bytes (WAL replay payloads) are
+/// imported as native bytes through `decode`'s memcpy branch.
+pub unsafe trait RawCopyCertified: Copy {}
+
+unsafe impl RawCopyCertified for u8 {}
+unsafe impl RawCopyCertified for u16 {}
+unsafe impl RawCopyCertified for u32 {}
+unsafe impl RawCopyCertified for u64 {}
+unsafe impl RawCopyCertified for usize {}
+unsafe impl RawCopyCertified for i8 {}
+unsafe impl RawCopyCertified for i16 {}
+unsafe impl RawCopyCertified for i32 {}
+unsafe impl RawCopyCertified for i64 {}
+unsafe impl RawCopyCertified for isize {}
+unsafe impl RawCopyCertified for f32 {}
+unsafe impl RawCopyCertified for f64 {}
+unsafe impl RawCopyCertified for bool {}
+
+/// Implement [`RawCopyCertified`] for `#[repr(C)]` `Copy` structs whose
+/// `#[derive(Archive)]` produces a byte-identical archived form (no
+/// `rkyv(with = ...)` attributes, no generics that change representation).
+#[macro_export]
+macro_rules! impl_raw_copy_certified {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            unsafe impl $crate::codec::RawCopyCertified for $t {}
+        )+
+    };
+}
+
 struct ComponentCodec {
     name: String,
     layout: Layout,
@@ -252,7 +295,7 @@ impl CodecRegistry {
             + rkyv::Portable,
     {
         let name = std::any::type_name::<T>().to_owned();
-        self.register_with_name::<T>(name, world)
+        self.register_with_name::<T>(name, world, false)
     }
 
     /// Register a component type for persistence with an explicit stable name.
@@ -269,13 +312,49 @@ impl CodecRegistry {
             + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
             + rkyv::Portable,
     {
-        self.register_with_name::<T>(stable_name.to_owned(), world)
+        self.register_with_name::<T>(stable_name.to_owned(), world, false)
+    }
+
+    /// Register a component type for persistence with the raw-copy fast
+    /// path: recovery imports its pages by `memcpy` instead of per-row rkyv
+    /// decode.
+    ///
+    /// # Soundness contract
+    ///
+    /// [`RawCopyCertified`] requires the native byte image of every value to
+    /// equal its rkyv archived byte image, and `T: Copy` (implied by the
+    /// supertrait) excludes `Drop` and any owned heap resource. Both are
+    /// necessary: native bytes are flushed verbatim and re-imported verbatim
+    /// on recovery, and `decode` memcpys rkyv-produced (archived) payloads
+    /// for these types during WAL replay. A custom `Archive` impl or
+    /// `rkyv(with = ...)` transform that changes bytes breaks the contract
+    /// and must not be certified. Size equality with the archived form is
+    /// additionally required here. Heap-owning components (`String`, `Vec`,
+    /// `Box`) cannot implement `Copy` and are excluded by construction.
+    pub fn register_raw_copy_as<T>(
+        &mut self,
+        stable_name: &str,
+        world: &mut World,
+    ) -> Result<(), CodecError>
+    where
+        T: RawCopyCertified
+            + Component
+            + Archive
+            + for<'a> RkyvSerialize<
+                rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
+            > + Clone,
+        T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
+            + rkyv::Portable,
+    {
+        self.register_with_name::<T>(stable_name.to_owned(), world, true)
     }
 
     fn register_with_name<T>(
         &mut self,
         stable_name: String,
         world: &mut World,
+        raw_copy: bool,
     ) -> Result<(), CodecError>
     where
         T: Component
@@ -323,13 +402,16 @@ impl CodecRegistry {
 
         let layout = Layout::new::<T>();
 
-        // Raw-copyability classification: a type whose rkyv archived size equals
-        // its native size is plain-old-data (no heap indirection) — its native
-        // bytes are position-independent and may be flushed/memcpy'd verbatim
-        // (RawCopy). Heap-backed types (String, Vec, …) have a differently-sized
-        // archived form; they persist via rkyv (Serialized) and decode per row on
-        // recovery. ZSTs satisfy 0 == 0 and are RawCopy. No type is rejected here.
-        let raw_copyable = std::mem::size_of::<T>() == std::mem::size_of::<T::Archived>();
+        // Raw-copyability classification. Size equality alone is unsound (a
+        // `Box<u64>` component has same-size native and archived forms whose
+        // native bytes are a heap address); the archived form must also be
+        // `Portable` — no relative pointers — before native bytes may be
+        // flushed/memcpy'd verbatim (RawCopy). Heap-backed types (String, Vec,
+        // Box, …) have non-`Portable` archived forms; they persist via rkyv
+        // (Serialized) and decode per row on recovery. ZSTs have nothing to
+        // copy and are RawCopy. No type is rejected here.
+        let raw_copyable =
+            raw_copy && std::mem::size_of::<T>() == std::mem::size_of::<T::Archived>();
 
         // `raw_copy_size` gates the decode() memcpy fast path, which is sound
         // ONLY for raw-copyable types (their rkyv payload is a native image).
@@ -728,6 +810,7 @@ impl CrcProof {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use rkyv::{Archive, Deserialize, Serialize};
 
@@ -982,6 +1065,8 @@ mod tests {
 
 #[cfg(test)]
 mod raw_copy_tests {
+
+    crate::impl_raw_copy_certified!(Plain, ZstTag);
     use super::*;
     use minkowski::World;
     use rkyv::{Archive, Deserialize, Serialize};
@@ -1027,8 +1112,12 @@ mod raw_copy_tests {
     fn raw_copyable_and_zst_classify_raw_copy() {
         let mut world = World::new();
         let mut codecs = CodecRegistry::new();
-        codecs.register_as::<Plain>("plain", &mut world).unwrap();
-        codecs.register_as::<ZstTag>("zst", &mut world).unwrap();
+        codecs
+            .register_raw_copy_as::<Plain>("plain", &mut world)
+            .unwrap();
+        codecs
+            .register_raw_copy_as::<ZstTag>("zst", &mut world)
+            .unwrap();
         assert_eq!(
             codecs.storage_kind_for_type(std::any::TypeId::of::<Plain>()),
             Some(crate::schema::StorageKind::RawCopy)
@@ -1172,7 +1261,9 @@ mod raw_copy_tests {
         );
 
         // POD types keep their raw_copy_size — the fast path stays enabled.
-        codecs.register_as::<Plain>("plain", &mut world).unwrap();
+        codecs
+            .register_raw_copy_as::<Plain>("plain", &mut world)
+            .unwrap();
         let pod_id = world.component_id::<Plain>().unwrap();
         assert!(
             codecs.raw_copy_size(pod_id).is_some(),
@@ -1292,5 +1383,36 @@ mod raw_copy_tests {
             result.is_err(),
             "heap decode must rkyv-validate, not memcpy garbage as a native image; got {result:?}"
         );
+    }
+
+    #[test]
+    fn box_component_is_not_raw_copyable() {
+        // Size equality alone would classify Box<u64> as RawCopy (8-byte
+        // native pointer, 8-byte archived form); the Portable gate must
+        // reject it — copying its native bytes would persist a heap address.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register_as::<Box<u64>>("boxed_u64", &mut world)
+            .unwrap();
+        codecs
+            .register_raw_copy_as::<u64>("plain_u64", &mut world)
+            .unwrap();
+
+        assert!(
+            matches!(
+                codecs.storage_kind_for_type(std::any::TypeId::of::<Box<u64>>()),
+                Some(StorageKind::Serialized)
+            ),
+            "Box must serialize, never raw-copy"
+        );
+        assert!(
+            matches!(
+                codecs.storage_kind_for_type(std::any::TypeId::of::<u64>()),
+                Some(StorageKind::RawCopy)
+            ),
+            "u64 is POD and raw-copyable"
+        );
+        let _ = &world;
     }
 }

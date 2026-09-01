@@ -88,6 +88,12 @@ CI runs fmt, clippy, test, TSan, and Loom on every PR. Miri runs nightly and on 
 
 For a comprehensive walkthrough of the internals — storage model, query engine, transaction system, persistence layer, memory management — [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Lewdwig-V/minkowski). It's auto-generated from the source and always up to date.
 
+Design documents record the subsystem architectures as delivered, with their invariants, invariant matrices, and test inventories:
+
+- [`docs/rsm-substrate-design.md`](docs/rsm-substrate-design.md) — Stage 4.0 replication substrate: commit=tick, view fencing, `Follower`, `world_fingerprint`, the convergence test
+- [`docs/lsm-design.md`](docs/lsm-design.md) — LSM storage: sorted-run format, manifest, compaction, hybrid dense persistence, recovery, identity-by-type
+- [`docs/reducer-correctness.md`](docs/reducer-correctness.md) — reducer determinism, termination, and purity requirements
+
 ## Performance
 
 Minkowski is optimized for the ECS hot path — iterating components, executing queries, and applying mutations. Key results on 10K entities (v1.3.0):

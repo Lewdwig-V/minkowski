@@ -86,15 +86,25 @@ pub fn spawn_world(n: usize) -> minkowski::World {
     world
 }
 
+minkowski_lsm::impl_raw_copy_certified!(Transform, Position, Rotation, Velocity);
+
 /// Register all 4 component types with the codec registry.
 pub fn register_codecs(
     codecs: &mut minkowski_persist::CodecRegistry,
     world: &mut minkowski::World,
 ) {
-    codecs.register::<Transform>(world).unwrap();
-    codecs.register::<Position>(world).unwrap();
-    codecs.register::<Rotation>(world).unwrap();
-    codecs.register::<Velocity>(world).unwrap();
+    codecs
+        .register_raw_copy_as::<Transform>("transform", world)
+        .unwrap();
+    codecs
+        .register_raw_copy_as::<Position>("position", world)
+        .unwrap();
+    codecs
+        .register_raw_copy_as::<Rotation>("rotation", world)
+        .unwrap();
+    codecs
+        .register_raw_copy_as::<Velocity>("velocity", world)
+        .unwrap();
 }
 
 /// Full 4x4 matrix inversion via cofactor expansion (~600 FLOPs per call).

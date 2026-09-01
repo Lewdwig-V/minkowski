@@ -29,14 +29,18 @@ struct Health(u32);
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+minkowski_lsm::impl_raw_copy_certified!(Pos, Vel, Health);
+
 /// Build a `CodecRegistry` with the flushable test components (`Pos`/`Vel`/
 /// `Health`) registered. The dense flush gate refuses any dense component
 /// lacking a codec, so every persisted dense column must be registered here.
 fn test_codecs(world: &mut World) -> CodecRegistry {
     let mut codecs = CodecRegistry::new();
-    codecs.register_as::<Pos>("pos", world).unwrap();
-    codecs.register_as::<Vel>("vel", world).unwrap();
-    codecs.register_as::<Health>("health", world).unwrap();
+    codecs.register_raw_copy_as::<Pos>("pos", world).unwrap();
+    codecs.register_raw_copy_as::<Vel>("vel", world).unwrap();
+    codecs
+        .register_raw_copy_as::<Health>("health", world)
+        .unwrap();
     codecs
 }
 
@@ -566,16 +570,15 @@ fn zst_component_round_trip() {
         "ZST component should have item_size 0"
     );
 
-    // ZST page should exist with row_count=5 but empty data region.
+    // ZST page should exist with row_count=5. Under the RawCopyCertified
+    // contract, `register_as` classifies non-certified components (including
+    // ZSTs) as Serialized, so the page body carries the offset-table format
+    // rather than being empty.
     let page = reader
         .get_page(0, entry.slot(), 0)
         .expect("get_page should not error")
         .expect("ZST page must exist");
     assert_eq!(page.header().row_count, 5);
-    assert!(
-        page.data().is_empty(),
-        "ZST page data should be empty (0 * PAGE_SIZE = 0 bytes)"
-    );
 
     // Entity page should also exist.
     let entity_page = reader

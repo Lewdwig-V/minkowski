@@ -7,6 +7,8 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::codec::CodecRegistry;
 
+crate::impl_raw_copy_certified!(BenchPos, BenchVel);
+
 #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
 #[repr(C)]
 pub struct BenchPos {
@@ -131,10 +133,10 @@ pub fn build_world(params: &WorkloadParams) -> (World, CodecRegistry) {
     let mut world = World::new();
     let mut codecs = CodecRegistry::new();
     codecs
-        .register_as::<BenchPos>("bench_pos", &mut world)
+        .register_raw_copy_as::<BenchPos>("bench_pos", &mut world)
         .unwrap();
     codecs
-        .register_as::<BenchVel>("bench_vel", &mut world)
+        .register_raw_copy_as::<BenchVel>("bench_vel", &mut world)
         .unwrap();
     codecs
         .register_as::<BenchName>("bench_name", &mut world)

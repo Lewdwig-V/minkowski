@@ -610,6 +610,72 @@ fn native_column_page(
     }
 }
 
+/// Per-signature resolution: canonical component ids, the import target, and
+/// per-column normalization metadata. Resolved once per signature and cached
+/// across its entity pages.
+struct ResolvedSignature {
+    comp_pairs: Vec<(ComponentId, String)>,
+    target: minkowski::ImportTarget,
+    item_sizes: Vec<usize>,
+    col_kinds: Vec<(crate::schema::StorageKind, Option<std::any::TypeId>)>,
+}
+
+fn resolve_signature(
+    sig: &ArchetypeSig,
+    name_to_id: &HashMap<String, ComponentId>,
+    world: &mut World,
+    component_layouts: &BTreeMap<String, (usize, usize)>,
+    component_kinds: &BTreeMap<String, crate::schema::StorageKind>,
+) -> Result<ResolvedSignature, LsmError> {
+    let mut comp_pairs: Vec<(ComponentId, String)> = sig
+        .iter()
+        .map(|name| {
+            name_to_id
+                .get(name)
+                .copied()
+                .ok_or_else(|| LsmError::Format(format!("unregistered component {name}")))
+                .map(|id| (id, name.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+    comp_pairs.sort_by_key(|(id, _)| *id);
+    let comp_ids: Vec<ComponentId> = comp_pairs.iter().map(|(id, _)| *id).collect();
+
+    let target = world
+        .import_target(&comp_ids)
+        .map_err(|e| LsmError::Format(format!("import_target failed for {sig:?}: {e}")))?;
+
+    let item_sizes: Vec<usize> = comp_pairs
+        .iter()
+        .map(|(_, name)| {
+            component_layouts.get(name).map_or(
+                Err(LsmError::Format(format!(
+                    "component {name} in archetype {sig:?} has no resolved layout"
+                ))),
+                |(size, _)| Ok(*size),
+            )
+        })
+        .collect::<Result<_, _>>()?;
+
+    let col_kinds: Vec<(crate::schema::StorageKind, Option<std::any::TypeId>)> = comp_pairs
+        .iter()
+        .map(|(id, name)| {
+            let kind = component_kinds.get(name).copied().ok_or_else(|| {
+                LsmError::Format(format!(
+                    "component {name} in archetype {sig:?} has no resolved storage kind"
+                ))
+            })?;
+            Ok::<_, LsmError>((kind, world.component_type_id(*id)))
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(ResolvedSignature {
+        comp_pairs,
+        target,
+        item_sizes,
+        col_kinds,
+    })
+}
+
 fn materialize_world(
     pages: BTreeMap<PageKey, StoredPage>,
     allocator: Option<&StoredAllocator>,
@@ -666,282 +732,296 @@ fn materialize_world(
     let (generations, free_list) = build_allocator_state(&by_sig, allocator);
     world.restore_allocator_state(generations, free_list);
 
+    // Archetype processing order: newest state image first. Runs are merged
+    // per page key, so an archetype migration (remove a component from the
+    // last row → the entity's new archetype page is dirty, the source
+    // archetype's pages stay clean) leaves the stale source page as the
+    // winner of its own key. Processing signatures by descending page
+    // `seq_hi` lets the newer placement claim the entity and the stale page
+    // skip it via the already-placed filter. Ascending order would let the
+    // stale source page place the entity with the removed component still
+    // attached, and the newer page would be skipped as already-placed.
+    // Within a signature, page_index ascending stays correct: swap_remove
+    // moves survivors to lower-or-equal rows, so newer placements sit at
+    // page indices the ascending scan reaches first.
+    type SignaturePages<'a> = (
+        &'a ArchetypeSig,
+        &'a BTreeMap<ColumnKey, BTreeMap<u16, StoredPage>>,
+    );
+    let mut sig_order: Vec<SignaturePages<'_>> = by_sig.iter().collect();
+    sig_order.sort_by_key(|(_, columns)| {
+        std::cmp::Reverse(
+            columns
+                .values()
+                .flat_map(|pages| pages.values())
+                .map(|p| p.seq_hi)
+                .max()
+                .unwrap_or(0),
+        )
+    });
+
+    // Entity pages process globally by descending page seq_hi: the newest
+    // state image of each entity claims it first, and stale pages from older
+    // runs skip via the already-placed filter. A signature-level maximum is
+    // not sufficient — an unrelated update to one page of a signature raises
+    // the signature max while another page of the same signature stays
+    // stale, and that stale page would process before a newer page in a
+    // different signature.
+    let mut entity_page_order: Vec<(u64, &ArchetypeSig, &StoredPage)> = Vec::new();
     for (sig, columns) in &by_sig {
-        // Resolve (comp_id, name) and sort by comp_id — the canonical archetype
-        // key and the order import_page expects its columns in.
-        let mut comp_pairs: Vec<(ComponentId, &String)> = sig
-            .iter()
-            .map(|name| {
-                name_to_id
-                    .get(name)
-                    .copied()
-                    .map(|id| (id, name))
-                    .ok_or_else(|| LsmError::Format(format!("unregistered component {name}")))
-            })
-            .collect::<Result<_, _>>()?;
-        comp_pairs.sort_by_key(|(id, _)| *id);
-        let comp_ids: Vec<ComponentId> = comp_pairs.iter().map(|(id, _)| *id).collect();
+        if let Some(entity_pages) = columns.get(&ColumnKey::Entity) {
+            for entity_page in entity_pages.values() {
+                entity_page_order.push((entity_page.seq_hi, sig, entity_page));
+            }
+        }
+    }
+    entity_page_order.sort_by_key(|(seq_hi, _, _)| std::cmp::Reverse(*seq_hi));
 
-        let target = world
-            .import_target(&comp_ids)
-            .map_err(|e| LsmError::Format(format!("import_target failed for {sig:?}: {e}")))?;
+    // Per-signature resolution cache (comp_pairs, import target, item sizes,
+    // column kinds), filled lazily on the signature's first processed page.
+    let mut resolved: HashMap<&ArchetypeSig, ResolvedSignature> = HashMap::new();
 
+    for &(_seq_hi, sig, entity_page) in &entity_page_order {
+        let columns = &by_sig[sig];
+        let resolved_sig = match resolved.entry(sig) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let r = resolve_signature(
+                    sig,
+                    &name_to_id,
+                    &mut world,
+                    component_layouts,
+                    component_kinds,
+                )?;
+                e.insert(r)
+            }
+        };
+        let ResolvedSignature {
+            comp_pairs,
+            target,
+            item_sizes,
+            col_kinds,
+        } = resolved_sig;
+
+        // Locate this page's index within the signature's entity column so
+        // column pages resolve by the same key.
         let entity_pages = columns
             .get(&ColumnKey::Entity)
             .ok_or_else(|| LsmError::Format(format!("archetype {sig:?} has no entity pages")))?;
-
-        // Pre-resolve the per-column item size for this archetype's components,
-        // used to slice column bytes when compacting a page down to its live
-        // rows. `component_layouts` was built from the on-disk schema entries
-        // and is keyed by component name. A missing entry is unreachable today
-        // (the signature is derived from the same schema via `entry_for_slot`,
-        // which errors first), but return an explicit error rather than
-        // silently treating a non-ZST component as a ZST (which would copy no
-        // bytes for its rows in the slow-path compaction → silent data loss).
-        // This guards against any future change that decouples the signature
-        // from the schema.
-        let item_sizes: Vec<usize> = comp_pairs
-            .iter()
-            .map(|(_, name)| {
-                component_layouts.get(*name).map_or(
-                    Err(LsmError::Format(format!(
-                        "component {name} in archetype {sig:?} has no resolved layout"
-                    ))),
-                    |(size, _)| Ok(*size),
-                )
-            })
-            .collect::<Result<_, _>>()?;
-
-        // Per-column normalization metadata, indexed identically to `comp_pairs`
-        // and `item_sizes`. `kind` selects RawCopy (native bytes already) vs
-        // Serialized (per-row rkyv decode); `type_id` is the recovered world's
-        // resolved component TypeId, required to pick the codec for a Serialized
-        // column. A Serialized column ALWAYS has a codec (the flush gate proves
-        // it), so its `type_id` is always `Some` and it was registered via the
-        // typed path — the archetype column holds T's correct drop_fn, never a
-        // raw (drop_fn = None) placeholder.
-        // Hard-error on a missing storage kind (mirrors the `item_sizes` block
-        // above). A silent RawCopy default could misclassify a Serialized column,
-        // cloning its raw `[offsets][values]` body into an archetype column as
-        // native heap pointers → corruption. The signature is derived from the
-        // same schema that records the kind, so a missing entry is unreachable
-        // today — but an explicit error keeps the recovery boundary sound against
-        // any future change that decouples the two.
-        let col_kinds: Vec<(crate::schema::StorageKind, Option<std::any::TypeId>)> = comp_pairs
-            .iter()
-            .map(|(id, name)| {
-                let kind = component_kinds.get(*name).copied().ok_or_else(|| {
-                    LsmError::Format(format!(
-                        "component {name} in archetype {sig:?} has no resolved storage kind"
-                    ))
-                })?;
-                Ok::<_, LsmError>((kind, world.component_type_id(*id)))
-            })
-            .collect::<Result<_, _>>()?;
-
-        for (&page_index, entity_page) in entity_pages {
-            let row_count = entity_page.row_count as usize;
-
-            // Read the raw entity handles for this page.
-            let mut page_entities: Vec<Entity> = Vec::with_capacity(row_count);
-            for chunk in entity_page.data.as_chunks::<8>().0.iter().take(row_count) {
-                page_entities.push(Entity::from_bits(u64::from_le_bytes(*chunk)));
-            }
-
-            // Dead-row filter: the persisted allocator is authoritative for
-            // alive/dead state. A stale page from an older run may carry
-            // entities that were alive when that run was written but have since
-            // been despawned (their generations were bumped). Importing them
-            // would resurrect despawned entities with stale component bytes and
-            // collide with survivors already imported from a newer page. Drop
-            // any entity whose current generation in the restored allocator
-            // does not match the on-disk handle's generation, OR that has
-            // already been placed by an earlier page in this recovery (a
-            // survivor that appears on both the newer page and a stale
-            // higher-index page from an older run — `store_page` keeps both
-            // because their page_index keys differ).
-            //
-            // Page iteration order (BTreeMap ascending by page_index) processes
-            // lower-index pages first. Because `swap_remove` only moves a
-            // survivor to a lower-or-equal row, the newer run places a survivor
-            // at a page_index <= the stale page's index, so the newer page is
-            // always seen first and the survivor is imported with current bytes;
-            // the stale page then skips it as already-placed.
-            let mut live_mask: Vec<bool> = Vec::with_capacity(row_count);
-            let mut live_count = 0usize;
-            for &e in &page_entities {
-                let alive = world.is_alive(e) && !world.is_placed(e);
-                live_mask.push(alive);
-                if alive {
-                    live_count += 1;
+        let page_index = {
+            let mut found = None;
+            for (&idx, page) in entity_pages {
+                if std::ptr::eq(page, entity_page) {
+                    found = Some(idx);
+                    break;
                 }
             }
-            if live_count == 0 {
-                continue;
-            }
+            found.ok_or_else(|| {
+                LsmError::Format(format!(
+                    "archetype {sig:?}: entity page missing from its column"
+                ))
+            })?
+        };
+        let row_count = entity_page.row_count as usize;
 
-            // Fast path: every entity on the page is alive — use the contiguous
-            // column slices directly, no copy.
-            let (entities, mut col_slices): (Vec<Entity>, Vec<DecodedColumn>) =
-                if live_count == row_count {
-                    let cols: Vec<DecodedColumn> = comp_pairs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_, name))| {
-                        let col_pages = columns
-                            .get(&ColumnKey::Component((*name).clone()))
-                            .ok_or_else(|| {
-                                LsmError::Format(format!("archetype {sig:?} missing column {name}"))
-                            })?;
-                        let page = col_pages.get(&page_index).ok_or_else(|| {
-                            LsmError::Format(format!(
-                                "archetype {sig:?} column {name} missing page {page_index}"
-                            ))
+        // Read the raw entity handles for this page.
+        let mut page_entities: Vec<Entity> = Vec::with_capacity(row_count);
+        for chunk in entity_page.data.as_chunks::<8>().0.iter().take(row_count) {
+            page_entities.push(Entity::from_bits(u64::from_le_bytes(*chunk)));
+        }
+
+        // Dead-row filter: the persisted allocator is authoritative for
+        // alive/dead state. A stale page from an older run may carry
+        // entities that were alive when that run was written but have since
+        // been despawned (their generations were bumped). Importing them
+        // would resurrect despawned entities with stale component bytes and
+        // collide with survivors already imported from a newer page. Drop
+        // any entity whose current generation in the restored allocator
+        // does not match the on-disk handle's generation, OR that has
+        // already been placed by an earlier page in this recovery (a
+        // survivor that appears on both the newer page and a stale
+        // higher-index page from an older run — `store_page` keeps both
+        // because their page_index keys differ).
+        //
+        // Page iteration order (BTreeMap ascending by page_index) processes
+        // lower-index pages first. Because `swap_remove` only moves a
+        // survivor to a lower-or-equal row, the newer run places a survivor
+        // at a page_index <= the stale page's index, so the newer page is
+        // always seen first and the survivor is imported with current bytes;
+        // the stale page then skips it as already-placed.
+        let mut live_mask: Vec<bool> = Vec::with_capacity(row_count);
+        let mut live_count = 0usize;
+        for &e in &page_entities {
+            let alive = world.is_alive(e) && !world.is_placed(e);
+            live_mask.push(alive);
+            if alive {
+                live_count += 1;
+            }
+        }
+        if live_count == 0 {
+            continue;
+        }
+
+        // Fast path: every entity on the page is alive — use the contiguous
+        // column slices directly, no copy.
+        let (entities, mut col_slices): (Vec<Entity>, Vec<DecodedColumn>) = if live_count
+            == row_count
+        {
+            let cols: Vec<DecodedColumn> = comp_pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (_, name))| {
+                    let col_pages = columns
+                        .get(&ColumnKey::Component((*name).clone()))
+                        .ok_or_else(|| {
+                            LsmError::Format(format!("archetype {sig:?} missing column {name}"))
                         })?;
-                        if page.row_count as usize != row_count {
-                            return Err(LsmError::Format(format!(
-                                "archetype {sig:?} column {name} page {page_index} has {} rows, \
+                    let page = col_pages.get(&page_index).ok_or_else(|| {
+                        LsmError::Format(format!(
+                            "archetype {sig:?} column {name} missing page {page_index}"
+                        ))
+                    })?;
+                    if page.row_count as usize != row_count {
+                        return Err(LsmError::Format(format!(
+                            "archetype {sig:?} column {name} page {page_index} has {} rows, \
                                  entity page has {row_count}",
-                                page.row_count
-                            )));
-                        }
-                        let (kind, type_id) = col_kinds[i];
-                        let item_size = item_sizes[i];
-                        // Resolve the drop info (fallible) BEFORE decoding, so the
-                        // guard is constructed infallibly after — a decoded heap
-                        // buffer can never be handed to a fallible op that would
-                        // drop it as plain bytes → leak.
-                        let armed = column_arm(kind, type_id, item_size, codecs)?;
-                        // All rows alive ⇒ pass `None` (no mask): every row is
-                        // materialized.
-                        let native = native_column_page(
-                            page,
-                            kind,
-                            type_id,
-                            codecs,
-                            item_size,
-                            None,
-                            &page.decode_mode,
-                        )
-                        .map_err(|e| {
-                            LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
-                        })?;
-                        // Release invariant: the normalized native buffer must be
-                        // exactly `row_count` native items wide. This mirrors the
-                        // slow-path assert so a kind/length disagreement can never
-                        // reach `import_page` unchecked on either path (all rows
-                        // alive ⇒ the page width must equal the native stride).
-                        assert_eq!(
-                            native.len(),
-                            row_count * item_size,
-                            "normalized column {name} page {page_index} is {} bytes, expected \
+                            page.row_count
+                        )));
+                    }
+                    let (kind, type_id) = col_kinds[i];
+                    let item_size = item_sizes[i];
+                    // Resolve the drop info (fallible) BEFORE decoding, so the
+                    // guard is constructed infallibly after — a decoded heap
+                    // buffer can never be handed to a fallible op that would
+                    // drop it as plain bytes → leak.
+                    let armed = column_arm(kind, type_id, item_size, codecs)?;
+                    // All rows alive ⇒ pass `None` (no mask): every row is
+                    // materialized.
+                    let native = native_column_page(
+                        page,
+                        kind,
+                        type_id,
+                        codecs,
+                        item_size,
+                        None,
+                        &page.decode_mode,
+                    )
+                    .map_err(|e| {
+                        LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
+                    })?;
+                    // Release invariant: the normalized native buffer must be
+                    // exactly `row_count` native items wide. This mirrors the
+                    // slow-path assert so a kind/length disagreement can never
+                    // reach `import_page` unchecked on either path (all rows
+                    // alive ⇒ the page width must equal the native stride).
+                    assert_eq!(
+                        native.len(),
+                        row_count * item_size,
+                        "normalized column {name} page {page_index} is {} bytes, expected \
                              {row_count} * {item_size}",
-                            native.len()
-                        );
-                        Ok(DecodedColumn::new(native, armed))
-                    })
-                    .collect::<Result<_, _>>()?;
-                    (page_entities.clone(), cols)
-                } else {
-                    // Slow path: compact the page down to its live rows. Rebuild
-                    // the entity Vec and each column's byte buffer with only the
-                    // rows whose entity is alive, so `import_page` sees a
-                    // consistent (entities, columns) pair with no dead rows.
-                    let mut live_entities = Vec::with_capacity(live_count);
-                    for (&e, &alive) in page_entities.iter().zip(live_mask.iter()) {
-                        if alive {
-                            live_entities.push(e);
-                        }
-                    }
-                    let mut live_cols: Vec<DecodedColumn> = Vec::with_capacity(comp_pairs.len());
-                    for (i, (_, name)) in comp_pairs.iter().enumerate() {
-                        let col_pages = columns
-                            .get(&ColumnKey::Component((*name).clone()))
-                            .ok_or_else(|| {
-                                LsmError::Format(format!("archetype {sig:?} missing column {name}"))
-                            })?;
-                        let page = col_pages.get(&page_index).ok_or_else(|| {
-                            LsmError::Format(format!(
-                                "archetype {sig:?} column {name} missing page {page_index}"
-                            ))
-                        })?;
-                        if page.row_count as usize != row_count {
-                            return Err(LsmError::Format(format!(
-                                "archetype {sig:?} column {name} page {page_index} has {} rows, \
-                             entity page has {row_count}",
-                                page.row_count
-                            )));
-                        }
-                        // Materialize ONLY the live rows' native bytes. Passing the
-                        // live mask is load-bearing: decoding a dead Serialized row
-                        // would reconstruct a heap-owning value that is never imported
-                        // into the World (so its drop_fn never runs) → a leak. The
-                        // mask skips dead rows entirely, so they are never decoded.
-                        let (kind, type_id) = col_kinds[i];
-                        let item_size = item_sizes[i];
-                        // Resolve the drop info (fallible) BEFORE decoding, so the
-                        // guard is constructed infallibly after — a decoded heap
-                        // buffer can never be handed to a fallible op that would
-                        // drop it as plain bytes → leak.
-                        let armed = column_arm(kind, type_id, item_size, codecs)?;
-                        let buf = native_column_page(
-                            page,
-                            kind,
-                            type_id,
-                            codecs,
-                            item_size,
-                            Some(&live_mask),
-                            &page.decode_mode,
-                        )
-                        .map_err(|e| {
-                            LsmError::Format(format!("archetype {sig:?} column {name}: {e}"))
-                        })?;
-                        // The compacted buffer must be exactly `live_count` native
-                        // items wide, or it disagrees with the live-row layout.
-                        assert_eq!(
-                            buf.len(),
-                            live_count * item_size,
-                            "compacted column {name} page {page_index} is {} bytes, expected \
-                         {live_count} * {item_size}",
-                            buf.len()
-                        );
-                        live_cols.push(DecodedColumn::new(buf, armed));
-                    }
-                    (live_entities, live_cols)
-                };
-
-            // Borrow the guarded column bytes as slices for `ImportPage::page`.
-            let import_result = {
-                let col_refs: Vec<&[u8]> = col_slices.iter().map(DecodedColumn::as_slice).collect();
-                let import_page = target.page(&entities, &col_refs).map_err(|e| {
-                    LsmError::Format(format!("import page build failed for {sig:?}: {e}"))
-                })?; // early return drops col_slices (armed) → heap values freed
-                // SAFETY: each column slice is the native (in-memory) byte image of
-                // its component, produced by `native_column_page`: RawCopy columns
-                // are the on-disk native bytes verbatim; Serialized columns are
-                // decoded row-by-row into native values whose heap ownership rides
-                // inside the bytes and transfers into the archetype column (which
-                // holds T's drop_fn — a Serialized column always has a codec, so it
-                // was registered via the typed path, never raw). Every dense column
-                // has a codec (the flush gate proves it). The source pages passed
-                // per-page CRC validation on read, and every entity in `entities` is
-                // alive per the allocator state restored above (dead rows filtered).
-                // The armed-drop-on-`Err` correctness relies on `World::import_page`
-                // being ALL-OR-NOTHING: it validates every entity (dead/already-placed)
-                // BEFORE any `append_bytes_unchecked`, and its byte-copy loop is
-                // infallible — so an `Err` means zero columns were transferred, and
-                // dropping the still-armed guards frees each heap value exactly once
-                // (no double free with a partially-populated archetype).
-                unsafe { world.import_page(&import_page) }
-                    .map_err(|e| LsmError::Format(format!("import_page failed for {sig:?}: {e}")))
-                // col_refs + import_page dropped at block end, releasing the borrow
-            };
-            import_result?; // on Err, col_slices (armed) drops here → heap values freed
-            // Success: ownership transferred to archetype columns; disarm so the
-            // guards drop only their byte buffers (no element drops → no double free).
-            for col in &mut col_slices {
-                col.disarm();
+                        native.len()
+                    );
+                    Ok(DecodedColumn::new(native, armed))
+                })
+                .collect::<Result<_, _>>()?;
+            (page_entities.clone(), cols)
+        } else {
+            // Slow path: compact the page down to its live rows. Rebuild
+            // the entity Vec and each column's byte buffer with only the
+            // rows whose entity is alive, so `import_page` sees a
+            // consistent (entities, columns) pair with no dead rows.
+            let mut live_entities = Vec::with_capacity(live_count);
+            for (&e, &alive) in page_entities.iter().zip(live_mask.iter()) {
+                if alive {
+                    live_entities.push(e);
+                }
             }
+            let mut live_cols: Vec<DecodedColumn> = Vec::with_capacity(comp_pairs.len());
+            for (i, (_, name)) in comp_pairs.iter().enumerate() {
+                let col_pages = columns
+                    .get(&ColumnKey::Component((*name).clone()))
+                    .ok_or_else(|| {
+                        LsmError::Format(format!("archetype {sig:?} missing column {name}"))
+                    })?;
+                let page = col_pages.get(&page_index).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "archetype {sig:?} column {name} missing page {page_index}"
+                    ))
+                })?;
+                if page.row_count as usize != row_count {
+                    return Err(LsmError::Format(format!(
+                        "archetype {sig:?} column {name} page {page_index} has {} rows, \
+                             entity page has {row_count}",
+                        page.row_count
+                    )));
+                }
+                // Materialize ONLY the live rows' native bytes. Passing the
+                // live mask is load-bearing: decoding a dead Serialized row
+                // would reconstruct a heap-owning value that is never imported
+                // into the World (so its drop_fn never runs) → a leak. The
+                // mask skips dead rows entirely, so they are never decoded.
+                let (kind, type_id) = col_kinds[i];
+                let item_size = item_sizes[i];
+                // Resolve the drop info (fallible) BEFORE decoding, so the
+                // guard is constructed infallibly after — a decoded heap
+                // buffer can never be handed to a fallible op that would
+                // drop it as plain bytes → leak.
+                let armed = column_arm(kind, type_id, item_size, codecs)?;
+                let buf = native_column_page(
+                    page,
+                    kind,
+                    type_id,
+                    codecs,
+                    item_size,
+                    Some(&live_mask),
+                    &page.decode_mode,
+                )
+                .map_err(|e| LsmError::Format(format!("archetype {sig:?} column {name}: {e}")))?;
+                // The compacted buffer must be exactly `live_count` native
+                // items wide, or it disagrees with the live-row layout.
+                assert_eq!(
+                    buf.len(),
+                    live_count * item_size,
+                    "compacted column {name} page {page_index} is {} bytes, expected \
+                         {live_count} * {item_size}",
+                    buf.len()
+                );
+                live_cols.push(DecodedColumn::new(buf, armed));
+            }
+            (live_entities, live_cols)
+        };
+
+        // Borrow the guarded column bytes as slices for `ImportPage::page`.
+        let import_result = {
+            let col_refs: Vec<&[u8]> = col_slices.iter().map(DecodedColumn::as_slice).collect();
+            let import_page = target.page(&entities, &col_refs).map_err(|e| {
+                LsmError::Format(format!("import page build failed for {sig:?}: {e}"))
+            })?; // early return drops col_slices (armed) → heap values freed
+            // SAFETY: each column slice is the native (in-memory) byte image of
+            // its component, produced by `native_column_page`: RawCopy columns
+            // are the on-disk native bytes verbatim; Serialized columns are
+            // decoded row-by-row into native values whose heap ownership rides
+            // inside the bytes and transfers into the archetype column (which
+            // holds T's drop_fn — a Serialized column always has a codec, so it
+            // was registered via the typed path, never raw). Every dense column
+            // has a codec (the flush gate proves it). The source pages passed
+            // per-page CRC validation on read, and every entity in `entities` is
+            // alive per the allocator state restored above (dead rows filtered).
+            // The armed-drop-on-`Err` correctness relies on `World::import_page`
+            // being ALL-OR-NOTHING: it validates every entity (dead/already-placed)
+            // BEFORE any `append_bytes_unchecked`, and its byte-copy loop is
+            // infallible — so an `Err` means zero columns were transferred, and
+            // dropping the still-armed guards frees each heap value exactly once
+            // (no double free with a partially-populated archetype).
+            unsafe { world.import_page(&import_page) }
+                .map_err(|e| LsmError::Format(format!("import_page failed for {sig:?}: {e}")))
+            // col_refs + import_page dropped at block end, releasing the borrow
+        };
+        import_result?; // on Err, col_slices (armed) drops here → heap values freed
+        // Success: ownership transferred to archetype columns; disarm so the
+        // guards drop only their byte buffers (no element drops → no double free).
+        for col in &mut col_slices {
+            col.disarm();
         }
     }
 

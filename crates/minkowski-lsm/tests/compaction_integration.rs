@@ -29,6 +29,8 @@ struct Pos {
 
 // ── Helper ───────────────────────────────────────────────────────────────────
 
+minkowski_lsm::impl_raw_copy_certified!(Pos);
+
 /// Do one flush from `world` (which must have dirty pages) and return the run
 /// path. Registers `Pos` in a codec registry first — the dense flush gate
 /// refuses any dense component lacking a codec. `register_component` is
@@ -43,7 +45,7 @@ fn do_flush<const N: usize>(
 ) -> std::path::PathBuf {
     let seq_range = SeqRange::new(SeqNo::from(seq_lo), SeqNo::from(seq_hi)).unwrap();
     let mut codecs = CodecRegistry::new();
-    codecs.register_as::<Pos>("pos", world).unwrap();
+    codecs.register_raw_copy_as::<Pos>("pos", world).unwrap();
     flush_and_record(world, seq_range, manifest, log, run_dir, &codecs)
         .unwrap()
         .expect("world must be dirty for flush to produce Some")

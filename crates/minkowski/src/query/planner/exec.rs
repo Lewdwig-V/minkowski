@@ -586,7 +586,9 @@ impl QueryPlanResult {
                 }
                 for comp_id in mutable.ones() {
                     if let Some(col_idx) = arch.column_index(comp_id) {
-                        arch.columns[col_idx].mark_changed(tick);
+                        let col = &mut arch.columns[col_idx];
+                        col.mark_changed(tick);
+                        col.mark_all_pages_dirty();
                     }
                 }
             }
@@ -794,7 +796,9 @@ impl QueryPlanResult {
                 }
                 for comp_id in mutable.ones() {
                     if let Some(col_idx) = arch.column_index(comp_id) {
-                        arch.columns[col_idx].mark_changed(tick);
+                        let col = &mut arch.columns[col_idx];
+                        col.mark_changed(tick);
+                        col.mark_all_pages_dirty();
                     }
                 }
             }
