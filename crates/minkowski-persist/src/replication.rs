@@ -9,8 +9,14 @@
 //! scenarios, [`WalCursor`](crate::WalCursor) reads batches directly from
 //! WAL segment files.
 
+#[cfg(loom)]
+use crate::sync::{Arc, AtomicBool, AtomicU64};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool as StdAtomicBool, AtomicU64 as StdAtomicU64};
+#[cfg(not(loom))]
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use minkowski::{ComponentId, World};
 
@@ -97,8 +103,8 @@ pub fn apply_batch(
 pub struct Follower {
     /// Next sequence the follower expects: all records below this are
     /// applied. 0 = nothing applied (WAL sequences start at 0).
-    high_water: StdAtomicU64,
-    poisoned: StdAtomicBool,
+    high_water: AtomicU64,
+    poisoned: AtomicBool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,8 +146,8 @@ impl Follower {
     /// pass the replay floor the recovery used.
     pub fn with_baseline(baseline_seq: u64) -> Self {
         Self {
-            high_water: StdAtomicU64::new(baseline_seq),
-            poisoned: StdAtomicBool::new(false),
+            high_water: AtomicU64::new(baseline_seq),
+            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -149,17 +155,16 @@ impl Follower {
     /// applied. 0 means nothing applied yet. `read_at(seq)` is valid for
     /// `seq < applied_seq()`.
     pub fn applied_seq(&self) -> u64 {
-        self.high_water.load(std::sync::atomic::Ordering::Acquire)
+        self.high_water.load(Ordering::Acquire)
     }
 
     /// True once a mid-batch failure has poisoned this follower.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned.load(std::sync::atomic::Ordering::Acquire)
+        self.poisoned.load(Ordering::Acquire)
     }
 
     fn poison(&self) {
-        self.poisoned
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.poisoned.store(true, Ordering::SeqCst);
     }
 
     /// Apply a transport batch in log order.
@@ -185,7 +190,7 @@ impl Follower {
             None
         } else {
             match codecs.build_remap(&batch.schema.components) {
-                Ok(r) => Some(std::sync::Arc::new(r)),
+                Ok(r) => Some(Arc::new(r)),
                 Err(e) => {
                     self.poison();
                     return Err(FollowerError::Apply(WalError::Format(e.to_string())));
@@ -228,8 +233,7 @@ impl Follower {
                 });
             }
             last = record.seq + 1;
-            self.high_water
-                .store(last, std::sync::atomic::Ordering::Release);
+            self.high_water.store(last, Ordering::Release);
         }
         Ok(last)
     }
@@ -1227,5 +1231,178 @@ mod tests {
         };
         follower.advance(&old, &mut replica, &reg).unwrap();
         assert!(replica.is_alive(minkowski::Entity::from_bits(0)));
+    }
+
+    // ── Loom: Follower state races (issue #255) ──────────────────────
+    //
+    // Worlds and batches are built OUTSIDE `loom::model` where possible:
+    // pool allocation is not part of the state machine under test, and loom
+    // re-executes thread bodies per schedule, so world operations inside the
+    // model must be idempotent — Insert records qualify (same-value re-apply
+    // is a no-op); Spawn does not (AlreadyPlaced on re-execution would
+    // poison spuriously). The follower's high_water/poisoned are
+    // `crate::sync` atomics — loom resets those per schedule, which is
+    // exactly the state machine under test.
+
+    #[cfg(loom)]
+    fn retarget_batch(batch: &ReplicationBatch, entity_bits: u64) -> ReplicationBatch {
+        let mut batch = batch.clone();
+        for record in &mut batch.records {
+            for m in &mut record.mutations {
+                if let SerializedMutation::Insert { entity, .. } = m {
+                    *entity = entity_bits;
+                }
+            }
+        }
+        batch
+    }
+
+    #[cfg(loom)]
+    fn pos_world() -> World {
+        World::new()
+    }
+
+    #[cfg(loom)]
+    fn make_insert_batch(seq: u64, _entity_bits: u64, value: f32) -> ReplicationBatch {
+        ReplicationBatch {
+            schema: test_schema(),
+            records: vec![WalRecord {
+                tick_after: seq + 1,
+                seq,
+                mutations: vec![SerializedMutation::Insert {
+                    entity: 0, // retarget_batch rewrites to the thread's entity
+                    component_id: 0usize,
+                    data: rkyv::to_bytes::<rkyv::rancor::Error>(&Pos { x: value, y: 0.0 })
+                        .unwrap()
+                        .to_vec(),
+                }],
+            }],
+        }
+    }
+
+    #[cfg(loom)]
+    fn pos_world_with_entity() -> (World, CodecRegistry) {
+        let mut world = World::new();
+        let mut reg = CodecRegistry::new();
+        reg.register_as::<Pos>("pos", &mut world).unwrap();
+        let _e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        (world, reg)
+    }
+
+    /// Writer advances one Insert record; reader probes `read_at`
+    /// concurrently. Worlds live in shared mutexes (hoisted out of the
+    /// model — loom re-executes the model closure, so nothing may be moved).
+    /// Invariants: `read_at` never returns Ok for a seq at or above the
+    /// applied prefix at check time, high-water never decreases, and the
+    /// final state is fully applied and unpoisoned.
+    #[cfg(loom)]
+    #[test]
+    fn loom_follower_advance_vs_read_at() {
+        use crate::sync::{Arc, Mutex};
+
+        let batch_proto = make_insert_batch(0, 0, 7.0);
+
+        loom::model(move || {
+            let follower = Arc::new(Follower::new());
+            let batch = batch_proto.clone();
+            let writer_world = Arc::new(Mutex::new(pos_world()));
+            let reader_world = Arc::new(Mutex::new(pos_world()));
+
+            let writer_follower = follower.clone();
+            let writer = loom::thread::spawn(move || {
+                let mut world = pos_world();
+                let mut reg = CodecRegistry::new();
+                reg.register_as::<Pos>("pos", &mut world).unwrap();
+                let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+                let batch = retarget_batch(&batch, e.to_bits());
+                writer_follower.advance(&batch, &mut world, &reg)
+            });
+
+            let reader_follower = follower.clone();
+            let reader = loom::thread::spawn(move || {
+                let world = reader_world.lock();
+                for seq in 0..=1 {
+                    match reader_follower.read_at(seq, &world, |_| ()) {
+                        Ok(()) => {
+                            assert!(
+                                reader_follower.applied_seq() > seq,
+                                "read_at({seq}) passed but applied_seq is {}",
+                                reader_follower.applied_seq()
+                            );
+                        }
+                        Err(FollowerError::Stale { applied_seq, .. }) => {
+                            assert!(
+                                seq >= applied_seq,
+                                "read_at({seq}) stale but applied_seq is {applied_seq}"
+                            );
+                        }
+                        Err(e) => panic!("unexpected error: {e:?}"),
+                    }
+                }
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+
+            assert_eq!(follower.applied_seq(), 1);
+            assert!(!follower.is_poisoned());
+        });
+    }
+
+    /// Two threads advance the same follower with disjoint single-record
+    /// Insert streams, each against its own world. Terminal states:
+    /// - A completes before B starts: both Ok, high-water 2, unpoisoned.
+    /// - B runs first: B gap-poisons; A either completes first (poisoned,
+    ///   high-water 1) or observes the poison (Err(Poisoned)).
+    /// A never gaps (seq 0 vs high-water 0 or 1 is never a gap).
+    #[cfg(loom)]
+    #[test]
+    fn loom_follower_concurrent_advance() {
+        use crate::sync::{Arc, Mutex};
+
+        let batch_a_proto = make_insert_batch(0, 0, 1.0);
+        let batch_b_proto = make_insert_batch(1, 0, 2.0);
+
+        loom::model(move || {
+            let follower = Arc::new(Follower::new());
+            let batch_a = batch_a_proto.clone();
+            let batch_b = batch_b_proto.clone();
+            let world_a = Arc::new(Mutex::new(pos_world()));
+            let world_b = Arc::new(Mutex::new(pos_world()));
+            let follower_a = follower.clone();
+            let follower_b = follower.clone();
+            let a = loom::thread::spawn(move || {
+                let mut world = pos_world();
+                let mut reg = CodecRegistry::new();
+                reg.register_as::<Pos>("pos", &mut world).unwrap();
+                let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+                let batch = retarget_batch(&batch_a, e.to_bits());
+                follower_a.advance(&batch, &mut world, &reg)
+            });
+            let b = loom::thread::spawn(move || {
+                let mut world = pos_world();
+                let mut reg = CodecRegistry::new();
+                reg.register_as::<Pos>("pos", &mut world).unwrap();
+                let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+                let batch = retarget_batch(&batch_b, e.to_bits());
+                follower_b.advance(&batch, &mut world, &reg)
+            });
+
+            let ra = a.join().unwrap();
+            let rb = b.join().unwrap();
+
+            match (&ra, &rb) {
+                (Ok(_), Ok(_)) => {
+                    assert_eq!(follower.applied_seq(), 2);
+                    assert!(!follower.is_poisoned());
+                }
+                (Ok(_), Err(FollowerError::Gap { .. }))
+                | (Err(FollowerError::Poisoned), Err(FollowerError::Gap { .. })) => {
+                    assert!(follower.is_poisoned());
+                    assert!(matches!(follower.applied_seq(), 0 | 1));
+                }
+                _ => panic!("unexpected outcome: {ra:?} / {rb:?}"),
+            }
+        });
     }
 }

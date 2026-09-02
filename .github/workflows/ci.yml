@@ -88,7 +88,9 @@ jobs:
         with:
           shared-key: stable
       - name: Loom concurrency tests
-        run: cargo test -p minkowski --lib --features loom -- loom_tests
+        run: |
+          cargo test -p minkowski --lib --features loom -- loom_tests
+          cargo test -p minkowski-persist --lib --features loom -- loom_follower
         env:
           RUSTFLAGS: "--cfg loom"
 
