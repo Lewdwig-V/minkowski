@@ -6,6 +6,8 @@ pub mod index;
 pub mod record;
 pub mod recover;
 pub mod replication;
+#[cfg(loom)]
+pub(crate) mod sync;
 pub mod wal;
 
 pub use blob::{BlobRef, BlobStore};

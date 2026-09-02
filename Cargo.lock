@@ -1010,6 +1010,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "fixedbitset",
+ "loom",
  "memmap2",
  "minkowski",
  "minkowski-lsm",

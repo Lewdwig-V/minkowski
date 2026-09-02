@@ -15,6 +15,7 @@ parking_lot = "0.12"
 fixedbitset = "0.5"
 thiserror = "2"
 crc32fast = "1"
+loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 # Re-declare minkowski-lsm with the bench-support feature so benches can use
@@ -22,7 +23,11 @@ crc32fast = "1"
 # dependency above; the feature is only active for dev/bench targets.
 minkowski-lsm = { path = "../minkowski-lsm", features = ["bench-support"] }
 tempfile = "3"
+
 criterion = "0.8"
+
+[features]
+loom = ["dep:loom", "minkowski/loom"]
 
 [[bench]]
 name = "persist"
