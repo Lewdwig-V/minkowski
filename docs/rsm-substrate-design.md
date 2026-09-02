@@ -55,6 +55,7 @@ The fence rule, one sentence: **a consumer that has seen view V must not act on 
 | `WalCursor::next_batch` | raises the fence | fenced: dropped, not shipped | raises the fence |
 | `try_advance_segment` (cursor) | raises the fence from the new segment's preamble | n/a | n/a |
 | `Wal::open` (crash recovery) | preamble stamped with the resumed view (views restore precedes a torn-header rewrite) | stale tail truncated at the frame offset — overwritten, so new-leader records reuse the sequence | counted by the header scan |
+| `Follower::ingest_frames` (4.0-b, shipped ranges) | processed always — a stale schema still builds the remap for its segment, matching `replay_from` | fenced: dropped before apply, high-water untouched | fenced: skipped, fence raised |
 
 Fence maintenance:
 
@@ -142,22 +143,29 @@ Second-order: retention deleting a sealed segment between cursor resolution and 
 
 ### 7.3 Ship the WAL bytes
 
-The shipped payload is the WAL frame bytes themselves — serialized once at commit, zero per-follower serialization. Followers append shipped ranges into their own WAL and replay through the existing `replay_from` pipeline, so network bytes and disk bytes are indistinguishable to the cursor code. `ReplicationBatch::to_bytes` retires; `from_bytes` becomes the frame-stream parse with refusable remap. View fencing and tick stamps ride the existing frame header.
+The shipped payload is the WAL frame bytes themselves — serialized once at commit, zero per-follower serialization. `ReplicationBatch::to_bytes` retires; `from_bytes` becomes the frame-stream parse with refusable remap. View fencing and tick stamps ride the existing frame header.
+
+Ingest has one chokepoint: `Follower::ingest_frames(&mut self, frames, world, codecs)`. It routes every record through `apply_record` (tick guard, remap, fences — the existing convergence point), updates `high_water` and `poisoned` (the positional invariants), and returns the applied boundary. It optionally appends the frames into the follower's own WAL first, so follower crash recovery replays the same bytes. `replay_from` alone is not the ingest path: it never updates follower state, and an at-least-once retransmission needs positional dedup to be safe. One door in, one door out.
 
 **Load-bearing premise, verified before wire code:** WAL frames must be self-describing for a live follower with divergent registration history. `recover_world` rebuilds a fresh world where leader and local ids coincide by construction. A live follower does not. The differential round-trip test decides this: leader commits N records; take the exact segment bytes; decode into a follower with different registration order and pre-existing entities; assert fingerprint equality. Its failure modes enumerate exactly what `WalEntry` needs (stable names, allocator adoption). This test is the first 4.0-b deliverable.
 
 ### 7.4 Transport contract
 
-One synchronous method: `send_batch(&mut self, batch: &BatchRef) -> Result<Ack, TransportError>`. The contract is in-order, at-least-once delivery. Retries, reconnect, and backoff are impl-private. `BatchRef` views an owned byte buffer detached at handoff; a hung transport pins one buffer and nothing else.
+4.0-b ships the **pull** contract. One method on the follower's fetch client:
 
-- `Ack { applied_seq: u64 }` flows in the return value. It is **opaque**: the constructor is `pub(crate)`, minted only from `Follower::advance`'s return. A premature ack (send-buffer flush, pre-apply) converts at-least-once into silent at-most-once — the type system closes that hole.
-- `ReplicationPump` is a sibling type, not a member of `Replicated<S>`. `pump_once()` ships one cursor step; no library-spawned threads.
-- Fixtures: `RecordingTransport` (log of batch-ack pairs) for invariant tests; a seeded chaos transport (drop, duplicate, reorder, delay; seeds pinned in test source) wired straight into `Follower::advance`; CI sweeps seeds and asserts convergence plus the ordering invariant: an acked applied_seq implies every record at or below it is applied.
-- `TransportError` splits into `Lost` (retry now) and `Down` (link dead, backoff). A gap ack or repeated failure routes to rejoin via state transfer.
+```rust
+fn fetch(&self, seq: u64, limit: usize) -> Result<BatchRef, TransportError>
+```
+
+`seq` is the follower's applied boundary; the response carries raw frame bytes for `[seq, seq + limit)`. There is no separate ack channel: the next `fetch`'s `seq` **is** the ack, and it is correct by construction — the follower advances its own high-water only inside `ingest_frames`, after apply. The premature-ack hole (an impl acking before the follower applied) cannot exist in pull, because nothing but the follower's own ingest moves the boundary.
+
+`BatchRef` views an owned byte buffer detached at handoff; a wedged transport pins one buffer and nothing else. `TransportError` splits into `Lost` (retry now) and `Down` (link dead, backoff, then rejoin via state transfer). Fixtures: `RecordingFetch` (log of fetch-respond pairs) for invariant tests; a seeded chaos fetch (drop, duplicate — a duplicate `fetch(seq)` is harmless, the follower re-ingests nothing below its high-water — reorder within a limit window, delay; seeds pinned in test source).
+
+The **push** shape (`send_batch(&mut self, batch) -> Result<Ack, TransportError>` with the opaque `Ack` minted only from follower ingest) is the 4.1 latency optimization. The framing is identical, so push adds a leader-side cursor and the opaque-Ack discipline over the same bytes; pull-first does not preclude it.
 
 ### 7.5 Pull-first
 
-The pump can live on the follower: `Transport` becomes `records_from(seq, limit)` served over the wire, and the leader gains no thread and no state. Push is a later latency optimization over identical framing. 4.0-b ships pull-first; the trait must not preclude push.
+4.0-b ships pull as specified in section 7.4: the leader serves `fetch(seq, limit)` from `records_from`, and the pump loop lives on the follower. The leader gains no thread and no state. Push (`send_batch` + opaque `Ack`) is the 4.1 optimization over identical framing; pull does not preclude it.
 
 ### 7.6 Fences on the new byte source
 
