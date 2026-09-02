@@ -108,13 +108,62 @@ The substrate invariant is a test (`convergence_100_transactions_leader_replica`
 
 ## 6. Remaining 4.0 phases
 
-- 4.0-b, `Replicated<S>` + `Transport`: the leader-side component wrapping `Durable<S>`, with an outbound pump behind a `Transport` trait (in-memory channel for tests, TCP later). Promotion of `replication.rs` primitives.
+- 4.0-b, `Replicated<S>` + pump + `Transport`. Scope reshaped by a design pass (2026-09-02, recorded in section 7). Deliverables in order: the durable-tail clamp and `records_from`; the differential round-trip test; `transport.rs` with the trait, `RecordingTransport`, loopback impl, and `ReplicationPump::pump_once`; the chaos fixture. Section 7 specifies the design.
 - 4.0-c, replica mode (INV-3): the `World` write-mode flag. Every `&mut self` mutation entry point returns a typed refusal on a replica; `Follower::advance` is the only mutation path; `apply_record`'s internal bypass is the documented exception.
 - 4.0-d, durable view record: view history persisted and validated at replay; real quorum installation stays in 4.1.
 
 Deferred to 4.1 and later, unchanged: VR consensus core, leader election, io_uring unified I/O, zero-copy buffer identity, client session tables, reducer-intent replication, linearizable read leases.
 
-## 7. Test inventory
+## 7. 4.0-b design: the pump and Transport (decision record)
+
+A divergent design pass (5 frames, 30 candidates, 3 deepened) reshaped 4.0-b. The core decision: **the WAL is the outbound queue.** The pump is a stateless per-follower cursor over committed WAL records. The commit path never touches the Transport, so commit latency is structurally independent of follower speed, and a crash between commit and ship cannot lose a batch because the leader keeps no ship state. Ship progress is the follower ack. WAL retention truncates whole segments strictly below min(follower ack). A read into a truncated region is a rejoin signal, not an error.
+
+### 7.1 Components
+
+```
+minkowski-persist
+├── Durable<S>            (commit point unchanged: fsync, then apply)
+├── durable_tail: AtomicU64 on Wal   (post-fsync record boundary — the clamp)
+├── records_from(seq, limit)         (cursor read; hard-errors past durable_tail)
+├── Replicated<S>         (wraps Durable<S>; transact delegates unchanged;
+│                         adds a follower registry: Transport + ack AtomicU64 each)
+└── ReplicationPump       (sibling type; pump_once(); no library-spawned threads)
+```
+
+- `Replicated<S>` delegates `Transact` to `Durable<S>`. It adds only a follower registry: per follower, a `Transport` and an ack position. The acks feed retention (min ack) and later quorum work.
+- `ReplicationPump` is external (same composition pattern as `ReducerRegistry`): one `WalCursor` per follower plus a `Box<dyn Transport>`, driven by caller-invoked `pump_once()`. The pump holds no locks or borrows across a send; a hung transport pins one owned buffer.
+- The commit path never calls the Transport. There is no commit-to-pump handoff edge, so backpressure manifests only as follower lag.
+
+### 7.2 The durable-tail clamp
+
+`Wal::append` advances `next_seq` before `sync_all`. A pump that trusts the tail can ship an un-fsynced record. If the leader then crashes before the fsync completes, the follower has applied a record the leader never committed: silent divergence. `Wal` therefore publishes `durable_tail: AtomicU64`, stored after `sync_all`, and `records_from` hard-errors past it.
+
+Second-order: retention deleting a sealed segment between cursor resolution and read serves a phantom gap. Segment reads pin their segment (reference-counted views) so rotation is safe.
+
+### 7.3 Ship the WAL bytes
+
+The shipped payload is the WAL frame bytes themselves — serialized once at commit, zero per-follower serialization. Followers append shipped ranges into their own WAL and replay through the existing `replay_from` pipeline, so network bytes and disk bytes are indistinguishable to the cursor code. `ReplicationBatch::to_bytes` retires; `from_bytes` becomes the frame-stream parse with refusable remap. View fencing and tick stamps ride the existing frame header.
+
+**Load-bearing premise, verified before wire code:** WAL frames must be self-describing for a live follower with divergent registration history. `recover_world` rebuilds a fresh world where leader and local ids coincide by construction. A live follower does not. The differential round-trip test decides this: leader commits N records; take the exact segment bytes; decode into a follower with different registration order and pre-existing entities; assert fingerprint equality. Its failure modes enumerate exactly what `WalEntry` needs (stable names, allocator adoption). This test is the first 4.0-b deliverable.
+
+### 7.4 Transport contract
+
+One synchronous method: `send_batch(&mut self, batch: &BatchRef) -> Result<Ack, TransportError>`. The contract is in-order, at-least-once delivery. Retries, reconnect, and backoff are impl-private. `BatchRef` views an owned byte buffer detached at handoff; a hung transport pins one buffer and nothing else.
+
+- `Ack { applied_seq: u64 }` flows in the return value. It is **opaque**: the constructor is `pub(crate)`, minted only from `Follower::advance`'s return. A premature ack (send-buffer flush, pre-apply) converts at-least-once into silent at-most-once — the type system closes that hole.
+- `ReplicationPump` is a sibling type, not a member of `Replicated<S>`. `pump_once()` ships one cursor step; no library-spawned threads.
+- Fixtures: `RecordingTransport` (log of batch-ack pairs) for invariant tests; a seeded chaos transport (drop, duplicate, reorder, delay; seeds pinned in test source) wired straight into `Follower::advance`; CI sweeps seeds and asserts convergence plus the ordering invariant: an acked applied_seq implies every record at or below it is applied.
+- `TransportError` splits into `Lost` (retry now) and `Down` (link dead, backoff). A gap ack or repeated failure routes to rejoin via state transfer.
+
+### 7.5 Pull-first
+
+The pump can live on the follower: `Transport` becomes `records_from(seq, limit)` served over the wire, and the leader gains no thread and no state. Push is a later latency optimization over identical framing. 4.0-b ships pull-first; the trait must not preclude push.
+
+### 7.6 Fences on the new byte source
+
+Shipped ranges are a new byte source. The fence matrix in section 3 gains one consumer column: the follower's ingest path. Fencing behavior there matches `replay_from` — the frame's `view` field is on the wire, and stale-view frames drop before apply. The matrix rule requires the column and its test names before implementation.
+
+## 8. Test inventory
 
 | Test | Pins |
 |---|---|
