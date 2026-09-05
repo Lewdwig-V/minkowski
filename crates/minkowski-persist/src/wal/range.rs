@@ -11,6 +11,15 @@ pub struct WalRangeLimits {
     pub max_control_frames: usize,
 }
 
+impl WalRangeLimits {
+    pub(super) fn validate(self) -> Result<(), WalError> {
+        if self.max_records == 0 || self.max_bytes == 0 || self.max_control_frames == 0 {
+            return Err(WalError::InvalidRangeLimits);
+        }
+        Ok(())
+    }
+}
+
 /// Detached original frames covering exactly `[from_seq, next_seq)`.
 /// This is a local read result, not a transport envelope or an application ack.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,9 +57,7 @@ impl Wal {
         from_seq: u64,
         limits: WalRangeLimits,
     ) -> Result<WalFrameRange, WalError> {
-        if limits.max_records == 0 || limits.max_bytes == 0 || limits.max_control_frames == 0 {
-            return Err(WalError::InvalidRangeLimits);
-        }
+        limits.validate()?;
         if from_seq > self.durable_next_seq {
             return Err(WalError::RangeAhead {
                 requested: from_seq,
