@@ -22,7 +22,7 @@ impl WalRangeLimits {
 
 /// Detached original frames covering exactly `[from_seq, next_seq)`.
 /// This is a local read result, not a transport envelope or an application ack.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct WalFrameRange {
     pub from_seq: u64,
     pub next_seq: u64,
@@ -34,7 +34,7 @@ pub struct WalFrameRange {
 
 /// One segment's exact schema frame followed by original mutation/checkpoint
 /// frames in source order. Buffers include frame headers, but no segment magic.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct WalSegmentRun {
     pub segment_start_seq: u64,
     pub schema_frame: Vec<u8>,

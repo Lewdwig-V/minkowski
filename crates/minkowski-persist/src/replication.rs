@@ -169,7 +169,7 @@ impl Follower {
         self.poisoned.load(Ordering::Acquire)
     }
 
-    fn poison(&self) {
+    pub(crate) fn poison(&self) {
         self.poisoned.store(true, Ordering::SeqCst);
     }
 
@@ -207,41 +207,54 @@ impl Follower {
 
         let mut last = self.applied_seq();
         for record in &batch.records {
-            if record.seq < last {
-                continue; // already-applied prefix: no-op by position
-            }
-            if record.seq > last {
-                // Gap: the transport skipped a record. Applying forward
-                // would accept reads over a mutation that never ran —
-                // poison, the replica must rejoin.
-                self.poison();
-                return Err(FollowerError::Gap {
-                    expected: last,
-                    got: record.seq,
-                });
-            }
-            if let Err(e) = apply_record(record, world, codecs, remap_ref, None) {
-                // Mid-batch failure: state is the applied prefix. Poison —
-                // the replica diverged from the log. The tick guard lives in
-                // apply_record; its regression error is re-surfaced typed.
-                self.poison();
-                return Err(match e {
-                    WalError::TickRegression {
-                        seq,
-                        record_tick,
-                        world_tick,
-                    } => FollowerError::TickRegression {
-                        seq,
-                        record_tick,
-                        world_tick,
-                    },
-                    other => FollowerError::Apply(other),
-                });
-            }
-            last = record.seq + 1;
-            self.high_water.store(last, Ordering::Release);
+            last = self.apply_next(record.seq, || {
+                apply_record(record, world, codecs, remap_ref, None)
+            })?;
         }
         Ok(last)
+    }
+
+    /// Shared positional/poison boundary for decoded and journaled ingestion.
+    pub(crate) fn apply_next(
+        &self,
+        seq: u64,
+        apply: impl FnOnce() -> Result<(), WalError>,
+    ) -> Result<u64, FollowerError> {
+        if self.is_poisoned() {
+            return Err(FollowerError::Poisoned);
+        }
+        let last = self.applied_seq();
+        if seq < last {
+            return Ok(last);
+        }
+        if seq > last {
+            self.poison();
+            return Err(FollowerError::Gap {
+                expected: last,
+                got: seq,
+            });
+        }
+        let Some(next) = seq.checked_add(1) else {
+            self.poison();
+            return Err(WalError::Format("follower sequence overflow".into()).into());
+        };
+        if let Err(error) = apply() {
+            self.poison();
+            return Err(match error {
+                WalError::TickRegression {
+                    seq,
+                    record_tick,
+                    world_tick,
+                } => FollowerError::TickRegression {
+                    seq,
+                    record_tick,
+                    world_tick,
+                },
+                other => FollowerError::Apply(other),
+            });
+        }
+        self.high_water.store(next, Ordering::Release);
+        Ok(next)
     }
 
     /// Bounded-staleness read at a logged prefix (INV-4).
