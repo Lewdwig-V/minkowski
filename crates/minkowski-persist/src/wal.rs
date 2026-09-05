@@ -333,6 +333,25 @@ pub(crate) fn build_apply_remap(
         .collect()
 }
 
+/// Validate the commit boundary and return the tick after successful apply.
+/// EnumChangeSet::apply_replay advances once, including for empty records.
+fn validate_record_tick(
+    record: &crate::record::WalRecord,
+    world_tick: u64,
+) -> Result<u64, WalError> {
+    if record.tick_after < world_tick {
+        return Err(WalError::TickRegression {
+            seq: record.seq,
+            record_tick: record.tick_after,
+            world_tick,
+        });
+    }
+    record
+        .tick_after
+        .checked_add(1)
+        .ok_or_else(|| WalError::Format(format!("tick overflow at seq {}", record.seq)))
+}
+
 /// Apply a single WAL record using destination-specific component bindings.
 pub(crate) fn apply_record(
     record: &crate::record::WalRecord,
@@ -341,17 +360,8 @@ pub(crate) fn apply_record(
     remap: Option<&ApplyRemap>,
     proof: Option<&CrcProof>,
 ) -> Result<(), WalError> {
-    // INV-1 (commit = tick): the record replays at its commit-boundary tick.
-    // A record tick below the world's current tick is a foreign or corrupt
-    // log. Every apply path routes through here, so all of them carry the
-    // tick semantics.
-    if record.tick_after < world.current_tick() {
-        return Err(WalError::TickRegression {
-            seq: record.seq,
-            record_tick: record.tick_after,
-            world_tick: world.current_tick(),
-        });
-    }
+    // INV-1: preflight and every application path share the same tick guard.
+    validate_record_tick(record, world.current_tick())?;
     // Legacy schema-less batches use codec IDs as source IDs. They still
     // resolve the destination by type instead of assuming numeric identity.
     let fallback;
@@ -498,7 +508,7 @@ impl<'a> ValidatedRange<'a> {
         let mut records = Vec::new();
         let mut last_seq = from_seq.saturating_sub(1);
         let mut max_view_seen = 0;
-        let mut prev_tick = world.current_tick();
+        let mut expected_tick = world.current_tick();
         for (_, path) in list_segments(dir)? {
             let file = File::open(&path)?;
             validate_segment_magic(&file, &path)?;
@@ -519,14 +529,7 @@ impl<'a> ValidatedRange<'a> {
                         )?));
                     }
                     WalEntry::Mutations(record) if !is_stale && record.seq >= from_seq => {
-                        if record.tick_after < prev_tick {
-                            return Err(WalError::TickRegression {
-                                seq: record.seq,
-                                record_tick: record.tick_after,
-                                world_tick: prev_tick,
-                            });
-                        }
-                        prev_tick = record.tick_after;
+                        expected_tick = validate_record_tick(&record, expected_tick)?;
                         // Preserve legacy schema-less local recovery. Raw
                         // follower ranges will require an explicit run schema.
                         let binding = match &remap {
@@ -1369,6 +1372,63 @@ mod tests {
         WalConfig {
             max_segment_bytes: 128,
             max_bytes_between_checkpoints: None,
+        }
+    }
+
+    #[test]
+    fn replay_preflight_validates_post_apply_ticks() {
+        for (tick, next_tick) in [(5, 5), (5, 6), (u64::MAX - 1, u64::MAX)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut world = World::builder().memory_budget(1024 * 1024).build().unwrap();
+            let mut codecs = CodecRegistry::new();
+            codecs.register_as::<Pos>("pos", &mut world).unwrap();
+            let entity = world.spawn((Pos { x: 1.0, y: 2.0 },));
+            world.set_current_tick(tick);
+            let mut wal = Wal::create(dir.path(), &codecs, default_config()).unwrap();
+            let file = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(segment_filename(0)))
+                .unwrap();
+            let mut writer = BufWriter::new(&file);
+            for (seq, tick_after) in [(0, tick), (1, next_tick)] {
+                let entry = WalEntry::Mutations(crate::record::WalRecord {
+                    seq,
+                    tick_after,
+                    mutations: vec![SerializedMutation::Insert {
+                        entity: entity.to_bits(),
+                        component_id: 0,
+                        data: rkyv::to_bytes::<rkyv::rancor::Error>(&Pos { x: 9.0, y: 10.0 })
+                            .unwrap()
+                            .to_vec(),
+                    }],
+                });
+                let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).unwrap();
+                write_frame(&mut writer, &bytes, 0).unwrap();
+            }
+            writer.flush().unwrap();
+
+            let result = wal.replay_from(0, &mut world, &codecs);
+            if next_tick == 6 {
+                assert_eq!(result.unwrap(), 1);
+                assert_eq!(world.current_tick(), 7);
+                assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 9.0, y: 10.0 }));
+            } else {
+                if next_tick == tick {
+                    assert!(matches!(
+                        result,
+                        Err(WalError::TickRegression {
+                            seq: 1,
+                            record_tick: 5,
+                            world_tick: 6,
+                        })
+                    ));
+                } else {
+                    assert!(matches!(result, Err(WalError::Format(ref message))
+                        if message.contains("tick overflow")));
+                }
+                assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
+                assert_eq!(world.current_tick(), tick);
+            }
         }
     }
 

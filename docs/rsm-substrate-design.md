@@ -266,6 +266,9 @@ Local WAL recovery now uses the private `ValidatedRange` raw-frame plan.
 It retains selected original frames and resolves every referenced component before execution.
 The plan exclusively borrows its destination world until execution finishes.
 Execution decodes the retained mutation frames again and calls `apply_record`.
+Preflight and execution share `validate_record_tick`.
+Each selected record must start at or after the preceding record's predicted post-apply tick, including the increment for an empty changeset.
+Tick overflow refuses before application.
 Component payload decoding and state-dependent application can still fail after earlier records have applied.
 Local recovery keeps its existing stale-frame and torn-tail rules.
 This caller does not establish contiguous finalized ranges or authorize follower progress.
@@ -274,7 +277,7 @@ The durable range reader, terminal dispositions, and ingest journal remain requi
 | Recovery plan input | Before effects | Execution |
 |---|---|---|
 | Schema | Validate codec layout and build destination mappings, including stale schemas. `replay_plan_preserves_schema_and_fence_across_resume` | Exempt: schema does not mutate the world. |
-| Eligible mutation | Validate every referenced component across the selected range. `replay_preflight_rejects_late_component_reference` | Use `apply_record` for ticks, entity allocation, and values. `follower_round_trip_divergent_component_ids` |
+| Eligible mutation | Validate every component reference and the predicted post-apply tick, including overflow. `replay_preflight_rejects_late_component_reference`, `replay_preflight_validates_post_apply_ticks` | Use the same tick guard in `apply_record`. `follower_tick_regression_poisons`, `replay_preflight_validates_post_apply_ticks` |
 | Stale mutation | Validate framing, then retain the existing local recovery exclusion. `stale_view_frames_dropped_by_replay` | Exempt: no application or progress publication. |
 | Checkpoint | Raise the fence in source order. `replay_plan_preserves_schema_and_fence_across_resume` | Exempt: checkpoint does not mutate the world. |
 | Corrupt frame or partial tail | Corruption refuses before effects; partial tails keep the existing recovery behavior. `replay_plan_preserves_schema_and_fence_across_resume`, `torn_entry_truncated_on_replay` | Exempt: no corrupt or partial frame executes. |
@@ -341,6 +344,7 @@ Delivery order:
 | `batch_round_trip_from_unaligned_bytes` | A valid batch decodes from a transport payload at an unaligned offset. |
 | `frame_round_trip_preserves_payload_and_view` | The frame reader validates and decodes file bytes while preserving the payload, view, and next offset. Also runs under Miri. |
 | `replay_preflight_rejects_late_component_reference` | An invalid component reference in a later record refuses before earlier records change the world or tick. |
+| `replay_preflight_validates_post_apply_ticks` | Equal boundary ticks and tick overflow refuse before effects; adjacent valid ticks replay successfully. |
 | `replay_plan_preserves_schema_and_fence_across_resume` | Mid-segment recovery preserves checkpoint fences and changed mappings across segments. A corrupt later frame refuses before effects. |
 
 **Planned 4.0-b tests (names reserved; not yet implemented):**
