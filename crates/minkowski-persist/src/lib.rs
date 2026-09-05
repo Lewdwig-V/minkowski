@@ -19,4 +19,6 @@ pub use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 pub use record::*;
 pub use recover::{RecoverError, recover_world};
 pub use replication::{Follower, FollowerError, ReplicationError, apply_batch};
-pub use wal::{Wal, WalConfig, WalCursor, WalError, WalStats};
+pub use wal::{
+    Wal, WalConfig, WalCursor, WalError, WalFrameRange, WalRangeLimits, WalSegmentRun, WalStats,
+};

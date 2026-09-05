@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -9,6 +9,9 @@ use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 
 use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
+
+mod range;
+pub use range::{WalFrameRange, WalRangeLimits, WalSegmentRun};
 
 // WAL segment format (v2):
 //   [segment_magic: 4 bytes "MKW3"]
@@ -41,6 +44,14 @@ fn read_exact_at(file: &File, pos: u64, buf: &mut [u8]) -> io::Result<()> {
     f.read_exact(buf)
 }
 
+// create_dir_all may have created more than the immediate WAL directory.
+fn sync_directory_ancestry(dir: &Path) -> io::Result<()> {
+    for ancestor in dir.canonicalize()?.ancestors() {
+        File::open(ancestor)?.sync_all()?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
     #[error(
@@ -67,6 +78,16 @@ pub enum WalError {
     },
     #[error("cursor behind: requested seq {requested} but oldest available is {oldest}")]
     CursorBehind { requested: u64, oldest: u64 },
+    #[error("range request {requested} is past durable tail {durable_tail}")]
+    RangeAhead { requested: u64, durable_tail: u64 },
+    #[error("range limits must all be positive")]
+    InvalidRangeLimits,
+    #[error("range limits cannot fit a mutation and its schema context")]
+    RangeLimitTooSmall,
+    #[error("retained WAL starts at {oldest}; prefix fence context requires rejoin")]
+    MissingFenceContext { oldest: u64 },
+    #[error("unresolved WAL history at seq {seq}: {reason}")]
+    UnresolvedHistory { seq: u64, reason: &'static str },
     #[error("WAL apply error: {0}")]
     Apply(#[from] minkowski::ApplyError),
 }
@@ -152,12 +173,13 @@ fn write_segment_magic(writer: &mut BufWriter<&File>) -> Result<u64, WalError> {
     Ok(SEGMENT_MAGIC_SIZE)
 }
 
-/// Try to read the next WAL entry at byte offset `pos`.
-/// Returns `Ok(Some((entry, next_pos)))` on success, `Ok(None)` if the
-/// file ends cleanly at a frame boundary or a partial frame is found
-/// (torn write). Returns `Err` on corrupt payload, checksum mismatch,
-/// or oversized frame. Does NOT truncate the file — callers decide how
-/// to handle errors.
+/// Raise the shared storage fence and report whether this frame is stale.
+fn observe_view(max_view: &mut u64, view: u64) -> bool {
+    let stale = view < *max_view;
+    *max_view = (*max_view).max(view);
+    stale
+}
+
 /// Highest frame view stamped anywhere in the WAL directory. Reads only the
 /// 16-byte frame headers (view lives in the header; payloads are skipped via
 /// the length field). Sealed and active segments both count — the live view
@@ -193,7 +215,7 @@ where
                 header_buf[14],
                 header_buf[15],
             ]);
-            max_view = max_view.max(view);
+            observe_view(&mut max_view, view);
             pos += FRAME_HEADER_SIZE + len;
         }
     }
@@ -209,8 +231,14 @@ struct RawFrame {
 
 impl RawFrame {
     fn read(file: &File, offset: u64) -> Result<Option<Self>, WalError> {
+        let mut reader = file;
+        reader.seek(SeekFrom::Start(offset))?;
+        Self::read_from(&mut reader, offset)
+    }
+
+    fn read_from(reader: &mut impl Read, offset: u64) -> Result<Option<Self>, WalError> {
         let mut header = [0u8; FRAME_HEADER_SIZE as usize];
-        match read_exact_at(file, offset, &mut header) {
+        match reader.read_exact(&mut header) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -224,7 +252,7 @@ impl RawFrame {
         // Vec<u8> guarantees only byte alignment; rkyv validates in place.
         let mut payload = rkyv::util::AlignedVec::<16>::with_capacity(len);
         payload.resize(len, 0);
-        match read_exact_at(file, offset + FRAME_HEADER_SIZE, &mut payload) {
+        match reader.read_exact(&mut payload) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -258,8 +286,15 @@ impl RawFrame {
     fn next_offset(&self) -> u64 {
         self.offset + FRAME_HEADER_SIZE + self.payload.len() as u64
     }
+
+    fn append_to(&self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&self.header);
+        bytes.extend_from_slice(&self.payload);
+    }
 }
 
+/// Read one frame without truncating. A partial frame returns `None`; corrupt
+/// payloads, checksums, and oversized frames return errors.
 pub(crate) fn read_next_frame(
     file: &File,
     pos: u64,
@@ -517,8 +552,7 @@ impl<'a> ValidatedRange<'a> {
             while let Some(frame) = RawFrame::read(&file, pos)? {
                 let (entry, _proof, view) = frame.decode()?;
                 pos = frame.next_offset();
-                let is_stale = view < max_view_seen;
-                max_view_seen = max_view_seen.max(view);
+                let is_stale = observe_view(&mut max_view_seen, view);
                 match entry {
                     // A stale schema still binds current mutations in its run.
                     WalEntry::Schema(schema) => {
@@ -629,6 +663,9 @@ pub struct Wal {
     active_start_seq: u64,
     active_bytes: u64,
     next_seq: u64,
+    // Published together only after fsync. Control frames also need byte bounds.
+    durable_next_seq: u64,
+    durable_ends: BTreeMap<u64, u64>,
     config: WalConfig,
     schema: WalSchema,
     last_checkpoint_seq: Option<u64>,
@@ -655,6 +692,8 @@ impl Wal {
             active_start_seq: 0,
             active_bytes: 0,
             next_seq: 0,
+            durable_next_seq: 0,
+            durable_ends: BTreeMap::new(),
             config,
             schema,
             last_checkpoint_seq: None,
@@ -663,6 +702,9 @@ impl Wal {
             views: Views::new(),
         };
         wal.active_bytes = wal.write_segment_header()?;
+        wal.active_file.sync_all()?;
+        sync_directory_ancestry(dir)?;
+        wal.publish_active_prefix();
         Ok(wal)
     }
 
@@ -703,6 +745,8 @@ impl Wal {
             active_start_seq: last_start_seq,
             active_bytes: 0,
             next_seq: 0,
+            durable_next_seq: 0,
+            durable_ends: BTreeMap::new(),
             config,
             schema,
             last_checkpoint_seq: None,
@@ -802,6 +846,15 @@ impl Wal {
             }
         }
 
+        // Recovered bytes may have survived only in the page cache. Make both
+        // recovery truncation and retained segments durable before serving them.
+        for (start, path) in &segments {
+            let file = File::open(path)?;
+            file.sync_all()?;
+            wal.durable_ends.insert(*start, file.metadata()?.len());
+        }
+        sync_directory_ancestry(dir)?;
+        wal.durable_next_seq = wal.next_seq;
         Ok(wal)
     }
 
@@ -840,7 +893,8 @@ impl Wal {
     }
 
     /// Record that a snapshot was taken at the given seq.
-    /// Writes a `Checkpoint` entry to the WAL stream and resets the byte counter.
+    /// Writes and synchronizes a `Checkpoint` entry, then publishes its byte
+    /// endpoint for range reads. Resets the checkpoint byte counter.
     pub fn acknowledge_flush(&mut self, seq: u64) -> Result<(), WalError> {
         assert!(
             seq <= self.next_seq,
@@ -859,7 +913,7 @@ impl Wal {
         self.active_bytes += frame_bytes;
         self.last_checkpoint_seq = Some(seq);
         self.bytes_since_checkpoint = 0;
-        Ok(())
+        self.sync_active_prefix()
     }
 
     /// Serialize and append a changeset as a WAL record.
@@ -905,7 +959,7 @@ impl Wal {
         // Durability: flush kernel buffers to stable storage so that a
         // process crash or power loss cannot lose the frame we just wrote.
         // Without this, BufWriter::flush only pushes to the page cache.
-        self.active_file.sync_all()?;
+        self.sync_active_prefix()?;
 
         // Roll to new segment if threshold exceeded. Failure is non-fatal:
         // the mutation is already persisted and the oversized segment is
@@ -969,6 +1023,7 @@ impl Wal {
             let next_start = segments[i + 1].0;
             if next_start <= seq {
                 std::fs::remove_file(&segments[i].1)?;
+                self.durable_ends.remove(&segments[i].0);
                 deleted += 1;
             } else {
                 break; // segments are sorted, no point continuing
@@ -979,6 +1034,18 @@ impl Wal {
     }
 
     // ── Internal helpers ─────────────────────────────────────────────
+
+    fn publish_active_prefix(&mut self) {
+        self.durable_ends
+            .insert(self.active_start_seq, self.active_bytes);
+        self.durable_next_seq = self.next_seq;
+    }
+
+    fn sync_active_prefix(&mut self) -> Result<(), WalError> {
+        self.active_file.sync_all()?;
+        self.publish_active_prefix();
+        Ok(())
+    }
 
     fn build_schema(codecs: &CodecRegistry) -> WalSchema {
         let mut components = Vec::new();
@@ -1028,11 +1095,14 @@ impl Wal {
             let frame_bytes = write_frame(&mut writer, &payload, self.views.current())?;
             magic_bytes + frame_bytes
         };
+        file.sync_all()?;
+        File::open(&self.dir)?.sync_all()?;
 
         // All I/O succeeded — atomically update state.
         self.active_file = file;
         self.active_start_seq = self.next_seq;
         self.active_bytes = preamble_bytes;
+        self.publish_active_prefix();
         Ok(())
     }
 
@@ -1070,13 +1140,12 @@ impl Wal {
 
         while let Some((entry, next_pos, view)) = self.read_next_entry(pos)? {
             let frame_bytes = next_pos - pos;
-            if view < max_view {
+            if observe_view(&mut max_view, view) {
                 // Stale-view tail: deposed leader's late write. Truncate it
                 // and everything after; new-leader records reuse the space.
                 self.active_file.set_len(pos)?;
                 break;
             }
-            max_view = max_view.max(view);
             match entry {
                 WalEntry::Mutations(record) => {
                     last_seq = record.seq;
@@ -1243,19 +1312,19 @@ impl WalCursor {
         loop {
             match read_next_frame(&file, pos)? {
                 Some((WalEntry::Schema(s), next_pos, _proof, view)) => {
-                    max_view_seen = max_view_seen.max(view);
+                    observe_view(&mut max_view_seen, view);
                     schema = Some(s);
                     pos = next_pos;
                 }
                 Some((WalEntry::Mutations(record), next_pos, _proof, view)) => {
-                    max_view_seen = max_view_seen.max(view);
+                    observe_view(&mut max_view_seen, view);
                     if record.seq >= from_seq {
                         break; // Don't advance past this record
                     }
                     pos = next_pos;
                 }
                 Some((WalEntry::Checkpoint { .. }, next_pos, _proof, view)) => {
-                    max_view_seen = max_view_seen.max(view);
+                    observe_view(&mut max_view_seen, view);
                     pos = next_pos;
                 }
                 None => break,
@@ -1283,25 +1352,24 @@ impl WalCursor {
         while records.len() < limit {
             match read_next_frame(&self.file, self.pos)? {
                 Some((WalEntry::Schema(s), next_pos, _proof, view)) => {
-                    self.max_view_seen = self.max_view_seen.max(view);
+                    observe_view(&mut self.max_view_seen, view);
                     self.schema = Some(s);
                     self.pos = next_pos;
                 }
                 Some((WalEntry::Mutations(record), next_pos, _proof, view)) => {
-                    if view < self.max_view_seen {
+                    if observe_view(&mut self.max_view_seen, view) {
                         // Stale-view frame: deposed leader's late write. The
                         // follower must never see it (P1: fence through
                         // replication, not just local replay).
                         self.pos = next_pos;
                         continue;
                     }
-                    self.max_view_seen = self.max_view_seen.max(view);
                     self.next_seq = record.seq + 1;
                     records.push(record);
                     self.pos = next_pos;
                 }
                 Some((WalEntry::Checkpoint { .. }, next_pos, _proof, view)) => {
-                    self.max_view_seen = self.max_view_seen.max(view);
+                    observe_view(&mut self.max_view_seen, view);
                     self.pos = next_pos;
                 }
                 None => {
@@ -1338,7 +1406,7 @@ impl WalCursor {
                 if let Some((WalEntry::Schema(s), next_pos, _proof, view)) =
                     read_next_frame(&self.file, SEGMENT_MAGIC_SIZE)?
                 {
-                    self.max_view_seen = self.max_view_seen.max(view);
+                    observe_view(&mut self.max_view_seen, view);
                     self.schema = Some(s);
                     self.pos = next_pos;
                 }
