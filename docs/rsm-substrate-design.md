@@ -1,6 +1,8 @@
 # RSM Substrate Design (Stage 4.0)
 
-Date: 2026-08-30. Status: **4.0-a delivered** (PR #251, #252). Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 specify pending work; proposed APIs and test names are not implementation claims.
+Date: 2026-08-30. Updated: 2026-09-05. Status: 4.0-a delivered (PR #251, #252).
+
+Phase 4.0-b starts with application prerequisites and a private recovery plan in section 7.7. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
 
 ## 1. Architecture summary
 
@@ -205,6 +207,101 @@ A push optimization for shipping already-finalized ranges can reuse this ingest 
 
 Section 3 adds **consumer rows** for raw range production and follower ingestion, with Schema/Mutations/Checkpoint cells and planned test names. Reuse shared frame validation/fence interpretation and positional publication; new ingress paths must not clone those rules. `apply_record` remains the convergence point for eligible mutation effects. Section 8 reserves the tests before implementation.
 
+### 7.7 Selected implementation work
+
+Decision: 2026-09-05. Adopt the three proposals below. Start with the private execution plan and its application prerequisites.
+These proposals preserve the ownership, durability, and sequence contracts in sections 7.1–7.6.
+
+#### Private execution plan
+
+`ValidatedRange` is a private, temporary execution plan for one raw range.
+It holds the original bytes, frame offsets, schema bindings, and component mappings.
+The shared frame interpreter constructs the plan before any world mutation.
+It makes sure that every frame, sequence, schema, component reference, and terminal disposition satisfies the range contract.
+
+Build and consume the plan during one ingestion call with exclusive access to the same world.
+Keep codec identifiers separate from destination component identifiers.
+Descriptors contain offsets and identifiers instead of references into world storage.
+Bound response bytes and control-frame counts separately from the mutation-slot limit.
+
+Persist and fsync the original range envelope before execution.
+Execute eligible mutations through `apply_record` and the shared settlement rules.
+State-dependent application failures still poison the follower and can leave partial effects.
+On restart, rebuild the plan from the journal and skip the journal-write stage.
+Do not persist the plan or reuse its numeric mappings in another world.
+
+The first implementation slice exercises the existing decoded follower path against equivalent, nonempty worlds with different component registrations and allocator histories.
+It establishes component mapping and logged-entity allocation before raw-range execution starts.
+`build_apply_remap` resolves each source component to a codec and a destination component by type.
+The schema can declare unused components that the destination does not register.
+Each record must resolve its referenced components before it changes the world or tick.
+WAL frames and incoming decoded batches use aligned storage before archive validation.
+Transport buffers and ordinary byte vectors do not guarantee the archive's required alignment.
+`EnumChangeSet::apply_replay` uses the existing mutation loop and claims logged entity slots when each spawn executes.
+Logged spawns must claim their specified slot without consuming an unrelated free slot.
+An occupied slot or an older generation requires a typed refusal.
+Process entity allocation in mutation order so a despawn and subsequent spawn can reuse one slot within a record.
+This prerequisite test does not replace `wal_frames_round_trip_divergent_live_follower`, which also requires exact raw ranges, schema runs, and durable bounds.
+
+The application prerequisites use this invariant matrix:
+
+| Consumer | Component identifiers | Entity allocation | Tick and failure behavior |
+|---|---|---|---|
+| `apply_record` through decoded follower or WAL recovery | Resolve source → codec → destination type. `follower_round_trip_divergent_live_world` | Claim the logged slot in mutation order. `follower_replay_reuses_logged_entity_slot_in_mutation_order` | Keep the existing per-record tick and poison rules. `follower_tick_regression_poisons` |
+| Raw `ValidatedRange` execution, planned | Resolve all runs before effects. `follower_ingest_preflight_rejects_invalid_range` | Use the same `apply_record` path. `wal_frames_round_trip_divergent_live_follower` | Journal before effects. `follower_ingest_retry_and_failure_preserve_prefix` |
+| Authorized terminal no-op, planned | Validate its run schema. `follower_ingest_processes_stale_schema_frame` | Exempt: no entity allocation occurs. `follower_ingest_drops_stale_mutation_frame` | Advance only the settled prefix. `follower_ingest_fenced_slot_advances_prefix` |
+
+Local WAL recovery now uses the private `ValidatedRange` raw-frame plan.
+It retains selected original frames and resolves every referenced component before execution.
+The plan exclusively borrows its destination world until execution finishes.
+Execution decodes the retained mutation frames again and calls `apply_record`.
+Component payload decoding and state-dependent application can still fail after earlier records have applied.
+Local recovery keeps its existing stale-frame and torn-tail rules.
+This caller does not establish contiguous finalized ranges or authorize follower progress.
+The durable range reader, terminal dispositions, and ingest journal remain required before exposing raw follower ingestion.
+
+| Recovery plan input | Before effects | Execution |
+|---|---|---|
+| Schema | Validate codec layout and build destination mappings, including stale schemas. `replay_plan_preserves_schema_and_fence_across_resume` | Exempt: schema does not mutate the world. |
+| Eligible mutation | Validate every referenced component across the selected range. `replay_preflight_rejects_late_component_reference` | Use `apply_record` for ticks, entity allocation, and values. `follower_round_trip_divergent_component_ids` |
+| Stale mutation | Validate framing, then retain the existing local recovery exclusion. `stale_view_frames_dropped_by_replay` | Exempt: no application or progress publication. |
+| Checkpoint | Raise the fence in source order. `replay_plan_preserves_schema_and_fence_across_resume` | Exempt: checkpoint does not mutate the world. |
+| Corrupt frame or partial tail | Corruption refuses before effects; partial tails keep the existing recovery behavior. `replay_plan_preserves_schema_and_fence_across_resume`, `torn_entry_truncated_on_replay` | Exempt: no corrupt or partial frame executes. |
+
+#### Replayable failure captures
+
+A failure capture is a diagnostic fixture that reproduces one ingestion failure.
+Its manifest references the verified baseline, preceding durable journal, and original failing range.
+It records the source history, frame identity, interpreter stage, settled boundary, and poison state as reproduction assertions.
+The fixture must preserve the allocator and component-registration context needed to reproduce the destination state.
+
+The replay harness restores these dependencies and uses the normal interpreter.
+It rebuilds component mappings from the destination world.
+Capture is best effort and cannot change ingestion results, recovery authority, or progress.
+Start with an in-memory fixture before defining an export format.
+Later fixtures can include fetch transcripts and reduced failure cases that retain their required schema and fence context.
+
+#### Deterministic crash sequencer
+
+A crash sequencer interrupts a repeatable execution trace at named persistence boundaries.
+Cover source writes, disposition-journal fsync, publication, follower-journal fsync, application, and the next progress report.
+After each interruption, compare the reconstructed world, tick, fence, and settled prefix.
+Include a successful apply followed by a lost progress report and an empty fetch after restart.
+
+Separate process-restart tests from simulated power-loss tests.
+A file reopen does not discard bytes that remain in the operating system's cache.
+The power-loss model must include segment creation and rollover durability before those cases support durability claims.
+Keep the model limited to the WAL and replication journals.
+A durable disposition record stores an authoritative decision but cannot establish finality by itself.
+
+Delivery order:
+
+1. Establish the decoded application prerequisites and their regression tests.
+2. Build the durable range reader and the shared interpreter for `ValidatedRange`.
+3. Pass the raw divergent-world gate before transport work.
+4. Add journals, restart reconstruction, crash tests, and failure captures.
+5. Add the pull pump, session registry, retention, and seeded transport faults.
+
 ## 8. Test inventory
 
 | Test | Pins |
@@ -224,6 +321,16 @@ Section 3 adds **consumer rows** for raw range production and follower ingestion
 | `open_truncates_stale_view_tail_in_active_segment` | overwrite-stale-slots at open |
 | `frame_header_size_is_sixteen` | 16-byte header format pin |
 | `rollover_many_appends_does_not_collide` | segment rollover under the new header |
+| `follower_round_trip_divergent_component_ids` | Source, codec registry, and destination use different component identifiers. Values reach the correct destination columns. |
+| `follower_round_trip_divergent_live_world` | Equivalent nonempty worlds have different component registrations and free-list orders. Heap values, tick, progress, retries, and subsequent allocation agree. |
+| `follower_replay_reuses_logged_entity_slot_in_mutation_order` | A despawn, replacement spawn, and insert reuse the logged slot within one record. |
+| `follower_replay_refuses_occupied_or_older_entity_generation` | Replay refuses occupied slots and older generations without changing allocator state or publishing progress. |
+| `follower_replay_claims_logged_slots_beyond_allocator_tail` | Logged spawns claim their exact indices and generations. Later local allocations cannot reuse those occupied slots. |
+| `follower_remap_refuses_missing_world_type_before_mutation` | A referenced component must exist in the destination world. Refusal leaves values, tick, allocator, and progress unchanged. |
+| `batch_round_trip_from_unaligned_bytes` | A valid batch decodes from a transport payload at an unaligned offset. |
+| `frame_round_trip_preserves_payload_and_view` | The frame reader validates and decodes file bytes while preserving the payload, view, and next offset. Also runs under Miri. |
+| `replay_preflight_rejects_late_component_reference` | An invalid component reference in a later record refuses before earlier records change the world or tick. |
+| `replay_plan_preserves_schema_and_fence_across_resume` | Mid-segment recovery preserves checkpoint fences and changed mappings across segments. A corrupt later frame refuses before effects. |
 
 **Planned 4.0-b tests (names reserved; not yet implemented):**
 

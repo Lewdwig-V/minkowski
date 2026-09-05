@@ -765,10 +765,29 @@ impl EnumChangeSet {
     /// non-`PartialApply` variant. Either way, callers must **discard** the
     /// World on error — there is no way to determine exactly which writes
     /// took effect.
-    pub fn apply(mut self, world: &mut World) -> Result<(), ApplyError> {
+    pub fn apply(self, world: &mut World) -> Result<(), ApplyError> {
+        self.apply_inner(world, false)
+    }
+
+    /// Apply committed log mutations and restore their original entity IDs.
+    ///
+    /// Spawns claim their specified slots in mutation order. Occupied slots
+    /// and older generations return an error. Component IDs must already
+    /// refer to this world's registered types.
+    ///
+    /// This persistence entry point uses the same tick, column marking, and
+    /// partial-application rules as [`Self::apply`]. A failure can also leave
+    /// allocator changes. Discard the world on error.
+    #[doc(hidden)]
+    pub fn apply_replay(self, world: &mut World) -> Result<(), ApplyError> {
+        world.drain_orphans();
+        self.apply_inner(world, true)
+    }
+
+    fn apply_inner(mut self, world: &mut World, adopt_entities: bool) -> Result<(), ApplyError> {
         let tick = world.next_tick();
 
-        let result = self.apply_mutations(world, tick);
+        let result = self.apply_mutations(world, tick, adopt_entities);
 
         match result {
             Ok(()) => {
@@ -815,6 +834,7 @@ impl EnumChangeSet {
         &self,
         world: &mut World,
         tick: crate::tick::Tick,
+        adopt_entities: bool,
     ) -> Result<(), (usize, ApplyError)> {
         // ── Fast lane: drain pre-resolved archetype batches ──
         for batch in &self.archetype_batches {
@@ -937,6 +957,9 @@ impl EnumChangeSet {
                     world.entities.materialize_reserved();
                     if world.is_placed(*entity) {
                         return Err(map_err(ApplyError::AlreadyPlaced(*entity)));
+                    }
+                    if adopt_entities && !world.entities.adopt(*entity) {
+                        return Err(map_err(ApplyError::DeadEntity(*entity)));
                     }
                     // --- Apply: push raw component data into the right archetype ---
                     let sorted_ids: Vec<ComponentId> = {

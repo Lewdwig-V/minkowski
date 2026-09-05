@@ -173,6 +173,39 @@ impl EntityAllocator {
         }
     }
 
+    /// Claim an unplaced entity from a committed log in its original slot.
+    /// The caller checks placement before calling this method.
+    pub(crate) fn adopt(&mut self, entity: Entity) -> bool {
+        // Keep the reservation counter representable after adopting the slot.
+        if entity.index() == u32::MAX {
+            return false;
+        }
+        self.materialize_reserved();
+        let index = entity.index() as usize;
+        if let Some(&generation) = self.generations.get(index) {
+            if generation > entity.generation() {
+                return false; // Never revive an older local handle.
+            }
+            if let Some(free_pos) = self.free_list.iter().position(|&i| i == entity.index()) {
+                self.free_list.remove(free_pos);
+                self.generations[index] = entity.generation();
+                self.total_spawns += 1;
+            } else if generation != entity.generation() {
+                return false; // Another unplaced reservation owns this slot.
+            }
+        } else {
+            let previous_len = self.generations.len();
+            self.generations.resize(index + 1, 0);
+            // A source can reserve indices that it never logs. Keep those
+            // holes available without allocating or claiming unrelated IDs.
+            self.free_list.extend(previous_len as u32..entity.index());
+            self.generations[index] = entity.generation();
+            self.sync_reserved();
+            self.total_spawns += 1;
+        }
+        true
+    }
+
     pub fn is_alive(&self, entity: Entity) -> bool {
         let idx = entity.index() as usize;
         idx < self.generations.len() && self.generations[idx] == entity.generation()
