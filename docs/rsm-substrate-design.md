@@ -2,7 +2,7 @@
 
 Date: 2026-08-30. Updated: 2026-09-05. Status: 4.0-a delivered (PR #251, #252).
 
-Phase 4.0-b starts with application prerequisites and a private recovery plan in section 7.7. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
+Phase 4.0-b delivers application prerequisites and a private recovery plan (section 7.7), plus the local durable raw-range reader (section 7.2). Raw follower ingestion, journals, and transport remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
 
 ## 1. Architecture summary
 
@@ -39,8 +39,8 @@ Convention sheet (INV-1 and INV-2 position semantics):
 |---|---|---|
 | `high_water` / `applied_seq()` (Follower) | 4.0-a: next expected sequence; all records below it are applied. 4.0-b: exclusive **settled prefix** — every slot below it is covered by the baseline, successfully applied, or authoritatively resolved as a terminal no-op (§4). 0 = no slots settled | `follower_baseline_seeds_high_water`; planned `follower_ingest_fenced_slot_advances_prefix` |
 | `consumed_seq` (4.0-b protocol) | the same settled boundary exported by ingest for fetch and retention; not a second independently advancing cursor, a mutation count, or evidence that a fenced command committed | planned `follower_ingest_fenced_slot_advances_prefix` |
-| `BatchRef.from_seq`, `next_seq`, `limit` (4.0-b) | mutation slots are exactly `[from_seq, next_seq)`; `limit > 0` caps slot count including fenced slots. Schema/checkpoint context consumes no slots | planned `records_from_range_boundary_edges` |
-| `durable_tail` (4.0-b) | exclusive post-fsync mutation boundary; accompanying durable byte bounds also gate control frames (§7.2) | planned `records_from_excludes_unsynced_frames` |
+| `WalFrameRange.from_seq`, `next_seq`, `WalRangeLimits.max_records` (4.0-b) | mutation slots are exactly `[from_seq, next_seq)`; positive limits cap slots, bytes, and controls separately. Schema/checkpoint context consumes no slots | `records_from_range_boundary_edges` |
+| `durable_next_seq` (4.0-b, internal published tail) | exclusive post-fsync mutation boundary; accompanying durable byte bounds also gate control frames (§7.2) | `records_from_excludes_unsynced_frames` |
 | WAL sequences | 0-based, one per committed record, contiguous per leader | `convergence_100_transactions_leader_replica` |
 | replay floor (`from_seq`) | `replay_from(from_seq)` applies records with `seq >= from_seq` — inclusive | `recover.rs` replay-floor invariant |
 | baseline coverage | a restored baseline covers records strictly below `baseline_seq`; a 4.0-b resume also restores the corresponding fence and stream identity. If recovery replays a tail, seed from its reconstructed settled boundary, not the pre-replay floor | `follower_baseline_seeds_high_water`; planned `follower_ingest_restart_reconstructs_progress` |
@@ -60,11 +60,12 @@ The delivered 4.0 storage fence rule is: **after seeing view V, a consumer must 
 | `WalCursor::next_batch` | raises the fence | fenced: dropped, not shipped | raises the fence |
 | `try_advance_segment` (cursor) | raises the fence from the new segment's preamble | n/a | n/a |
 | `Wal::open` (crash recovery) | preamble stamped with the resumed view (views restore precedes a torn-header rewrite) | stale tail truncated at the frame offset — overwritten, so new-leader records reuse the sequence | counted by the header scan |
-| `records_from` (4.0-b raw range reader) | enforced: include each run's schema, even stale; `records_from_mid_segment_includes_schema_context` | exempt from filtering: preserve every returned slot; stale bytes require a durable source terminal disposition, otherwise refuse; never publish a rewritable stale active tail; `records_from_preserves_fenced_slots` | enforced: preserve durable control order and prefix fence context; `records_from_resume_preserves_fence_context` |
+| `records_from` (4.0-b raw range reader) | enforced: include each run's schema, even stale when sealed; refuse stale active schemas; `records_from_mid_segment_includes_schema_context`, `records_from_resume_preserves_fence_context` | exempt from filtering: preserve every returned slot; refuse stale mutations until durable terminal dispositions exist; never publish a rewritable stale active tail; `records_from_refuses_unresolved_history` | enforced: preserve durable control order and prefix fence context; refuse stale active controls; `records_from_resume_preserves_fence_context`, `records_from_refuses_unresolved_history` |
 | `Follower::ingest_frames` (4.0-b, shipped ranges) | enforced: validate/build the run's remap even when stale; raise fence with `max`, never lower it; `follower_ingest_processes_stale_schema_frame` | enforced: reject stale effects before `apply_record`; settle an expected stale slot only with a terminal disposition (§4), otherwise refuse; `follower_ingest_drops_stale_mutation_frame`, `follower_ingest_fenced_slot_advances_prefix`, `follower_ingest_refuses_unresolved_fenced_slot` | enforced: raise fence with `max`; ignore `flush_seq` for world/progress/baseline coverage; `follower_ingest_checkpoint_raises_fence` |
 
 Fence maintenance:
 
+- `observe_view` owns the fence arithmetic for header scans, recovery, cursors, and raw range reads. Consumers decide whether a stale frame can supply schema context, must be filtered, or requires refusal/truncation.
 - `Wal::open` resumes `views` from `scan_max_view` — a header-only scan (the view lives in the header; payloads are skipped via the length field) across **all** segments, active and sealed. It runs before a torn-header rewrite, so a rewritten preamble stamps the recovered view.
 - `scan_active_segment` seeds its fence from the sealed segments' max view. A stale frame in the active segment truncates the file at that offset: the deposed leader's bytes are overwritten, and the next leader append reuses the stale record's sequence.
 - Cursors seed `max_view_seen` from all segments before the resume point (`scan_max_view(&segments[..seg_idx])`), then from each frame they pass, including segment preambles and checkpoints.
@@ -152,9 +153,35 @@ Retention's candidate cutoff is `min(leader_replay_floor, min(registered consume
 
 ### 7.2 The durable range boundary
 
-Verified in `wal.rs::Wal::append`: `next_seq` advances before `sync_all`. Publish `durable_tail` only after successful fsync, using a consistent read snapshot. Also capture durable frame/byte endpoints: schema and checkpoint frames have no mutation sequence, and `acknowledge_flush` currently does not fsync. The scalar tail alone cannot authorize shipping a later unsynced checkpoint or using its view to seed a range. Publish control-only progress only after its bytes are durable.
+The local reader is `Wal::records_from(from_seq, WalRangeLimits)`.
+Limits bound mutation slots, returned bytes, and returned control frames independently; zero limits refuse.
+The detached `WalFrameRange` contains exact schema, mutation, and checkpoint frames in segment runs.
+It is a local read result, not yet a versioned transport envelope or proof of follower application.
+It carries no terminal no-op decisions until the source disposition journal exists.
 
-For `records_from(seq, limit)`, `limit > 0` caps mutation slots, including fenced slots; use checked bounds. Requests at the published tail return no mutation slots; requests beyond it are typed refusals; a large limit yields a shorter range. A sequence is not durable merely because it was allocated.
+The WAL publishes a sequence boundary and per-segment byte endpoints only after successful file synchronization.
+Creation also synchronizes directory ancestry; rollover synchronizes the new segment and its directory before publication.
+Reopen synchronizes recovered files and directory entries before publishing their retained endpoints.
+The reader holds a shared WAL borrow while copying; append and deletion require exclusive access.
+Deletion updates the published segment set, and a missing prefix requires rejoin until durable fence-at-floor metadata exists.
+
+| Reader input or transition | Required behavior | Check |
+|---|---|---|
+| Mid-segment start and rollover | Return exact original schemas and frames in separate runs. | `records_from_mid_segment_includes_schema_context` |
+| Schema and checkpoint prefix | Seed only from the prefix before the first returned mutation; tail requests include durable control context. | `records_from_resume_preserves_fence_context` |
+| Unsynced writes | Exclude sequence slots and control bytes beyond published endpoints, including after failed fsync. | `records_from_excludes_unsynced_frames` |
+| Create, rollover, and reopen | Publish only synchronized files and directory entries. | `records_from_survives_reopen_and_rollover` |
+| Failed rollover | Remove the uncommitted segment and synchronize deletion before later writes or retention; failed cleanup blocks both until cleanup succeeds. | `records_from_survives_failed_rollover_sync`, `failed_rollover_cleanup_blocks_writes` |
+| Stale or missing history | Refuse unresolved slots and a stale active suffix; never infer terminal no-ops. | `records_from_refuses_unresolved_history` |
+| Corrupt published bytes | Refuse bad magic, CRCs, missing schemas, and torn frames. | `records_from_rejects_corrupt_published_frames` |
+| Request and size bounds | Refuse zero limits and past-tail requests; return a bounded contiguous prefix or a size refusal. | `records_from_range_boundary_edges` |
+| Retention | Refuse below-floor requests and missing prefix fence context after deletion or reopen. | `records_from_requires_retained_fence_context` |
+
+`wal.rs::Wal::append` advances allocated `next_seq` before fsync. `sync_active_prefix` publishes `durable_next_seq` and the active byte endpoint only after successful fsync; `acknowledge_flush` now uses the same helper. The scalar tail alone cannot authorize shipping a later unsynced checkpoint or using its view to seed a range. Schema and checkpoint frames consume no sequence slots, so byte endpoints also gate control-only progress.
+
+The reader currently scans and validates the retained prefix to reconstruct the exact seed fence and detect unresolved history. Returned bytes and controls are bounded; prefix scan work is proportional to history before the requested range. Add a durable seek/fence index before using repeated small reads for large-log catch-up. After retention removes the prefix, raw reads require rejoin until a durable fence-at-floor summary exists.
+
+For `records_from(seq, limits)`, positive `max_records` caps mutation slots; byte and control limits can shorten that prefix further. If the first mutation and its schema cannot fit, return `RangeLimitTooSmall`. Requests at the published tail return no mutation slots; requests beyond it return `RangeAhead`; sequence arithmetic is bounded by the published tail. A sequence is not durable merely because it was allocated. Terminal no-op slots remain unsupported until the disposition journal below exists.
 
 The published prefix must also be stable under source recovery. Sealed stale bytes are immutable, but that storage fact alone does not establish the logical slot's outcome. A stale slot may be transported as a terminal no-op only when the authoritative source has durably finalized that disposition. Without a disposition, return unresolved-history/rejoin-required; never manufacture one from the frame view or from file sealing. Under 4.1, view-change/commit rules must establish the selected history, preserving committed older-view operations. A stale active suffix is different: `scan_active_segment` can truncate it and reuse its sequence numbers. Stop range publication before such a rewritable suffix and require source recovery/rejoin; do not report caught-up while unresolved slots remain. No slot already advertised as settled may later be silently reused in the same stream/session.
 
@@ -272,7 +299,7 @@ Tick overflow refuses before application.
 Component payload decoding and state-dependent application can still fail after earlier records have applied.
 Local recovery keeps its existing stale-frame and torn-tail rules.
 This caller does not establish contiguous finalized ranges or authorize follower progress.
-The durable range reader, terminal dispositions, and ingest journal remain required before exposing raw follower ingestion.
+The durable range reader is now available (section 7.2). Terminal dispositions and the ingest journal remain required before exposing raw follower ingestion.
 
 | Recovery plan input | Before effects | Execution |
 |---|---|---|
@@ -346,17 +373,23 @@ Delivery order:
 | `replay_preflight_rejects_late_component_reference` | An invalid component reference in a later record refuses before earlier records change the world or tick. |
 | `replay_preflight_validates_post_apply_ticks` | Equal boundary ticks and tick overflow refuse before effects; adjacent valid ticks replay successfully. |
 | `replay_plan_preserves_schema_and_fence_across_resume` | Mid-segment recovery preserves checkpoint fences and changed mappings across segments. A corrupt later frame refuses before effects. |
+| `records_from_mid_segment_includes_schema_context` | A mid-segment read includes exact original schema and mutation bytes. |
+| `records_from_resume_preserves_fence_context` | Prefix-only seed, durable control-only progress, and sealed versus active stale schemas. |
+| `records_from_survives_reopen_and_rollover` | Exact segment runs, per-run control limits, nested directory creation, and equivalent results after reopen. |
+| `records_from_refuses_unresolved_history` | Gaps, duplicates, stale mutations (active or sealed), and stale active controls cannot advance a returned prefix. |
+| `records_from_rejects_corrupt_published_frames` | Bad magic, CRC mismatch, missing schema, and torn published bytes refuse. |
+| `records_from_range_boundary_edges` | Sequence zero, positive limits, byte/control caps, short prefixes, tail-empty, past-tail, and maximum integer requests. |
+| `records_from_excludes_unsynced_frames` | Pending mutations and controls stay outside published endpoints, including after a failed fsync. |
+| `records_from_requires_retained_fence_context` | Below-floor requests and retained-floor reads refuse after deletion and reopen until prefix fence metadata exists. |
+| `records_from_survives_failed_rollover_sync` | File-sync and directory-sync failures leave no orphan segment; later appends and rollover still produce identical ranges after reopen. |
+| `failed_rollover_cleanup_blocks_writes` | Failed cleanup blocks appends, checkpoint writes, and retention before changes; retry resumes after cleanup becomes possible. |
 
 **Planned 4.0-b tests (names reserved; not yet implemented):**
 
 | Test | Pins |
 |---|---|
-| `records_from_mid_segment_includes_schema_context` | Mid-segment fetch and reconnect carry the exact active schema; rollover starts a new remap scope; schema consumes no slots. |
-| `records_from_resume_preserves_fence_context` | A checkpoint or schema before the resume point, including an earlier segment, seeds the first mutation's fence; a later view cannot retroactively fence the prefix. |
 | `records_from_preserves_fenced_slots` | A sealed stale slot with a durable source no-op disposition is returned and counted; a rewritable stale active suffix produces a refusal instead of progress or false caught-up. |
 | `terminal_disposition_survives_source_restart` | Crashes before/after disposition fsync and before/after range publication never advertise an undurable decision or lose a durable one; source recovery and resumed ranges restore the same settled slot after WAL retention; conflicting identity, committed-operation reclassification and missing/corrupt required journal state refuse. |
-| `records_from_range_boundary_edges` | 0, baseline floor, limit=0 refusal, limit including stale slots, short reads, tail-empty, past-tail refusal, overflow and retained-floor rejoin. |
-| `records_from_excludes_unsynced_frames` | Pause before fsync: neither mutations nor later schema/checkpoint bytes or their views escape the durable snapshot. |
 | `wal_frames_round_trip_divergent_live_follower` | Before wire code: equivalent nonempty baseline, divergent IDs/allocation history, POD+heap components, mid-segment/rollover raw bytes; fingerprint, tick, settled boundary. |
 | `follower_ingest_processes_stale_schema_frame` | Stale schema still builds the correct remap for later current mutations; neither progress nor fence regresses. |
 | `follower_ingest_drops_stale_mutation_frame` | A fenced mutation performs no world, tick, allocator, or column-mark effects; its terminal slot is accounted for. |
