@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,9 @@ use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 
+mod plan;
 mod range;
+use plan::ValidatedRange;
 pub use range::{WalFrameRange, WalRangeLimits, WalSegmentRun};
 
 // WAL segment format (v2):
@@ -291,6 +293,22 @@ impl RawFrame {
         bytes.extend_from_slice(&self.header);
         bytes.extend_from_slice(&self.payload);
     }
+
+    /// Read a complete frame from a bounded buffer. Check the claimed size
+    /// before allocating aligned storage; short network buffers are errors.
+    fn read_bytes(bytes: &mut &[u8], offset: u64) -> Result<Self, WalError> {
+        let header = bytes.get(..FRAME_HEADER_SIZE as usize).ok_or_else(|| {
+            WalError::Format(format!("truncated frame header at offset {offset}"))
+        })?;
+        let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        if len > bytes.len() - FRAME_HEADER_SIZE as usize {
+            return Err(WalError::Format(format!(
+                "truncated frame payload at offset {offset}"
+            )));
+        }
+        Self::read_from(bytes, offset)?
+            .ok_or_else(|| WalError::Format(format!("truncated frame at offset {offset}")))
+    }
 }
 
 /// Read one frame without truncating. A partial frame returns `None`; corrupt
@@ -308,7 +326,7 @@ pub(crate) fn read_next_frame(
 
 /// Write a single WAL frame: `[len: u32 LE][crc32: u32 LE][view: u64 LE][payload]`.
 /// Returns the total bytes written (header + payload).
-fn write_frame(writer: &mut BufWriter<&File>, payload: &[u8], view: u64) -> Result<u64, WalError> {
+fn write_frame(writer: &mut impl Write, payload: &[u8], view: u64) -> Result<u64, WalError> {
     let len: u32 = payload.len().try_into().map_err(|_| {
         WalError::Format(format!(
             "WAL frame too large: {} bytes exceeds u32 max",
@@ -341,7 +359,17 @@ pub(crate) fn build_apply_remap(
     codecs: &CodecRegistry,
 ) -> Result<ApplyRemap, WalError> {
     let source_to_codec = match schema {
-        Some(schema) => codecs.build_remap(schema)?,
+        Some(schema) => {
+            let remap = codecs.build_remap(schema)?;
+            if remap.len() != schema.len()
+                || remap.values().collect::<HashSet<_>>().len() != schema.len()
+            {
+                return Err(WalError::Format(
+                    "duplicate component ID or name in WAL schema".into(),
+                ));
+            }
+            remap
+        }
         None => codecs
             .registered_ids()
             .into_iter()
@@ -521,87 +549,6 @@ fn validate_record_components(
         }
     }
     Ok(())
-}
-
-/// Private local-recovery plan. The exclusive borrow prevents mappings from
-/// escaping to another world or surviving a change to its component registry.
-/// This does not establish a finalized range for follower ingestion.
-struct ValidatedRange<'a> {
-    world: &'a mut World,
-    codecs: &'a CodecRegistry,
-    records: Vec<(RawFrame, Arc<ApplyRemap>)>,
-    last_seq: u64,
-}
-
-impl<'a> ValidatedRange<'a> {
-    fn read(
-        dir: &Path,
-        from_seq: u64,
-        world: &'a mut World,
-        codecs: &'a CodecRegistry,
-    ) -> Result<Self, WalError> {
-        let mut records = Vec::new();
-        let mut last_seq = from_seq.saturating_sub(1);
-        let mut max_view_seen = 0;
-        let mut expected_tick = world.current_tick();
-        for (_, path) in list_segments(dir)? {
-            let file = File::open(&path)?;
-            validate_segment_magic(&file, &path)?;
-            let mut pos = SEGMENT_MAGIC_SIZE;
-            let mut remap = None;
-            while let Some(frame) = RawFrame::read(&file, pos)? {
-                let (entry, _proof, view) = frame.decode()?;
-                pos = frame.next_offset();
-                let is_stale = observe_view(&mut max_view_seen, view);
-                match entry {
-                    // A stale schema still binds current mutations in its run.
-                    WalEntry::Schema(schema) => {
-                        remap = Some(Arc::new(build_apply_remap(
-                            Some(&schema.components),
-                            world,
-                            codecs,
-                        )?));
-                    }
-                    WalEntry::Mutations(record) if !is_stale && record.seq >= from_seq => {
-                        expected_tick = validate_record_tick(&record, expected_tick)?;
-                        // Preserve legacy schema-less local recovery. Raw
-                        // follower ranges will require an explicit run schema.
-                        let binding = match &remap {
-                            Some(binding) => Arc::clone(binding),
-                            None => {
-                                let binding = Arc::new(build_apply_remap(None, world, codecs)?);
-                                remap = Some(Arc::clone(&binding));
-                                binding
-                            }
-                        };
-                        validate_record_components(&record, &binding, codecs)?;
-                        last_seq = record.seq;
-                        records.push((frame, binding));
-                    }
-                    WalEntry::Mutations(_) | WalEntry::Checkpoint { .. } => {}
-                }
-            }
-        }
-        Ok(Self {
-            world,
-            codecs,
-            records,
-            last_seq,
-        })
-    }
-
-    fn execute(self) -> Result<u64, WalError> {
-        for (frame, remap) in self.records {
-            // ponytail: decode the owned archive again; cache record descriptors
-            // only if replay profiling shows this second decode matters.
-            let (entry, proof, _) = frame.decode()?;
-            let WalEntry::Mutations(record) = entry else {
-                unreachable!("the private plan stores only mutation frames");
-            };
-            apply_record(&record, self.world, self.codecs, Some(&remap), Some(&proof))?;
-        }
-        Ok(self.last_seq)
-    }
 }
 
 /// Read-only snapshot of WAL statistics. Plain data struct — no references
@@ -1013,7 +960,9 @@ impl Wal {
         world: &mut World,
         codecs: &CodecRegistry,
     ) -> Result<u64, WalError> {
-        ValidatedRange::read(&self.dir, from_seq, world, codecs)?.execute()
+        ValidatedRange::read(&self.dir, from_seq, world, codecs)?
+            .execute()
+            .map(|(last_seq, _view)| last_seq)
     }
 
     /// Delete all segment files whose entire seq range is before `seq`.

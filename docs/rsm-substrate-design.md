@@ -2,7 +2,7 @@
 
 Date: 2026-08-30. Updated: 2026-09-05. Status: 4.0-a delivered (PR #251, #252).
 
-Phase 4.0-b delivers application prerequisites and a private recovery plan (section 7.7), plus the local durable raw-range reader (section 7.2). Raw follower ingestion, journals, and transport remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
+Phase 4.0-b delivers application prerequisites, private recovery/raw-range plans and the raw divergent-world gate (section 7.7), plus the local durable raw-range reader (section 7.2). Raw follower ingestion, journals, and transport remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
 
 ## 1. Architecture summary
 
@@ -210,7 +210,7 @@ Mutation frames cover exactly `[from_seq, next_seq)`, once per slot and in order
 
 Apply and publish per the shared §4 state machine. Only its successful return may supply the next pull position or a future applied-progress Ack for finalized-range push (§7.5); a failed journal write/apply produces no successful progress result. On restart, restore a consistent world baseline, its fence and stream identity, then replay the journal through the same interpreter/position rules (without re-journaling) before reconstructing progress. Never restore a saved number onto an older world. `replay_from` alone and `recover_world` alone do not reconstruct follower progress today. Volatile-only acknowledgment is outside this 4.0-b contract.
 
-**First semantic gate, before wire code:** `wal_frames_round_trip_divergent_live_follower` starts from equivalent leader/follower baseline state, with pre-existing entities and divergent component registration/allocation history. Ship exact ranged frame bytes, including a mid-segment start and rollover; assert fingerprint/tick equality and the exclusive settled boundary. Merely decoding an entire segment into a fresh world does not prove this contract. Failure identifies required remap or allocator-adoption work; do not assert that existing recovery already guarantees it.
+**First semantic gate, before wire code:** `wal_frames_round_trip_divergent_live_follower` now starts from equivalent leader/follower baseline state, with pre-existing entities and divergent component registration/allocation history. It passes exact ranged frame bytes through the private plan, including a mid-segment start and rollover, and verifies fingerprints, ticks, the executed range end, and subsequent allocation. This proves raw application equivalence, not durable follower progress: journal-backed ingestion must still establish the settled boundary. Merely decoding an entire segment into a fresh world does not prove this contract.
 
 ### 7.4 Pull contract and failure behavior
 
@@ -286,7 +286,7 @@ The application prerequisites use this invariant matrix:
 | Consumer | Component identifiers | Entity allocation | Tick and failure behavior |
 |---|---|---|---|
 | `apply_record` through decoded follower or WAL recovery | Resolve source → codec → destination type. `follower_round_trip_divergent_live_world` | Claim the logged slot in mutation order. `follower_replay_reuses_logged_entity_slot_in_mutation_order` | Keep the existing per-record tick and poison rules. `follower_tick_regression_poisons` |
-| Raw `ValidatedRange` execution, planned | Resolve all runs before effects. `follower_ingest_preflight_rejects_invalid_range` | Use the same `apply_record` path. `wal_frames_round_trip_divergent_live_follower` | Journal before effects. `follower_ingest_retry_and_failure_preserve_prefix` |
+| Private raw `ValidatedRange` execution | Resolve all runs before effects. `raw_plan_rejects_invalid_range_before_effects` | Use the same `apply_record` path. `wal_frames_round_trip_divergent_live_follower` | Private execution only; public ingestion still requires journal-before-effects. Planned `follower_ingest_retry_and_failure_preserve_prefix` |
 | Authorized terminal no-op, planned | Validate its run schema. `follower_ingest_processes_stale_schema_frame` | Exempt: no entity allocation occurs. `follower_ingest_drops_stale_mutation_frame` | Advance only the settled prefix. `follower_ingest_fenced_slot_advances_prefix` |
 
 Local WAL recovery now uses the private `ValidatedRange` raw-frame plan.
@@ -300,6 +300,22 @@ Component payload decoding and state-dependent application can still fail after 
 Local recovery keeps its existing stale-frame and torn-tail rules.
 This caller does not establish contiguous finalized ranges or authorize follower progress.
 The durable range reader is now available (section 7.2). Terminal dispositions and the ingest journal remain required before exposing raw follower ingestion.
+
+`wal/plan.rs::ValidatedRange::from_frames` extends the private plan to detached `WalFrameRange` inputs and passes the raw divergent-world gate.
+It validates one complete range against the destination world and an explicitly supplied restored fence.
+It does not deduplicate overlapping deliveries, journal bytes, poison a follower, or publish follower progress; those responsibilities remain with the planned ingest entry point.
+Execution reports the local recovery last-sequence convention and the final fence for the internal gate. Local recovery keeps its inclusive return and empty-range fallback; this result is not a follower acknowledgment.
+No public raw apply API is added before journal durability exists.
+The constructor is compiled privately and tested directly; its production caller arrives with journal integration.
+Schema remapping rejects duplicate source IDs and duplicate names at the shared `build_apply_remap` boundary, including decoded replication and recovery callers.
+
+| Raw plan input | Before effects | Check |
+|---|---|---|
+| Mid-segment range crossing rollover | Validate exact original schema/frame buffers; resolve source, codec, and destination IDs independently; adopt logged slots. | `wal_frames_round_trip_divergent_live_follower` |
+| Schema and checkpoint | Require one exact schema per ordered run; raise the restored/source fence with the shared interpreter; checkpoint sequence is not baseline coverage. | `raw_plan_preserves_run_remaps_and_fences` |
+| Mutation | Require exact interval coverage, current view, valid component references and predicted ticks before any effects. | `raw_plan_rejects_invalid_range_before_effects` |
+| Malformed or oversized input | Check interval, byte and control limits, full frames, CRCs, and run boundaries before execution; truncated buffers must not allocate their claimed payload size. | `raw_plan_rejects_invalid_range_before_effects`, `raw_plan_enforces_limits`, `raw_frame_buffer_checks_lengths_and_alignment` |
+| State-dependent failure | Preserve the existing partial-application error; do not return a successful completion boundary. | `raw_plan_propagates_partial_apply_failure` |
 
 | Recovery plan input | Before effects | Execution |
 |---|---|---|
@@ -383,6 +399,12 @@ Delivery order:
 | `records_from_requires_retained_fence_context` | Below-floor requests and retained-floor reads refuse after deletion and reopen until prefix fence metadata exists. |
 | `records_from_survives_failed_rollover_sync` | File-sync and directory-sync failures leave no orphan segment; later appends and rollover still produce identical ranges after reopen. |
 | `failed_rollover_cleanup_blocks_writes` | Failed cleanup blocks appends, checkpoint writes, and retention before changes; retry resumes after cleanup becomes possible. |
+| `wal_frames_round_trip_divergent_live_follower` | Private raw execution from equivalent nonempty baselines with divergent IDs/allocation history, heap values, mid-segment resume, and rollover; matching fingerprints, ticks, range end, and later allocation. |
+| `raw_plan_preserves_run_remaps_and_fences` | Per-run ID changes, stale schema context, restored fence, ordered checkpoints, and empty control progress without tick changes. |
+| `raw_plan_rejects_invalid_range_before_effects` | Malformed ranges, corrupt frames, duplicate schema IDs/names, gaps, stale mutations, bad component references, and invalid ticks leave the world and allocator unchanged. |
+| `raw_plan_enforces_limits` | Exact/over-limit records, bytes, and controls; reject truncated claimed payloads before allocation. |
+| `raw_frame_buffer_checks_lengths_and_alignment` | Decode from a byte buffer starting at offset one; reject every truncated prefix and oversized claimed payload. Runs under Miri without a world/pool fixture. |
+| `raw_plan_propagates_partial_apply_failure` | A late state-dependent failure propagates the shared partial-application error without a successful completion result. |
 
 **Planned 4.0-b tests (names reserved; not yet implemented):**
 
@@ -390,7 +412,6 @@ Delivery order:
 |---|---|
 | `records_from_preserves_fenced_slots` | A sealed stale slot with a durable source no-op disposition is returned and counted; a rewritable stale active suffix produces a refusal instead of progress or false caught-up. |
 | `terminal_disposition_survives_source_restart` | Crashes before/after disposition fsync and before/after range publication never advertise an undurable decision or lose a durable one; source recovery and resumed ranges restore the same settled slot after WAL retention; conflicting identity, committed-operation reclassification and missing/corrupt required journal state refuse. |
-| `wal_frames_round_trip_divergent_live_follower` | Before wire code: equivalent nonempty baseline, divergent IDs/allocation history, POD+heap components, mid-segment/rollover raw bytes; fingerprint, tick, settled boundary. |
 | `follower_ingest_processes_stale_schema_frame` | Stale schema still builds the correct remap for later current mutations; neither progress nor fence regresses. |
 | `follower_ingest_drops_stale_mutation_frame` | A fenced mutation performs no world, tick, allocator, or column-mark effects; its terminal slot is accounted for. |
 | `follower_ingest_checkpoint_raises_fence` | A higher-view checkpoint fences later stale mutations; schema/checkpoints and flush_seq never advance the sequence or claim follower baseline coverage. |
