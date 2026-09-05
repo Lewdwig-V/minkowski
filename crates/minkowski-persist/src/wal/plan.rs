@@ -12,16 +12,8 @@ pub(super) struct ValidatedRange<'a> {
 }
 
 impl<'a> ValidatedRange<'a> {
-    /// Preflight one complete raw range. This is not follower ingestion: no
-    /// deduplication, journal, poison state, or progress publication lives here.
-    /// The future ingest caller must persist the range before executing it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "private raw ingest prerequisite; journal integration follows"
-        )
-    )]
+    /// Preflight one complete raw range for the private application gate.
+    #[cfg(test)]
     pub(super) fn from_frames(
         range: &WalFrameRange,
         restored_view: u64,
@@ -29,7 +21,24 @@ impl<'a> ValidatedRange<'a> {
         world: &'a mut World,
         codecs: &'a CodecRegistry,
     ) -> Result<Self, WalError> {
+        Self::from_frames_after(range, restored_view, range.from_seq, limits, world, codecs)
+    }
+
+    pub(super) fn from_frames_after(
+        range: &WalFrameRange,
+        restored_view: u64,
+        apply_from: u64,
+        limits: WalRangeLimits,
+        world: &'a mut World,
+        codecs: &'a CodecRegistry,
+    ) -> Result<Self, WalError> {
         limits.validate()?;
+        if range.from_seq > apply_from {
+            return Err(WalError::UnresolvedHistory {
+                seq: apply_from,
+                reason: "range starts beyond the applied prefix",
+            });
+        }
         let slots = range
             .next_seq
             .checked_sub(range.from_seq)
@@ -57,7 +66,9 @@ impl<'a> ValidatedRange<'a> {
             Ok(())
         };
         let mut expected_seq = range.from_seq;
-        let mut max_view = restored_view;
+        // Validate the source prefix on its own. A restored later fence must
+        // not retroactively reject already-applied duplicate frames.
+        let mut max_view = 0;
         observe_view(&mut max_view, range.seed_view);
         let mut expected_tick = world.current_tick();
         let mut records = Vec::new();
@@ -108,15 +119,17 @@ impl<'a> ValidatedRange<'a> {
                                 reason: "raw range mutation gap, duplicate, or out-of-bounds slot",
                             });
                         }
-                        if stale {
+                        if stale || (record.seq >= apply_from && view < restored_view) {
                             return Err(WalError::UnresolvedHistory {
                                 seq: expected_seq,
                                 reason: "stale mutation has no durable terminal disposition",
                             });
                         }
-                        expected_tick = validate_record_tick(&record, expected_tick)?;
                         validate_record_components(&record, &remap, codecs)?;
-                        records.push((frame, Arc::clone(&remap)));
+                        if record.seq >= apply_from {
+                            expected_tick = validate_record_tick(&record, expected_tick)?;
+                            records.push((frame, Arc::clone(&remap)));
+                        }
                         expected_seq += 1;
                     }
                 }
@@ -128,6 +141,7 @@ impl<'a> ValidatedRange<'a> {
                 reason: "raw range is missing mutation slots",
             });
         }
+        observe_view(&mut max_view, restored_view);
         Ok(Self {
             world,
             codecs,
@@ -205,6 +219,28 @@ impl<'a> ValidatedRange<'a> {
             apply_record(&record, self.world, self.codecs, Some(&remap), Some(&proof))?;
         }
         Ok((self.last_seq, self.max_view))
+    }
+
+    pub(super) fn view(&self) -> u64 {
+        self.max_view
+    }
+
+    pub(super) fn execute_following(
+        self,
+        follower: &crate::Follower,
+    ) -> Result<u64, crate::FollowerError> {
+        for (frame, remap) in self.records {
+            let (entry, _, _) = frame.decode()?;
+            let WalEntry::Mutations(record) = entry else {
+                unreachable!("the private plan stores only mutation frames");
+            };
+            follower.apply_next(record.seq, || {
+                // Received bytes can carry a valid CRC and invalid component
+                // values (e.g. bool = 2). Require checked component decoding.
+                apply_record(&record, self.world, self.codecs, Some(&remap), None)
+            })?;
+        }
+        Ok(self.max_view)
     }
 }
 

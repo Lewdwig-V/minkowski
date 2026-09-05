@@ -20,5 +20,6 @@ pub use record::*;
 pub use recover::{RecoverError, recover_world};
 pub use replication::{Follower, FollowerError, ReplicationError, apply_batch};
 pub use wal::{
-    Wal, WalConfig, WalCursor, WalError, WalFrameRange, WalRangeLimits, WalSegmentRun, WalStats,
+    IngestError, JournaledFollower, Wal, WalConfig, WalCursor, WalError, WalFrameRange,
+    WalRangeLimits, WalSegmentRun, WalStats,
 };

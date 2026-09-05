@@ -10,8 +10,10 @@ use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 
+mod ingest;
 mod plan;
 mod range;
+pub use ingest::{IngestError, JournaledFollower};
 use plan::ValidatedRange;
 pub use range::{WalFrameRange, WalRangeLimits, WalSegmentRun};
 
@@ -266,15 +268,18 @@ impl RawFrame {
         }))
     }
 
-    fn decode(&self) -> Result<(WalEntry, CrcProof, u64), WalError> {
+    fn verify(&self) -> Result<CrcProof, WalError> {
         let stored_crc = u32::from_le_bytes(self.header[4..8].try_into().unwrap());
+        CrcProof::verify(&self.payload, stored_crc).ok_or(WalError::ChecksumMismatch {
+            offset: self.offset,
+            expected: stored_crc,
+            actual: crc32fast::hash(&self.payload),
+        })
+    }
+
+    fn decode(&self) -> Result<(WalEntry, CrcProof, u64), WalError> {
+        let proof = self.verify()?;
         let view = u64::from_le_bytes(self.header[8..].try_into().unwrap());
-        let proof =
-            CrcProof::verify(&self.payload, stored_crc).ok_or(WalError::ChecksumMismatch {
-                offset: self.offset,
-                expected: stored_crc,
-                actual: crc32fast::hash(&self.payload),
-            })?;
         let entry =
             rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&self.payload).map_err(|e| {
                 WalError::Format(format!(

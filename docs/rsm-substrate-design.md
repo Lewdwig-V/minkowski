@@ -2,7 +2,7 @@
 
 Date: 2026-08-30. Updated: 2026-09-05. Status: 4.0-a delivered (PR #251, #252).
 
-Phase 4.0-b delivers application prerequisites, private recovery/raw-range plans and the raw divergent-world gate (section 7.7), plus the local durable raw-range reader (section 7.2). Raw follower ingestion, journals, and transport remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
+Phase 4.0-b delivers application prerequisites, private recovery/raw-range plans and the raw divergent-world gate (section 7.7), plus the local durable raw-range reader (section 7.2). Journal-backed raw follower ingestion and restart from an empty baseline are also delivered (section 7.4). Nonempty state-transfer baselines, terminal dispositions, journal compaction, and transport remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
 
 ## 1. Architecture summary
 
@@ -206,13 +206,40 @@ Every nonempty range includes the active schema at its start, even for a mid-seg
 
 Mutation frames cover exactly `[from_seq, next_seq)`, once per slot and in order, including stale frames with explicit terminal dispositions. A stale frame without such a disposition is an unresolved logical slot, not an automatically consumable no-op. No server-side filtering creates invisible holes. A response may contain no mutations and still provide durable context; repeated context is harmless. Reject missing/incorrect schema, bad CRCs, format errors, unaccounted gaps, and inconsistent envelope bounds before applying.
 
-`Follower::ingest_frames(&mut self, batch, world, codecs)` is the raw ingestion chokepoint. After preflight, persist the complete replayable range and its schema/fence context in a follower ingest journal and fsync it before application or advertising progress. Repeated ranges remain positionally deduplicated, including during recovery. This is new raw-frame persistence work: `Wal::append` currently serializes changesets and cannot be assumed to append received frames. Treat a journal as replayable range envelopes; blindly concatenating response buffers into a local leader WAL is not the format contract.
+The proposed raw ingestion chokepoint is delivered as `JournaledFollower::ingest_frames(history, range)` for the empty-baseline subset described in section 7.4; the wrapper owns its world and codecs. After preflight, persist the complete replayable range and its schema/fence context in a follower ingest journal and fsync it before application or advertising progress. Repeated ranges remain positionally deduplicated, including during recovery. This is new raw-frame persistence work: `Wal::append` currently serializes changesets and cannot be assumed to append received frames. Treat a journal as replayable range envelopes; blindly concatenating response buffers into a local leader WAL is not the format contract.
 
 Apply and publish per the shared §4 state machine. Only its successful return may supply the next pull position or a future applied-progress Ack for finalized-range push (§7.5); a failed journal write/apply produces no successful progress result. On restart, restore a consistent world baseline, its fence and stream identity, then replay the journal through the same interpreter/position rules (without re-journaling) before reconstructing progress. Never restore a saved number onto an older world. `replay_from` alone and `recover_world` alone do not reconstruct follower progress today. Volatile-only acknowledgment is outside this 4.0-b contract.
 
-**First semantic gate, before wire code:** `wal_frames_round_trip_divergent_live_follower` now starts from equivalent leader/follower baseline state, with pre-existing entities and divergent component registration/allocation history. It passes exact ranged frame bytes through the private plan, including a mid-segment start and rollover, and verifies fingerprints, ticks, the executed range end, and subsequent allocation. This proves raw application equivalence, not durable follower progress: journal-backed ingestion must still establish the settled boundary. Merely decoding an entire segment into a fresh world does not prove this contract.
+**First semantic gate, before wire code:** `wal_frames_round_trip_divergent_live_follower` now starts from equivalent leader/follower baseline state, with pre-existing entities and divergent component registration/allocation history. It passes exact ranged frame bytes through the private plan, including a mid-segment start and rollover, and verifies fingerprints, ticks, the executed range end, and subsequent allocation. This proves raw application equivalence, not durable follower progress: journal-backed ingestion separately establishes the applied boundary for its empty-baseline subset. Merely decoding an entire segment into a fresh world does not prove this contract.
 
 ### 7.4 Pull contract and failure behavior
+
+The delivered journal slice adds `JournaledFollower`, owning its world, codecs, legacy `Follower` position/poison state, source-history identity, restored view, and ingest file.
+It starts from an empty world at sequence zero; opening reconstructs that world from the retained journal before returning any progress.
+Nonempty state-transfer baselines and journal compaction remain deferred. No journal prefix can be deleted in this slice.
+The caller supplies a stable 16-byte source-history identity and must change it when replacing the source history.
+`ingest_frames(history, range)` checks that identity, preflights the complete range, appends and fsyncs its envelope, then executes only the unapplied suffix.
+The owned world is accessible only through the existing poisoned/read-at gate, so progress cannot be paired with another world or bypassed by local writes.
+Decoded and journaled application share per-record position checking, poison handling, and publication after successful apply.
+
+Journal format: `MKI1`, 16-byte history identity, CRC32 of those header bytes; then 16-byte length/CRC/complemented-length headers and rkyv envelopes containing history plus the original `WalFrameRange`. The length guard is checked before allocating or interpreting a partial tail, so a damaged length cannot silently discard later committed entries.
+Creation fsyncs the file and directory ancestry before returning. Reopen fsyncs recovered bytes before replay; only an incomplete final frame may be truncated, followed by fsync. Complete checksum/format errors refuse.
+Empty ranges that raise the fence are journaled and fsynced even though they consume no sequence slots. Complete duplicates that add no context need no extra journal entry.
+Overlapping responses retain their full original bytes in the journal; sequence deduplication and restored fences select only the new suffix on ingestion and restart.
+Stale mutation slots still refuse until authoritative terminal dispositions exist.
+
+| Ingest/restart input or boundary | Required behavior | Check |
+|---|---|---|
+| Valid raw range | Fsync before effects; publish each slot only after successful apply. | `journaled_follower_round_trip_and_restart` |
+| Duplicate/overlap and empty controls | Skip applied effects; retain the restored fence; persist new control-only context. | `journaled_follower_deduplicates_overlap_and_controls` |
+| Bad schema/frame, gaps, bounds, or history | Poison without new effects or successful progress; reads refuse. | `journaled_follower_refuses_invalid_input` |
+| Invalid component value with valid CRC | Checked decoding refuses on ingest and restart, including raw-copy-certified types. | `journaled_follower_checks_component_bytes_despite_valid_crc` |
+| Write/fsync failure and late apply failure | No successful result; preserve only applied prefix, poison reads, retain replayable evidence. | `journaled_follower_failure_boundaries` |
+| Restart and partial tail | Reconstruct world, ticks, fence, and sequence from the same history; truncate only incomplete tail. | `journaled_follower_restart_reconstructs_progress` |
+| Corrupt or mismatched journal | Refuse recovery; never restore a number onto an unrelated world. | `journaled_follower_rejects_corrupt_history` |
+| Concurrent journal owner | Acquire a nonblocking exclusive file lock before reading or writing; refuse a second owner. | `journaled_follower_rejects_corrupt_history` |
+
+The failure-boundary tests distinguish process restart (page-cache bytes may survive) from explicitly discarding unflushed tail bytes. Copying a failed journal plus the matching codec setup reproduces application failure from the fixed empty baseline; broader state-transfer failure-capture manifests remain planned.
 
 The fetch client is bound to one registered follower/session. Its synchronous wire operation remains:
 
@@ -286,7 +313,7 @@ The application prerequisites use this invariant matrix:
 | Consumer | Component identifiers | Entity allocation | Tick and failure behavior |
 |---|---|---|---|
 | `apply_record` through decoded follower or WAL recovery | Resolve source → codec → destination type. `follower_round_trip_divergent_live_world` | Claim the logged slot in mutation order. `follower_replay_reuses_logged_entity_slot_in_mutation_order` | Keep the existing per-record tick and poison rules. `follower_tick_regression_poisons` |
-| Private raw `ValidatedRange` execution | Resolve all runs before effects. `raw_plan_rejects_invalid_range_before_effects` | Use the same `apply_record` path. `wal_frames_round_trip_divergent_live_follower` | Private execution only; public ingestion still requires journal-before-effects. Planned `follower_ingest_retry_and_failure_preserve_prefix` |
+| Private raw `ValidatedRange` execution | Resolve all runs before effects. `raw_plan_rejects_invalid_range_before_effects` | Use the same `apply_record` path. `wal_frames_round_trip_divergent_live_follower` | Journal-before-effects and shared per-record publication. `journaled_follower_failure_boundaries` |
 | Authorized terminal no-op, planned | Validate its run schema. `follower_ingest_processes_stale_schema_frame` | Exempt: no entity allocation occurs. `follower_ingest_drops_stale_mutation_frame` | Advance only the settled prefix. `follower_ingest_fenced_slot_advances_prefix` |
 
 Local WAL recovery now uses the private `ValidatedRange` raw-frame plan.
@@ -299,14 +326,13 @@ Tick overflow refuses before application.
 Component payload decoding and state-dependent application can still fail after earlier records have applied.
 Local recovery keeps its existing stale-frame and torn-tail rules.
 This caller does not establish contiguous finalized ranges or authorize follower progress.
-The durable range reader is now available (section 7.2). Terminal dispositions and the ingest journal remain required before exposing raw follower ingestion.
+The durable range reader (section 7.2) and journal-backed raw ingestion (section 7.4) are available. Unresolved stale slots still refuse pending terminal dispositions.
 
-`wal/plan.rs::ValidatedRange::from_frames` extends the private plan to detached `WalFrameRange` inputs and passes the raw divergent-world gate.
+`wal/plan.rs::ValidatedRange::from_frames_after` extends the private plan to detached `WalFrameRange` inputs and passes the raw divergent-world gate.
 It validates one complete range against the destination world and an explicitly supplied restored fence.
-It does not deduplicate overlapping deliveries, journal bytes, poison a follower, or publish follower progress; those responsibilities remain with the planned ingest entry point.
+It validates overlapping deliveries and selects only the unapplied suffix. `JournaledFollower` journals bytes before execution, poisons on failure, and uses the shared `Follower::apply_next` boundary to publish progress.
 Execution reports the local recovery last-sequence convention and the final fence for the internal gate. Local recovery keeps its inclusive return and empty-range fallback; this result is not a follower acknowledgment.
-No public raw apply API is added before journal durability exists.
-The constructor is compiled privately and tested directly; its production caller arrives with journal integration.
+The public journal owner calls this private constructor on both live ingestion and restart. Received component payloads use checked decoding even when their frame CRC is valid; local WAL recovery retains its existing certified raw-copy path.
 Schema remapping rejects duplicate source IDs and duplicate names at the shared `build_apply_remap` boundary, including decoded replication and recovery callers.
 
 | Raw plan input | Before effects | Check |
