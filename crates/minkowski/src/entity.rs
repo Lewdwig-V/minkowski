@@ -1,4 +1,110 @@
 use crate::sync::{AtomicU32, Ordering};
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Ordered free slots with a lazy index for replay's arbitrary removals.
+/// Tombstones avoid shifting the tail; snapshots expose only live entries.
+#[derive(Default)]
+pub(crate) struct FreeList {
+    slots: Vec<u32>,
+    positions: Option<HashMap<u32, usize>>,
+    holes: usize,
+    snapshot: OnceLock<Vec<u32>>,
+}
+
+impl From<Vec<u32>> for FreeList {
+    fn from(slots: Vec<u32>) -> Self {
+        Self {
+            slots,
+            ..Self::default()
+        }
+    }
+}
+
+impl FreeList {
+    // The allocator never issues u32::MAX (Entity::DANGLING's index).
+    const REMOVED: u32 = u32::MAX;
+
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len() - self.holes
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        if self.holes == 0 {
+            &self.slots
+        } else {
+            self.snapshot.get_or_init(|| {
+                self.slots
+                    .iter()
+                    .copied()
+                    .filter(|&i| i != Self::REMOVED)
+                    .collect()
+            })
+        }
+    }
+
+    fn push(&mut self, index: u32) {
+        self.snapshot.take();
+        if let Some(positions) = &mut self.positions {
+            positions.insert(index, self.slots.len());
+        }
+        self.slots.push(index);
+    }
+
+    fn extend(&mut self, indices: impl Iterator<Item = u32>) {
+        for index in indices {
+            self.push(index);
+        }
+    }
+
+    fn pop(&mut self) -> Option<u32> {
+        self.snapshot.take();
+        while let Some(index) = self.slots.pop() {
+            if index == Self::REMOVED {
+                self.holes -= 1;
+                continue;
+            }
+            if let Some(positions) = &mut self.positions {
+                positions.remove(&index);
+            }
+            return Some(index);
+        }
+        self.positions = None;
+        None
+    }
+
+    fn remove(&mut self, index: u32) -> bool {
+        if self.slots.last() == Some(&index) {
+            self.pop();
+            return true;
+        }
+        let positions = self.positions.get_or_insert_with(|| {
+            self.slots
+                .iter()
+                .enumerate()
+                .map(|(pos, &i)| (i, pos))
+                .collect()
+        });
+        let Some(pos) = positions.remove(&index) else {
+            return false;
+        };
+        self.snapshot.take();
+        self.slots[pos] = Self::REMOVED;
+        self.holes += 1;
+        // Rebuild only after enough removals to amortize the linear scan.
+        if self.holes > self.slots.len() / 2 {
+            self.slots.retain(|&i| i != Self::REMOVED);
+            self.holes = 0;
+            *positions = self
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(pos, &i)| (i, pos))
+                .collect();
+        }
+        true
+    }
+}
 
 /// A unique entity identifier: 32-bit index + 32-bit generation packed into a u64.
 ///
@@ -58,14 +164,14 @@ impl Entity {
 ///
 /// # Pool threading status
 ///
-/// The `generations` and `free_list` Vecs use the standard system
+/// The generations and free-slot storage use the standard system
 /// allocator. Pool-backed allocation is **deferred to v2**:
 ///
 /// - `generations: Vec<u32>` — one `u32` per entity index ever created.
 ///   Grows monotonically, never shrinks. Cold-path metadata accessed
 ///   only during alloc/dealloc/is_alive.
-/// - `free_list: Vec<u32>` — recycled entity indices. Bounded by total
-///   despawns minus reuses. Typically small.
+/// - `free_list: FreeList` — ordered recycled indices, with a lazy lookup
+///   index for replay. Ordinary allocation uses its Vec tail directly.
 ///
 /// Together these account for negligible memory relative to the BlobVec
 /// columns that store actual component data (>95% of total). Converting
@@ -73,7 +179,7 @@ impl Entity {
 /// significant additional machinery for minimal memory accounting benefit.
 pub(crate) struct EntityAllocator {
     pub(crate) generations: Vec<u32>,
-    pub(crate) free_list: Vec<u32>,
+    pub(crate) free_list: FreeList,
     // PERF: Padding isolates the atomic from Vec fields on separate cache
     // lines. Prevents false sharing when concurrent spawners (via reserve())
     // contend with sequential alloc()/materialize() which mutate the Vecs.
@@ -90,7 +196,7 @@ impl EntityAllocator {
     pub fn new() -> Self {
         Self {
             generations: Vec::new(),
-            free_list: Vec::new(),
+            free_list: FreeList::default(),
             _pad: [0; 64],
             next_reserved: AtomicU32::new(0),
             total_spawns: 0,
@@ -186,8 +292,7 @@ impl EntityAllocator {
             if generation > entity.generation() {
                 return false; // Never revive an older local handle.
             }
-            if let Some(free_pos) = self.free_list.iter().position(|&i| i == entity.index()) {
-                self.free_list.remove(free_pos);
+            if self.free_list.remove(entity.index()) {
                 self.generations[index] = entity.generation();
                 self.total_spawns += 1;
             } else if generation != entity.generation() {
@@ -215,6 +320,41 @@ impl EntityAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_list_matches_ordered_vec() {
+        let mut expected: Vec<u32> = (0..64).collect();
+        let mut free = FreeList::from(expected.clone());
+        let mut next = 64;
+        let mut seed = 42u64;
+        for step in 0..2048 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            match (seed >> 32) % 4 {
+                0 | 1 => {
+                    free.push(next);
+                    expected.push(next);
+                    next += 1;
+                }
+                2 if !expected.is_empty() => {
+                    let pos = seed as usize % expected.len();
+                    assert!(free.remove(expected.remove(pos)));
+                }
+                _ => assert_eq!(free.pop(), expected.pop()),
+            }
+            assert!(!free.remove(next));
+            assert_eq!(free.len(), expected.len());
+            assert_eq!(free.as_slice(), expected);
+            if step % 127 == 0 {
+                free = expected.clone().into();
+            }
+        }
+        while let Some(index) = expected.pop() {
+            assert_eq!(free.pop(), Some(index));
+        }
+        assert_eq!(free.pop(), None);
+        assert_eq!(free.len(), 0);
+        assert!(free.as_slice().is_empty());
+    }
 
     #[test]
     fn entity_bit_packing() {

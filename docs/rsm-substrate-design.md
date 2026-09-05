@@ -239,6 +239,17 @@ WAL frames and incoming decoded batches use aligned storage before archive valid
 Transport buffers and ordinary byte vectors do not guarantee the archive's required alignment.
 `EnumChangeSet::apply_replay` uses the existing mutation loop and claims logged entity slots when each spawn executes.
 Logged spawns must claim their specified slot without consuming an unrelated free slot.
+Recycled-slot lookup must avoid repeated scans and preserve the order of untouched free slots.
+The allocator keeps the ordinary tail pop and lazily indexes non-tail removals.
+Removed entries use internal tombstones, with amortized compaction and a dense snapshot view.
+
+| Free-list consumer | Ordering and membership | Check |
+|---|---|---|
+| Replay adoption | Remove the specified free slot; preserve the order of other slots. | `replay_recycled_slots_preserves_order_and_snapshot` |
+| Local allocation and despawn | Pop the last live slot and append returned slots; update any existing index. | `replay_recycled_slots_preserves_order_and_snapshot` |
+| Snapshot read and restore | Export the original dense format; invalidate cached views on mutation and rebuild indexes after restore. | `replay_recycled_slots_preserves_order_and_snapshot` |
+| Repeated recycled spawns | Tail pops remain constant time; indexed removals and compaction are amortized constant time. | `replay_recycled_slots_scaling` (release timing, tail/head/permuted orders) |
+
 An occupied slot or an older generation requires a typed refusal.
 Process entity allocation in mutation order so a despawn and subsequent spawn can reuse one slot within a record.
 This prerequisite test does not replace `wal_frames_round_trip_divergent_live_follower`, which also requires exact raw ranges, schema runs, and durable bounds.

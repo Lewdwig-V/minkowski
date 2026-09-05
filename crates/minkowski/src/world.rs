@@ -2188,14 +2188,17 @@ impl World {
     /// Read-only view of entity allocator state for snapshot serialization.
     /// Returns (generations_slice, free_list_slice).
     pub fn entity_allocator_state(&self) -> (&[u32], &[u32]) {
-        (&self.entities.generations, &self.entities.free_list)
+        (
+            &self.entities.generations,
+            self.entities.free_list.as_slice(),
+        )
     }
 
     /// Restore entity allocator state from a snapshot.
     pub fn restore_allocator_state(&mut self, generations: Vec<u32>, free_list: Vec<u32>) {
         self.drain_orphans();
         self.entities.generations = generations;
-        self.entities.free_list = free_list;
+        self.entities.free_list = free_list.into();
         // Sync the atomic counter so reserve() doesn't hand out already-used indices.
         self.entities.sync_reserved();
         self.entity_locations
