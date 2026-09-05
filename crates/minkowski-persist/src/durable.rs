@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use minkowski::{Access, EnumChangeSet, Transact, TransactError, Tx, World, WorldMismatch};
 
 use crate::checkpoint::CheckpointHandler;
-use crate::wal::Wal;
+use crate::wal::{Wal, WalError, WalFrameRange, WalRangeLimits};
 use minkowski_lsm::codec::CodecRegistry;
 
 /// Wraps any [`Transact`] strategy to guarantee WAL logging on commit.
@@ -48,6 +48,16 @@ impl<S: Transact> Durable<S> {
     /// Current WAL sequence number (next append will use this).
     pub fn wal_seq(&self) -> u64 {
         self.wal.lock().next_seq()
+    }
+
+    /// Copy synchronized raw frames, releasing the WAL lock before returning.
+    /// Transport may retain or send the detached range without blocking commits.
+    pub fn records_from(
+        &self,
+        from_seq: u64,
+        limits: WalRangeLimits,
+    ) -> Result<WalFrameRange, WalError> {
+        self.wal.lock().records_from(from_seq, limits)
     }
 }
 

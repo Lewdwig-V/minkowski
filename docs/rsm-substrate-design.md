@@ -2,7 +2,7 @@
 
 Date: 2026-08-30. Updated: 2026-09-05. Status: 4.0-a delivered (PR #251, #252).
 
-Phase 4.0-b delivers application prerequisites, private recovery/raw-range plans and the raw divergent-world gate (section 7.7), plus the local durable raw-range reader (section 7.2). Journal-backed raw follower ingestion and restart from an empty baseline are also delivered (section 7.4). Nonempty state-transfer baselines, terminal dispositions, journal compaction, and transport remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
+Phase 4.0-b delivers application prerequisites, private recovery/raw-range plans and the raw divergent-world gate (section 7.7), plus the local durable raw-range reader (section 7.2). Journal-backed raw follower ingestion and restart from an empty baseline are also delivered (section 7.4). A caller-driven pull pump, loopback/recording adapters, and deterministic transport-fault tests are delivered (section 7.4). Nonempty state-transfer baselines, terminal dispositions, journal compaction, network transport, session registration, and retention integration remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
 
 ## 1. Architecture summary
 
@@ -141,7 +141,7 @@ Deferred to 4.1 and later, unchanged: VR consensus core, leader election, io_uri
 | Owner | Owns | Responsibility |
 |---|---|---|
 | Leader `Replicated<S>` | `Durable<S>`, WAL read access, source disposition journal, registry keyed by follower identity and session generation | Delegate transactions unchanged; serve ranges; track reported settled boundaries for retention |
-| Follower `ReplicationPump` | fetch client bound to that identity/session, `Follower`, ingest journal | Caller invokes `pump_once`; fetch, ingest, then use ingest's returned boundary for the next request; world/codecs are supplied to apply |
+| Follower `ReplicationPump` | `JournaledFollower` (world, codecs, journal, progress), fetch client; identity/session registration remains planned | Caller invokes `pump_once`; fetch from restored/applied progress, ingest, then report only completed progress on the next request |
 | Each fetch response | detached owned buffer with a self-describing `BatchRef` | No WAL lock or segment pin crosses network handoff |
 | 4.1 VSR normal delivery | leader prepare pipeline, send transport, durable-receipt acknowledgment | Persist prepares and acknowledge receipt before application; apply only after quorum commitment (§7.5) |
 
@@ -241,7 +241,7 @@ Stale mutation slots still refuse until authoritative terminal dispositions exis
 
 The failure-boundary tests distinguish process restart (page-cache bytes may survive) from explicitly discarding unflushed tail bytes. Copying a failed journal plus the matching codec setup reproduces application failure from the fixed empty baseline; broader state-transfer failure-capture manifests remain planned.
 
-The fetch client is bound to one registered follower/session. Its synchronous wire operation remains:
+The planned network fetch client is bound to one registered follower/session. Its proposed synchronous wire operation remains:
 
 ```rust
 fn fetch(&self, seq: u64, limit: usize) -> Result<BatchRef, TransportError>
@@ -252,6 +252,24 @@ The pump obtains `seq` only from the restored or successfully ingested `consumed
 4.0-b permits one outstanding fetch per follower. `Lost` retries the same position; `Down` backs off and reconnects. Neither changes progress. `CursorBehind`/rejoin-required and source-history changes require state transfer; corruption, remap failure, sequence gaps and tick/apply failures are not transport loss. Duplicate complete responses deduplicate by position. Frame reordering/gaps are rejected; chaos reordering does not license applying out of sequence.
 
 Fixtures are `RecordingFetch`, loopback, and a seeded chaos fetch with pinned seeds (loss, duplicate responses/requests, delay, and invalid order). A blocked fetch holds its detached response buffer, not a leader WAL lock.
+
+#### Pull pump implementation slice
+
+The delivered pull slice adds `transport.rs` with `Fetch`, `FetchResponse`, `TransportError`, `RecordingFetch`, `LoopbackFetch`, and `ReplicationPump`.
+`Durable::records_from` copies a range under its existing WAL mutex and releases it before the response reaches transport.
+The pump owns a `JournaledFollower` and one fetch client. `pump_once(&mut self)` permits one outstanding request, uses the follower's restored/applied prefix and configured limits, and passes received history plus raw range through `ingest_frames`.
+It has no separate fetch cursor. A successful return is the exclusive applied boundary, not a claim that the source has no more work.
+`Lost` and `Down` leave progress unchanged; the caller schedules retries or reconnects. Ingestion, source-validation, and rejoin errors stop the pump before another request can report partial progress.
+Restart reconstructs the follower from its journal before creating a new pump. An empty subsequent fetch reports the last completed prefix and still ingests durable control context.
+
+This slice implements a typed fetch boundary and loopback adapter, not a network wire format or authenticated session registration. The adapter must bind the configured authoritative source to its stable history identity. Session generations, membership restoration, and retention remain the next source-side work; no segment deletion is added here. Nonempty baselines remain required before retiring the decoded public `Follower` API.
+
+| Consumer | Mutation/progress input | Schema/checkpoint context | Loss or failure |
+|---|---|---|---|
+| `Durable::records_from` / loopback | Enforced: delegate to the durable reader, return detached bytes. `pull_blocked_delivery_does_not_hold_wal_lock` | Enforced: same raw reader, including empty tail fence. `pull_pump_reports_only_ingested_progress` | Enforced: source errors remain terminal, not link loss. `pull_pump_stops_on_terminal_errors` |
+| Live pump | Enforced: request only the follower's applied prefix; ingest before returning progress. `pull_pump_reports_only_ingested_progress` | Enforced: use the journal interpreter without a second fence implementation. `pull_pump_reports_only_ingested_progress` | Enforced: retry only link loss/down without advancing; stop after ingest failure. `pull_fetch_chaos_converges_pinned_seeds`, `pull_pump_stops_on_terminal_errors`, `pull_pump_never_reports_partial_apply` |
+| Restarted pump | Enforced: restore journal before issuing a request, including a lost final progress report. `pull_pump_restart_reports_reconstructed_progress` | Enforced: restore the journal fence; ingest empty tail context normally. `pull_pump_restart_reports_reconstructed_progress` | Enforced: no pump is created from a failed journal open. Existing `journaled_follower_rejects_corrupt_history` |
+| Recording/chaos adapters | Enforced: record requests; duplicate responses do not supply new progress. `pull_fetch_chaos_converges_pinned_seeds` | Exempt: adapters do not interpret frames. | Enforced: bounded scripted faults followed by a repaired link; corrupted/out-of-order responses stop ingestion. `pull_fetch_chaos_converges_pinned_seeds`, `pull_pump_stops_on_terminal_errors` |
 
 ### 7.5 4.1 consensus and push
 
@@ -431,6 +449,12 @@ Delivery order:
 | `raw_plan_enforces_limits` | Exact/over-limit records, bytes, and controls; reject truncated claimed payloads before allocation. |
 | `raw_frame_buffer_checks_lengths_and_alignment` | Decode from a byte buffer starting at offset one; reject every truncated prefix and oversized claimed payload. Runs under Miri without a world/pool fixture. |
 | `raw_plan_propagates_partial_apply_failure` | A late state-dependent failure propagates the shared partial-application error without a successful completion result. |
+| `pull_pump_reports_only_ingested_progress` | Requests report only completed ingestion, preserve configured bounds, and ingest empty tail fences; fingerprints and ticks converge across divergent codec IDs. |
+| `pull_pump_restart_reports_reconstructed_progress` | Restart after application but before reporting resumes from journal-reconstructed progress, including an empty final fetch. |
+| `pull_pump_stops_on_terminal_errors` | Corrupt, wrong-history, out-of-order, source-error, and rejoin responses stop further fetches; poisoned followers cannot resume through a new pump. |
+| `pull_pump_never_reports_partial_apply` | A late apply failure preserves the diagnostic prefix but blocks another fetch from reporting it. |
+| `pull_fetch_chaos_converges_pinned_seeds` | Seeds 1, 7, and 42 cover request/response loss, disconnection, delayed duplicate responses, and duplicate requests; a repaired link converges without fabricated progress. |
+| `pull_blocked_delivery_does_not_hold_wal_lock` | A source transaction commits while the detached response is withheld from the follower. |
 
 **Planned 4.0-b tests (names reserved; not yet implemented):**
 
@@ -447,10 +471,10 @@ Delivery order:
 | `follower_ingest_retry_and_failure_preserve_prefix` | Duplicate spawn bytes never reapply; journal/fsync failure advertises nothing; mid-range apply/tick failure preserves only the settled boundary, poisons reads and emits no successful progress. |
 | `follower_ingest_restart_reconstructs_progress` | Crash before fsync, after durable receipt but before apply, and after apply but before next fetch; restore baseline plus journal including fenced slots, fence and IDs; never restore progress ahead of world. |
 | `read_at_after_fenced_slot_uses_settled_prefix` | After slot 40 is authoritatively resolved as a no-op, read_at(40) observes the no-op projection and read_at(41) refuses; after current slot 41 applies, read_at(41) succeeds; poison always refuses. |
-| `pull_pump_reports_only_ingested_progress` | Fetch runs on follower; stalled/lost response cannot advance registry or touch leader commit path; next request, including empty catch-up, reports only successful ingest. |
+| `pull_registry_reports_only_ingested_progress` | Pending registry integration: stalled/lost response cannot advance registry; next request, including empty catch-up, records only successful ingest. |
 | `retention_respects_followers_and_recovery_floor` | Two follower positions, lagging/disconnected member, no followers and absent baseline; cutoff cannot cross leader LSM replay floor or use checkpoint flush_seq in its place. |
 | `retention_rejects_old_session_progress` | Old-session/duplicate/delayed requests cannot inflate new-session progress; rejoin seeds only a verified baseline; leader restart blocks deletion until conservative registry restoration. |
 | `retention_preserves_resume_fence_and_pinned_reads` | Deletion cannot race an in-flight copy or erase required fence context; retained-floor resume uses the right schema/fence, older requests require rejoin. |
-| `pull_fetch_chaos_converges_pinned_seeds` | Loss/duplicates/delay converge after recovery of the link; injected invalid frame ordering fails closed; retries do not falsely report completion. |
+| `pull_session_chaos_rejects_old_generation` | Pending session integration: loss/duplicates/delay never let an old generation update a rejoined member's registry entry. |
 
 Existing Loom tests `loom_follower_advance_vs_read_at` and `loom_follower_concurrent_advance` cover the decoded follower path. Pending, listed so the gaps stay visible: Loom coverage for the new raw-ingest state, `fuzz_wal_replay` corpus entries with view-stamped frames (stale views included — its mode 0 already feeds raw bytes at replay), and failpoint hooks in the outbound pump for the 4.1 simulator.
