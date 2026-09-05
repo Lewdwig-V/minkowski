@@ -515,11 +515,34 @@ mod tests {
             &mut follower.file,
             File::open(path.join("ingest.log")).unwrap(),
         );
-        assert!(follower.ingest_frames(HISTORY, &range).is_err());
+        // Ensure all writes fit in the buffer: only explicit flushing can
+        // report this descriptor's write error before sync/application.
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&JournalEntry {
+            history: HISTORY,
+            range: range.clone(),
+        })
+        .unwrap();
+        assert!(
+            FRAME_HEADER_SIZE as usize + payload.len() < BufWriter::new(&follower.file).capacity()
+        );
+        let tick = follower.world.current_tick();
+        let mut sync_called = false;
+        let result = follower.ingest_with_sync(HISTORY, &range, |_| {
+            sync_called = true;
+            Ok(()) // A successful sync must not hide an earlier flush error.
+        });
+        assert!(!sync_called);
+        assert!(matches!(result, Err(IngestError::Wal(WalError::Io(_)))));
         follower.file = writable;
         assert_eq!(follower.file.metadata().unwrap().len(), JOURNAL_HEADER_SIZE);
         assert_eq!(follower.applied_seq(), 0);
+        assert_eq!(follower.world.current_tick(), tick);
+        assert!(follower.world.entity_allocator_state().0.is_empty());
         assert!(follower.is_poisoned());
+        assert!(matches!(
+            follower.read_at(0, |_| ()),
+            Err(FollowerError::Poisoned)
+        ));
 
         // A valid later record can still fail on world state after the first
         // slot applied. The complete journal is a replayable failure capture.

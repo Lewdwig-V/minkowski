@@ -331,6 +331,8 @@ pub(crate) fn read_next_frame(
 
 /// Write a single WAL frame: `[len: u32 LE][crc32: u32 LE][view: u64 LE][payload]`.
 /// Returns the total bytes written (header + payload).
+/// Flushes the writer and propagates errors before returning; callers must
+/// separately synchronize the underlying file before claiming durability.
 fn write_frame(writer: &mut impl Write, payload: &[u8], view: u64) -> Result<u64, WalError> {
     let len: u32 = payload.len().try_into().map_err(|_| {
         WalError::Format(format!(
