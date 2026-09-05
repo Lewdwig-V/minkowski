@@ -200,55 +200,75 @@ where
     Ok(max_view)
 }
 
+/// Original frame bytes, owned until the replay plan is consumed.
+struct RawFrame {
+    offset: u64,
+    header: [u8; FRAME_HEADER_SIZE as usize],
+    payload: rkyv::util::AlignedVec<16>,
+}
+
+impl RawFrame {
+    fn read(file: &File, offset: u64) -> Result<Option<Self>, WalError> {
+        let mut header = [0u8; FRAME_HEADER_SIZE as usize];
+        match read_exact_at(file, offset, &mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(WalError::Format(format!(
+                "WAL frame at offset {offset} claims {len} bytes, exceeding maximum {MAX_FRAME_SIZE}"
+            )));
+        }
+        // Vec<u8> guarantees only byte alignment; rkyv validates in place.
+        let mut payload = rkyv::util::AlignedVec::<16>::with_capacity(len);
+        payload.resize(len, 0);
+        match read_exact_at(file, offset + FRAME_HEADER_SIZE, &mut payload) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        Ok(Some(Self {
+            offset,
+            header,
+            payload,
+        }))
+    }
+
+    fn decode(&self) -> Result<(WalEntry, CrcProof, u64), WalError> {
+        let stored_crc = u32::from_le_bytes(self.header[4..8].try_into().unwrap());
+        let view = u64::from_le_bytes(self.header[8..].try_into().unwrap());
+        let proof =
+            CrcProof::verify(&self.payload, stored_crc).ok_or(WalError::ChecksumMismatch {
+                offset: self.offset,
+                expected: stored_crc,
+                actual: crc32fast::hash(&self.payload),
+            })?;
+        let entry =
+            rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&self.payload).map_err(|e| {
+                WalError::Format(format!(
+                    "corrupt WAL entry at byte offset {}: {e}",
+                    self.offset
+                ))
+            })?;
+        Ok((entry, proof, view))
+    }
+
+    fn next_offset(&self) -> u64 {
+        self.offset + FRAME_HEADER_SIZE + self.payload.len() as u64
+    }
+}
+
 pub(crate) fn read_next_frame(
     file: &File,
     pos: u64,
 ) -> Result<Option<(WalEntry, u64, CrcProof, u64)>, WalError> {
-    // Read 16-byte header: [len: u32 LE][crc32: u32 LE][view: u64 LE]
-    let mut header_buf = [0u8; FRAME_HEADER_SIZE as usize];
-    match read_exact_at(file, pos, &mut header_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let len =
-        u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]) as usize;
-    let stored_crc =
-        u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
-    let view = u64::from_le_bytes([
-        header_buf[8],
-        header_buf[9],
-        header_buf[10],
-        header_buf[11],
-        header_buf[12],
-        header_buf[13],
-        header_buf[14],
-        header_buf[15],
-    ]);
-    if len > MAX_FRAME_SIZE {
-        return Err(WalError::Format(format!(
-            "WAL frame at offset {pos} claims {len} bytes, exceeding maximum {MAX_FRAME_SIZE}"
-        )));
-    }
-    let mut payload = vec![0u8; len];
-    match read_exact_at(file, pos + FRAME_HEADER_SIZE, &mut payload) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let proof = CrcProof::verify(&payload, stored_crc).ok_or(WalError::ChecksumMismatch {
-        offset: pos,
-        expected: stored_crc,
-        actual: crc32fast::hash(&payload),
-    })?;
-    let entry = rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&payload)
-        .map_err(|e| WalError::Format(format!("corrupt WAL entry at byte offset {pos}: {e}")))?;
-    Ok(Some((
-        entry,
-        pos + FRAME_HEADER_SIZE + len as u64,
-        proof,
-        view,
-    )))
+    let Some(frame) = RawFrame::read(file, pos)? else {
+        return Ok(None);
+    };
+    let (entry, proof, view) = frame.decode()?;
+    Ok(Some((entry, frame.next_offset(), proof, view)))
 }
 
 /// Write a single WAL frame: `[len: u32 LE][crc32: u32 LE][view: u64 LE][payload]`.
@@ -269,61 +289,105 @@ fn write_frame(writer: &mut BufWriter<&File>, payload: &[u8], view: u64) -> Resu
     Ok(FRAME_HEADER_SIZE + payload.len() as u64)
 }
 
-/// Apply a single WAL record to a World, optionally remapping component IDs.
+/// A source component resolves separately to a decoder and a world column.
+#[derive(Clone, Copy)]
+pub(crate) struct ApplyComponent {
+    codec_id: ComponentId,
+    world_id: Option<ComponentId>,
+}
+
+pub(crate) type ApplyRemap = HashMap<ComponentId, ApplyComponent>;
+
+/// Resolve a schema against both the codec registry and the destination world.
+/// This does not register components or otherwise mutate the destination.
+pub(crate) fn build_apply_remap(
+    schema: Option<&[ComponentSchema]>,
+    world: &World,
+    codecs: &CodecRegistry,
+) -> Result<ApplyRemap, WalError> {
+    let source_to_codec = match schema {
+        Some(schema) => codecs.build_remap(schema)?,
+        None => codecs
+            .registered_ids()
+            .into_iter()
+            .map(|id| (id, id))
+            .collect(),
+    };
+    let world_ids: HashMap<_, _> = (0..world.component_count())
+        .filter_map(|id| {
+            let type_id = world.component_type_id(id)?;
+            Some((codecs.stable_name_by_type(type_id)?, id))
+        })
+        .collect();
+    source_to_codec
+        .into_iter()
+        .map(|(source_id, codec_id)| {
+            let name = codecs
+                .stable_name(codec_id)
+                .ok_or(CodecError::UnregisteredComponent(codec_id))?;
+            // A segment schema can declare types that no retained record
+            // uses. Require a destination column only when a record uses it.
+            let world_id = world_ids.get(name).copied();
+            Ok((source_id, ApplyComponent { codec_id, world_id }))
+        })
+        .collect()
+}
+
+/// Validate the commit boundary and return the tick after successful apply.
+/// EnumChangeSet::apply_replay advances once, including for empty records.
+fn validate_record_tick(
+    record: &crate::record::WalRecord,
+    world_tick: u64,
+) -> Result<u64, WalError> {
+    if record.tick_after < world_tick {
+        return Err(WalError::TickRegression {
+            seq: record.seq,
+            record_tick: record.tick_after,
+            world_tick,
+        });
+    }
+    record
+        .tick_after
+        .checked_add(1)
+        .ok_or_else(|| WalError::Format(format!("tick overflow at seq {}", record.seq)))
+}
+
+/// Apply a single WAL record using destination-specific component bindings.
 pub(crate) fn apply_record(
     record: &crate::record::WalRecord,
     world: &mut World,
     codecs: &CodecRegistry,
-    remap: Option<&HashMap<ComponentId, ComponentId>>,
+    remap: Option<&ApplyRemap>,
     proof: Option<&CrcProof>,
 ) -> Result<(), WalError> {
-    // INV-1 (commit = tick): the record replays at its commit-boundary tick.
-    // A record tick below the world's current tick is a foreign or corrupt
-    // log. Every apply path routes through here, so all of them carry the
-    // tick semantics.
-    if record.tick_after < world.current_tick() {
-        return Err(WalError::TickRegression {
-            seq: record.seq,
-            record_tick: record.tick_after,
-            world_tick: world.current_tick(),
-        });
-    }
-    world.set_current_tick(record.tick_after);
-
-    // When no remap is provided, use identity mapping (same-process replay).
-    // When a schema-derived remap exists, unmapped IDs are an error — the
-    // sender wrote a mutation for a component not in its own preamble.
-    let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
-        match remap {
-            None => Ok(id),
-            Some(r) => r
-                .get(&id)
-                .copied()
-                .ok_or(WalError::Codec(CodecError::UnregisteredComponent(id))),
+    // INV-1: preflight and every application path share the same tick guard.
+    validate_record_tick(record, world.current_tick())?;
+    // Legacy schema-less batches use codec IDs as source IDs. They still
+    // resolve the destination by type instead of assuming numeric identity.
+    let fallback;
+    let remap = match remap {
+        Some(remap) => remap,
+        None => {
+            fallback = build_apply_remap(None, world, codecs)?;
+            &fallback
         }
     };
+    let remap_id = |id| resolve_apply_component(remap, codecs, id);
 
     let mut changeset = EnumChangeSet::new();
     for mutation in &record.mutations {
         match mutation {
             SerializedMutation::Spawn { entity, components } => {
                 let entity = Entity::from_bits(*entity);
-                // Ensure the entity's allocator slot exists so that
-                // subsequent mutations (Insert, etc.) can pass is_alive
-                // checks. The changeset Spawn path only checks
-                // !is_placed, but Insert checks is_alive which requires
-                // the generation entry.
-                world.alloc_entity();
-
                 let mut raw_components: Vec<(minkowski::ComponentId, Vec<u8>, std::alloc::Layout)> =
                     Vec::new();
                 for (comp_id, data) in components {
-                    let local_id = remap_id(*comp_id)?;
-                    let raw = codecs.decode(local_id, data, proof)?;
+                    let (codec_id, world_id) = remap_id(*comp_id)?;
+                    let raw = codecs.decode(codec_id, data, proof)?;
                     let layout = codecs
-                        .layout(local_id)
-                        .ok_or(CodecError::UnregisteredComponent(local_id))?;
-                    raw_components.push((local_id, raw, layout));
+                        .layout(codec_id)
+                        .ok_or(CodecError::UnregisteredComponent(codec_id))?;
+                    raw_components.push((world_id, raw, layout));
                 }
                 let ptrs: Vec<_> = raw_components
                     .iter()
@@ -339,32 +403,32 @@ pub(crate) fn apply_record(
                 component_id,
                 data,
             } => {
-                let local_id = remap_id(*component_id)?;
-                let raw = codecs.decode(local_id, data, proof)?;
+                let (codec_id, world_id) = remap_id(*component_id)?;
+                let raw = codecs.decode(codec_id, data, proof)?;
                 let layout = codecs
-                    .layout(local_id)
-                    .ok_or(CodecError::UnregisteredComponent(local_id))?;
-                changeset.record_insert(Entity::from_bits(*entity), local_id, raw.as_ptr(), layout);
+                    .layout(codec_id)
+                    .ok_or(CodecError::UnregisteredComponent(codec_id))?;
+                changeset.record_insert(Entity::from_bits(*entity), world_id, raw.as_ptr(), layout);
             }
             SerializedMutation::Remove {
                 entity,
                 component_id,
             } => {
-                changeset.record_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
+                changeset.record_remove(Entity::from_bits(*entity), remap_id(*component_id)?.1);
             }
             SerializedMutation::SparseInsert {
                 entity,
                 component_id,
                 data,
             } => {
-                let local_id = remap_id(*component_id)?;
-                let raw = codecs.decode(local_id, data, proof)?;
+                let (codec_id, world_id) = remap_id(*component_id)?;
+                let raw = codecs.decode(codec_id, data, proof)?;
                 let layout = codecs
-                    .layout(local_id)
-                    .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                    .layout(codec_id)
+                    .ok_or(CodecError::UnregisteredComponent(codec_id))?;
                 changeset.record_sparse_insert(
                     Entity::from_bits(*entity),
-                    local_id,
+                    world_id,
                     raw.as_ptr(),
                     layout,
                 );
@@ -374,20 +438,137 @@ pub(crate) fn apply_record(
                 component_id,
             } => {
                 changeset
-                    .record_sparse_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
+                    .record_sparse_remove(Entity::from_bits(*entity), remap_id(*component_id)?.1);
             }
         }
     }
-    changeset.apply(world).map_err(WalError::Apply)?;
+    world.set_current_tick(record.tick_after);
+    changeset.apply_replay(world).map_err(WalError::Apply)?;
     Ok(())
 }
 
-/// A collected WAL record with its CRC proof and optional ID remap.
-type CollectedRecord = (
-    crate::record::WalRecord,
-    CrcProof,
-    Option<Arc<HashMap<ComponentId, ComponentId>>>,
-);
+fn resolve_apply_component(
+    remap: &ApplyRemap,
+    codecs: &CodecRegistry,
+    id: ComponentId,
+) -> Result<(ComponentId, ComponentId), WalError> {
+    let binding = remap
+        .get(&id)
+        .ok_or(CodecError::UnregisteredComponent(id))?;
+    let world_id = binding.world_id.ok_or_else(|| {
+        WalError::Format(format!(
+            "component '{}' is not registered in the destination world",
+            codecs.stable_name(binding.codec_id).unwrap_or("unknown"),
+        ))
+    })?;
+    Ok((binding.codec_id, world_id))
+}
+
+fn validate_record_components(
+    record: &crate::record::WalRecord,
+    remap: &ApplyRemap,
+    codecs: &CodecRegistry,
+) -> Result<(), WalError> {
+    for mutation in &record.mutations {
+        match mutation {
+            SerializedMutation::Spawn { components, .. } => {
+                for (id, _) in components {
+                    resolve_apply_component(remap, codecs, *id)?;
+                }
+            }
+            SerializedMutation::Insert { component_id, .. }
+            | SerializedMutation::Remove { component_id, .. }
+            | SerializedMutation::SparseInsert { component_id, .. }
+            | SerializedMutation::SparseRemove { component_id, .. } => {
+                resolve_apply_component(remap, codecs, *component_id)?;
+            }
+            SerializedMutation::Despawn { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// Private local-recovery plan. The exclusive borrow prevents mappings from
+/// escaping to another world or surviving a change to its component registry.
+/// This does not establish a finalized range for follower ingestion.
+struct ValidatedRange<'a> {
+    world: &'a mut World,
+    codecs: &'a CodecRegistry,
+    records: Vec<(RawFrame, Arc<ApplyRemap>)>,
+    last_seq: u64,
+}
+
+impl<'a> ValidatedRange<'a> {
+    fn read(
+        dir: &Path,
+        from_seq: u64,
+        world: &'a mut World,
+        codecs: &'a CodecRegistry,
+    ) -> Result<Self, WalError> {
+        let mut records = Vec::new();
+        let mut last_seq = from_seq.saturating_sub(1);
+        let mut max_view_seen = 0;
+        let mut expected_tick = world.current_tick();
+        for (_, path) in list_segments(dir)? {
+            let file = File::open(&path)?;
+            validate_segment_magic(&file, &path)?;
+            let mut pos = SEGMENT_MAGIC_SIZE;
+            let mut remap = None;
+            while let Some(frame) = RawFrame::read(&file, pos)? {
+                let (entry, _proof, view) = frame.decode()?;
+                pos = frame.next_offset();
+                let is_stale = view < max_view_seen;
+                max_view_seen = max_view_seen.max(view);
+                match entry {
+                    // A stale schema still binds current mutations in its run.
+                    WalEntry::Schema(schema) => {
+                        remap = Some(Arc::new(build_apply_remap(
+                            Some(&schema.components),
+                            world,
+                            codecs,
+                        )?));
+                    }
+                    WalEntry::Mutations(record) if !is_stale && record.seq >= from_seq => {
+                        expected_tick = validate_record_tick(&record, expected_tick)?;
+                        // Preserve legacy schema-less local recovery. Raw
+                        // follower ranges will require an explicit run schema.
+                        let binding = match &remap {
+                            Some(binding) => Arc::clone(binding),
+                            None => {
+                                let binding = Arc::new(build_apply_remap(None, world, codecs)?);
+                                remap = Some(Arc::clone(&binding));
+                                binding
+                            }
+                        };
+                        validate_record_components(&record, &binding, codecs)?;
+                        last_seq = record.seq;
+                        records.push((frame, binding));
+                    }
+                    WalEntry::Mutations(_) | WalEntry::Checkpoint { .. } => {}
+                }
+            }
+        }
+        Ok(Self {
+            world,
+            codecs,
+            records,
+            last_seq,
+        })
+    }
+
+    fn execute(self) -> Result<u64, WalError> {
+        for (frame, remap) in self.records {
+            // ponytail: decode the owned archive again; cache record descriptors
+            // only if replay profiling shows this second decode matters.
+            let (entry, proof, _) = frame.decode()?;
+            let WalEntry::Mutations(record) = entry else {
+                unreachable!("the private plan stores only mutation frames");
+            };
+            apply_record(&record, self.world, self.codecs, Some(&remap), Some(&proof))?;
+        }
+        Ok(self.last_seq)
+    }
+}
 
 /// Read-only snapshot of WAL statistics. Plain data struct — no references
 /// to internal state.
@@ -750,10 +931,10 @@ impl Wal {
     /// Iterates across all segments. Schema preambles are used for component
     /// ID remapping from the sender's ID space to the receiver's.
     ///
-    /// Uses batched replay: all matching records are collected first, their
-    /// mutations decoded and applied as a single `EnumChangeSet`. Mutation
-    /// order within and across records is preserved so that sequences like
-    /// insert-then-despawn replay correctly.
+    /// Preflights the selected raw frames and all component references before
+    /// changing the world. A private plan then applies one record at a time,
+    /// preserving each record's tick and mutation order. Component payload
+    /// decoding and state-dependent application can still fail during execution.
     ///
     /// # Error Recovery
     ///
@@ -770,77 +951,7 @@ impl Wal {
         world: &mut World,
         codecs: &CodecRegistry,
     ) -> Result<u64, WalError> {
-        let segments = list_segments(&self.dir)?;
-        let mut last_seq = if from_seq > 0 { from_seq - 1 } else { 0 };
-
-        // Phase 1: Read all matching records with their proofs and remaps.
-        let mut pending: Vec<CollectedRecord> = Vec::new();
-        // INV-2 (view fencing): frames stamped with a view older than the
-        // newest view already seen in the log are from a superseded view and
-        // are dropped. A deposed leader's late writes never replay.
-        let mut max_view_seen: u64 = 0;
-        // INV-1 (commit = tick): record ticks must be non-decreasing in log
-        // order. A regression means a foreign or corrupt log.
-        let mut prev_tick: Option<u64> = None;
-
-        for (_, seg_path) in &segments {
-            let seg_file = File::open(seg_path)?;
-            validate_segment_magic(&seg_file, seg_path)?;
-            let mut pos: u64 = SEGMENT_MAGIC_SIZE;
-            // Each segment has its own schema preamble; remap is scoped per segment.
-            let mut remap: Option<Arc<HashMap<ComponentId, ComponentId>>> = None;
-
-            while let Some((entry, next_pos, proof, view)) = read_next_frame(&seg_file, pos)? {
-                let is_stale = view < max_view_seen;
-                max_view_seen = max_view_seen.max(view);
-                match entry {
-                    // Schema preambles are processed even when their frame
-                    // view is stale: a rewritten segment header can carry an
-                    // older view while its data frames are current, and the
-                    // records after it need their remap built.
-                    WalEntry::Schema(schema) => {
-                        remap = Some(Arc::new(codecs.build_remap(&schema.components)?));
-                    }
-                    WalEntry::Mutations(record) => {
-                        if is_stale {
-                            // Stale-view frame: written by a deposed leader.
-                            pos = next_pos;
-                            continue;
-                        }
-                        if record.seq >= from_seq {
-                            if let Some(prev) = prev_tick
-                                && record.tick_after < prev
-                            {
-                                return Err(WalError::TickRegression {
-                                    seq: record.seq,
-                                    record_tick: record.tick_after,
-                                    world_tick: prev,
-                                });
-                            }
-                            prev_tick = Some(record.tick_after);
-                            last_seq = record.seq;
-                            pending.push((record, proof, remap.clone()));
-                        }
-                    }
-                    WalEntry::Checkpoint { .. } => {}
-                }
-                pos = next_pos;
-            }
-        }
-
-        if pending.is_empty() {
-            return Ok(last_seq);
-        }
-
-        // Phase 2: Apply per record in WAL order (INV-1: commit = tick).
-        // Each record replays at its own commit-boundary tick so the world's
-        // tick history matches the leader's exactly. Decode is still batched
-        // per record inside `apply_record`.
-        for (record, proof, remap) in &pending {
-            apply_record(record, world, codecs, remap.as_deref(), Some(proof))?;
-        }
-
-        Ok(last_seq)
+        ValidatedRange::read(&self.dir, from_seq, world, codecs)?.execute()
     }
 
     /// Delete all segment files whose entire seq range is before `seq`.
@@ -1261,6 +1372,204 @@ mod tests {
         WalConfig {
             max_segment_bytes: 128,
             max_bytes_between_checkpoints: None,
+        }
+    }
+
+    #[test]
+    fn replay_preflight_validates_post_apply_ticks() {
+        for (tick, next_tick) in [(5, 5), (5, 6), (u64::MAX - 1, u64::MAX)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut world = World::builder().memory_budget(1024 * 1024).build().unwrap();
+            let mut codecs = CodecRegistry::new();
+            codecs.register_as::<Pos>("pos", &mut world).unwrap();
+            let entity = world.spawn((Pos { x: 1.0, y: 2.0 },));
+            world.set_current_tick(tick);
+            let mut wal = Wal::create(dir.path(), &codecs, default_config()).unwrap();
+            let file = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(segment_filename(0)))
+                .unwrap();
+            let mut writer = BufWriter::new(&file);
+            for (seq, tick_after) in [(0, tick), (1, next_tick)] {
+                let entry = WalEntry::Mutations(crate::record::WalRecord {
+                    seq,
+                    tick_after,
+                    mutations: vec![SerializedMutation::Insert {
+                        entity: entity.to_bits(),
+                        component_id: 0,
+                        data: rkyv::to_bytes::<rkyv::rancor::Error>(&Pos { x: 9.0, y: 10.0 })
+                            .unwrap()
+                            .to_vec(),
+                    }],
+                });
+                let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).unwrap();
+                write_frame(&mut writer, &bytes, 0).unwrap();
+            }
+            writer.flush().unwrap();
+
+            let result = wal.replay_from(0, &mut world, &codecs);
+            if next_tick == 6 {
+                assert_eq!(result.unwrap(), 1);
+                assert_eq!(world.current_tick(), 7);
+                assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 9.0, y: 10.0 }));
+            } else {
+                if next_tick == tick {
+                    assert!(matches!(
+                        result,
+                        Err(WalError::TickRegression {
+                            seq: 1,
+                            record_tick: 5,
+                            world_tick: 6,
+                        })
+                    ));
+                } else {
+                    assert!(matches!(result, Err(WalError::Format(ref message))
+                        if message.contains("tick overflow")));
+                }
+                assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
+                assert_eq!(world.current_tick(), tick);
+            }
+        }
+    }
+
+    #[test]
+    fn replay_preflight_rejects_late_component_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut world = World::builder().memory_budget(1024 * 1024).build().unwrap();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world).unwrap();
+        let entity = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let tick = world.current_tick();
+        let mut wal = Wal::create(dir.path(), &codecs, default_config()).unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(segment_filename(0)))
+            .unwrap();
+        let mut writer = BufWriter::new(&file);
+        for (seq, component_id) in [(0, 0), (1, 99)] {
+            let entry = WalEntry::Mutations(crate::record::WalRecord {
+                seq,
+                tick_after: tick + seq,
+                mutations: vec![SerializedMutation::Insert {
+                    entity: entity.to_bits(),
+                    component_id,
+                    data: rkyv::to_bytes::<rkyv::rancor::Error>(&Pos { x: 9.0, y: 10.0 })
+                        .unwrap()
+                        .to_vec(),
+                }],
+            });
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).unwrap();
+            write_frame(&mut writer, &bytes, 0).unwrap();
+        }
+        writer.flush().unwrap();
+
+        assert!(matches!(
+            wal.replay_from(0, &mut world, &codecs),
+            Err(WalError::Codec(CodecError::UnregisteredComponent(99)))
+        ));
+        assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
+        assert_eq!(world.current_tick(), tick);
+    }
+
+    #[test]
+    fn replay_plan_preserves_schema_and_fence_across_resume() {
+        for corrupt_tail in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut codec_world = World::builder().memory_budget(1024 * 1024).build().unwrap();
+            let mut codecs = CodecRegistry::new();
+            codecs.register_as::<Pos>("pos", &mut codec_world).unwrap();
+            let mut world = World::builder().memory_budget(1024 * 1024).build().unwrap();
+            world.register_component::<Health>();
+            let entity = world.spawn((Pos { x: 1.0, y: 2.0 },));
+            let tick = world.current_tick();
+            assert_ne!(
+                world.component_id::<Pos>(),
+                codec_world.component_id::<Pos>()
+            );
+            let mut wal = Wal::create(dir.path(), &codecs, default_config()).unwrap();
+
+            let mutation = |seq, component_id, x| {
+                WalEntry::Mutations(crate::record::WalRecord {
+                    seq,
+                    tick_after: if seq < 4 { tick } else { tick + 1 },
+                    mutations: vec![SerializedMutation::Insert {
+                        entity: entity.to_bits(),
+                        component_id,
+                        data: rkyv::to_bytes::<rkyv::rancor::Error>(&Pos { x, y: 0.0 })
+                            .unwrap()
+                            .to_vec(),
+                    }],
+                })
+            };
+            let runs = [
+                (
+                    0,
+                    vec![
+                        (mutation(0, 0, 99.0), 0), // Before the replay floor.
+                        (WalEntry::Checkpoint { flush_seq: 1 }, 7),
+                        (mutation(1, 99, 99.0), 6), // Stale: no component resolution or effects.
+                    ],
+                ),
+                (
+                    2,
+                    vec![
+                        (
+                            WalEntry::Schema(WalSchema {
+                                components: vec![ComponentSchema {
+                                    id: 77,
+                                    name: "pos".into(),
+                                    size: 8,
+                                    align: 4,
+                                }],
+                            }),
+                            0,
+                        ), // Stale schema must still establish the new mapping.
+                        (mutation(2, 77, 3.0), 7),
+                        (WalEntry::Checkpoint { flush_seq: 3 }, 8),
+                        (mutation(3, 99, 99.0), 7),
+                        (mutation(4, 77, 5.0), 8),
+                    ],
+                ),
+            ];
+            for (start, entries) in runs {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.path().join(segment_filename(start)))
+                    .unwrap();
+                let mut writer = BufWriter::new(&file);
+                if start != 0 {
+                    write_segment_magic(&mut writer).unwrap();
+                }
+                for (entry, view) in entries {
+                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).unwrap();
+                    write_frame(&mut writer, &bytes, view).unwrap();
+                }
+                if start == 2 && corrupt_tail {
+                    let bytes =
+                        rkyv::to_bytes::<rkyv::rancor::Error>(&mutation(5, 77, 7.0)).unwrap();
+                    writer
+                        .write_all(&(bytes.len() as u32).to_le_bytes())
+                        .unwrap();
+                    writer
+                        .write_all(&(crc32fast::hash(&bytes) ^ 1).to_le_bytes())
+                        .unwrap();
+                    writer.write_all(&8u64.to_le_bytes()).unwrap();
+                    writer.write_all(&bytes).unwrap();
+                }
+                writer.flush().unwrap();
+            }
+
+            let result = wal.replay_from(1, &mut world, &codecs);
+            if corrupt_tail {
+                assert!(matches!(result, Err(WalError::ChecksumMismatch { .. })));
+                assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
+                assert_eq!(world.current_tick(), tick);
+            } else {
+                assert_eq!(result.unwrap(), 4);
+                assert_eq!(world.get::<Pos>(entity), Some(&Pos { x: 5.0, y: 0.0 }));
+                assert_eq!(world.current_tick(), tick + 2);
+            }
         }
     }
 
@@ -2551,6 +2860,32 @@ mod tests {
 
         let after_len = std::fs::metadata(&seg_path).unwrap().len();
         assert_eq!(after_len, file_len);
+    }
+
+    #[test]
+    fn frame_round_trip_preserves_payload_and_view() {
+        let file = tempfile::tempfile().unwrap();
+        let mut writer = BufWriter::new(&file);
+        let start = write_segment_magic(&mut writer).unwrap();
+        let entry = WalEntry::Mutations(crate::record::WalRecord {
+            seq: 42,
+            tick_after: 7,
+            mutations: vec![SerializedMutation::Despawn { entity: 99 }],
+        });
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).unwrap();
+        let size = write_frame(&mut writer, &payload, 3).unwrap();
+        writer.flush().unwrap();
+
+        let (restored, next, _proof, view) = read_next_frame(&file, start).unwrap().unwrap();
+        assert_eq!(view, 3);
+        assert_eq!(next, start + size);
+        assert_eq!(
+            rkyv::to_bytes::<rkyv::rancor::Error>(&restored)
+                .unwrap()
+                .as_slice(),
+            payload.as_slice()
+        );
+        assert!(read_next_frame(&file, next).unwrap().is_none());
     }
 
     #[test]

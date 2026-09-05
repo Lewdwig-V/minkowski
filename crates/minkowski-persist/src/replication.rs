@@ -11,17 +11,16 @@
 
 #[cfg(loom)]
 use crate::sync::{Arc, AtomicBool, AtomicU64};
-use std::collections::HashMap;
 #[cfg(not(loom))]
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use minkowski::{ComponentId, World};
+use minkowski::World;
 
 use crate::record::ReplicationBatch;
-use crate::wal::{WalError, apply_record};
+use crate::wal::{WalError, apply_record, build_apply_remap};
 use minkowski_lsm::codec::{CodecError, CodecRegistry};
 
 /// Errors from transport-agnostic replication operations.
@@ -56,7 +55,10 @@ impl ReplicationBatch {
 
     /// Deserialize from bytes via rkyv.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ReplicationError> {
-        rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
+        // Transport buffers do not guarantee the archive's alignment.
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        aligned.extend_from_slice(bytes);
+        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&aligned)
             .map_err(|e| ReplicationError::Format(e.to_string()))
     }
 }
@@ -74,10 +76,14 @@ pub fn apply_batch(
     world: &mut World,
     codecs: &CodecRegistry,
 ) -> Result<Option<u64>, ReplicationError> {
-    let remap: Option<HashMap<ComponentId, ComponentId>> = if batch.schema.components.is_empty() {
+    let remap = if batch.schema.components.is_empty() {
         None
     } else {
-        Some(codecs.build_remap(&batch.schema.components)?)
+        Some(build_apply_remap(
+            Some(&batch.schema.components),
+            world,
+            codecs,
+        )?)
     };
 
     let mut last_seq = None;
@@ -189,7 +195,7 @@ impl Follower {
         let remap = if batch.schema.components.is_empty() {
             None
         } else {
-            match codecs.build_remap(&batch.schema.components) {
+            match build_apply_remap(Some(&batch.schema.components), world, codecs) {
                 Ok(r) => Some(Arc::new(r)),
                 Err(e) => {
                     self.poison();
@@ -347,6 +353,25 @@ mod tests {
         assert_eq!(restored.records[1].seq, 1);
         assert_eq!(restored.schema.components.len(), 1);
         assert_eq!(restored.schema.components[0].name, "pos");
+    }
+
+    #[test]
+    fn batch_round_trip_from_unaligned_bytes() {
+        let batch = ReplicationBatch {
+            schema: test_schema(),
+            records: vec![WalRecord {
+                tick_after: 7,
+                seq: 3,
+                mutations: vec![SerializedMutation::Despawn { entity: 42 }],
+            }],
+        };
+        let bytes = batch.to_bytes().unwrap();
+        // A transport envelope can place its payload at an arbitrary offset.
+        let mut envelope = rkyv::util::AlignedVec::<16>::new();
+        envelope.push(0);
+        envelope.extend_from_slice(&bytes);
+        let restored = ReplicationBatch::from_bytes(&envelope[1..]).unwrap();
+        assert_eq!(restored.to_bytes().unwrap(), bytes);
     }
 
     #[test]
@@ -980,6 +1005,368 @@ mod tests {
             cs.apply(&mut world).unwrap();
         }
         (wal_dir, world, codecs)
+    }
+
+    // These fixtures need only a few rows, including under Miri.
+    fn replay_test_world() -> World {
+        World::builder().memory_budget(1024 * 1024).build().unwrap()
+    }
+
+    #[test]
+    fn follower_round_trip_divergent_component_ids() {
+        #[derive(
+            Clone, Copy, Debug, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+        )]
+        struct Left(u64);
+        #[derive(
+            Clone, Copy, Debug, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+        )]
+        struct Right(u64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut leader = replay_test_world();
+        leader.register_component::<bool>();
+        let mut source_codecs = CodecRegistry::new();
+        source_codecs.register::<Left>(&mut leader).unwrap();
+        source_codecs.register::<Right>(&mut leader).unwrap();
+        let entity = leader.spawn((Left(1), Right(2)));
+
+        // The codec registry and destination each have their own ID space.
+        // Equal-sized POD types make a wrong mapping observable without
+        // interpreting a heap value as another type in the failing test.
+        let mut codec_world = replay_test_world();
+        let mut target_codecs = CodecRegistry::new();
+        target_codecs.register::<Right>(&mut codec_world).unwrap();
+        target_codecs.register::<Left>(&mut codec_world).unwrap();
+        let mut replica = replay_test_world();
+        assert_eq!(replica.spawn((Left(1), Right(2))), entity);
+        assert_ne!(
+            leader.component_id::<Left>(),
+            replica.component_id::<Left>()
+        );
+        assert_ne!(
+            codec_world.component_id::<Left>(),
+            replica.component_id::<Left>()
+        );
+
+        let mut wal = Wal::create(dir.path(), &source_codecs, WalConfig::default()).unwrap();
+        let mut changes = EnumChangeSet::new();
+        changes.insert(&mut leader, entity, Left(10));
+        changes.insert(&mut leader, entity, Right(20));
+        wal.append(&changes, &source_codecs, leader.current_tick())
+            .unwrap();
+        changes.apply(&mut leader).unwrap();
+
+        let mut cursor = WalCursor::open(dir.path(), 0).unwrap();
+        let batch = cursor.next_batch(1).unwrap();
+        let decoded = ReplicationBatch::from_bytes(&batch.to_bytes().unwrap()).unwrap();
+        let follower = Follower::new();
+        assert_eq!(
+            follower
+                .advance(&decoded, &mut replica, &target_codecs)
+                .unwrap(),
+            1
+        );
+        assert_eq!(replica.get::<Left>(entity), Some(&Left(10)));
+        assert_eq!(replica.get::<Right>(entity), Some(&Right(20)));
+        assert_eq!(replica.current_tick(), leader.current_tick());
+
+        let mut recovered = replay_test_world();
+        assert_eq!(recovered.spawn((Left(1), Right(2))), entity);
+        wal.replay_from(0, &mut recovered, &target_codecs).unwrap();
+        assert_eq!(recovered.get::<Left>(entity), Some(&Left(10)));
+        assert_eq!(recovered.get::<Right>(entity), Some(&Right(20)));
+        assert_eq!(recovered.current_tick(), leader.current_tick());
+    }
+
+    #[test]
+    fn follower_round_trip_divergent_live_world() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut leader = replay_test_world();
+        let mut source_codecs = CodecRegistry::new();
+        source_codecs
+            .register_as::<Pos>("pos", &mut leader)
+            .unwrap();
+        source_codecs
+            .register_as::<Health>("health", &mut leader)
+            .unwrap();
+        source_codecs
+            .register_as::<Name>("name", &mut leader)
+            .unwrap();
+        let baseline = leader.spawn((Pos { x: 1.0, y: 2.0 }, Name("baseline".into())));
+        let a = leader.spawn((Health(1),));
+        let b = leader.spawn((Health(2),));
+        assert!(leader.despawn(b));
+        assert!(leader.despawn(a));
+
+        let mut codec_world = replay_test_world();
+        let mut target_codecs = CodecRegistry::new();
+        target_codecs
+            .register_as::<Name>("name", &mut codec_world)
+            .unwrap();
+        target_codecs
+            .register_as::<Pos>("pos", &mut codec_world)
+            .unwrap();
+        target_codecs
+            .register_as::<Health>("health", &mut codec_world)
+            .unwrap();
+        let mut replica = replay_test_world();
+        replica.register_component::<Health>();
+        replica.register_component::<Name>();
+        replica.register_component::<Pos>();
+        assert_eq!(
+            replica.spawn((Pos { x: 1.0, y: 2.0 }, Name("baseline".into()))),
+            baseline
+        );
+        assert_eq!(replica.spawn((Health(1),)), a);
+        assert_eq!(replica.spawn((Health(2),)), b);
+        // Same live state and generations, different free-list order.
+        assert!(replica.despawn(a));
+        assert!(replica.despawn(b));
+        assert_ne!(
+            leader.entity_allocator_state().1,
+            replica.entity_allocator_state().1
+        );
+        assert_eq!(leader.current_tick(), replica.current_tick());
+        assert_eq!(
+            crate::world_fingerprint(&leader, &source_codecs).unwrap(),
+            crate::world_fingerprint(&replica, &target_codecs).unwrap(),
+        );
+
+        let mut wal = Wal::create(dir.path(), &source_codecs, WalConfig::default()).unwrap();
+        let entity = leader.alloc_entity();
+        assert_eq!(entity.index(), a.index());
+        let mut changes = EnumChangeSet::new();
+        changes
+            .spawn_bundle(
+                &mut leader,
+                entity,
+                (Pos { x: 3.0, y: 4.0 }, Name("spawned".into())),
+            )
+            .unwrap();
+        changes.insert(&mut leader, entity, Health(42));
+        changes.insert(&mut leader, baseline, Name("updated".into()));
+        wal.append(&changes, &source_codecs, leader.current_tick())
+            .unwrap();
+        changes.apply(&mut leader).unwrap();
+
+        let mut cursor = WalCursor::open(dir.path(), 0).unwrap();
+        let batch = cursor.next_batch(1).unwrap();
+        let batch = ReplicationBatch::from_bytes(&batch.to_bytes().unwrap()).unwrap();
+        let follower = Follower::new();
+        assert_eq!(
+            follower
+                .advance(&batch, &mut replica, &target_codecs)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            follower
+                .advance(&batch, &mut replica, &target_codecs)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::world_fingerprint(&leader, &source_codecs).unwrap(),
+            crate::world_fingerprint(&replica, &target_codecs).unwrap(),
+        );
+        assert_eq!(replica.current_tick(), leader.current_tick());
+        assert_eq!(replica.get::<Health>(entity), Some(&Health(42)));
+        assert_eq!(replica.get::<Name>(entity).unwrap().0, "spawned");
+        // The adopted slot must no longer be free, and adopting it must not
+        // consume the unrelated slot at the end of the local free list.
+        assert_eq!(replica.alloc_entity(), leader.alloc_entity());
+        assert_ne!(replica.alloc_entity(), entity);
+        assert!(!follower.is_poisoned());
+    }
+
+    #[test]
+    fn follower_replay_reuses_logged_entity_slot_in_mutation_order() {
+        let mut replica = replay_test_world();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut replica).unwrap();
+        let old = replica.spawn((Pos { x: 1.0, y: 2.0 },));
+        let replacement = minkowski::Entity::from_bits(old.to_bits() + (1u64 << 32));
+        let encode = |value| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(&value)
+                .unwrap()
+                .to_vec()
+        };
+        let batch = ReplicationBatch {
+            schema: test_schema(),
+            records: vec![WalRecord {
+                seq: 0,
+                tick_after: replica.current_tick(),
+                mutations: vec![
+                    SerializedMutation::Despawn {
+                        entity: old.to_bits(),
+                    },
+                    SerializedMutation::Spawn {
+                        entity: replacement.to_bits(),
+                        components: vec![(0, encode(Pos { x: 3.0, y: 4.0 }))],
+                    },
+                    SerializedMutation::Insert {
+                        entity: replacement.to_bits(),
+                        component_id: 0,
+                        data: encode(Pos { x: 5.0, y: 6.0 }),
+                    },
+                ],
+            }],
+        };
+        let follower = Follower::new();
+        assert_eq!(follower.advance(&batch, &mut replica, &codecs).unwrap(), 1);
+        assert!(!replica.is_alive(old));
+        assert!(replica.is_alive(replacement));
+        assert_eq!(
+            replica.get::<Pos>(replacement),
+            Some(&Pos { x: 5.0, y: 6.0 })
+        );
+        assert_ne!(replica.alloc_entity().index(), replacement.index());
+    }
+
+    #[test]
+    fn follower_replay_refuses_occupied_or_older_entity_generation() {
+        for occupied in [true, false] {
+            let mut replica = replay_test_world();
+            let mut codecs = CodecRegistry::new();
+            codecs.register_as::<Pos>("pos", &mut replica).unwrap();
+            let entity = replica.spawn((Pos { x: 1.0, y: 2.0 },));
+            let requested = if occupied {
+                // Placement conflicts even when the incoming generation differs.
+                minkowski::Entity::from_bits(entity.to_bits() + (1u64 << 32))
+            } else {
+                assert!(replica.despawn(entity));
+                entity // The local generation is now newer than this handle.
+            };
+            let before = replica.entity_allocator_state();
+            let before = (before.0.to_vec(), before.1.to_vec());
+            let batch = ReplicationBatch {
+                schema: test_schema(),
+                records: vec![WalRecord {
+                    seq: 0,
+                    tick_after: replica.current_tick(),
+                    mutations: vec![SerializedMutation::Spawn {
+                        entity: requested.to_bits(),
+                        components: vec![(
+                            0,
+                            rkyv::to_bytes::<rkyv::rancor::Error>(&Pos { x: 9.0, y: 10.0 })
+                                .unwrap()
+                                .to_vec(),
+                        )],
+                    }],
+                }],
+            };
+            let follower = Follower::new();
+            let err = follower.advance(&batch, &mut replica, &codecs).unwrap_err();
+            if occupied {
+                assert!(matches!(err, FollowerError::Apply(WalError::Apply(
+                    minkowski::ApplyError::AlreadyPlaced(e)
+                )) if e == requested));
+                assert_eq!(replica.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
+            } else {
+                assert!(matches!(err, FollowerError::Apply(WalError::Apply(
+                    minkowski::ApplyError::DeadEntity(e)
+                )) if e == requested));
+                assert!(!replica.is_alive(entity));
+            }
+            assert_eq!(
+                replica.entity_allocator_state(),
+                (before.0.as_slice(), before.1.as_slice())
+            );
+            assert_eq!(follower.applied_seq(), 0);
+            assert!(follower.is_poisoned());
+            assert!(matches!(
+                follower.read_at(0, &replica, |_| ()),
+                Err(FollowerError::Poisoned)
+            ));
+        }
+    }
+
+    #[test]
+    fn follower_replay_claims_logged_slots_beyond_allocator_tail() {
+        let mut replica = replay_test_world();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut replica).unwrap();
+        let entities = [
+            minkowski::Entity::from_bits((7u64 << 32) | 5),
+            minkowski::Entity::from_bits((2u64 << 32) | 3),
+        ];
+        let batch = ReplicationBatch {
+            schema: test_schema(),
+            records: vec![WalRecord {
+                seq: 0,
+                tick_after: replica.current_tick(),
+                mutations: entities
+                    .iter()
+                    .map(|entity| SerializedMutation::Spawn {
+                        entity: entity.to_bits(),
+                        components: vec![(
+                            0,
+                            rkyv::to_bytes::<rkyv::rancor::Error>(&Pos { x: 1.0, y: 2.0 })
+                                .unwrap()
+                                .to_vec(),
+                        )],
+                    })
+                    .collect(),
+            }],
+        };
+        let follower = Follower::new();
+        assert_eq!(follower.advance(&batch, &mut replica, &codecs).unwrap(), 1);
+        for entity in entities {
+            assert!(replica.is_alive(entity));
+            assert_eq!(replica.get::<Pos>(entity), Some(&Pos { x: 1.0, y: 2.0 }));
+        }
+        let mut allocated = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let entity = replica.alloc_entity();
+            assert!(
+                !entities
+                    .iter()
+                    .any(|adopted| adopted.index() == entity.index())
+            );
+            assert!(allocated.insert(entity.index()));
+        }
+    }
+
+    #[test]
+    fn follower_remap_refuses_missing_world_type_before_mutation() {
+        let mut codec_world = replay_test_world();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut codec_world).unwrap();
+        let mut replica = replay_test_world();
+        replica.spawn((Health(10),));
+        let before = replica.entity_allocator_state();
+        let before = (before.0.to_vec(), before.1.to_vec());
+        let tick = replica.current_tick();
+        let batch = ReplicationBatch {
+            schema: test_schema(),
+            records: vec![WalRecord {
+                seq: 0,
+                tick_after: tick + 10,
+                mutations: vec![SerializedMutation::Spawn {
+                    entity: 1,
+                    components: vec![(
+                        0,
+                        rkyv::to_bytes::<rkyv::rancor::Error>(&Pos { x: 1.0, y: 2.0 })
+                            .unwrap()
+                            .to_vec(),
+                    )],
+                }],
+            }],
+        };
+        let follower = Follower::new();
+        assert!(matches!(
+            follower.advance(&batch, &mut replica, &codecs),
+            Err(FollowerError::Apply(WalError::Format(_)))
+        ));
+        assert_eq!(replica.current_tick(), tick);
+        assert_eq!(replica.entity_count(), 1);
+        assert_eq!(
+            replica.entity_allocator_state(),
+            (before.0.as_slice(), before.1.as_slice())
+        );
+        assert_eq!(follower.applied_seq(), 0);
+        assert!(follower.is_poisoned());
     }
 
     #[test]
