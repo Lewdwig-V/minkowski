@@ -1,6 +1,6 @@
 # RSM Substrate Design (Stage 4.0)
 
-Date: 2026-08-30. Updated: 2026-09-05. Status: 4.0-a delivered (PR #251, #252).
+Date: 2026-08-30. Updated: 2026-09-06. Status: 4.0-a delivered (PR #251, #252).
 
 Phase 4.0-b delivers application prerequisites, private recovery/raw-range plans and the raw divergent-world gate (section 7.7), plus the local durable raw-range reader (section 7.2). Journal-backed raw follower ingestion and restart from an empty baseline are also delivered (section 7.4). A caller-driven pull pump, loopback/recording adapters, and deterministic transport-fault tests are delivered (section 7.4). Process-local session registration, conservative retention planning, and a replication prefix deletion guard are delivered (section 7.1). Nonempty state-transfer baselines, terminal dispositions, journal compaction, network authentication/transport, and durable fence metadata for actual WAL reclamation remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
 
@@ -170,6 +170,13 @@ The effective deletion cutoff remains zero because the raw reader still needs pr
 | Retention policy | Exempt: no token is needed for a read-only plan. | Enforced: lagging/disconnected/unjoined members constrain the candidate; no members use only leader floor/tail. `retention_plan_respects_members_and_recovery_floor` | Enforced: restart resets configured floors; candidate cannot authorize deletion. `session_restart_resets_members_and_rejects_old_capability` |
 | WAL deletion, including checkpoint callbacks | Exempt: the installed prefix pin applies regardless of caller. | Enforced: preserve original fence context and active segment while replication is enabled. `replicated_checkpoint_cannot_delete_required_prefix` | Enforced: source construction installs the pin before exposing transactions. `replicated_checkpoint_cannot_delete_required_prefix` |
 | Source transactions and response delivery | Exempt: commit needs no follower session. | Enforced: delegate durable transactions; release membership/WAL locks before delivery. `session_blocked_delivery_does_not_block_commit_or_rejoin` | Exempt: link failure runs outside the commit path. |
+
+The append-before-apply boundary is `Durable::try_commit`, shared by the direct and replicated wrappers. After inner validation succeeds it drains fast-lane batches and appends the forward changeset before returning it. Callers of the building-block API must then mark the transaction committed, drop it, and apply the returned changeset unchanged before any other world mutation. A WAL failure remains fatal and cannot return a successful commit.
+
+| Commit consumer | Successful validation | Conflict/refusal | Application/checkpoint |
+|---|---|---|---|
+| `Durable` / `Replicated` building-block API | Enforced: publish one WAL record before returning the unapplied changeset. `building_block_commits_reach_recovery_and_followers` | Enforced: inner validation failure returns before append. `durable_failed_attempt_not_logged` | Caller marks/drops/applies; automatic checkpoint is exempt because the wrapper does not observe caller application. |
+| `transact`, `transact_with`, and default `transact_inner` | Enforced: share `try_commit`; no second append in the closure path. `building_block_commits_reach_recovery_and_followers` | Enforced: retries log only their successful attempt. `durable_failed_attempt_not_logged` | Apply once; the `Durable::transact` override retains its post-apply checkpoint callback. `durable_fires_checkpoint_handler` |
 
 ### 7.2 The durable range boundary
 

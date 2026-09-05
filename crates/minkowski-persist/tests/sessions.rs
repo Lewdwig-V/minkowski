@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use minkowski::{Access, Optimistic, Transact, World};
+use minkowski::{Access, Entity, Optimistic, Pessimistic, Transact, World};
 use minkowski_persist::{
     CheckpointHandler, CodecRegistry, Durable, Fetch, JournaledFollower, LoopbackFetch, PumpError,
     Replicated, ReplicationPump, SessionError, TransportError, Wal, WalConfig, WalError,
@@ -57,6 +57,85 @@ fn durable(dir: &Path, records: usize) -> (Durable<Optimistic>, World) {
 
 fn follower(dir: &Path) -> JournaledFollower {
     JournaledFollower::create(dir, HISTORY, codecs(), limits()).unwrap()
+}
+
+#[test]
+fn building_block_commits_reach_recovery_and_followers() {
+    fn exercise<S: Transact, F: Fetch>(
+        source: &S,
+        world: &mut World,
+        pump: &mut ReplicationPump<F>,
+    ) -> Entity {
+        let access = Access::of::<(&mut u32,)>(&mut *world);
+        let mut tx = source.begin(world, &access).unwrap();
+        let entity = tx.spawn(world, (10u32,));
+        let forward = source.try_commit(&mut tx, world).unwrap();
+        assert!(world.get::<u32>(entity).is_none());
+        // Successful try_commit must already be published/durable before the
+        // caller applies it. Exercise the public reader through a real follower.
+        assert_eq!(pump.pump_once().unwrap(), 1);
+        tx.mark_committed();
+        drop(tx);
+        forward.apply(world).unwrap();
+        source
+            .transact(world, &access, |tx, w| tx.write(w, entity, 20u32))
+            .unwrap();
+        assert_eq!(pump.pump_once().unwrap(), 2);
+        source
+            .transact_with(world, &access, |scope| scope.write(entity, 30u32))
+            .unwrap();
+        assert_eq!(pump.pump_once().unwrap(), 3);
+        source
+            .transact_inner(world, &access, |tx, w| tx.write(w, entity, 40u32))
+            .unwrap();
+        assert_eq!(pump.pump_once().unwrap(), 4);
+        assert_eq!(pump.pump_once().unwrap(), 4); // exactly one record per entry point
+        assert_eq!(
+            pump.follower()
+                .read_at(3, |w| *w.get::<u32>(entity).unwrap())
+                .unwrap(),
+            40
+        );
+        assert_eq!(
+            pump.follower().read_at(3, World::current_tick).unwrap(),
+            world.current_tick()
+        );
+        entity
+    }
+
+    fn run<S: Transact>(strategy: impl FnOnce(&World) -> S, replicated: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        let mut world = world();
+        world.register_component::<u32>();
+        let wal = Wal::create(&path, &codecs(), WalConfig::default()).unwrap();
+        let durable = Durable::new(strategy(&world), wal, codecs());
+        let follower = follower(&dir.path().join("follower"));
+        let entity = if replicated {
+            let source = Replicated::new(durable, HISTORY, ["a".to_owned()]).unwrap();
+            let mut pump = source.join("a", follower).unwrap();
+            exercise(&source, &mut world, &mut pump)
+        } else {
+            let mut pump = ReplicationPump::new(follower, LoopbackFetch::new(&durable, HISTORY));
+            exercise(&durable, &mut world, &mut pump)
+        };
+        let mut wal = Wal::open(&path, &codecs(), WalConfig::default()).unwrap();
+        assert_eq!(wal.next_seq(), 4);
+        let recovered = minkowski_persist::recover_world(
+            &dir.path().join("lsm"),
+            &dir.path().join("manifest.log"),
+            &mut wal,
+            &codecs(),
+        )
+        .unwrap();
+        assert_eq!(recovered.get::<u32>(entity), Some(&40));
+        assert_eq!(recovered.current_tick(), world.current_tick());
+    }
+
+    for replicated in [true, false] {
+        run(Optimistic::new, replicated);
+        run(Pessimistic::new, replicated);
+    }
 }
 
 #[test]
