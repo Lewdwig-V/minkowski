@@ -627,6 +627,8 @@ pub struct Wal {
     roll_failures: u64,
     // An uncommitted rollover must be durably removed before later writes.
     pending_roll_cleanup: Option<PathBuf>,
+    // Raw replication needs the retained prefix until durable fence summaries exist.
+    replication_prefix_pinned: bool,
     /// View counter for frame stamping (INV-2).
     pub views: Views,
 }
@@ -656,6 +658,7 @@ impl Wal {
             bytes_since_checkpoint: 0,
             roll_failures: 0,
             pending_roll_cleanup: None,
+            replication_prefix_pinned: false,
             views: Views::new(),
         };
         wal.active_bytes = wal.write_segment_header()?;
@@ -710,6 +713,7 @@ impl Wal {
             bytes_since_checkpoint: 0,
             roll_failures: 0,
             pending_roll_cleanup: None,
+            replication_prefix_pinned: false,
             views: Views::new(),
         };
 
@@ -975,9 +979,14 @@ impl Wal {
     /// Delete all segment files whose entire seq range is before `seq`.
     /// A segment is safe to delete if the next segment's start_seq <= `seq`.
     /// The active (last) segment is never deleted.
+    /// A source wrapped by `Replicated` pins its required replication prefix;
+    /// while pinned this returns zero, including calls from checkpoint handlers.
     /// Returns the number of segments deleted.
     pub fn delete_segments_before(&mut self, seq: u64) -> Result<usize, WalError> {
         self.cleanup_pending_roll()?;
+        if self.replication_prefix_pinned {
+            return Ok(0);
+        }
         let segments = list_segments(&self.dir)?;
         if segments.len() <= 1 {
             return Ok(0);
@@ -996,6 +1005,14 @@ impl Wal {
         }
 
         Ok(deleted)
+    }
+
+    pub(crate) fn pin_replication_prefix(&mut self) {
+        self.replication_prefix_pinned = true;
+    }
+
+    pub(crate) fn durable_seq(&self) -> u64 {
+        self.durable_next_seq
     }
 
     // ── Internal helpers ─────────────────────────────────────────────

@@ -5,6 +5,7 @@ pub mod fingerprint;
 pub mod index;
 pub mod record;
 pub mod recover;
+pub mod replicated;
 pub mod replication;
 #[cfg(loom)]
 pub(crate) mod sync;
@@ -19,6 +20,7 @@ pub use index::{IndexPersistError, PersistentIndex, load_btree_index, load_hash_
 pub use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 pub use record::*;
 pub use recover::{RecoverError, recover_world};
+pub use replicated::{Replicated, RetentionPlan, SessionError, SessionFetch};
 pub use replication::{Follower, FollowerError, ReplicationError, apply_batch};
 pub use transport::{
     Fetch, FetchRequest, FetchResponse, LoopbackFetch, PumpError, RecordingFetch, ReplicationPump,

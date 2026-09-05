@@ -59,6 +59,14 @@ impl<S: Transact> Durable<S> {
     ) -> Result<WalFrameRange, WalError> {
         self.wal.lock().records_from(from_seq, limits)
     }
+
+    pub(crate) fn pin_replication_prefix(&self) {
+        self.wal.lock().pin_replication_prefix();
+    }
+
+    pub(crate) fn durable_seq(&self) -> u64 {
+        self.wal.lock().durable_seq()
+    }
 }
 
 impl<S: Transact> Transact for Durable<S> {
