@@ -234,6 +234,10 @@ impl JournaledFollower {
         self.follower.applied_seq()
     }
 
+    pub(crate) fn range_limits(&self) -> WalRangeLimits {
+        self.limits
+    }
+
     pub fn view(&self) -> u64 {
         self.view
     }

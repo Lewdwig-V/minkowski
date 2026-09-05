@@ -8,6 +8,7 @@ pub mod recover;
 pub mod replication;
 #[cfg(loom)]
 pub(crate) mod sync;
+pub mod transport;
 pub mod wal;
 
 pub use blob::{BlobRef, BlobStore};
@@ -19,6 +20,10 @@ pub use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 pub use record::*;
 pub use recover::{RecoverError, recover_world};
 pub use replication::{Follower, FollowerError, ReplicationError, apply_batch};
+pub use transport::{
+    Fetch, FetchRequest, FetchResponse, LoopbackFetch, PumpError, RecordingFetch, ReplicationPump,
+    TransportError,
+};
 pub use wal::{
     IngestError, JournaledFollower, Wal, WalConfig, WalCursor, WalError, WalFrameRange,
     WalRangeLimits, WalSegmentRun, WalStats,
