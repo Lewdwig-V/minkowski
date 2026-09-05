@@ -171,6 +171,7 @@ Deletion updates the published segment set, and a missing prefix requires rejoin
 | Schema and checkpoint prefix | Seed only from the prefix before the first returned mutation; tail requests include durable control context. | `records_from_resume_preserves_fence_context` |
 | Unsynced writes | Exclude sequence slots and control bytes beyond published endpoints, including after failed fsync. | `records_from_excludes_unsynced_frames` |
 | Create, rollover, and reopen | Publish only synchronized files and directory entries. | `records_from_survives_reopen_and_rollover` |
+| Failed rollover | Remove the uncommitted segment and synchronize deletion before later writes or retention; failed cleanup blocks both until cleanup succeeds. | `records_from_survives_failed_rollover_sync`, `failed_rollover_cleanup_blocks_writes` |
 | Stale or missing history | Refuse unresolved slots and a stale active suffix; never infer terminal no-ops. | `records_from_refuses_unresolved_history` |
 | Corrupt published bytes | Refuse bad magic, CRCs, missing schemas, and torn frames. | `records_from_rejects_corrupt_published_frames` |
 | Request and size bounds | Refuse zero limits and past-tail requests; return a bounded contiguous prefix or a size refusal. | `records_from_range_boundary_edges` |
@@ -380,6 +381,8 @@ Delivery order:
 | `records_from_range_boundary_edges` | Sequence zero, positive limits, byte/control caps, short prefixes, tail-empty, past-tail, and maximum integer requests. |
 | `records_from_excludes_unsynced_frames` | Pending mutations and controls stay outside published endpoints, including after a failed fsync. |
 | `records_from_requires_retained_fence_context` | Below-floor requests and retained-floor reads refuse after deletion and reopen until prefix fence metadata exists. |
+| `records_from_survives_failed_rollover_sync` | File-sync and directory-sync failures leave no orphan segment; later appends and rollover still produce identical ranges after reopen. |
+| `failed_rollover_cleanup_blocks_writes` | Failed cleanup blocks appends, checkpoint writes, and retention before changes; retry resumes after cleanup becomes possible. |
 
 **Planned 4.0-b tests (names reserved; not yet implemented):**
 

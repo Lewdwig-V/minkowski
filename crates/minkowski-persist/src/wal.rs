@@ -671,6 +671,8 @@ pub struct Wal {
     last_checkpoint_seq: Option<u64>,
     bytes_since_checkpoint: u64,
     roll_failures: u64,
+    // An uncommitted rollover must be durably removed before later writes.
+    pending_roll_cleanup: Option<PathBuf>,
     /// View counter for frame stamping (INV-2).
     pub views: Views,
 }
@@ -699,6 +701,7 @@ impl Wal {
             last_checkpoint_seq: None,
             bytes_since_checkpoint: 0,
             roll_failures: 0,
+            pending_roll_cleanup: None,
             views: Views::new(),
         };
         wal.active_bytes = wal.write_segment_header()?;
@@ -752,6 +755,7 @@ impl Wal {
             last_checkpoint_seq: None,
             bytes_since_checkpoint: 0,
             roll_failures: 0,
+            pending_roll_cleanup: None,
             views: Views::new(),
         };
 
@@ -896,6 +900,7 @@ impl Wal {
     /// Writes and synchronizes a `Checkpoint` entry, then publishes its byte
     /// endpoint for range reads. Resets the checkpoint byte counter.
     pub fn acknowledge_flush(&mut self, seq: u64) -> Result<(), WalError> {
+        self.cleanup_pending_roll()?;
         assert!(
             seq <= self.next_seq,
             "cannot checkpoint future sequence {seq}, WAL is at {}",
@@ -922,13 +927,16 @@ impl Wal {
     /// If the active segment exceeds `max_segment_bytes` after the write,
     /// rollover to a new segment is attempted. Rollover failure is *not*
     /// propagated — the mutation is already durable in the current segment
-    /// and the next `append` will retry the roll.
+    /// and the next `append` will retry the roll. If removing a failed segment
+    /// also fails, subsequent writes first retry that cleanup and return its
+    /// error without writing until cleanup succeeds.
     pub fn append(
         &mut self,
         changeset: &EnumChangeSet,
         codecs: &CodecRegistry,
         tick_after: u64,
     ) -> Result<u64, WalError> {
+        self.cleanup_pending_roll()?;
         let seq = self.next_seq;
         let record = Self::changeset_to_record(seq, changeset, codecs, tick_after)?;
         let entry = WalEntry::Mutations(record);
@@ -1013,6 +1021,7 @@ impl Wal {
     /// The active (last) segment is never deleted.
     /// Returns the number of segments deleted.
     pub fn delete_segments_before(&mut self, seq: u64) -> Result<usize, WalError> {
+        self.cleanup_pending_roll()?;
         let segments = list_segments(&self.dir)?;
         if segments.len() <= 1 {
             return Ok(0);
@@ -1074,31 +1083,69 @@ impl Wal {
         Ok(magic_bytes + frame_bytes)
     }
 
-    /// Roll to a new segment file. All I/O completes before internal state
-    /// is updated so a failure leaves `self` unchanged.
+    /// Remove an uncommitted rollover before the old segment can grow past its
+    /// start sequence. Keep the pending path until deletion is durable, so an
+    /// unlink or directory-sync failure blocks subsequent writes for retry.
+    fn cleanup_pending_roll(&mut self) -> Result<(), WalError> {
+        if let Some(path) = &self.pending_roll_cleanup {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            File::open(&self.dir)?.sync_all()?;
+            self.pending_roll_cleanup = None;
+        }
+        Ok(())
+    }
+
+    /// Roll to a new segment file. Publish it only after synchronization;
+    /// remove it on failure, retaining the current active segment.
     fn roll_segment(&mut self) -> Result<(), WalError> {
+        self.roll_segment_with_sync(File::sync_all)
+    }
+
+    fn roll_segment_with_sync(
+        &mut self,
+        mut sync: impl FnMut(&File) -> io::Result<()>,
+    ) -> Result<(), WalError> {
+        self.cleanup_pending_roll()?;
         let seg_path = self.dir.join(segment_filename(self.next_seq));
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .read(true)
             .open(&seg_path)?;
+        self.pending_roll_cleanup = Some(seg_path);
 
         // Write segment header (magic + schema preamble) to the NEW file
-        // before touching self.
-        let entry = WalEntry::Schema(self.schema.clone());
-        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
-            .map_err(|e| WalError::Format(e.to_string()))?;
-        let preamble_bytes = {
-            let mut writer = BufWriter::new(&file);
-            let magic_bytes = write_segment_magic(&mut writer)?;
-            let frame_bytes = write_frame(&mut writer, &payload, self.views.current())?;
-            magic_bytes + frame_bytes
+        // before replacing the active segment. Every post-create error uses
+        // the same cleanup path, including serialization and partial writes.
+        let prepared = (|| -> Result<u64, WalError> {
+            let entry = WalEntry::Schema(self.schema.clone());
+            let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
+                .map_err(|e| WalError::Format(e.to_string()))?;
+            let preamble_bytes = {
+                let mut writer = BufWriter::new(&file);
+                let magic_bytes = write_segment_magic(&mut writer)?;
+                let frame_bytes = write_frame(&mut writer, &payload, self.views.current())?;
+                magic_bytes + frame_bytes
+            };
+            sync(&file)?;
+            sync(&File::open(&self.dir)?)?;
+            Ok(preamble_bytes)
+        })();
+        let preamble_bytes = match prepared {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                drop(file);
+                self.cleanup_pending_roll()?;
+                return Err(error);
+            }
         };
-        file.sync_all()?;
-        File::open(&self.dir)?.sync_all()?;
 
         // All I/O succeeded — atomically update state.
+        self.pending_roll_cleanup = None;
         self.active_file = file;
         self.active_start_seq = self.next_seq;
         self.active_bytes = preamble_bytes;

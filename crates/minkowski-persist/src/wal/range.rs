@@ -576,6 +576,77 @@ mod tests {
     }
 
     #[test]
+    fn records_from_survives_failed_rollover_sync() {
+        for fail_at in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let codecs = CodecRegistry::new();
+            let mut wal = Wal::create(dir.path(), &codecs, WalConfig::default()).unwrap();
+            let changeset = EnumChangeSet::new();
+            wal.append(&changeset, &codecs, 0).unwrap();
+            let mut syncs = 0;
+            assert!(
+                wal.roll_segment_with_sync(|file| {
+                    syncs += 1;
+                    if syncs == fail_at {
+                        Err(io::Error::other("injected rollover sync failure"))
+                    } else {
+                        file.sync_all()
+                    }
+                })
+                .is_err()
+            );
+            assert_eq!(wal.active_start_seq, 0);
+            assert!(!dir.path().join(segment_filename(1)).exists());
+            // append treats rollover failure as nonfatal. Continue in the old
+            // segment, then roll at a later sequence and reopen the directory.
+            wal.config.max_segment_bytes = 1;
+            wal.append(&changeset, &codecs, 1).unwrap();
+            let expected = wal.records_from(0, limits()).unwrap();
+            assert_eq!(expected.next_seq, 2);
+            drop(wal);
+            let wal = Wal::open(dir.path(), &codecs, WalConfig::default()).unwrap();
+            assert_eq!(wal.records_from(0, limits()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_rollover_cleanup_blocks_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let codecs = CodecRegistry::new();
+        let mut wal = Wal::create(dir.path(), &codecs, WalConfig::default()).unwrap();
+        let changeset = EnumChangeSet::new();
+        wal.append(&changeset, &codecs, 0).unwrap();
+        let pending = dir.path().join(segment_filename(1));
+        assert!(
+            wal.roll_segment_with_sync(|_| {
+                // A directory in place of the failed file makes unlink fail even
+                // when tests run as root. Unix permits unlinking the open file.
+                std::fs::remove_file(&pending)?;
+                std::fs::create_dir(&pending)?;
+                Err(io::Error::other("injected rollover sync failure"))
+            })
+            .is_err()
+        );
+        let original = std::fs::read(dir.path().join(segment_filename(0))).unwrap();
+        assert!(wal.append(&changeset, &codecs, 1).is_err());
+        assert!(wal.acknowledge_flush(1).is_err());
+        assert!(wal.delete_segments_before(1).is_err());
+        assert_eq!(wal.next_seq(), 1);
+        assert_eq!(
+            std::fs::read(dir.path().join(segment_filename(0))).unwrap(),
+            original
+        );
+
+        std::fs::remove_dir(&pending).unwrap();
+        wal.config.max_segment_bytes = 1;
+        wal.append(&changeset, &codecs, 1).unwrap();
+        drop(wal);
+        let wal = Wal::open(dir.path(), &codecs, WalConfig::default()).unwrap();
+        assert_eq!(wal.records_from(0, limits()).unwrap().next_seq, 2);
+    }
+
+    #[test]
     fn records_from_requires_retained_fence_context() {
         let dir = tempfile::tempdir().unwrap();
         let codecs = CodecRegistry::new();
