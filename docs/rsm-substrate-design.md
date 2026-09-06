@@ -1,8 +1,8 @@
 # RSM Substrate Design (Stage 4.0)
 
-Date: 2026-08-30. Updated: 2026-09-05. Status: 4.0-a delivered (PR #251, #252).
+Date: 2026-08-30. Updated: 2026-09-06. Status: 4.0-a delivered (PR #251, #252).
 
-Phase 4.0-b delivers application prerequisites, private recovery/raw-range plans and the raw divergent-world gate (section 7.7), plus the local durable raw-range reader (section 7.2). Journal-backed raw follower ingestion and restart from an empty baseline are also delivered (section 7.4). A caller-driven pull pump, loopback/recording adapters, and deterministic transport-fault tests are delivered (section 7.4). Nonempty state-transfer baselines, terminal dispositions, journal compaction, network transport, session registration, and retention integration remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
+Phase 4.0-b delivers application prerequisites, private recovery/raw-range plans and the raw divergent-world gate (section 7.7), plus the local durable raw-range reader (section 7.2). Journal-backed raw follower ingestion and restart from an empty baseline are also delivered (section 7.4). A caller-driven pull pump, loopback/recording adapters, and deterministic transport-fault tests are delivered (section 7.4). Process-local session registration, conservative retention planning, and a replication prefix deletion guard are delivered (section 7.1). Nonempty state-transfer baselines, terminal dispositions, journal compaction, network authentication/transport, and durable fence metadata for actual WAL reclamation remain planned. Sections 1–5 describe delivered behavior except the explicitly marked 4.0-b amendments. Sections 6–8 distinguish those changes from the remaining planned work. Proposed APIs and reserved test names are not implementation claims.
 
 ## 1. Architecture summary
 
@@ -140,8 +140,8 @@ Deferred to 4.1 and later, unchanged: VR consensus core, leader election, io_uri
 
 | Owner | Owns | Responsibility |
 |---|---|---|
-| Leader `Replicated<S>` | `Durable<S>`, WAL read access, source disposition journal, registry keyed by follower identity and session generation | Delegate transactions unchanged; serve ranges; track reported settled boundaries for retention |
-| Follower `ReplicationPump` | `JournaledFollower` (world, codecs, journal, progress), fetch client; identity/session registration remains planned | Caller invokes `pump_once`; fetch from restored/applied progress, ingest, then report only completed progress on the next request |
+| Leader `Replicated<S>` | `Durable<S>`, configured members, private session capabilities, reported progress; source disposition journal remains planned | Delegate transactions unchanged; serve session-bound ranges; calculate retention proposals and pin required prefix context |
+| Follower `ReplicationPump` | `JournaledFollower` (world, codecs, journal, progress), fetch client; `Replicated::join` binds local sessions, network authentication remains planned | Caller invokes `pump_once`; fetch from restored/applied progress, ingest, then report only completed progress on the next request |
 | Each fetch response | detached owned buffer with a self-describing `BatchRef` | No WAL lock or segment pin crosses network handoff |
 | 4.1 VSR normal delivery | leader prepare pipeline, send transport, durable-receipt acknowledgment | Persist prepares and acknowledge receipt before application; apply only after quorum commitment (§7.5) |
 
@@ -150,6 +150,33 @@ There are no leader-owned per-follower transports, persistent shipping cursors, 
 The registry stores the last valid `consumed_seq` reported by each registered session. Registration/rejoin binds a verified baseline and log identity to a new session generation; old-session requests cannot update its entry. Updates are monotonic within a session, cannot exceed the published source boundary, and never use the end of a response as evidence of follower progress. A duplicate or delayed request can conservatively lag the registry; it cannot move it backward or invent progress. Restart blocks retention until the configured membership and conservative progress floors are restored/re-established. Disconnect does not silently remove a member; removal is an explicit policy action.
 
 Retention's candidate cutoff is `min(leader_replay_floor, min(registered consumed_seq))`. `leader_replay_floor` is the recoverable LSM baseline's replay floor, not merely `last_checkpoint_seq`; without a baseline it is 0. With no registered followers, only the leader floor applies. Delete only whole sealed segments whose exclusive end is at or below the cutoff, after existing read pins release. Preserve the fence context needed at the retained floor: until a durable fence-at-floor summary exists, keep the segments needed to reconstruct it. Never erase view history required by §3. A follower below the retained floor gets a typed rejoin response; it must install state, not skip forward.
+
+#### Session and retention implementation slice
+
+`Replicated<S>` owns `Durable<S>` and a configured membership map. Its transaction methods delegate unchanged; transport never runs during commit.
+`join(member, JournaledFollower)` consumes a successfully created/restored follower, verifies its source-history identity and poison state, and bounds its reconstructed applied prefix by the published source tail. It seeds only that owned follower's progress and returns its pump with a `SessionFetch` client.
+Each join installs a fresh private capability. An old client, removed member, or capability from another source instance cannot report progress. These are process-local session generations; authenticated wire tokens and persistent membership administration remain separate work.
+Membership comes from the caller's authoritative configuration. Construction recreates every configured member at zero with no active session; disconnect leaves membership intact. Add/remove are explicit policy operations. Rejoin may conservatively lower that member's floor to the restored follower's prefix.
+
+Session fetch validates membership/capability, releases the membership lock, and reads a bounded durable range. It then revalidates the capability under the membership lock before recording `max(previous_report, requested_seq)`, so rejoin/removal during the copy cannot update a replacement session. Membership and WAL locks never overlap. It never uses the response end as evidence of application. The WAL reader bounds reports by its published tail. Locks end before the detached response is delivered. Invalid requests do not update progress; lost responses may leave the valid request's report recorded.
+
+`retention_plan(leader_replay_floor)` reports the policy candidate `min(leader_replay_floor, published_tail, member floors)`. Missing LSM coverage is represented by zero; callers must obtain a nonzero input from verified recovery coverage, never checkpoint `flush_seq`. The candidate is informational and grants no deletion authority.
+The effective deletion cutoff remains zero because the raw reader still needs prefix fence context. Construction pins the WAL prefix at the shared `delete_segments_before` boundary, including checkpoint callbacks. There is no public unpin path. Durable fence-at-floor metadata and baseline ownership must be implemented before raising this guard; this slice does not claim disk reclamation.
+
+| Consumer | Session/history input | Progress and retention | Failure/restart |
+|---|---|---|---|
+| Join/rejoin | Enforced: configured member, matching source history, healthy owned follower; issue a fresh capability. `session_join_validates_follower_and_revokes_old_client` | Enforced: seed only reconstructed prefix, refuse beyond published tail. `session_join_validates_follower_and_revokes_old_client` | Enforced: failed join leaves existing session intact; restart starts configured floors at zero. `session_restart_resets_members_and_rejects_old_capability` |
+| Session fetch | Enforced: current capability only, including after removal/re-add. `session_join_validates_follower_and_revokes_old_client` | Enforced: monotonic request reports bounded by durable tail; response end is not progress. `session_requests_report_only_applied_progress` | Enforced: invalid requests do not advance; loss can retain the preceding report; rejoin during copy refuses publication. `session_requests_report_only_applied_progress`, `session_restart_resets_members_and_rejects_old_capability` |
+| Retention policy | Exempt: no token is needed for a read-only plan. | Enforced: lagging/disconnected/unjoined members constrain the candidate; no members use only leader floor/tail. `retention_plan_respects_members_and_recovery_floor` | Enforced: restart resets configured floors; candidate cannot authorize deletion. `session_restart_resets_members_and_rejects_old_capability` |
+| WAL deletion, including checkpoint callbacks | Exempt: the installed prefix pin applies regardless of caller. | Enforced: preserve original fence context and active segment while replication is enabled. `replicated_checkpoint_cannot_delete_required_prefix` | Enforced: source construction installs the pin before exposing transactions. `replicated_checkpoint_cannot_delete_required_prefix` |
+| Source transactions and response delivery | Exempt: commit needs no follower session. | Enforced: delegate durable transactions; release membership/WAL locks before delivery. `session_blocked_delivery_does_not_block_commit_or_rejoin` | Exempt: link failure runs outside the commit path. |
+
+The append-before-apply boundary is `Durable::try_commit`, shared by the direct and replicated wrappers. After inner validation succeeds it drains fast-lane batches and appends the forward changeset before returning it. Callers of the building-block API must then mark the transaction committed, drop it, and apply the returned changeset unchanged before any other world mutation. A WAL failure remains fatal and cannot return a successful commit.
+
+| Commit consumer | Successful validation | Conflict/refusal | Application/checkpoint |
+|---|---|---|---|
+| `Durable` / `Replicated` building-block API | Enforced: publish one WAL record before returning the unapplied changeset. `building_block_commits_reach_recovery_and_followers` | Enforced: inner validation failure returns before append. `durable_failed_attempt_not_logged` | Caller marks/drops/applies; automatic checkpoint is exempt because the wrapper does not observe caller application. |
+| `transact`, `transact_with`, and default `transact_inner` | Enforced: share `try_commit`; no second append in the closure path. `building_block_commits_reach_recovery_and_followers` | Enforced: retries log only their successful attempt. `durable_failed_attempt_not_logged` | Apply once; the `Durable::transact` override retains its post-apply checkpoint callback. `durable_fires_checkpoint_handler` |
 
 ### 7.2 The durable range boundary
 
@@ -262,7 +289,7 @@ It has no separate fetch cursor. A successful return is the exclusive applied bo
 `Lost` and `Down` leave progress unchanged; the caller schedules retries or reconnects. Ingestion, source-validation, and rejoin errors stop the pump before another request can report partial progress.
 Restart reconstructs the follower from its journal before creating a new pump. An empty subsequent fetch reports the last completed prefix and still ingests durable control context.
 
-This slice implements a typed fetch boundary and loopback adapter, not a network wire format or authenticated session registration. The adapter must bind the configured authoritative source to its stable history identity. Session generations, membership restoration, and retention remain the next source-side work; no segment deletion is added here. Nonempty baselines remain required before retiring the decoded public `Follower` API.
+This slice implements a typed fetch boundary and loopback adapter, not a network wire format or authenticated session registration. The adapter must bind the configured authoritative source to its stable history identity. The source wrapper in section 7.1 now supplies process-local sessions, membership reconstruction from caller configuration, and retention proposals with a prefix guard; durable fence metadata and actual reclamation remain pending. Nonempty baselines remain required before retiring the decoded public `Follower` API.
 
 | Consumer | Mutation/progress input | Schema/checkpoint context | Loss or failure |
 |---|---|---|---|
@@ -455,6 +482,12 @@ Delivery order:
 | `pull_pump_never_reports_partial_apply` | A late apply failure preserves the diagnostic prefix but blocks another fetch from reporting it. |
 | `pull_fetch_chaos_converges_pinned_seeds` | Seeds 1, 7, and 42 cover request/response loss, disconnection, delayed duplicate responses, and duplicate requests; a repaired link converges without fabricated progress. |
 | `pull_blocked_delivery_does_not_hold_wal_lock` | A source transaction commits while the detached response is withheld from the follower. |
+| `session_join_validates_follower_and_revokes_old_client` | Join checks configured membership, history, poison, and published tail; failed joins preserve the old session; rejoin/removal/re-add invalidate old clients. |
+| `session_requests_report_only_applied_progress` | Request reports advance monotonically; response ends, lost responses, delayed requests, and invalid limits cannot fabricate progress. |
+| `session_restart_resets_members_and_rejects_old_capability` | Real WAL/follower-journal reopen resets configured source floors; only restored followers seed rejoin; old and mid-copy-revoked capabilities refuse. |
+| `retention_plan_respects_members_and_recovery_floor` | Lagging, unjoined, disconnected, removed, and absent members constrain proposals; baseline zero and published tail bound them; effective deletion remains zero. |
+| `replicated_checkpoint_cannot_delete_required_prefix` | Checkpoint callbacks cannot delete the required prefix across rollovers; sequence-zero followers still catch up; checkpoint progress is not recovery coverage. |
+| `session_blocked_delivery_does_not_block_commit_or_rejoin` | A withheld response holds neither source lock; replacement join and durable commit finish before old delivery resumes. |
 
 **Planned 4.0-b tests (names reserved; not yet implemented):**
 
@@ -471,10 +504,9 @@ Delivery order:
 | `follower_ingest_retry_and_failure_preserve_prefix` | Duplicate spawn bytes never reapply; journal/fsync failure advertises nothing; mid-range apply/tick failure preserves only the settled boundary, poisons reads and emits no successful progress. |
 | `follower_ingest_restart_reconstructs_progress` | Crash before fsync, after durable receipt but before apply, and after apply but before next fetch; restore baseline plus journal including fenced slots, fence and IDs; never restore progress ahead of world. |
 | `read_at_after_fenced_slot_uses_settled_prefix` | After slot 40 is authoritatively resolved as a no-op, read_at(40) observes the no-op projection and read_at(41) refuses; after current slot 41 applies, read_at(41) succeeds; poison always refuses. |
-| `pull_registry_reports_only_ingested_progress` | Pending registry integration: stalled/lost response cannot advance registry; next request, including empty catch-up, records only successful ingest. |
-| `retention_respects_followers_and_recovery_floor` | Two follower positions, lagging/disconnected member, no followers and absent baseline; cutoff cannot cross leader LSM replay floor or use checkpoint flush_seq in its place. |
-| `retention_rejects_old_session_progress` | Old-session/duplicate/delayed requests cannot inflate new-session progress; rejoin seeds only a verified baseline; leader restart blocks deletion until conservative registry restoration. |
+| `retention_reclamation_respects_recovery_floor` | Actual deletion must use verified source baseline coverage and durable fence summaries, applying the delivered member-floor policy without accepting arbitrary caller floors as authority. |
+| `retention_rejects_old_wire_session_progress` | Authenticated wire generations must preserve the local capability rules across network reconnect and source restart. |
 | `retention_preserves_resume_fence_and_pinned_reads` | Deletion cannot race an in-flight copy or erase required fence context; retained-floor resume uses the right schema/fence, older requests require rejoin. |
-| `pull_session_chaos_rejects_old_generation` | Pending session integration: loss/duplicates/delay never let an old generation update a rejoined member's registry entry. |
+| `pull_session_chaos_rejects_old_generation` | Pending network integration: loss/duplicates/delay never let an old wire generation update a rejoined member's registry entry. |
 
 Existing Loom tests `loom_follower_advance_vs_read_at` and `loom_follower_concurrent_advance` cover the decoded follower path. Pending, listed so the gaps stay visible: Loom coverage for the new raw-ingest state, `fuzz_wal_replay` corpus entries with view-stamped frames (stale views included — its mode 0 already feeds raw bytes at replay), and failpoint hooks in the outbound pump for the 4.1 simulator.

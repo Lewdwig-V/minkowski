@@ -8,8 +8,9 @@ use minkowski_lsm::codec::CodecRegistry;
 
 /// Wraps any [`Transact`] strategy to guarantee WAL logging on commit.
 ///
-/// Every successful `transact` writes the forward changeset to the WAL
-/// before applying it to World. Failed attempts (retries) are not logged.
+/// Every successful `try_commit` writes the forward changeset to the WAL
+/// before returning it. The closure API then applies it to World. Failed
+/// attempts (retries) are not logged.
 ///
 /// WAL write failure panics — the durability invariant is non-negotiable.
 pub struct Durable<S: Transact> {
@@ -59,6 +60,14 @@ impl<S: Transact> Durable<S> {
     ) -> Result<WalFrameRange, WalError> {
         self.wal.lock().records_from(from_seq, limits)
     }
+
+    pub(crate) fn pin_replication_prefix(&self) {
+        self.wal.lock().pin_replication_prefix();
+    }
+
+    pub(crate) fn durable_seq(&self) -> u64 {
+        self.wal.lock().durable_seq()
+    }
 }
 
 impl<S: Transact> Transact for Durable<S> {
@@ -71,7 +80,15 @@ impl<S: Transact> Transact for Durable<S> {
         tx: &mut Tx<'_>,
         world: &mut World,
     ) -> Result<EnumChangeSet, TransactError> {
-        self.inner.try_commit(tx, world)
+        let mut forward = self.inner.try_commit(tx, world)?;
+        // Shared by building-block commits and all closure entry points.
+        // The WAL serializer requires ordinary mutations, not fast-lane batches.
+        forward.drain_fast_lane_to_mutations();
+        self.wal
+            .lock()
+            .append(&forward, &self.codecs, world.current_tick())
+            .expect("WAL write failed — durable commit impossible");
+        Ok(forward)
     }
 
     fn max_retries(&self) -> usize {
@@ -95,17 +112,9 @@ impl<S: Transact> Transact for Durable<S> {
             let value = f(&mut tx, world);
             let commit_result = self.try_commit(&mut tx, world);
             match commit_result {
-                Ok(mut forward) => {
+                Ok(forward) => {
                     tx.mark_committed();
                     drop(tx);
-                    // Drain fast-lane archetype batches into regular mutations
-                    // so the WAL serializer can iterate them.
-                    forward.drain_fast_lane_to_mutations();
-                    // WAL write BEFORE apply — durable commit point
-                    self.wal
-                        .lock()
-                        .append(&forward, &self.codecs, world.current_tick())
-                        .expect("WAL write failed — durable commit impossible");
                     forward
                         .apply(world)
                         .expect("changeset apply after successful commit");

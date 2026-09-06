@@ -238,6 +238,10 @@ impl JournaledFollower {
         self.limits
     }
 
+    pub(crate) fn source_history(&self) -> [u8; 16] {
+        self.history
+    }
+
     pub fn view(&self) -> u64 {
         self.view
     }
