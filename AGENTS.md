@@ -54,6 +54,7 @@ cargo +nightly fuzz run fuzz_world_ops -- -max_total_time=60     # fuzz: random 
 cargo +nightly fuzz run fuzz_reducers -- -max_total_time=60      # fuzz: query iteration paths
 cargo +nightly fuzz run fuzz_lsm_recovery -- -max_total_time=60 -max_len=65536   # fuzz: LSM flush+recover round-trip (world-state variation)
 cargo +nightly fuzz run fuzz_wal_replay -- -max_total_time=60 -max_len=65536    # fuzz: WAL replay (mode 0 feeds raw malformed bytes)
+cargo +nightly fuzz run fuzz_pool_columns -- -max_total_time=60   # fuzz: two-frontier pool via World (3 MiB budget, large runs, grow, collision; shadow-model value checks)
 ```
 
 Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows. Runs the full test suite via nextest (parallel execution). Exclusions defined in `.config/nextest.toml` (`[profile.default-miri]`, auto-activated under Miri): `par_for_each` (rayon unsupported by Miri, covered by TSan), concurrent/contention pool tests (too slow, covered by TSan + Loom). To list selected tests: `cargo nextest list -p minkowski --lib --profile default-miri`.

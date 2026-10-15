@@ -42,7 +42,7 @@ The pool allocator uses lock-free intrusive stacks via 128-bit tagged pointer CA
 
 ### Two-Frontier Layout
 
-Slab classes carve 64 KiB chunks from the bottom of the pool on demand. Allocations above 64 KiB are 1 MiB-unit runs from the top. The frontier mutex is taken once per chunk carve and once per large alloc/free/grow, never on the free-list fast path. `SlabPool::grow` widens a large run in place (memmove only if it must shift down), so huge SIMD columns usually grow without a copy. On a 64 MiB pool, multi-archetype workloads use 92–96 % of the budget before `PoolExhausted` (34–37 % with the old fixed per-class split). `cargo run -p minkowski-examples --example pool_fragmentation --release` reproduces the numbers.
+Slab classes carve 64 KiB chunks from the bottom of the pool on demand. Allocations above 64 KiB are 1 MiB-unit runs from the top. The frontier mutex is taken once per chunk carve (O(1)) and once per large alloc/free/grow (O(budget / 1 MiB) scan of the unit map: 256 entries for the default pool), never on the free-list fast path. `SlabPool::grow` widens a large run in place (memmove only if it must shift down), so huge SIMD columns usually grow without a copy. On a 64 MiB pool, multi-archetype workloads use 92–96 % of the budget before `PoolExhausted` (34–37 % with the old fixed per-class split). `cargo run -p minkowski-examples --example pool_fragmentation --release` reproduces the numbers.
 
 ### Thread-Local Cache
 

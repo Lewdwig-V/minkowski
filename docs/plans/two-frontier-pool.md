@@ -109,9 +109,12 @@ of every live allocation names its true class; every other slot is
 |---|---|---|---|---|---|
 | `allocate` (TCache path) | enforced: `slab_pool_concurrent_allocate_no_duplicates`, `tcache_concurrent_no_duplicates` | enforced: `loom_concurrent_carve_no_duplicates` | exempt: bypasses TCache (`slab_pool_large_and_slab_share_one_budget`) | enforced: `tcache_overflow_refill_correct_bin` | n/a |
 | `deallocate` (TCache path) | enforced: `slab_pool_concurrent_alloc_dealloc_interleaved` | enforced (same as slab block) | enforced: routes to `large_deallocate` (`slab_pool_multi_megabyte_allocation`) | enforced: `slab_pool_overflow_dealloc_returns_to_correct_class` | enforced: `grow_large_run_shifts_down_and_moves_bytes` |
-| `global_*` (loom path) | enforced: `loom_concurrent_pop_no_duplicates` | enforced: `loom_concurrent_carve_no_duplicates` | enforced: `loom_carve_and_large_run_disjoint` | enforced: `slab_pool_largest_slab_class_overflows_into_large_run` | enforced: `loom_grow_races_carve` |
+| `global_*` path (loom runs it; also called directly by unit tests) | enforced: `loom_concurrent_pop_no_duplicates` | enforced: `loom_concurrent_carve_no_duplicates` | enforced: `loom_carve_and_large_run_disjoint` | enforced: `slab_pool_largest_slab_class_overflows_into_large_run` | enforced: `loom_grow_races_carve` |
 | TCache flush/spill/drop | enforced: `tcache_epoch_flush_*`, `tcache_thread_exit_*` | enforced (same) | exempt: never cached (refill returns overflow uncached; dealloc bypasses) | enforced: `tcache_thread_exit_with_overflow_blocks` | exempt: never cached |
-| frontier collision | enforced: `slab_pool_concurrent_frontier_collision_no_overlap` | enforced: `slab_pool_window_is_unit_aligned_and_budget_sized` | enforced: `slab_pool_large_run_reuses_interior_hole`, `loom_large_free_races_carve` | enforced: `loom_large_free_races_carve` (overflow interleaving) | enforced: `grow_failure_leaves_original_allocation_intact`, `grow_doubling_column_reaches_whole_budget` |
+| frontier collision | enforced: `slab_pool_concurrent_frontier_collision_no_overlap` | enforced: `slab_pool_concurrent_frontier_collision_no_overlap` (tail reach: `slab_pool_window_is_unit_aligned_and_budget_sized`) | enforced: `slab_pool_large_run_reuses_interior_hole`, `loom_large_free_races_carve` | enforced: `loom_large_free_races_carve` (overflow interleaving) | enforced: `grow_failure_leaves_original_allocation_intact`, `grow_doubling_column_reaches_whole_budget`, `loom_grow_races_take_run` |
+| `grow` | enforced: `grow_within_same_slab_block_keeps_pointer` (fits), `grow_slab_to_larger_class_copies_live_bytes` | exempt: a chunk remainder is a slab block once handed out | enforced: `grow_large_run_in_place_upward`, `grow_large_run_falls_back_to_fresh_run`, `slab_pool_concurrent_grow_and_large_churn` | enforced: `grow_overflow_run_keeps_overflow_accounting` | enforced: `grow_large_run_shifts_down_and_moves_bytes`, `loom_grow_races_carve`, `growth_past_one_mebibyte_preserves_values` (BlobVec), `recover_column_past_one_mebibyte_preserves_values` (LSM import) |
+
+Break harness: `fuzz_pool_columns` drives all of the above through `World` against a 3 MiB + 12 345 B budget (large runs, multi-unit grow, collision, archetype-wide frees) and checks every live value after each op against a shadow model.
 
 ### Convention Sheet
 
@@ -152,13 +155,24 @@ of every live allocation names its true class; every other slot is
    asserts the pointer is inside this pool's window (`lookup`). No new
    cross-world surface.
 2. **Drop sees inconsistent state?** `SlabPoolInner::drop` frees only the side
-   table box. `Frontier::units` is an owned `Box` dropped with the `Mutex`. No
-   Drop path takes the frontier lock.
+   table box. `Frontier::units` is an owned `Box` dropped with the `Mutex`, and
+   `SlabPoolInner::drop` never takes the frontier lock. `BlobVec::drop` /
+   `Arena::drop` do take it, through `deallocate` of a large run. That is not
+   reentrant (no pool call happens while the lock is held), so it is sound.
 3. **Two threads through `&self`?** Yes, by design. Free lists are lock-free
    (unchanged protocol). Every frontier mutation and every large-run side
    table write happens under `Mutex<Frontier>`. Chunk remainders are published
-   with the push CAS (AcqRel) after Relaxed link stores. Covered by the 4 new
-   loom models plus the existing 3.
+   with the push CAS (AcqRel) after Relaxed link stores. The *logic* (who gets
+   which block or unit) is covered by the 5 new loom models plus the existing
+   3. Loom does not see the *memory ordering* of the next-pointer links:
+   under `cfg(loom)` the list head is a `Mutex<u128>` shim and the link
+   stores use `std` atomics. TSan covers that ordering through the std-thread
+   `slab_pool_concurrent_*` and `tcache_concurrent_no_duplicates` tests.
+   Exhaustion is deterministic only for single-threaded use of a pool:
+   across threads, TCache holdings and the order in which threads take the
+   frontier lock decide placement, and so whether a later `grow` fits in
+   place. Committed state below the budget is unaffected, and addresses are
+   never persisted.
 4. **Dedup/merge preserves the strongest invariant?** `release_run` and the
    `hi` retreat only ever clear units that the run being freed owned (asserted
    run start). `grow_run` claims only free units.
@@ -183,7 +197,11 @@ of every live allocation names its true class; every other slot is
 3. Tests: rewrite the proportion-based overflow tests around frontier
    exhaustion, plus the new frontier, grow, and loom tests in the matrix above.
 4. `examples/pool_fragmentation.rs`: utilization-at-exhaustion and
-   RSS-after-`World::new()` benchmark.
+   RSS-after-`World::new()` benchmark. `fuzz/fuzz_targets/fuzz_pool_columns.rs`:
+   break harness.
+5. Limits: `MAX_POOL_BUDGET` (mmap `Layout` size, and `n_units < u32::MAX`
+   for the run encoding, which also bounds the O(n_units) frontier scans).
+   Hugepage mappings are rounded to 2 MiB so `munmap` gets a valid length.
 
 ## Results (64 MiB pool, `pool_fragmentation`, release)
 
@@ -196,11 +214,23 @@ of every live allocation names its true class; every other slot is
 | RSS after `World::new()` (256 MiB pool) | 75.9 MiB | 0.0 MiB |
 
 The single-column ceiling of 50 % is set by doubling growth itself: the next
-step would need the entire budget.
+step would need the entire budget. The utilization numbers are deterministic
+(single-threaded, fixed budget, address-independent window). The RSS line is
+indicative only: it depends on the kernel and THP settings.
+
+Overflow ablation: with both overflow paths disabled (`c → c+1`, and
+64 KiB → 1-unit run), all four scenarios give identical numbers. Overflow
+fires only once the frontiers have met, and these workloads have no churn
+phase. See Follow-ups.
 
 ## Follow-ups
 
-- Return fully-free slab chunks to the bottom frontier (alternative 4).
+- Return fully-free slab chunks to the bottom frontier (alternative 4). If a
+  churn scenario confirms the ablation result, overflow can then be removed
+  (`WorldStats::pool_overflow_*` are public fields, so that is a breaking
+  change).
+- With prefault on, the up-to-1 MiB of mapping slack around the window is
+  also faulted in. Pre-fault only the window, or `munmap` the slack.
 - Expose `lo` / `hi` in `WorldStats` so operators can see how close the
   frontiers are.
 - Optionally `madvise(MADV_DONTNEED)` large runs freed in demand-paged pools.

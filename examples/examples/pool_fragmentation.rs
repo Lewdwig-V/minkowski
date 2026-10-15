@@ -10,7 +10,8 @@
 //!
 //! A final section measures resident memory (RSS) right after `World::new()`
 //! for the default demand-paged pool, which shows how much of the pool the
-//! allocator touches before the application allocates anything.
+//! allocator touches before the application allocates anything. The
+//! utilization numbers are deterministic; the RSS line is indicative only.
 //!
 //! Run: cargo run -p minkowski-examples --example pool_fragmentation --release
 
@@ -111,11 +112,14 @@ fn report(name: &str, o: &Outcome) {
     );
 }
 
+/// Resident set size from `/proc/self/status` (`VmRSS`, in kB — independent
+/// of the system page size).
 #[cfg(target_os = "linux")]
 fn rss_bytes() -> Option<usize> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let resident: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
-    Some(resident * 4096)
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -147,6 +151,8 @@ fn main() {
     // All 64 archetypes with equal weight.
     report("uniform (64 arch)", &run(&mixed, |_| 1));
 
+    // Indicative only: RSS depends on the kernel, THP settings, and the
+    // process's own allocations (e.g. the pool's side table).
     println!("\n--- Resident memory after World::new() (256 MiB demand-paged pool) ---");
     match (rss_bytes(), {
         let w = World::new();

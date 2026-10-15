@@ -186,6 +186,10 @@ pub struct WorldStats {
     pub pool_overflow_total: [u64; 6],
 }
 
+// `WorldStats` exposes the pool's per-class arrays with a literal length;
+// keep it tied to the pool's class count.
+const _: () = assert!(crate::pool::NUM_SIZE_CLASSES == 6);
+
 /// Debug information about the tick state of a cached query type.
 ///
 /// Returned by [`World::query_tick_info`]. Helps diagnose unexpected

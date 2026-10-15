@@ -35,3 +35,8 @@ doc = false
 name = "fuzz_wal_replay"
 path = "fuzz_targets/fuzz_wal_replay.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_pool_columns"
+path = "fuzz_targets/fuzz_pool_columns.rs"
+doc = false

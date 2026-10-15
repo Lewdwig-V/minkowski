@@ -722,6 +722,28 @@ mod tests {
     }
 
     #[test]
+    fn growth_past_one_mebibyte_preserves_values() {
+        // 2 MiB+ of u64s: the column crosses from slab blocks into large
+        // runs and through multi-unit SlabPool::grow (in-place widening and
+        // shift-down memmove). A small pool forces the shift path.
+        let pool =
+            Arc::new(SlabPool::new(6 * 1024 * 1024, crate::pool::HugePages::Off, false).unwrap());
+        let mut bv = BlobVec::new(Layout::new::<u64>(), None, 0, pool);
+        let n = (2 * 1024 * 1024 / 8 + 1) as u64;
+        for i in 0..n {
+            unsafe { push_val(&mut bv, i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) };
+        }
+        assert!(bv.capacity() * 8 > 2 * 1024 * 1024);
+        for i in 0..n {
+            assert_eq!(
+                unsafe { read_val::<u64>(&bv, i as usize) },
+                i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                "row {i}"
+            );
+        }
+    }
+
+    #[test]
     fn push_triggers_growth() {
         let mut bv = bv_for::<u32>();
         // Push enough to force multiple reallocations
