@@ -6,7 +6,8 @@
 (`[1, 2, 4, 20, 40, 33]` %). That caused three problems:
 
 1. **Stranded capacity.** A class runs out while other classes still hold free
-   blocks. Overflow only went one class up. Measured on a 64 MiB pool with the
+   blocks. Overflow (borrowing a block one class up) helped only at the
+   margin. Measured on a 64 MiB pool with the
    new `pool_fragmentation` example, multi-archetype workloads hit
    `PoolExhausted` at **34–37 %** utilization.
 2. **A hard 1 MiB ceiling.** `size_class_for` returned `None` above 1 MiB, so a
@@ -45,14 +46,15 @@ chunks or runs, not individual objects.
 
 ### API Surface
 
-All of it is internal (`pub(crate)`); no public API changes.
+The allocator API is internal (`pub(crate)`). One public change: the overflow counters are removed from `WorldStats` (breaking).
 
 | Item | Change |
 |---|---|
 | `SlabPool::allocate` / `deallocate` | Same signatures and contract. Requests > 64 KiB now succeed up to the budget (no 1 MiB ceiling). Alignment > 1 MiB → `Err(PoolExhausted)`. |
 | `SlabPool::grow(ptr, old, new, live)` (new, `unsafe`) | Realloc. Returns the same pointer if the block already fits, or widens a large run in place. Otherwise allocate + copy + free. On `Err` the original allocation is untouched. |
-| `capacity()` / `used()` / `overflow_*_counts()` | Unchanged shape (`[u64; 6]`). Index 5 now counts class-4 overflow into a 1-unit large run. |
-| `WorldStats` | Unchanged. |
+| `capacity()` / `used()` | Unchanged. |
+| `overflow_active_counts()` / `overflow_total_counts()` | **Removed**, together with cross-class overflow itself (see "Overflow removed" below). |
+| `WorldStats::pool_overflow_active` / `pool_overflow_total` | **Removed (breaking).** |
 
 ### Internal Architecture
 
@@ -77,14 +79,15 @@ All of it is internal (`pub(crate)`); no public API changes.
   downward. Freeing a run at the low edge retreats `hi` past every free unit,
   so the bottom frontier can reuse that space immediately.
 - **Allocation order for slab class c:** pop c's free list → carve a chunk for
-  c → pop (c+1)'s free list (overflow) → for c = 4 only, a 1-unit large run
-  (overflow) → `PoolExhausted`.
+  c → `PoolExhausted`. A class never borrows another class's blocks, and a
+  slab request never takes a large run.
 - **TCache.** Bins exist for the 5 slab classes only. Refill takes one block
-  through the full path (it may carve or overflow), then up to 15 extras popped
-  from the same class's *already-carved* free list. Extras never carve, so one
-  thread's cache cannot pull fresh frontier memory away from other classes. An
-  overflow block is returned uncached. Large runs bypass the TCache on both
-  allocate and deallocate.
+  through the full path (it may carve), then up to 15 extras popped from the
+  same class's *already-carved* free list. Extras never carve, so one thread's
+  cache cannot pull fresh frontier memory away from other classes. Large runs
+  bypass the TCache on both allocate and deallocate.
+- **Side table entry** = the bare class index (`0..6`), or `0xFF` when
+  unallocated.
 - **`grow`.** For a large run, widen into free units directly above it first.
   Take any shortfall from free units directly below (or from unclaimed units
   below `hi` that are still ≥ `lo`), then `ptr::copy` (memmove) the live bytes
@@ -105,14 +108,19 @@ returned pointer is inside the window. Invariant **I2**: the side table entry
 of every live allocation names its true class; every other slot is
 `UNALLOCATED`.
 
-| Consumer \ input | slab block | carved chunk remainder | large run | overflow block | grown run (moved) |
-|---|---|---|---|---|---|
-| `allocate` (TCache path) | enforced: `slab_pool_concurrent_allocate_no_duplicates`, `tcache_concurrent_no_duplicates` | enforced: `loom_concurrent_carve_no_duplicates` | exempt: bypasses TCache (`slab_pool_large_and_slab_share_one_budget`) | enforced: `tcache_overflow_refill_correct_bin` | n/a |
-| `deallocate` (TCache path) | enforced: `slab_pool_concurrent_alloc_dealloc_interleaved` | enforced (same as slab block) | enforced: routes to `large_deallocate` (`slab_pool_multi_megabyte_allocation`) | enforced: `slab_pool_overflow_dealloc_returns_to_correct_class` | enforced: `grow_large_run_shifts_down_and_moves_bytes` |
-| `global_*` path (loom runs it; also called directly by unit tests) | enforced: `loom_concurrent_pop_no_duplicates` | enforced: `loom_concurrent_carve_no_duplicates` | enforced: `loom_carve_and_large_run_disjoint` | enforced: `slab_pool_largest_slab_class_overflows_into_large_run` | enforced: `loom_grow_races_carve` |
-| TCache flush/spill/drop | enforced: `tcache_epoch_flush_*`, `tcache_thread_exit_*` | enforced (same) | exempt: never cached (refill returns overflow uncached; dealloc bypasses) | enforced: `tcache_thread_exit_with_overflow_blocks` | exempt: never cached |
-| frontier collision | enforced: `slab_pool_concurrent_frontier_collision_no_overlap` | enforced: `slab_pool_concurrent_frontier_collision_no_overlap` (tail reach: `slab_pool_window_is_unit_aligned_and_budget_sized`) | enforced: `slab_pool_large_run_reuses_interior_hole`, `loom_large_free_races_carve` | enforced: `loom_large_free_races_carve` (overflow interleaving) | enforced: `grow_failure_leaves_original_allocation_intact`, `grow_doubling_column_reaches_whole_budget`, `loom_grow_races_take_run` |
-| `grow` | enforced: `grow_within_same_slab_block_keeps_pointer` (fits), `grow_slab_to_larger_class_copies_live_bytes` | exempt: a chunk remainder is a slab block once handed out | enforced: `grow_large_run_in_place_upward`, `grow_large_run_falls_back_to_fresh_run`, `slab_pool_concurrent_grow_and_large_churn` | enforced: `grow_overflow_run_keeps_overflow_accounting` | enforced: `grow_large_run_shifts_down_and_moves_bytes`, `loom_grow_races_carve`, `growth_past_one_mebibyte_preserves_values` (BlobVec), `recover_column_past_one_mebibyte_preserves_values` (LSM import) |
+| Consumer \ input | slab block | carved chunk remainder | large run | grown run (moved) |
+|---|---|---|---|---|
+| `allocate` (TCache path) | enforced: `slab_pool_concurrent_allocate_no_duplicates`, `tcache_concurrent_no_duplicates`, `tcache_refill_caches_only_its_own_class` | enforced: `loom_concurrent_carve_no_duplicates` | exempt: bypasses TCache (`slab_pool_large_and_slab_share_one_budget`) | n/a |
+| `deallocate` (TCache path) | enforced: `slab_pool_concurrent_alloc_dealloc_interleaved` | enforced (same as slab block) | enforced: routes to `large_deallocate` (`slab_pool_multi_megabyte_allocation`) | enforced: `grow_large_run_shifts_down_and_moves_bytes` |
+| `global_*` path (loom runs it; also called directly by unit tests) | enforced: `loom_concurrent_pop_no_duplicates`, `slab_pool_dealloc_routes_by_side_table_not_layout` | enforced: `loom_concurrent_carve_no_duplicates` | enforced: `loom_carve_and_large_run_disjoint` | enforced: `loom_grow_races_carve` |
+| TCache flush/spill/drop | enforced: `tcache_epoch_flush_*`, `tcache_thread_exit_*` | enforced (same) | exempt: never cached (dealloc bypasses) | exempt: never cached |
+| frontier collision | enforced: `slab_pool_concurrent_frontier_collision_no_overlap`, `slab_pool_one_class_can_exhaust_the_frontier` | enforced: `slab_pool_concurrent_frontier_collision_no_overlap` (tail reach: `slab_pool_window_is_unit_aligned_and_budget_sized`) | enforced: `slab_pool_large_run_reuses_interior_hole`, `loom_large_free_races_carve` | enforced: `grow_failure_leaves_original_allocation_intact`, `grow_doubling_column_reaches_whole_budget`, `loom_grow_races_take_run` |
+| `grow` | enforced: `grow_within_same_slab_block_keeps_pointer` (fits), `grow_slab_to_larger_class_copies_live_bytes`, `grow_slab_block_into_large_run` | exempt: a chunk remainder is a slab block once handed out | enforced: `grow_large_run_in_place_upward`, `grow_large_run_falls_back_to_fresh_run`, `slab_pool_concurrent_grow_and_large_churn` | enforced: `grow_large_run_shifts_down_and_moves_bytes`, `loom_grow_races_carve`, `growth_past_one_mebibyte_preserves_values` (BlobVec), `recover_column_past_one_mebibyte_preserves_values` (LSM import) |
+
+No-borrowing rule (a class never takes another class's blocks or a large
+run): `slab_pool_exhausted_class_never_borrows_larger_class`,
+`slab_pool_classes_never_share_blocks`,
+`slab_pool_largest_slab_class_never_takes_large_run`.
 
 Break harness: `fuzz_pool_columns` drives all of the above through `World` against a 3 MiB + 12 345 B budget (large runs, multi-unit grow, collision, archetype-wide frees) and checks every live value after each op against a shadow model.
 
@@ -194,8 +202,9 @@ Break harness: `fuzz_pool_columns` drives all of the above through `World` again
 2. `storage/blob_vec.rs`: `reserve` / `grow` / `try_grow` go through
    `grow_allocation`. `changeset.rs`: `Arena::grow` goes through
    `SlabPool::grow`.
-3. Tests: rewrite the proportion-based overflow tests around frontier
-   exhaustion, plus the new frontier, grow, and loom tests in the matrix above.
+3. Tests: replace the proportion-based overflow tests with frontier
+   exhaustion and no-borrowing tests, plus the new frontier, grow, and loom
+   tests in the matrix above.
 4. `examples/pool_fragmentation.rs`: utilization-at-exhaustion and
    RSS-after-`World::new()` benchmark. `fuzz/fuzz_targets/fuzz_pool_columns.rs`:
    break harness.
@@ -229,17 +238,24 @@ indicative only: it depends on the kernel and THP settings.
 | `add_remove/*` | 2.99–3.21 ms | 2.97–3.22 ms | 3 interleaved runs each; within noise |
 | `simple_iter/*` | 29.9–30.0 / 4.50–4.65 / 48.8–55.7 µs | 29.6–30.9 / 4.48–4.64 / 48.5–50.1 µs | `for_each` / `for_each_chunk` / `par_for_each`, 2 interleaved runs; no allocator on this path |
 
-Overflow ablation: with both overflow paths disabled (`c → c+1`, and
-64 KiB → 1-unit run), all four scenarios give identical numbers. Overflow
-fires only once the frontiers have met, and these workloads have no churn
-phase. See Follow-ups.
+### Overflow removed
+
+The first version kept the old cross-class overflow (`c → c+1`, and
+64 KiB → 1-unit run). With both paths disabled, all four scenarios gave
+identical numbers. With demand-carved chunks a class only runs dry once the
+frontiers have met. Borrowing a larger block at that point wastes 4–16× per
+request for a handful of extra allocations, and it cost an overflow bit in
+the side table, telemetry, a TCache refill special case, and an extra
+interleaving in the loom models. Overflow existed to soften `PROPORTIONS`
+starvation; without `PROPORTIONS` it is dead weight. It is gone, along with
+`WorldStats::pool_overflow_*` (breaking). Memory stranded in one class is
+addressed by the chunk-return follow-up instead.
 
 ## Follow-ups
 
-- Return fully-free slab chunks to the bottom frontier (alternative 4). If a
-  churn scenario confirms the ablation result, overflow can then be removed
-  (`WorldStats::pool_overflow_*` are public fields, so that is a breaking
-  change).
+- Return fully-free slab chunks to the bottom frontier (alternative 4): the
+  real fix for capacity stranded in one class after a workload shift
+  (`slab_pool_one_class_can_exhaust_the_frontier` pins today's behavior).
 - With prefault on, the up-to-1 MiB of mapping slack around the window is
   also faulted in. Pre-fault only the window, or `munmap` the slack.
 - Expose `lo` / `hi` in `WorldStats` so operators can see how close the
