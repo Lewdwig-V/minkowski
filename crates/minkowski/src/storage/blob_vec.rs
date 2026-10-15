@@ -722,6 +722,9 @@ mod tests {
     }
 
     #[test]
+    // 262K pushes exceed the Miri per-test timeout; the pool-level grow
+    // tests (grow_large_run_*) cover the same unsafe paths under Miri.
+    #[cfg_attr(miri, ignore)]
     fn growth_past_one_mebibyte_preserves_values() {
         // 2 MiB+ of u64s: the column crosses from slab blocks into large
         // runs and through multi-unit SlabPool::grow (in-place widening and

@@ -1833,6 +1833,10 @@ mod tests {
         );
     }
 
+    /// Two chunks: small enough to exhaust quickly under Miri, and no room
+    /// for a large unit, so frontier exhaustion is purely slab chunks.
+    const SMALL_POOL: usize = 2 * CHUNK_SIZE;
+
     /// Fill the whole frontier with chunks of `layout`'s class via the
     /// global path. Returns every block handed out.
     fn exhaust_frontier(pool: &SlabPool, layout: Layout) -> Vec<NonNull<u8>> {
@@ -1847,12 +1851,12 @@ mod tests {
     fn slab_pool_overflow_enabled() {
         // Overflow happens only once the frontier cannot carve: then a
         // class borrows already-carved free blocks one class up.
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
+        let pool = SlabPool::new(SMALL_POOL, HugePages::Off, false).unwrap();
         let class1 = Layout::from_size_align(200, 8).unwrap();
         let class0 = Layout::from_size_align(32, 8).unwrap();
 
         let mut medium = exhaust_frontier(&pool, class1);
-        assert_eq!(medium.len(), 1024 * 1024 / SIZE_CLASSES[1]);
+        assert_eq!(medium.len(), SMALL_POOL / SIZE_CLASSES[1]);
 
         // Return 5 class-1 blocks; class 0 can now borrow exactly those.
         for ptr in medium.drain(..5) {
@@ -1892,7 +1896,7 @@ mod tests {
 
     #[test]
     fn slab_pool_overflow_dealloc_returns_to_correct_class() {
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
+        let pool = SlabPool::new(SMALL_POOL, HugePages::Off, false).unwrap();
         let class1 = Layout::from_size_align(200, 8).unwrap();
         let class0 = Layout::from_size_align(32, 8).unwrap();
 
@@ -1955,7 +1959,7 @@ mod tests {
     #[test]
     fn slab_pool_overflow_telemetry() {
         // Test overflow telemetry via global paths (bypassing TCache).
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
+        let pool = SlabPool::new(SMALL_POOL, HugePages::Off, false).unwrap();
         let class1 = Layout::from_size_align(200, 8).unwrap();
         let class0 = Layout::from_size_align(32, 8).unwrap();
 
@@ -2149,7 +2153,9 @@ mod tests {
         let one = Layout::from_size_align(LARGE_UNIT, 64).unwrap();
         let three = Layout::from_size_align(3 * LARGE_UNIT, 64).unwrap();
         let a = pool.allocate(one).unwrap(); // unit 3: nothing above
-        let live = LARGE_UNIT - 7;
+        // Most of the unit natively; a few KiB under Miri, where a byte loop
+        // over 1 MiB exceeds the per-test timeout.
+        let live = if cfg!(miri) { 8192 + 7 } else { LARGE_UNIT - 7 };
         unsafe { fill(a, live) };
 
         let grown = unsafe { pool.grow(a, one, three, live) }.unwrap();
@@ -2673,7 +2679,7 @@ mod tests {
 
     #[test]
     fn tcache_overflow_refill_correct_bin() {
-        let pool = SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap();
+        let pool = SlabPool::new(SMALL_POOL, HugePages::Off, false).unwrap();
         let class1 = Layout::from_size_align(200, 8).unwrap();
         let class0 = Layout::from_size_align(32, 8).unwrap();
 
@@ -2829,7 +2835,7 @@ mod tests {
 
     #[test]
     fn tcache_thread_exit_with_overflow_blocks() {
-        let pool = Arc::new(SlabPool::new(1024 * 1024, HugePages::Off, false).unwrap());
+        let pool = Arc::new(SlabPool::new(SMALL_POOL, HugePages::Off, false).unwrap());
         let layout_small = Layout::from_size_align(32, 8).unwrap();
 
         let class1 = Layout::from_size_align(200, 8).unwrap();
