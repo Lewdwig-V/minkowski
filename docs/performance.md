@@ -40,6 +40,10 @@ For large hash joins where the working set exceeds L2 cache, entities are bucket
 
 The pool allocator uses lock-free intrusive stacks via 128-bit tagged pointer CAS (`Atomic<u128>`). ABA prevention via 64-bit monotonic tag. A side table routes deallocation to the correct size class.
 
+### Two-Frontier Layout
+
+Slab classes carve 64 KiB chunks from the bottom of the pool on demand. Allocations above 64 KiB are 1 MiB-unit runs from the top. The frontier mutex is taken once per chunk carve (O(1)) and once per large alloc/free/grow (O(budget / 1 MiB) scan of the unit map: 256 entries for the default pool), never on the free-list fast path. `SlabPool::grow` widens a large run in place (memmove only if it must shift down), so huge SIMD columns usually grow without a copy. On a 64 MiB pool, multi-archetype workloads use 92–96 % of the budget before `PoolExhausted` (34–37 % with the old fixed per-class split). `cargo run -p minkowski-examples --example pool_fragmentation --release` reproduces the numbers.
+
 ### Thread-Local Cache
 
 A per-thread L1 cache with 32-slot bins per size class sits in front of the lock-free stack. 15 out of 16 allocations hit the L1 cache (~3 instructions) instead of the global stack (~7 CAS operations). Epoch-based lazy flush prevents Rayon worker threads from hoarding memory. `add_remove/pool` dropped from 8.03 ms to 1.35 ms — within 5% of jemalloc.

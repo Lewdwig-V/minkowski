@@ -34,6 +34,7 @@ cargo run -p minkowski-examples --example observe --release   # Observability: M
 cargo run -p minkowski-examples --example blob --release   # Blob offloading: BlobRef component + BlobStore lifecycle trait, MemoryBlobStore cleanup (5 entities, orphan deletion)
 cargo run -p minkowski-examples --example retention --release   # Retention: Expiry countdown + RetentionReducer, dispatch-count TTL, progressive despawn (5 entities, 8 frames)
 cargo run -p minkowski-examples --example pool --release   # Memory pool: TigerBeetle-style WorldBuilder with 16 MB budget, try_spawn until exhaustion, pool stats (131K entities)
+cargo run -p minkowski-examples --example pool_fragmentation --release   # Pool utilization at PoolExhausted across column-growth patterns + RSS after World::new() (64 MiB pool, 4 scenarios)
 cargo run -p minkowski-examples --example profile_changeset --release   # Profiling harness: QueryWriter vs QueryMut flamegraph capture (10K entities, 1K iterations)
 cargo run -p minkowski-examples --example planner --release   # Compiled push-based query planner: cost-based plans, index selection, joins, execute/for_each/for_each_raw (1K entities, 2 archetypes)
 cargo run -p minkowski-examples --example materialized_view --release   # Materialized views: cached debounced subscription queries, change detection, invalidation (200 entities, 7 demos)
@@ -53,6 +54,7 @@ cargo +nightly fuzz run fuzz_world_ops -- -max_total_time=60     # fuzz: random 
 cargo +nightly fuzz run fuzz_reducers -- -max_total_time=60      # fuzz: query iteration paths
 cargo +nightly fuzz run fuzz_lsm_recovery -- -max_total_time=60 -max_len=65536   # fuzz: LSM flush+recover round-trip (world-state variation)
 cargo +nightly fuzz run fuzz_wal_replay -- -max_total_time=60 -max_len=65536    # fuzz: WAL replay (mode 0 feeds raw malformed bytes)
+cargo +nightly fuzz run fuzz_pool_columns -- -max_total_time=60   # fuzz: two-frontier pool via World (3 MiB budget, large runs, grow, collision; shadow-model value checks)
 ```
 
 Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows. Runs the full test suite via nextest (parallel execution). Exclusions defined in `.config/nextest.toml` (`[profile.default-miri]`, auto-activated under Miri): `par_for_each` (rayon unsupported by Miri, covered by TSan), concurrent/contention pool tests (too slow, covered by TSan + Loom). To list selected tests: `cargo nextest list -p minkowski --lib --profile default-miri`.

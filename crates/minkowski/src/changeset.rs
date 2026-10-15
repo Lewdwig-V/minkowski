@@ -142,20 +142,19 @@ impl Arena {
         let new_layout =
             Layout::from_size_align(new_capacity, ARENA_ALIGN).expect("invalid arena layout");
 
-        // Always use alloc + copy + dealloc instead of realloc.
-        // realloc may not preserve alignment > max_align_t (typically 16 bytes).
-        // Same reasoning as BlobVec::grow — alignment guarantees are non-negotiable.
-        let new_data = self
-            .pool
-            .allocate(new_layout)
-            .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout));
-        if self.capacity > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.data.as_ptr(), new_data.as_ptr(), self.len);
-                let old_layout = Layout::from_size_align(self.capacity, ARENA_ALIGN).unwrap();
-                self.pool.deallocate(self.data, old_layout);
-            }
+        // Pool realloc, never the system realloc: the system realloc may not
+        // preserve alignment > max_align_t (typically 16 bytes). SlabPool::grow
+        // keeps the original alignment (class-aligned blocks, unit-aligned
+        // runs) — same reasoning as BlobVec::grow.
+        let new_data = if self.capacity > 0 {
+            let old_layout = Layout::from_size_align(self.capacity, ARENA_ALIGN).unwrap();
+            // SAFETY: self.data was allocated from self.pool with old_layout;
+            // self.len <= self.capacity live bytes. self.data is replaced below.
+            unsafe { self.pool.grow(self.data, old_layout, new_layout, self.len) }
+        } else {
+            self.pool.allocate(new_layout)
         }
+        .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout));
         self.data = new_data;
         self.capacity = new_capacity;
     }

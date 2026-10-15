@@ -2012,6 +2012,42 @@ mod tests {
         );
     }
 
+    /// A column past 1 MiB (300K × 8 B ≈ 2.4 MiB): recovery's bulk import
+    /// grows it through multi-unit `SlabPool::grow` (in-place widening and
+    /// shift-down memmove). Every recovered value must match.
+    #[test]
+    fn recover_column_past_one_mebibyte_preserves_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+
+        let n = 300_000usize;
+        for i in 0..n {
+            world.spawn((Pos {
+                x: i as f32,
+                y: -(i as f32),
+            },));
+        }
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_world(&world, &mut manifest, &mut log, dir.path(), 0, 10, &codecs);
+
+        let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
+        let mut rows: Vec<(f32, f32)> = result
+            .world
+            .query::<(&Pos,)>()
+            .map(|(p,)| (p.x, p.y))
+            .collect();
+        assert_eq!(rows.len(), n);
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (i, &(x, y)) in rows.iter().enumerate() {
+            assert_eq!((x, y), (i as f32, -(i as f32)), "row {i}");
+        }
+    }
+
     /// More than ~16K entity slots makes the allocator blob exceed `u16::MAX`
     /// bytes, forcing multi-page allocator metadata. Before the fix this failed
     /// to flush entirely.
@@ -2046,6 +2082,11 @@ mod tests {
 
         let (mut result, _, _) = LsmRecovery::recover::<4>(dir.path(), &log_path, &codecs).unwrap();
         assert_eq!(result.world.query::<(&Pos,)>().count(), n);
+        // Values, not just the count: import grows the column through the
+        // pool's realloc path (slab block -> large run).
+        let mut xs: Vec<f32> = result.world.query::<(&Pos,)>().map(|(p,)| p.x).collect();
+        xs.sort_by(f32::total_cmp);
+        assert!(xs.iter().enumerate().all(|(i, &x)| x == i as f32));
         let (gen_after, _) = result.world.entity_allocator_state();
         assert_eq!(
             gen_after.len(),
