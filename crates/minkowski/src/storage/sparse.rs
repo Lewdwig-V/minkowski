@@ -5,6 +5,7 @@ use crate::sync::Arc;
 
 use crate::pool::SlabPool;
 use crate::storage::blob_vec::BlobVec;
+use crate::storage::pool_vec::PoolVec;
 
 const PAGE_SIZE: usize = 4096;
 const EMPTY: u32 = u32::MAX;
@@ -18,27 +19,20 @@ const EMPTY: u32 = u32::MAX;
 ///
 /// # Pool threading status
 ///
-/// The dense `BlobVec` uses the shared pool (threaded via `new()`).
-/// The remaining heap allocations are **deferred to v2**:
+/// The dense `BlobVec` and `dense_entities` live in the world's pool (threaded
+/// via `new()`), so per-value storage counts against the memory budget. Both
+/// grow through aborting paths, matching `insert`'s infallible contract.
 ///
-/// - `pages: Vec<Option<Box<[u32; PAGE_SIZE]>>>` — each page is 16 KiB
-///   (`Box::new([EMPTY; PAGE_SIZE])`). Pages are allocated lazily and
-///   infrequently (one per 4096 unique entity indices). They are cold-path
-///   metadata, not hot-path component data.
-/// - `dense_entities: Vec<Entity>` — one `Entity` (8 bytes) per stored value.
-///   Grows with the dense array but is small relative to `BlobVec` columns.
-///
-/// These account for <5% of total memory in typical workloads. The `BlobVec`
-/// columns (hot-path component data) account for >95% and already use the
-/// pool. Converting pages to pool allocation is straightforward (16 KiB fits
-/// in size class 4 = 64 KiB) but the complexity isn't justified until strict
-/// zero-system-malloc is required.
+/// `pages: Vec<Option<Box<[u32; PAGE_SIZE]>>>` stays on the heap for now:
+/// each page is 16 KiB, allocated lazily (one per 4096 entity indices
+/// touched). Moving pages into the pool is phase 2 of
+/// `docs/plans/pool-entity-bookkeeping.md`.
 pub(crate) struct PagedSparseSet {
     // PERF: Two pointer chases per lookup (Vec data → Box page → array slot).
     // Inherent to paged design — flat array would be 16 GiB for u32 index space.
     // Prefer archetype-stored components for hot-path queries.
     pages: Vec<Option<Box<[u32; PAGE_SIZE]>>>,
-    dense_entities: Vec<Entity>,
+    dense_entities: PoolVec<Entity>,
     pub(crate) dense_values: BlobVec,
 }
 
@@ -51,7 +45,7 @@ impl PagedSparseSet {
     ) -> Self {
         Self {
             pages: Vec::new(),
-            dense_entities: Vec::new(),
+            dense_entities: PoolVec::new(Arc::clone(&pool)),
             dense_values: BlobVec::new(item_layout, drop_fn, 0, pool),
         }
     }

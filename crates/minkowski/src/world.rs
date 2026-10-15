@@ -1,6 +1,8 @@
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
+use crate::entity::FreeList;
 use crate::entity::{Entity, EntityAllocator};
+use crate::storage::pool_vec::PoolVec;
 
 use crate::pool::{PoolExhausted, SlabPool, default_pool};
 use crate::query::fetch::WorldQuery;
@@ -217,7 +219,8 @@ pub struct World {
     pub(crate) archetypes: Archetypes,
     pub(crate) components: ComponentRegistry,
     pub(crate) sparse: SparseStorage,
-    pub(crate) entity_locations: Vec<Option<EntityLocation>>,
+    /// Entity index -> placement. Lives in the world's pool.
+    pub(crate) entity_locations: PoolVec<Option<EntityLocation>>,
     pub(crate) table_cache: TableCache,
     pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry, crate::component::TypeIdBuildHasher>,
     pub(crate) current_tick: Tick,
@@ -233,11 +236,11 @@ impl World {
     pub(crate) fn new_with_pool(pool: Arc<SlabPool>) -> Self {
         Self {
             id: WorldId::next(),
-            entities: EntityAllocator::new(),
+            entities: EntityAllocator::new(pool.clone()),
             archetypes: Archetypes::new(),
             components: ComponentRegistry::new(),
             sparse: SparseStorage::new(pool.clone()),
-            entity_locations: Vec::new(),
+            entity_locations: PoolVec::new(pool.clone()),
             table_cache: TableCache::new(),
             query_cache: HashMap::with_hasher(crate::component::TypeIdBuildHasher),
             current_tick: Tick::default(),
@@ -455,9 +458,10 @@ impl World {
     ///
     /// # Panics
     ///
-    /// This method can still panic if the global allocator (used for internal
-    /// metadata like entity location tables) runs out of memory. Only pool-backed
-    /// storage (component columns) is covered by the `Result` return type.
+    /// The `Result` covers everything stored in the pool: component columns
+    /// and per-entity bookkeeping (archetype entity list, entity generations,
+    /// free list, entity location table). Archetype and component metadata
+    /// still come from the global allocator, which aborts on exhaustion.
     pub fn try_spawn<B: Bundle>(&mut self, bundle: B) -> Result<Entity, PoolExhausted> {
         self.drain_orphans();
         let component_ids = B::component_ids(&mut self.components);
@@ -474,6 +478,15 @@ impl World {
                 col.try_grow()?;
             }
         }
+        // Same for the per-entity bookkeeping (pool-backed): the archetype's
+        // row slot, the allocator's generation + free-list capacity, and an
+        // entity_locations slot for the highest index alloc() can return.
+        // Each step only grows spare capacity, so an Err leaves the world
+        // unchanged.
+        archetype.entities.try_reserve(1)?;
+        let bound = self.entities.try_prepare_alloc()?;
+        self.entity_locations
+            .try_reserve(bound.saturating_sub(self.entity_locations.len()))?;
 
         // All columns have capacity — proceed with infallible push.
         let entity = self.entities.alloc();
@@ -1584,6 +1597,9 @@ impl World {
                     col.try_grow()?;
                 }
             }
+            // The entity list lives in the pool too (B1): reserve its slot
+            // before any column is touched.
+            target_arch.entities.try_reserve(1)?;
         }
 
         // All target columns have capacity — proceed with infallible migration.
@@ -2188,10 +2204,15 @@ impl World {
     }
 
     /// Restore entity allocator state from a snapshot.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "public API kept stable; contents are copied into the pool"
+    )]
     pub fn restore_allocator_state(&mut self, generations: Vec<u32>, free_list: Vec<u32>) {
         self.drain_orphans();
-        self.entities.generations = generations;
-        self.entities.free_list = free_list.into();
+        self.entities.generations = PoolVec::from_slice(self.pool.clone(), &generations);
+        self.entities.free_list = FreeList::from_slice(self.pool.clone(), &free_list);
+        self.entities.ensure_free_capacity();
         // Sync the atomic counter so reserve() doesn't hand out already-used indices.
         self.entities.sync_reserved();
         self.entity_locations
@@ -4020,7 +4041,9 @@ mod tests {
     #[test]
     fn try_spawn_returns_error_on_pool_exhaustion() {
         let mut world = World::builder()
-            .memory_budget(64 * 1024) // tiny 64KB pool
+            // Small pool: a few 64 KiB chunks, enough for columns plus
+            // per-entity bookkeeping in their own slab classes.
+            .memory_budget(512 * 1024)
             .hugepages(HugePages::Off)
             .build()
             .unwrap();
@@ -4057,7 +4080,7 @@ mod tests {
     #[test]
     fn try_insert_returns_error_on_pool_exhaustion() {
         let mut world = World::builder()
-            .memory_budget(64 * 1024)
+            .memory_budget(512 * 1024)
             .hugepages(HugePages::Off)
             .build()
             .unwrap();
@@ -4079,6 +4102,127 @@ mod tests {
         let mut count = 0;
         world.query::<(&u32,)>().for_each(|_| count += 1);
         assert_eq!(count, entities.len());
+    }
+
+    /// Everything a failed `try_spawn` / `try_insert` must leave untouched.
+    fn bookkeeping_snapshot(world: &World) -> (usize, usize, usize, usize, Vec<usize>) {
+        (
+            world.entity_count(),
+            world.entities.generations.len(),
+            world.entities.free_list.len(),
+            world.entity_locations.len(),
+            world
+                .archetypes
+                .archetypes
+                .iter()
+                .map(Archetype::len)
+                .collect(),
+        )
+    }
+
+    fn exhausted_world(budget: usize, spawn: impl Fn(&mut World, u32) -> bool) -> (World, u32) {
+        let mut world = World::builder()
+            .memory_budget(budget)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        let mut n = 0;
+        while spawn(&mut world, n) {
+            n += 1;
+        }
+        assert!(n > 0);
+        (world, n)
+    }
+
+    #[test]
+    fn try_spawn_exhaustion_leaves_bookkeeping_unchanged() {
+        // Vary budget and row width so exhaustion lands on different
+        // preflight steps (column, entity list, generations, free list,
+        // entity_locations).
+        for budget in [256 << 10, 320 << 10, 384 << 10, 512 << 10, 1 << 20] {
+            for wide in [false, true] {
+                let spawn = |w: &mut World, n: u32| {
+                    if wide {
+                        w.try_spawn((n, [u64::from(n); 8])).is_ok()
+                    } else {
+                        w.try_spawn((n,)).is_ok()
+                    }
+                };
+                let (mut world, n) = exhausted_world(budget, spawn);
+                let before = bookkeeping_snapshot(&world);
+                for i in 0..3 {
+                    assert!(!spawn(&mut world, n + i));
+                }
+                assert_eq!(bookkeeping_snapshot(&world), before);
+                let mut sum = 0u64;
+                world
+                    .query::<(&u32,)>()
+                    .for_each(|(v,)| sum += u64::from(*v));
+                assert_eq!(sum, (0..u64::from(n)).sum::<u64>());
+            }
+        }
+    }
+
+    #[test]
+    fn try_insert_exhaustion_leaves_bookkeeping_unchanged() {
+        // Migration frees source rows into their class free lists, so some
+        // budgets migrate every entity; sweep until several fail at
+        // different points.
+        let mut failures = 0;
+        for budget in (4..=16).map(|chunks| chunks * 65_536) {
+            let (mut world, n) = exhausted_world(budget, |w, n| w.try_spawn((n,)).is_ok());
+            let entities: Vec<Entity> = world.query::<(Entity,)>().map(|(e,)| e).collect();
+            assert_eq!(entities.len(), n as usize);
+            for &e in &entities {
+                let before = bookkeeping_snapshot(&world);
+                let value = *world.get::<u32>(e).unwrap();
+                if world.try_insert(e, (1.5f64,)).is_err() {
+                    assert_eq!(bookkeeping_snapshot(&world), before);
+                    assert_eq!(*world.get::<u32>(e).unwrap(), value);
+                    assert!(world.get::<f64>(e).is_none());
+                    failures += 1;
+                    break;
+                }
+            }
+            let mut sum = 0u64;
+            world
+                .query::<(&u32,)>()
+                .for_each(|(v,)| sum += u64::from(*v));
+            assert_eq!(sum, (0..u64::from(n)).sum::<u64>());
+        }
+        assert!(
+            failures >= 3,
+            "only {failures} budgets ran out during inserts"
+        );
+    }
+
+    #[test]
+    fn despawn_and_respawn_with_exhausted_pool() {
+        let (mut world, n) = exhausted_world(512 << 10, |w, n| w.try_spawn((n,)).is_ok());
+        let entities: Vec<Entity> = world.query::<(Entity,)>().map(|(e,)| e).collect();
+        let caps = (
+            world.entities.generations.capacity(),
+            world.entities.free_list.capacity(),
+            world.entity_locations.capacity(),
+        );
+        // Despawn never allocates (B3), so it works with the pool exhausted.
+        for &e in &entities {
+            assert!(world.despawn(e));
+        }
+        assert_eq!(world.entity_count(), 0);
+        // Freed rows and slots are reused without growing anything.
+        for i in 0..n {
+            world.try_spawn((i,)).unwrap();
+        }
+        assert_eq!(world.entity_count(), n as usize);
+        assert_eq!(
+            (
+                world.entities.generations.capacity(),
+                world.entities.free_list.capacity(),
+                world.entity_locations.capacity(),
+            ),
+            caps
+        );
     }
 
     // ── insert / try_insert dead entity tests ──────────────────────

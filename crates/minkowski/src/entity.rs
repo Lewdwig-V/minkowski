@@ -1,29 +1,70 @@
-use crate::sync::{AtomicU32, Ordering};
+use crate::pool::{PoolExhausted, SlabPool};
+use crate::storage::pool_vec::PoolVec;
+use crate::sync::{Arc, AtomicU32, Ordering};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Ordered free slots with a lazy index for replay's arbitrary removals.
 /// Tombstones avoid shifting the tail; snapshots expose only live entries.
-#[derive(Default)]
+///
+/// `slots` lives in the world's pool. `positions` (built only on the
+/// `adopt`/`remove` replay path) and `snapshot` (a lazy copy for persistence)
+/// stay on the heap: both are transient and empty on the spawn/despawn path.
 pub(crate) struct FreeList {
-    slots: Vec<u32>,
+    slots: PoolVec<u32>,
     positions: Option<HashMap<u32, usize>>,
     holes: usize,
     snapshot: OnceLock<Vec<u32>>,
 }
 
-impl From<Vec<u32>> for FreeList {
-    fn from(slots: Vec<u32>) -> Self {
-        Self {
-            slots,
-            ..Self::default()
-        }
-    }
-}
-
 impl FreeList {
     // The allocator never issues u32::MAX (Entity::DANGLING's index).
     const REMOVED: u32 = u32::MAX;
+
+    pub(crate) fn new(pool: Arc<SlabPool>) -> Self {
+        Self {
+            slots: PoolVec::new(pool),
+            positions: None,
+            holes: 0,
+            snapshot: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn from_slice(pool: Arc<SlabPool>, slots: &[u32]) -> Self {
+        let mut list = Self::new(Arc::clone(&pool));
+        list.slots = PoolVec::from_slice(pool, slots);
+        list
+    }
+
+    /// Ensure capacity for `total` slots without allocating later.
+    /// On `Err` nothing changed.
+    fn try_reserve_total(&mut self, total: usize) -> Result<(), PoolExhausted> {
+        self.slots
+            .try_reserve(total.saturating_sub(self.slots.len()))
+    }
+
+    fn reserve_total(&mut self, total: usize) {
+        self.slots.reserve(total.saturating_sub(self.slots.len()));
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
+    /// Drop tombstones in place. Never allocates in the pool; rebuilds the
+    /// heap-side `positions` index if one exists.
+    fn compact(&mut self) {
+        self.slots.retain(|&i| i != Self::REMOVED);
+        self.holes = 0;
+        if let Some(positions) = &mut self.positions {
+            *positions = self
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(pos, &i)| (i, pos))
+                .collect();
+        }
+    }
 
     pub(crate) fn len(&self) -> usize {
         self.slots.len() - self.holes
@@ -45,6 +86,13 @@ impl FreeList {
 
     fn push(&mut self, index: u32) {
         self.snapshot.take();
+        // Despawn must not allocate (B3): reclaim tombstones before growing.
+        // Live free entries never exceed generations.len() - 1 here, and the
+        // allocator keeps capacity >= generations.len(), so compaction always
+        // makes room.
+        if self.slots.len() == self.slots.capacity() && self.holes > 0 {
+            self.compact();
+        }
         if let Some(positions) = &mut self.positions {
             positions.insert(index, self.slots.len());
         }
@@ -93,14 +141,7 @@ impl FreeList {
         self.holes += 1;
         // Rebuild only after enough removals to amortize the linear scan.
         if self.holes > self.slots.len() / 2 {
-            self.slots.retain(|&i| i != Self::REMOVED);
-            self.holes = 0;
-            *positions = self
-                .slots
-                .iter()
-                .enumerate()
-                .map(|(pos, &i)| (i, pos))
-                .collect();
+            self.compact();
         }
         true
     }
@@ -162,23 +203,17 @@ impl Entity {
 ///   generations vec yet — call `materialize_reserved()` before using
 ///   `alloc()` or `is_alive()` on reserved indices.
 ///
-/// # Pool threading status
+/// # Pool backing
 ///
-/// The generations and free-slot storage use the standard system
-/// allocator. Pool-backed allocation is **deferred to v2**:
+/// `generations` (one `u32` per index ever created) and the free list's
+/// slots live in the world's pool, so entity count is bounded by the pool
+/// budget (`docs/plans/pool-entity-bookkeeping.md`).
 ///
-/// - `generations: Vec<u32>` — one `u32` per entity index ever created.
-///   Grows monotonically, never shrinks. Cold-path metadata accessed
-///   only during alloc/dealloc/is_alive.
-/// - `free_list: FreeList` — ordered recycled indices, with a lazy lookup
-///   index for replay. Ordinary allocation uses its Vec tail directly.
-///
-/// Together these account for negligible memory relative to the BlobVec
-/// columns that store actual component data (>95% of total). Converting
-/// to pool-backed storage would require a pool-aware Vec type, which is
-/// significant additional machinery for minimal memory accounting benefit.
+/// Invariant B3: `free_list.capacity() >= generations.len()` after every
+/// operation that grows `generations`, so `dealloc` (and therefore despawn)
+/// never allocates.
 pub(crate) struct EntityAllocator {
-    pub(crate) generations: Vec<u32>,
+    pub(crate) generations: PoolVec<u32>,
     pub(crate) free_list: FreeList,
     // PERF: Padding isolates the atomic from Vec fields on separate cache
     // lines. Prevents false sharing when concurrent spawners (via reserve())
@@ -193,10 +228,10 @@ pub(crate) struct EntityAllocator {
 }
 
 impl EntityAllocator {
-    pub fn new() -> Self {
+    pub fn new(pool: Arc<SlabPool>) -> Self {
         Self {
-            generations: Vec::new(),
-            free_list: FreeList::default(),
+            generations: PoolVec::new(Arc::clone(&pool)),
+            free_list: FreeList::new(pool),
             _pad: [0; 64],
             next_reserved: AtomicU32::new(0),
             total_spawns: 0,
@@ -246,13 +281,38 @@ impl EntityAllocator {
     pub fn materialize_reserved(&mut self) {
         let reserved = self.next_reserved.load(Ordering::Relaxed);
         let before = self.generations.len();
-        while self.generations.len() < reserved as usize {
-            self.generations.push(0);
+        if self.generations.len() < reserved as usize {
+            self.generations.resize(reserved as usize, 0);
+            self.ensure_free_capacity();
         }
         // Count reserved entities that were just materialized as spawns.
         // reserve() is &self (lock-free), so it can't increment the counter;
         // this is the first &mut self point where we know the count.
         self.total_spawns += (self.generations.len() - before) as u64;
+    }
+
+    /// Keep invariant B3 (aborting if the pool is exhausted).
+    pub(crate) fn ensure_free_capacity(&mut self) {
+        self.free_list.reserve_total(self.generations.len());
+        debug_assert!(self.free_list.capacity() >= self.generations.len());
+    }
+
+    /// Fallible preflight for `alloc`: reserve every pool slot the next
+    /// `alloc()` call will need (materializing reserved indices, a fresh
+    /// generation if the free list is empty, and matching free-list capacity
+    /// for B3). On `Ok`, the next `alloc()` does not allocate, and the
+    /// returned bound exceeds the index it will return. On `Err` nothing
+    /// observable changed (only spare capacity may have grown).
+    pub(crate) fn try_prepare_alloc(&mut self) -> Result<usize, PoolExhausted> {
+        let reserved = self.next_reserved.load(Ordering::Relaxed) as usize;
+        let mut target = self.generations.len().max(reserved);
+        if self.free_list.len() == 0 {
+            target += 1;
+        }
+        self.generations
+            .try_reserve(target - self.generations.len())?;
+        self.free_list.try_reserve_total(target)?;
+        Ok(target)
     }
 
     pub fn alloc(&mut self) -> Entity {
@@ -266,6 +326,7 @@ impl EntityAllocator {
         } else {
             let index = self.generations.len() as u32;
             self.generations.push(0);
+            self.ensure_free_capacity();
             self.next_reserved.store(index + 1, Ordering::Relaxed);
             Entity::new(index, 0)
         }
@@ -309,6 +370,7 @@ impl EntityAllocator {
         } else {
             let previous_len = self.generations.len();
             self.generations.resize(index + 1, 0);
+            self.ensure_free_capacity();
             // A source can reserve indices that it never logs. Keep those
             // holes available without allocating or claiming unrelated IDs.
             self.free_list.extend(previous_len as u32..entity.index());
@@ -332,7 +394,8 @@ mod tests {
     #[test]
     fn free_list_matches_ordered_vec() {
         let mut expected: Vec<u32> = (0..64).collect();
-        let mut free = FreeList::from(expected.clone());
+        let pool = crate::pool::default_pool();
+        let mut free = FreeList::from_slice(Arc::clone(&pool), &expected);
         let mut next = 64;
         let mut seed = 42u64;
         for step in 0..2048 {
@@ -353,7 +416,7 @@ mod tests {
             assert_eq!(free.len(), expected.len());
             assert_eq!(free.as_slice(), expected);
             if step % 127 == 0 {
-                free = expected.clone().into();
+                free = FreeList::from_slice(Arc::clone(&pool), &expected);
             }
         }
         while let Some(index) = expected.pop() {
@@ -389,7 +452,7 @@ mod tests {
 
     #[test]
     fn allocator_basic() {
-        let mut alloc = EntityAllocator::new();
+        let mut alloc = EntityAllocator::new(crate::pool::default_pool());
         let e1 = alloc.alloc();
         let e2 = alloc.alloc();
         assert_eq!(e1.index(), 0);
@@ -402,7 +465,7 @@ mod tests {
 
     #[test]
     fn allocator_recycle() {
-        let mut alloc = EntityAllocator::new();
+        let mut alloc = EntityAllocator::new(crate::pool::default_pool());
         let e1 = alloc.alloc();
         assert!(alloc.dealloc(e1));
         let e2 = alloc.alloc();
@@ -414,7 +477,7 @@ mod tests {
 
     #[test]
     fn allocator_double_dealloc() {
-        let mut alloc = EntityAllocator::new();
+        let mut alloc = EntityAllocator::new(crate::pool::default_pool());
         let e = alloc.alloc();
         assert!(alloc.dealloc(e));
         assert!(!alloc.dealloc(e));
@@ -434,7 +497,7 @@ mod tests {
 
     #[test]
     fn reserve_basic() {
-        let alloc = EntityAllocator::new();
+        let alloc = EntityAllocator::new(crate::pool::default_pool());
         let e1 = alloc.reserve();
         let e2 = alloc.reserve();
         assert_eq!(e1.index(), 0);
@@ -446,7 +509,7 @@ mod tests {
     #[test]
     fn reserve_concurrent() {
         use std::sync::Arc;
-        let alloc = Arc::new(EntityAllocator::new());
+        let alloc = Arc::new(EntityAllocator::new(crate::pool::default_pool()));
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let alloc = alloc.clone();
@@ -464,7 +527,7 @@ mod tests {
 
     #[test]
     fn reserve_then_alloc_no_overlap() {
-        let mut alloc = EntityAllocator::new();
+        let mut alloc = EntityAllocator::new(crate::pool::default_pool());
         let r1 = alloc.reserve();
         let r2 = alloc.reserve();
         alloc.materialize_reserved();
@@ -476,7 +539,7 @@ mod tests {
 
     #[test]
     fn alloc_after_reserve_recycles_free_list() {
-        let mut alloc = EntityAllocator::new();
+        let mut alloc = EntityAllocator::new(crate::pool::default_pool());
         // alloc two entities, dealloc one
         let e0 = alloc.alloc();
         let _e1 = alloc.alloc();
@@ -494,7 +557,7 @@ mod tests {
 
     #[test]
     fn spawn_counter_counts_alloc() {
-        let mut alloc = EntityAllocator::new();
+        let mut alloc = EntityAllocator::new(crate::pool::default_pool());
         assert_eq!(alloc.total_spawns, 0);
         alloc.alloc();
         alloc.alloc();
@@ -503,7 +566,7 @@ mod tests {
 
     #[test]
     fn spawn_counter_counts_reserve_on_materialize() {
-        let mut alloc = EntityAllocator::new();
+        let mut alloc = EntityAllocator::new(crate::pool::default_pool());
         alloc.reserve();
         alloc.reserve();
         alloc.reserve();
@@ -516,7 +579,7 @@ mod tests {
 
     #[test]
     fn spawn_counter_no_double_count_alloc_after_reserve() {
-        let mut alloc = EntityAllocator::new();
+        let mut alloc = EntityAllocator::new(crate::pool::default_pool());
         alloc.reserve(); // index 0
         alloc.reserve(); // index 1
         // alloc calls materialize_reserved internally, then allocates one more
@@ -528,7 +591,7 @@ mod tests {
 
     #[test]
     fn despawn_counter_counts_dealloc() {
-        let mut alloc = EntityAllocator::new();
+        let mut alloc = EntityAllocator::new(crate::pool::default_pool());
         let e1 = alloc.alloc();
         let _e2 = alloc.alloc();
         assert_eq!(alloc.total_despawns, 0);
@@ -537,6 +600,100 @@ mod tests {
         // Failed dealloc (double-free) must NOT increment counter
         alloc.dealloc(e1);
         assert_eq!(alloc.total_despawns, 1);
+    }
+
+    /// Allocate from `pool` until every size class refuses, so any later
+    /// growth (other than reuse of already-free slots) fails.
+    fn exhaust(pool: &SlabPool) {
+        for size in [1 << 20, 65_536, 16_384, 4096, 1024, 256, 64] {
+            let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+            while pool.allocate(layout).is_ok() {}
+        }
+    }
+
+    fn small_pool() -> Arc<SlabPool> {
+        Arc::new(SlabPool::new(8 * 65_536, crate::pool::HugePages::Off, false).unwrap())
+    }
+
+    #[test]
+    fn failed_prepare_alloc_changes_nothing() {
+        let mut alloc = EntityAllocator::new(small_pool());
+        // An outstanding reservation makes prepare also cover
+        // materialize_reserved's growth.
+        let reserved = alloc.reserve();
+        while alloc.try_prepare_alloc().is_ok() {
+            let free_cap = alloc.free_list.capacity();
+            let gen_cap = alloc.generations.capacity();
+            alloc.alloc();
+            // Ok means alloc() did not need to grow anything.
+            assert_eq!(alloc.free_list.capacity(), free_cap);
+            assert_eq!(alloc.generations.capacity(), gen_cap);
+        }
+        let before = (
+            alloc.generations.len(),
+            alloc.free_list.len(),
+            alloc.next_reserved.load(Ordering::Relaxed),
+            alloc.total_spawns,
+        );
+        for _ in 0..3 {
+            assert!(alloc.try_prepare_alloc().is_err());
+        }
+        let after = (
+            alloc.generations.len(),
+            alloc.free_list.len(),
+            alloc.next_reserved.load(Ordering::Relaxed),
+            alloc.total_spawns,
+        );
+        assert_eq!(before, after);
+        assert!(alloc.is_alive(reserved));
+    }
+
+    #[test]
+    fn dealloc_never_allocates_with_exhausted_pool() {
+        let pool = small_pool();
+        let mut alloc = EntityAllocator::new(Arc::clone(&pool));
+        let mut live: Vec<Entity> = (0..2000).map(|_| alloc.alloc()).collect();
+        // Free every third entity, then adopt some of them back from the
+        // middle of the free list so it carries tombstones (holes).
+        let mut freed = Vec::new();
+        let mut i = 0;
+        live.retain(|&e| {
+            i += 1;
+            if i % 3 == 0 {
+                assert!(alloc.dealloc(e));
+                freed.push(e);
+                false
+            } else {
+                true
+            }
+        });
+        for e in freed.iter().step_by(4).take(100) {
+            let revived = Entity::new(e.index(), alloc.generations[e.index() as usize]);
+            assert!(alloc.adopt(revived));
+            live.push(revived);
+        }
+        assert!(alloc.free_list.holes > 0, "test needs tombstones");
+
+        exhaust(&pool);
+        let caps = (alloc.generations.capacity(), alloc.free_list.capacity());
+        for &e in &live {
+            assert!(alloc.dealloc(e));
+        }
+        assert_eq!(alloc.free_list.len(), alloc.generations.len());
+        assert_eq!(
+            (alloc.generations.capacity(), alloc.free_list.capacity()),
+            caps,
+            "despawn must not grow pool-backed bookkeeping"
+        );
+        // Every slot is reusable without growth.
+        for _ in 0..alloc.generations.len() {
+            assert!(alloc.try_prepare_alloc().is_ok());
+            alloc.alloc();
+        }
+        assert_eq!(
+            (alloc.generations.capacity(), alloc.free_list.capacity()),
+            caps
+        );
     }
 }
 
@@ -552,7 +709,7 @@ mod loom_tests {
     #[test]
     fn loom_reserve_no_duplicate_indices() {
         loom::model(|| {
-            let alloc = Arc::new(EntityAllocator::new());
+            let alloc = Arc::new(EntityAllocator::new(crate::pool::default_pool()));
 
             let a1 = alloc.clone();
             let t1 = thread::spawn(move || {

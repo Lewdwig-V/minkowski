@@ -1,3 +1,4 @@
+use crate::storage::pool_vec::PoolVec;
 use std::collections::HashMap;
 
 use fixedbitset::FixedBitSet;
@@ -26,8 +27,9 @@ pub(crate) struct Archetype {
     // every init_fetch, get_mut, insert, and migration path.
     /// ComponentId -> index into columns. Dense array indexed by ComponentId.
     pub component_index: Vec<Option<usize>>,
-    /// Row -> Entity mapping.
-    pub entities: Vec<Entity>,
+    /// Row -> Entity mapping. Lives in the world's pool (per-entity
+    /// bookkeeping counts against the budget).
+    pub entities: PoolVec<Entity>,
 }
 
 impl Archetype {
@@ -55,7 +57,7 @@ impl Archetype {
             sorted_ids: sorted_component_ids.to_vec(),
             columns,
             component_index,
-            entities: Vec::new(),
+            entities: PoolVec::new(Arc::clone(pool)),
         }
     }
 
