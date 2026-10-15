@@ -1,13 +1,23 @@
 use crate::entity::Entity;
 use crate::world::EntityLocation;
 
-/// Pool-aware reusable entity buffer for allocation-free query execution.
+/// Reusable entity buffer for allocation-free query execution.
 ///
 /// Used by join/gather plans instead of per-node `Vec<Entity>` allocation.
 /// Call [`clear`](ScratchBuffer::clear) between uses to reset length while
 /// preserving the backing allocation.
+///
+/// Lives on the system heap, not the `SlabPool`: the pool budget covers
+/// component storage only (see `docs/memory-management.md`). Growth past
+/// the pre-allocated capacity is driven by result size.
 pub(super) struct ScratchBuffer {
     pub(super) entities: Vec<Entity>,
+    /// Per-partition buckets for [`partitioned_intersection`], kept across
+    /// executions so a repeated join reuses their capacity instead of
+    /// allocating up to `MAX_PARTITIONS` vectors per call.
+    ///
+    /// [`partitioned_intersection`]: ScratchBuffer::partitioned_intersection
+    buckets: Vec<Vec<u64>>,
 }
 
 /// Maximum pre-allocation cap: 64K entities.
@@ -18,6 +28,7 @@ impl ScratchBuffer {
     pub(super) fn new(estimated_capacity: usize) -> Self {
         Self {
             entities: Vec::with_capacity(estimated_capacity.min(SCRATCH_MAX_CAP)),
+            buckets: Vec::new(),
         }
     }
 
@@ -109,14 +120,22 @@ impl ScratchBuffer {
             return self.sorted_intersection(left_len);
         }
 
-        // Bucket left and right entities by partition.
-        let mut left_buckets: Vec<Vec<u64>> = vec![Vec::new(); partitions];
+        // Bucket left entities by partition, reusing bucket capacity from
+        // earlier executions. Buckets beyond `partitions` keep their
+        // capacity for a later call that needs more partitions.
+        if self.buckets.len() < partitions {
+            self.buckets.resize_with(partitions, Vec::new);
+        }
+        let left_buckets = &mut self.buckets[..partitions];
+        for bucket in left_buckets.iter_mut() {
+            bucket.clear();
+        }
         for &e in &self.entities[..left_len] {
             let bits = e.to_bits();
             left_buckets[(bits % partitions as u64) as usize].push(bits);
         }
         // Sort each left bucket for binary search.
-        for bucket in &mut left_buckets {
+        for bucket in left_buckets.iter_mut() {
             bucket.sort_unstable();
         }
 
