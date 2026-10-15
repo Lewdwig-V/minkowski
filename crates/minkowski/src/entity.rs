@@ -209,16 +209,24 @@ impl EntityAllocator {
     /// generations vec yet — call `materialize_reserved()` from `&mut self`
     /// before using `alloc()` or `is_alive()` on reserved indices.
     pub fn reserve(&self) -> Entity {
-        let index = self
-            .next_reserved
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if current < u32::MAX {
-                    Some(current + 1)
-                } else {
-                    None
-                }
-            })
-            .expect("entity index space exhausted: reserve() cannot allocate past u32::MAX");
+        // Explicit CAS loop rather than `fetch_update` (deprecated in newer
+        // std as `try_update`) or `try_update` (absent from loom's atomics).
+        let mut current = self.next_reserved.load(Ordering::Relaxed);
+        let index = loop {
+            assert!(
+                current < u32::MAX,
+                "entity index space exhausted: reserve() cannot allocate past u32::MAX"
+            );
+            match self.next_reserved.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(index) => break index,
+                Err(actual) => current = actual,
+            }
+        };
         Entity::new(index, 0)
     }
 
@@ -353,7 +361,7 @@ mod tests {
         }
         assert_eq!(free.pop(), None);
         assert_eq!(free.len(), 0);
-        assert!(free.as_slice().is_empty());
+        assert_eq!(free.as_slice().len(), 0);
     }
 
     #[test]

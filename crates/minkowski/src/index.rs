@@ -644,7 +644,7 @@ mod tests {
         assert!(twenties.contains(&e2));
 
         // Missing value returns empty slice.
-        assert!(idx.get(&Score(99)).is_empty());
+        assert_eq!(idx.get(&Score(99)).len(), 0);
     }
 
     #[test]
@@ -676,7 +676,7 @@ mod tests {
         let mut idx = BTreeIndex::<Score>::new();
         idx.rebuild(&mut world);
 
-        assert!(idx.get(&Score(0)).is_empty());
+        assert_eq!(idx.get(&Score(0)).len(), 0);
         assert_eq!(idx.range(..).count(), 0);
     }
 
@@ -695,7 +695,7 @@ mod tests {
         idx.update(&mut world);
 
         // Old bucket should be empty, new bucket should have the entity.
-        assert!(idx.get(&Score(10)).is_empty());
+        assert_eq!(idx.get(&Score(10)).len(), 0);
         let thirties = idx.get(&Score(30));
         assert_eq!(thirties.len(), 1);
         assert!(thirties.contains(&e1));
@@ -721,7 +721,7 @@ mod tests {
 
         // Rebuild cleans up stale entries.
         idx.rebuild(&mut world);
-        assert!(idx.get(&Score(10)).is_empty());
+        assert_eq!(idx.get(&Score(10)).len(), 0);
 
         let twenties = idx.get(&Score(20));
         assert_eq!(twenties.len(), 1);
@@ -766,7 +766,7 @@ mod tests {
         assert_eq!(twenties.len(), 1);
         assert!(twenties.contains(&e2));
 
-        assert!(idx.get(&Score(99)).is_empty());
+        assert_eq!(idx.get(&Score(99)).len(), 0);
     }
 
     #[test]
@@ -783,7 +783,7 @@ mod tests {
         *world.get_mut::<Score>(e1).unwrap() = Score(30);
         idx.update(&mut world);
 
-        assert!(idx.get(&Score(10)).is_empty());
+        assert_eq!(idx.get(&Score(10)).len(), 0);
         let thirties = idx.get(&Score(30));
         assert_eq!(thirties.len(), 1);
         assert!(thirties.contains(&e1));
@@ -873,10 +873,10 @@ mod tests {
         hash.update(&mut world);
 
         // Both should see the change
-        assert!(btree.get(&Score(10)).is_empty());
+        assert_eq!(btree.get(&Score(10)).len(), 0);
         assert_eq!(btree.get(&Score(30)).len(), 1);
 
-        assert!(hash.get(&Score(10)).is_empty());
+        assert_eq!(hash.get(&Score(10)).len(), 0);
         assert_eq!(hash.get(&Score(30)).len(), 1);
     }
 

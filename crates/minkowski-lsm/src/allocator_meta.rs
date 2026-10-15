@@ -66,8 +66,8 @@ mod tests {
     fn round_trip_empty() {
         let bytes = encode(&[], &[]);
         let (gens, free) = decode(&bytes).unwrap();
-        assert!(gens.is_empty());
-        assert!(free.is_empty());
+        assert_eq!(gens.len(), 0);
+        assert_eq!(free.len(), 0);
     }
 
     #[test]

@@ -485,7 +485,7 @@ mod tests {
         loaded.update(&mut world);
 
         // Verify: Score(20) gone, Score(30) and Score(40) present
-        assert!(loaded.get(&Score(20)).is_empty());
+        assert_eq!(loaded.get(&Score(20)).len(), 0);
         assert_eq!(loaded.get(&Score(30)).len(), 1);
         assert_eq!(loaded.get(&Score(40)).len(), 1);
         assert_eq!(loaded.get(&Score(10)).len(), 1);

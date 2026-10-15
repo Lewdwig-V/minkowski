@@ -805,7 +805,7 @@ mod tests {
         assert!(result.output_bytes > 0);
 
         // L0 must be drained; L1 has one run.
-        assert!(manifest.runs_at_level(Level::L0).is_empty());
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), 0);
         assert_eq!(manifest.runs_at_level(Level::L1).len(), 1);
     }
 
@@ -875,7 +875,7 @@ mod tests {
         assert_eq!(r2.input_run_count, 4);
 
         // After second: 0 L0, 2 L1.
-        assert!(manifest.runs_at_level(Level::L0).is_empty());
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), 0);
         assert_eq!(manifest.runs_at_level(Level::L1).len(), 2);
 
         // Third call: nothing left at L0; L1 has 2 < 4.
@@ -1254,7 +1254,7 @@ mod tests {
             .unwrap()
             .expect("K=4 runs must produce Some(report)");
 
-        assert!(manifest.runs_at_level(Level::L0).is_empty());
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), 0);
         assert_eq!(manifest.runs_at_level(Level::L1).len(), 1);
 
         // Verify all entities from BOTH archetypes are in the output
