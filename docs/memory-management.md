@@ -22,7 +22,7 @@ match world.try_spawn((pos, vel)) {
 }
 ```
 
-The pool uses size-classed slab allocation (64 B to 1 MB). All worlds use mmap-backed `SlabPool` — `World::new()` creates a 256 MiB demand-paged pool, while `WorldBuilder::memory_budget()` creates a pre-faulted pool with a specific budget and optional hugepage support.
+The pool is one window with two opposing frontiers. The bottom frontier grows upward and carves 64 KiB chunks on demand for five slab size classes (64 B – 64 KiB). The top frontier grows downward and serves anything larger as runs of 1 MiB units, so one column can grow to any size the budget allows. Nothing is reserved per size class up front: `PoolExhausted` means the frontiers have met (or every carved block of the needed class is in use), not that one fixed partition ran out. Large runs grow in place when free units border them, which avoids the transient 2× footprint of copy-on-grow. All worlds use the mmap-backed `SlabPool`: `World::new()` creates a 256 MiB demand-paged pool that touches no pages until the first allocation, while `WorldBuilder::memory_budget()` creates a pre-faulted pool with a specific budget and optional hugepage support. See [the design doc](plans/two-frontier-pool.md) for the layout and measured utilization.
 
 ## Blob Offloading
 

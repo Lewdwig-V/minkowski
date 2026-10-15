@@ -217,24 +217,8 @@ impl BlobVec {
         .expect("invalid layout");
 
         let new_data = self
-            .pool
-            .allocate(new_layout)
+            .grow_allocation(new_layout)
             .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout));
-        if self.capacity > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.data.as_ptr(),
-                    new_data.as_ptr(),
-                    size * self.len,
-                );
-                let old_layout = Layout::from_size_align(
-                    size * self.capacity,
-                    Self::alloc_align(&self.item_layout),
-                )
-                .unwrap();
-                self.pool.deallocate(self.data, old_layout);
-            }
-        }
         self.data = new_data;
         self.capacity = new_capacity;
     }
@@ -598,31 +582,13 @@ impl BlobVec {
         )
         .expect("invalid layout");
 
-        // Always use alloc + copy + dealloc instead of realloc.
-        // realloc may not preserve alignment > max_align_t (typically 16 bytes),
-        // and we require 64-byte alignment for cache line / SIMD guarantees.
-        //
-        // Check the allocation result BEFORE copying — alloc can return null
-        // under memory pressure, and copy_nonoverlapping on a null dst is UB.
+        // Pool realloc (SlabPool::grow), never the system realloc: the system
+        // realloc may not preserve alignment > max_align_t (typically 16
+        // bytes), and we require 64-byte alignment for cache line / SIMD
+        // guarantees. The pool keeps the original alignment.
         let new_data = self
-            .pool
-            .allocate(new_layout)
+            .grow_allocation(new_layout)
             .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout));
-        if self.capacity > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.data.as_ptr(),
-                    new_data.as_ptr(),
-                    size * self.len,
-                );
-                let old_layout = Layout::from_size_align(
-                    size * self.capacity,
-                    Self::alloc_align(&self.item_layout),
-                )
-                .unwrap();
-                self.pool.deallocate(self.data, old_layout);
-            }
-        }
         self.data = new_data;
         self.capacity = new_capacity;
     }
@@ -645,25 +611,31 @@ impl BlobVec {
         )
         .expect("invalid layout");
 
-        let new_data = self.pool.allocate(new_layout)?;
-        if self.capacity > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.data.as_ptr(),
-                    new_data.as_ptr(),
-                    size * self.len,
-                );
-                let old_layout = Layout::from_size_align(
-                    size * self.capacity,
-                    Self::alloc_align(&self.item_layout),
-                )
-                .unwrap();
-                self.pool.deallocate(self.data, old_layout);
-            }
-        }
+        let new_data = self.grow_allocation(new_layout)?;
         self.data = new_data;
         self.capacity = new_capacity;
         Ok(())
+    }
+
+    /// Move the column's storage to an allocation of `new_layout`, keeping
+    /// the `len` live elements. Uses the pool's realloc (`SlabPool::grow`),
+    /// which can widen a large run in place instead of copying. On `Err`
+    /// the current allocation is untouched.
+    fn grow_allocation(&mut self, new_layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
+        let size = self.item_layout.size();
+        if self.capacity == 0 {
+            return self.pool.allocate(new_layout);
+        }
+        let old_layout =
+            Layout::from_size_align(size * self.capacity, Self::alloc_align(&self.item_layout))
+                .expect("valid layout for existing allocation");
+        // SAFETY: self.data was allocated from self.pool with old_layout
+        // (capacity > 0), and size * len <= size * capacity live bytes. On
+        // Ok the caller replaces self.data with the returned pointer.
+        unsafe {
+            self.pool
+                .grow(self.data, old_layout, new_layout, size * self.len)
+        }
     }
 }
 

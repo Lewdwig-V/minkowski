@@ -176,8 +176,11 @@ pub struct WorldStats {
     pub pool_capacity: usize,
     /// Bytes currently allocated from the pool.
     pub pool_used: usize,
-    /// Per-class count of blocks currently serving overflow allocations.
-    /// Array indices match size classes: [64B, 256B, 1KB, 4KB, 64KB, 1MB].
+    /// Per-class count of blocks currently serving overflow allocations
+    /// (a request served by the next class up because its own class had no
+    /// free block and the pool's frontiers had met). Indices 0–4 are the
+    /// slab classes [64B, 256B, 1KB, 4KB, 64KB]; index 5 is the large-run
+    /// path (1 MiB units), which counts 64KB-class overflow into a run.
     pub pool_overflow_active: [u64; 6],
     /// Per-class cumulative count of overflow allocations.
     pub pool_overflow_total: [u64; 6],
