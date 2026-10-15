@@ -28,16 +28,17 @@ The pool is one window with two opposing frontiers. The bottom frontier grows up
 
 The pool budget applies to **component storage only**. That's a design decision, not an oversight: component columns are expected to dominate memory, so a TigerBeetle-style whole-process limit was judged unnecessary.
 
-| Inside the pool budget | Outside it (system heap) |
+| Inside the world's pool budget | Outside it |
 |---|---|
-| Dense component columns (`BlobVec`) | Entity bookkeeping: generations, free list, `entity_locations`, per-archetype entity lists |
-| Sparse component values (`PagedSparseSet` dense storage) | `PagedSparseSet` page directory, component registry, query cache |
-| `EnumChangeSet` component bytes (the changeset `Arena`) | `EnumChangeSet` mutation records and drop entries |
-| | Per-column dirty-page bitsets |
-| | Query planner scratch (grows with join/result size), user-owned indexes (`BTreeIndex`, `HashIndex`, spatial) |
-| | WAL and LSM buffers, and the pool's own side table |
+| Dense component columns (`BlobVec`) | Entity bookkeeping: generations, free list, `entity_locations`, per-archetype entity lists (system heap) |
+| Sparse component values (`PagedSparseSet` dense storage) | `PagedSparseSet` page directory, component registry, query cache (system heap) |
+| | `EnumChangeSet` component bytes (the changeset `Arena`): `EnumChangeSet::new()` / `with_capacity()`, including the changeset inside every transaction, allocate from a separate default pool created per changeset, not the world's |
+| | `EnumChangeSet` mutation records and drop entries (system heap) |
+| | Per-column dirty-page bitsets (system heap) |
+| | Query planner scratch (grows with join/result size), user-owned indexes (`BTreeIndex`, `HashIndex`, spatial) (system heap) |
+| | WAL and LSM buffers, and the pool's own side table (system heap) |
 
-Most heap-side structures scale with entity count rather than component bytes. Query scratch scales with result size: a plan pre-sizes it (capped at 64K entities) and reuses it across executions, but it can grow past that for large joins. `PoolExhausted` therefore bounds component memory, not process RSS. Size the process limit (container memory, `RLIMIT_AS`) with headroom for the heap side.
+Most heap-side structures scale with entity count rather than component bytes. Query scratch scales with result size: a plan pre-sizes it (capped at 64K entities) and reuses it across executions, but it can grow past that for large joins. `PoolExhausted` therefore bounds the world's component columns, not process RSS, and recording a large changeset never raises it. Size the process limit (container memory, `RLIMIT_AS`) with headroom for the heap side.
 
 ## Blob Offloading
 
@@ -77,7 +78,7 @@ Together, these four features let a Minkowski deployment run indefinitely within
 
 ## LSM Disk-Space Management
 
-The `minkowski-lsm` crate adds a fourth dimension to memory management: **incremental disk persistence with bounded space amplification**. Where the pool caps in-memory RAM, blob offloading keeps large assets external, and retention prevents unbounded entity growth, LSM compaction prevents unbounded disk usage.
+The `minkowski-lsm` crate adds a fourth dimension to memory management: **incremental disk persistence with bounded space amplification**. Where the pool caps in-memory component storage, blob offloading keeps large assets external, and retention prevents unbounded entity growth, LSM compaction prevents unbounded disk usage.
 
 ### Dirty-Page Tracking
 

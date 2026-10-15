@@ -2386,6 +2386,31 @@ fn scratch_buffer_partitioned_intersection_reuses_buckets_without_stale_entries(
 }
 
 #[test]
+fn scratch_buffer_partition_bucket_retention_is_bounded() {
+    // Joins with different partition counts on one plan must not accumulate
+    // each bucket's peak capacity under every earlier modulus.
+    let mut buf = ScratchBuffer::new(0);
+    let big: Vec<u32> = (0..20_000).collect();
+    for partitions in 2..=16 {
+        partitioned_matches(&mut buf, &big, &[1], partitions);
+        // Bounded by a constant multiple of this call's build side.
+        assert!(
+            buf.retained_bucket_capacity() <= 6 * big.len() + 16 * partitions,
+            "p={partitions}: retained {}",
+            buf.retained_bucket_capacity()
+        );
+    }
+    // A much smaller join afterwards gives the excess back.
+    let small: Vec<u32> = (0..100).collect();
+    partitioned_matches(&mut buf, &small, &[1], 4);
+    assert!(
+        buf.retained_bucket_capacity() <= 6 * small.len() + 16 * 4,
+        "after small join: retained {}",
+        buf.retained_bucket_capacity()
+    );
+}
+
+#[test]
 fn scratch_buffer_partitioned_intersection_no_overlap() {
     let mut buf = ScratchBuffer::new(10);
     for idx in [1, 3, 5] {
