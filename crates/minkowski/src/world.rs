@@ -1502,7 +1502,6 @@ impl World {
 
         if all_existing {
             // All bundle components already exist — overwrite in-place (no allocation)
-            let tick = self.next_tick();
             let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
             let row = location.row;
             unsafe {
@@ -1517,6 +1516,9 @@ impl World {
                         scratches.push(arch.columns[col_idx].alloc_scratch()?);
                     }
                 }
+                // Advance the tick only once every fallible step has passed,
+                // so Err leaves the world's tick unchanged too.
+                let tick = self.current_tick.advance();
                 let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
@@ -1551,7 +1553,6 @@ impl World {
         let target_arch_id =
             self.archetypes
                 .get_or_create(&target_ids, &self.components, &self.pool);
-        let tick = self.next_tick();
 
         // Defensive: same archetype → overwrite in-place
         if src_arch_id == target_arch_id {
@@ -1567,6 +1568,9 @@ impl World {
                         scratches.push(arch.columns[col_idx].alloc_scratch()?);
                     }
                 }
+                // Advance the tick only once every fallible step has passed,
+                // so Err leaves the world's tick unchanged too.
+                let tick = self.current_tick.advance();
                 let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
@@ -1601,6 +1605,8 @@ impl World {
             // before any column is touched.
             target_arch.entities.try_reserve(1)?;
         }
+        // Every fallible preflight passed: only now advance the tick.
+        let tick = self.next_tick();
 
         // All target columns have capacity — proceed with infallible migration.
         let (src_arch, target_arch) = get_pair_mut(
@@ -4105,8 +4111,9 @@ mod tests {
     }
 
     /// Everything a failed `try_spawn` / `try_insert` must leave untouched.
-    fn bookkeeping_snapshot(world: &World) -> (usize, usize, usize, usize, Vec<usize>) {
+    fn bookkeeping_snapshot(world: &World) -> (u64, usize, usize, usize, usize, Vec<usize>) {
         (
+            world.current_tick(),
             world.entity_count(),
             world.entities.generations.len(),
             world.entities.free_list.len(),
