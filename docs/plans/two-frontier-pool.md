@@ -218,6 +218,17 @@ step would need the entire budget. The utilization numbers are deterministic
 (single-threaded, fixed budget, address-independent window). The RSS line is
 indicative only: it depends on the kernel and THP settings.
 
+### Criterion benchmarks (`minkowski-bench`, release, `main` vs this branch)
+
+| Benchmark | `main` | branch | Note |
+|---|---|---|---|
+| `simple_insert/batch` | 44.3 ms | 2.19 ms | fresh `World` per iteration: `main` threads every free-list block of the 256 MiB pool at construction |
+| `simple_insert/spawn_batch` | 43.1 ms | 1.22 ms | same cause |
+| `simple_insert/changeset` | **aborts** | runs | `Arena` needs 1.83 MiB > the old 1 MiB ceiling → `handle_alloc_error` |
+| `reducer/*` (QueryWriter) | **aborts** | runs | `Arena::grow` → `handle_alloc_error` on `main` |
+| `add_remove/*` | 2.99–3.21 ms | 2.97–3.22 ms | 3 interleaved runs each; within noise |
+| `simple_iter/*` | 29.9–30.0 / 4.50–4.65 / 48.8–55.7 µs | 29.6–30.9 / 4.48–4.64 / 48.5–50.1 µs | `for_each` / `for_each_chunk` / `par_for_each`, 2 interleaved runs; no allocator on this path |
+
 Overflow ablation: with both overflow paths disabled (`c → c+1`, and
 64 KiB → 1-unit run), all four scenarios give identical numbers. Overflow
 fires only once the frontiers have met, and these workloads have no churn
