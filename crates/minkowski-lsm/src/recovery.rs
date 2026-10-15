@@ -2125,7 +2125,7 @@ mod tests {
             let (g, f) = world.entity_allocator_state();
             (g.to_vec(), f.to_vec())
         };
-        assert!(!free_before.is_empty());
+        assert_ne!(free_before.len(), 0);
 
         // Accumulate COMPACTION_TRIGGER (4) L0 runs. Mutate between flushes so
         // each has dirty pages; the allocator state stays constant post-despawn.

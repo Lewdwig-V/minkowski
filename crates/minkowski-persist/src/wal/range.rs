@@ -292,7 +292,7 @@ mod tests {
         }
         assert_eq!(checkpoints, 1);
         let tail = wal.records_from(3, limits()).unwrap();
-        assert!(tail.runs.is_empty());
+        assert_eq!(tail.runs.len(), 0);
         assert_eq!((tail.next_seq, tail.seed_view), (3, 9));
         // A control-only fsync advances context without allocating a sequence.
         wal.views = Views::with_current(12);
@@ -579,7 +579,7 @@ mod tests {
             wal.records_from(two.next_seq, limits()).unwrap().next_seq,
             3
         );
-        assert!(wal.records_from(3, limits()).unwrap().runs.is_empty());
+        assert_eq!(wal.records_from(3, limits()).unwrap().runs.len(), 0);
     }
 
     #[test]

@@ -2927,7 +2927,7 @@ mod tests {
         let mut bits = FixedBitSet::with_capacity(pos_id + 1);
         bits.insert(pos_id);
         let snap = world.snapshot_column_ticks(&bits);
-        assert!(!snap.is_empty());
+        assert_ne!(snap.len(), 0);
     }
 
     #[test]
@@ -3009,7 +3009,7 @@ mod tests {
         for idx in 0..world.archetype_count() {
             if world.archetype_len(idx) > 0 {
                 let comp_ids = world.archetype_component_ids(idx);
-                assert!(!comp_ids.is_empty());
+                assert_ne!(comp_ids.len(), 0);
                 let entities = world.archetype_entities(idx);
                 assert_eq!(entities.len(), world.archetype_len(idx));
                 found = true;
@@ -3023,7 +3023,7 @@ mod tests {
         let mut world = World::new();
         world.spawn((1.0f32,));
         let (gens, free) = world.entity_allocator_state();
-        assert!(!gens.is_empty());
+        assert_ne!(gens.len(), 0);
         // free list may or may not be empty
         let _ = free;
     }
@@ -3122,7 +3122,7 @@ mod tests {
 
         let changed = world.query_changed_since::<Pos>(tick);
         // e1's archetype column was touched, so all entities in that archetype returned
-        assert!(!changed.is_empty());
+        assert_ne!(changed.len(), 0);
         assert!(changed.iter().any(|(e, _)| *e == e1));
     }
 
@@ -3134,7 +3134,7 @@ mod tests {
         let tick = world.change_tick();
         // No mutations
         let changed = world.query_changed_since::<Pos>(tick);
-        assert!(changed.is_empty());
+        assert_eq!(changed.len(), 0);
     }
 
     #[test]
@@ -3205,7 +3205,7 @@ mod tests {
     fn get_batch_empty_input() {
         let world = World::new();
         let results = world.get_batch::<Health>(&[]);
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 0);
     }
 
     #[test]
@@ -3409,7 +3409,7 @@ mod tests {
     fn get_batch_mut_empty_input() {
         let mut world = World::new();
         let results = world.get_batch_mut::<Health>(&[]);
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 0);
     }
 
     #[test]
@@ -4067,7 +4067,7 @@ mod tests {
         while let Ok(e) = world.try_spawn((0u32,)) {
             entities.push(e);
         }
-        assert!(!entities.is_empty());
+        assert_ne!(entities.len(), 0);
 
         // Try inserting a new component — should fail (pool exhausted)
         let result = world.try_insert(entities[0], (1.5f64,));
@@ -4127,7 +4127,7 @@ mod tests {
     fn spawn_batch_empty() {
         let mut world = World::new();
         let entities = world.spawn_batch::<(Pos,)>(std::iter::empty());
-        assert!(entities.is_empty());
+        assert_eq!(entities.len(), 0);
     }
 
     #[test]

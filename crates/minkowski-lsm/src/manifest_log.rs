@@ -1040,7 +1040,7 @@ mod tests {
         }
         // Pre-apply state intact.
         assert_eq!(m.runs_at_level(Level::L0).len(), 1);
-        assert!(m.runs_at_level(Level::L1).is_empty());
+        assert_eq!(m.runs_at_level(Level::L1).len(), 0);
     }
 
     #[test]
@@ -1134,7 +1134,7 @@ mod tests {
         drop(log);
 
         let (replayed, _) = ManifestLog::recover::<4>(&path).unwrap();
-        assert!(replayed.runs_at_level(Level::L0).is_empty());
+        assert_eq!(replayed.runs_at_level(Level::L0).len(), 0);
         assert_eq!(replayed.runs_at_level(Level::L1).len(), 1);
         assert_eq!(
             replayed.runs_at_level(Level::L1)[0].path(),
