@@ -1174,7 +1174,7 @@ mod tests {
         while let Ok(ptr) = pool.allocate(layout) {
             ptrs.push(ptr);
         }
-        assert!(!ptrs.is_empty());
+        assert_ne!(ptrs.len(), 0);
 
         // Deallocate one and re-allocate succeeds.
         // SAFETY: ptrs were returned by `allocate` with this layout.

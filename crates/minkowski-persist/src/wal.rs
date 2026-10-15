@@ -1966,7 +1966,7 @@ mod tests {
     fn list_segments_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let segments = list_segments(dir.path()).unwrap();
-        assert!(segments.is_empty());
+        assert_eq!(segments.len(), 0);
     }
 
     #[test]

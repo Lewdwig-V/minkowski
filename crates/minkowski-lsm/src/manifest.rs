@@ -229,7 +229,7 @@ mod tests {
     fn new_manifest_is_empty() {
         let m: DefaultManifest = LsmManifest::new();
         for lvl in 0..4 {
-            assert!(m.runs_at_level(Level::new(lvl as u8).unwrap()).is_empty());
+            assert_eq!(m.runs_at_level(Level::new(lvl as u8).unwrap()).len(), 0);
         }
         assert_eq!(m.next_sequence(), SeqNo::from(0u64));
         assert_eq!(m.total_runs(), 0);
@@ -241,7 +241,7 @@ mod tests {
         let meta = test_meta("run_l1.sst");
         m.add_run(Level::L1, meta.clone()).unwrap();
         assert_eq!(m.runs_at_level(Level::L1), &[meta]);
-        assert!(m.runs_at_level(Level::L0).is_empty());
+        assert_eq!(m.runs_at_level(Level::L0).len(), 0);
     }
 
     #[test]
@@ -251,7 +251,7 @@ mod tests {
         m.add_run(Level::L0, meta.clone()).unwrap();
         let removed = m.remove_run(Level::L0, Path::new("run_a.sst"));
         assert_eq!(removed, Some(meta));
-        assert!(m.runs_at_level(Level::L0).is_empty());
+        assert_eq!(m.runs_at_level(Level::L0).len(), 0);
     }
 
     #[test]
@@ -270,7 +270,7 @@ mod tests {
         m.add_run(Level::L0, meta).unwrap();
         m.promote_run(Level::L0, Level::L1, Path::new("run_x.sst"))
             .unwrap();
-        assert!(m.runs_at_level(Level::L0).is_empty());
+        assert_eq!(m.runs_at_level(Level::L0).len(), 0);
         assert_eq!(m.runs_at_level(Level::L1).len(), 1);
         assert_eq!(m.runs_at_level(Level::L1)[0].path(), Path::new("run_x.sst"));
     }
@@ -393,7 +393,7 @@ mod tests {
         let mut m4: DefaultManifest = LsmManifest::new();
         let err = m4.add_run(level_6, test_meta("l6.run")).unwrap_err();
         assert!(matches!(err, LsmError::Format(_)));
-        assert!(m4.runs_at_level(level_6).is_empty());
+        assert_eq!(m4.runs_at_level(level_6).len(), 0);
     }
 
     #[test]
@@ -434,6 +434,6 @@ mod tests {
     fn runs_at_level_returns_empty_for_out_of_range_level() {
         let m: DefaultManifest = LsmManifest::new();
         let oor = Level::new(4).unwrap();
-        assert!(m.runs_at_level(oor).is_empty());
+        assert_eq!(m.runs_at_level(oor).len(), 0);
     }
 }

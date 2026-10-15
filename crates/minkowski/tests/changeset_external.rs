@@ -29,7 +29,7 @@ fn replay_recycled_slots_scaling() {
                 let start = Instant::now();
                 changes.apply_replay(&mut world).unwrap();
                 times.push(start.elapsed());
-                assert!(world.entity_allocator_state().1.is_empty());
+                assert_eq!(world.entity_allocator_state().1.len(), 0);
                 assert_eq!(world.alloc_entity().index(), n);
             }
             times.sort();
@@ -82,7 +82,7 @@ fn replay_recycled_slots_preserves_order_and_snapshot() {
     for index in [0, 6, 9] {
         assert_eq!(world.alloc_entity(), entity(index, 1));
     }
-    assert!(world.entity_allocator_state().1.is_empty());
+    assert_eq!(world.entity_allocator_state().1.len(), 0);
     assert_eq!(world.alloc_entity().index(), 12);
 }
 

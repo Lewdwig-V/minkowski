@@ -647,7 +647,7 @@ mod tests {
         );
         assert_eq!(reader.schema().len(), 1); // Pos only
         assert!(reader.page_count() > 0);
-        assert!(!reader.archetype_ids().is_empty());
+        assert_ne!(reader.archetype_ids().len(), 0);
     }
 
     #[test]
@@ -656,7 +656,7 @@ mod tests {
         let reader = SortedRunReader::open(&path).unwrap();
 
         // Find the first index entry to know a valid key.
-        assert!(!reader.archetype_ids().is_empty());
+        assert_ne!(reader.archetype_ids().len(), 0);
         let entry = &reader.index[0];
         let page = reader
             .get_page(entry.arch_id, entry.slot, entry.page_index)
@@ -664,7 +664,7 @@ mod tests {
             .expect("page should exist");
 
         assert!(page.header().row_count > 0);
-        assert!(!page.data().is_empty());
+        assert_ne!(page.data().len(), 0);
     }
 
     #[test]
@@ -873,7 +873,7 @@ mod tests {
         let reader = SortedRunReader::open(&path).unwrap();
 
         // Find the first page and validate its CRC, extracting the proof.
-        assert!(!reader.archetype_ids().is_empty());
+        assert_ne!(reader.archetype_ids().len(), 0);
         let entry = &reader.index[0];
         let page = reader
             .get_page(entry.arch_id, entry.slot, entry.page_index)

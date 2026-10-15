@@ -274,7 +274,7 @@ mod tests {
         unaligned.extend_from_slice(&bytes);
         let mut input = &unaligned[1..];
         let frame = RawFrame::read_bytes(&mut input, 0).unwrap();
-        assert!(input.is_empty());
+        assert_eq!(input.len(), 0);
         let (entry, _, view) = frame.decode().unwrap();
         assert!(matches!(entry, WalEntry::Checkpoint { flush_seq: 7 }));
         assert_eq!(view, 3);

@@ -116,7 +116,7 @@ mod tests {
         // Just the single offsets[0] = 0 entry.
         assert_eq!(body, 0u32.to_le_bytes());
         assert_eq!(encoded_len(&body, 0).unwrap(), 4);
-        assert!(decode(&body, 0).unwrap().is_empty());
+        assert_eq!(decode(&body, 0).unwrap().len(), 0);
     }
 
     #[test]

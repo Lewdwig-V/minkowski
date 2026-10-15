@@ -175,7 +175,7 @@ mod tests {
         let after = MetricsSnapshot::capture(&world, None);
 
         let diff = MetricsDiff::compute(&before, &after);
-        assert!(!diff.largest_archetypes.is_empty());
+        assert_ne!(diff.largest_archetypes.len(), 0);
         assert_eq!(diff.largest_archetypes[0].entity_count, 10);
     }
 

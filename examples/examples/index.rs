@@ -87,8 +87,8 @@ fn main() {
     assert_eq!(high_scores.len(), 10);
 
     // Old values should be gone
-    assert!(btree.get(&Score(0)).is_empty());
-    assert!(hash.get(&Score(0)).is_empty());
+    assert_eq!(btree.get(&Score(0)).len(), 0);
+    assert_eq!(hash.get(&Score(0)).len(), 0);
     println!("Old value Score(0) cleared from both indexes.");
     println!();
 
@@ -115,7 +115,7 @@ fn main() {
     );
 
     let valid_hash: Vec<_> = hash.get_valid(&Score(victim_score), &world).collect();
-    assert!(valid_hash.is_empty());
+    assert_eq!(valid_hash.len(), 0);
     println!(
         "  hash get_valid filters stale entry (found {})",
         valid_hash.len()
@@ -124,7 +124,7 @@ fn main() {
     // Rebuild cleans up permanently
     btree.rebuild(&mut world);
     hash.rebuild(&mut world);
-    assert!(btree.get(&Score(victim_score)).is_empty());
+    assert_eq!(btree.get(&Score(victim_score)).len(), 0);
     println!("  After rebuild: stale entry cleaned up");
     println!();
 

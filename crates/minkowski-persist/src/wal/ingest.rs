@@ -416,7 +416,7 @@ mod tests {
             assert!(follower.is_poisoned());
             assert_eq!(follower.applied_seq(), 0);
             assert_eq!(follower.world.current_tick(), tick);
-            assert!(follower.world.entity_allocator_state().0.is_empty());
+            assert_eq!(follower.world.entity_allocator_state().0.len(), 0);
             assert_eq!(follower.file.metadata().unwrap().len(), len);
             assert!(matches!(
                 follower.read_at(0, |_| ()),
@@ -463,7 +463,7 @@ mod tests {
             )))
         ));
         assert_eq!(follower.applied_seq(), 0);
-        assert!(follower.world.entity_allocator_state().0.is_empty());
+        assert_eq!(follower.world.entity_allocator_state().0.len(), 0);
         assert!(matches!(
             follower.read_at(0, |_| ()),
             Err(FollowerError::Poisoned)
@@ -498,7 +498,7 @@ mod tests {
                     .is_err()
             );
             assert_eq!(follower.applied_seq(), 0);
-            assert!(follower.world.entity_allocator_state().0.is_empty());
+            assert_eq!(follower.world.entity_allocator_state().0.len(), 0);
             assert!(follower.is_poisoned());
             assert!(matches!(
                 follower.read_at(0, |_| ()),
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(follower.file.metadata().unwrap().len(), JOURNAL_HEADER_SIZE);
         assert_eq!(follower.applied_seq(), 0);
         assert_eq!(follower.world.current_tick(), tick);
-        assert!(follower.world.entity_allocator_state().0.is_empty());
+        assert_eq!(follower.world.entity_allocator_state().0.len(), 0);
         assert!(follower.is_poisoned());
         assert!(matches!(
             follower.read_at(0, |_| ()),

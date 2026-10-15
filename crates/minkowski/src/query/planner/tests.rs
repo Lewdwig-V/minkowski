@@ -106,7 +106,7 @@ fn scan_no_predicates() {
     let planner = QueryPlanner::new(&world);
     let plan = planner.scan::<(&Pos,)>().build();
 
-    assert!(plan.warnings().is_empty());
+    assert_eq!(plan.warnings().len(), 0);
     assert_eq!(plan.cost().rows, 100.0);
     match plan.root() {
         PlanNode::Scan { estimated_rows, .. } => assert_eq!(*estimated_rows, 100),
@@ -133,7 +133,7 @@ fn eq_predicate_uses_hash_index() {
         .filter(Predicate::eq(Team(5)))
         .build();
 
-    assert!(plan.warnings().is_empty());
+    assert_eq!(plan.warnings().len(), 0);
     match plan.root() {
         PlanNode::IndexLookup { index_kind, .. } => {
             assert_eq!(*index_kind, IndexKind::Hash);
@@ -159,7 +159,7 @@ fn range_predicate_uses_btree_index() {
         .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
         .build();
 
-    assert!(plan.warnings().is_empty());
+    assert_eq!(plan.warnings().len(), 0);
     match plan.root() {
         PlanNode::IndexLookup {
             index_kind,
@@ -240,7 +240,7 @@ fn no_warning_for_custom_predicate() {
         .build();
 
     // Custom predicates can never use indexes — no warning expected
-    assert!(plan.warnings().is_empty());
+    assert_eq!(plan.warnings().len(), 0);
 }
 
 // ── Multiple predicates ─────────────────────────────────────────
@@ -918,7 +918,7 @@ fn validate_plan_constraints() {
     let plan = planner.scan::<(&Score,)>().build();
 
     let violations = plan.validate_constraints(&[("max_100", CardinalityConstraint::AtMost(100))]);
-    assert!(violations.is_empty());
+    assert_eq!(violations.len(), 0);
 
     let violations = plan.validate_constraints(&[("max_10", CardinalityConstraint::AtMost(10))]);
     assert_eq!(violations.len(), 1);
@@ -1042,9 +1042,9 @@ fn plan_display_does_not_panic() {
         .build();
 
     let display = format!("{plan}");
-    assert!(!display.is_empty());
+    assert_ne!(display.len(), 0);
     let debug = format!("{plan:?}");
-    assert!(!debug.is_empty());
+    assert_ne!(debug.len(), 0);
 }
 
 // ── Indexed witness ─────────────────────────────────────────────
@@ -1802,7 +1802,7 @@ fn execute_empty_world() {
     let planner = QueryPlanner::new(&world);
     let mut plan = planner.scan::<(&Score,)>().build();
     let result = plan.execute_collect(&mut world).unwrap();
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
@@ -1955,7 +1955,7 @@ fn execute_btree_eq_nonexistent_value_returns_empty() {
         .filter(Predicate::eq(Score(999)))
         .build();
     let result = plan.execute_collect(&mut world).unwrap();
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
@@ -1975,7 +1975,7 @@ fn execute_hash_eq_nonexistent_value_returns_empty() {
         .filter(Predicate::eq(Team(999)))
         .build();
     let result = plan.execute_collect(&mut world).unwrap();
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 // ── Live index reads ──────────────────────────────────────────────
@@ -2261,7 +2261,7 @@ fn scratch_buffer_sorted_intersection_empty_left() {
         buf.push(Entity::new(idx, 0));
     }
     let result = buf.sorted_intersection(left_len);
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
@@ -2272,7 +2272,7 @@ fn scratch_buffer_sorted_intersection_empty_right() {
     }
     let left_len = buf.len(); // right partition is empty
     let result = buf.sorted_intersection(left_len);
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
@@ -2302,7 +2302,7 @@ fn scratch_buffer_sorted_intersection_no_overlap() {
         buf.push(Entity::new(idx, 0));
     }
     let result = buf.sorted_intersection(left_len);
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
@@ -2338,7 +2338,7 @@ fn scratch_buffer_partitioned_intersection_no_overlap() {
         buf.push(Entity::new(idx, 0));
     }
     let result = buf.partitioned_intersection(left_len, 2);
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
@@ -2394,7 +2394,7 @@ fn scratch_buffer_partitioned_intersection_fallback_when_empty() {
         buf.push(Entity::new(idx, 0));
     }
     let result = buf.partitioned_intersection(left_len, 100);
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 // ── Execute with ScratchBuffer ─────────────────────────────────
@@ -3037,7 +3037,7 @@ fn spatial_predicate_within_creates_spatial_lookup() {
     }
 
     // No warnings expected — spatial index was registered.
-    assert!(plan.warnings().is_empty());
+    assert_eq!(plan.warnings().len(), 0);
 }
 
 #[test]
@@ -3481,7 +3481,7 @@ fn spatial_partial_capability_within_supported_intersects_declined() {
         "Within should produce SpatialLookup, got {:?}",
         within_plan.root()
     );
-    assert!(within_plan.warnings().is_empty());
+    assert_eq!(within_plan.warnings().len(), 0);
 
     // Intersects should fall back with a SpatialIndexDeclined warning.
     let intersects_plan = planner
@@ -3551,7 +3551,7 @@ fn multiple_spatial_predicates_first_drives_rest_filter() {
         count_filters(plan.root()) >= 1,
         "expected at least one Filter wrapping the SpatialLookup"
     );
-    assert!(plan.warnings().is_empty());
+    assert_eq!(plan.warnings().len(), 0);
 }
 
 /// Spatial index with low CPU but high estimated_rows.
@@ -4543,7 +4543,7 @@ fn execute_raw_empty_join_result() {
         .join::<(&Health,)>(JoinKind::Inner)
         .build();
     let result = plan.execute_collect_raw(&world).unwrap();
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
@@ -5569,7 +5569,7 @@ fn join_chunk_column_filter_partial() {
     let mut total = 0u32;
     let mut collected = Vec::new();
     plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
-        assert!(!entities.is_empty());
+        assert_ne!(entities.len(), 0);
         assert_eq!(entities.len(), rows.len());
         for &row in rows {
             assert!(row < scores.len());
@@ -5680,7 +5680,7 @@ fn execute_stream_join_chunk_multi_archetype() {
     // Collect chunk info: (entity_count, first_entity) per chunk.
     let mut chunk_entities: Vec<Vec<Entity>> = Vec::new();
     plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |entities, _, _| {
-        assert!(!entities.is_empty());
+        assert_ne!(entities.len(), 0);
         chunk_entities.push(entities.to_vec());
     })
     .unwrap();
