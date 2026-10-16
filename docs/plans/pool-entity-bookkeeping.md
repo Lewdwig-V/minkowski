@@ -106,7 +106,7 @@ Every "new test" cell gets a test that exhausts the pool at exactly that preflig
 ## Phase 2 (out of scope here)
 
 - **`PagedSparseSet::pages`** (done): 16 KiB pages would land in the 64 KiB slab class (4× waste), so pages shrank to 1024 entries (4 KiB, exactly the 4 KiB class) and moved into the pool. Only the page directory stays on the heap.
-- **Shrink `EntityLocation`** from 16 B (24 B as `Option`) to `{ archetype_id: u32, row: u32 }` with a niche (8 B). This cuts the largest bookkeeping term by about two thirds, in the pool or on the heap. It's independent of this design, but it multiplies its effect.
+- **Shrink `EntityLocation`** (done) from 16 B (24 B as `Option`) to `{ archetype_id: u32, row: u32 }` with a niche (8 B). This cuts the largest bookkeeping term by about two thirds, in the pool or on the heap. It's independent of this design, but it multiplies its effect.
 - **Fix the per-transaction changeset pools** (`Tx::new` and commit's `mem::take` each build a 256 MiB default pool; ~453 µs per empty transaction). Independent bug; separate PR.
 
 ## Semantic Review

@@ -291,7 +291,7 @@ fn gather_index_candidates(
         let Some(loc) = world.validate_entity(entity) else {
             continue;
         };
-        let arch_idx = loc.archetype_id.0;
+        let arch_idx = loc.archetype_id().0;
 
         // Check archetype cache: if we've already validated this archetype,
         // skip the bitset subset and change-filter checks entirely.
@@ -346,7 +346,7 @@ fn gather_index_batched(
         let Some(loc) = world.validate_entity(entity) else {
             continue;
         };
-        let arch_idx = loc.archetype_id.0;
+        let arch_idx = loc.archetype_id().0;
 
         let arch_ok = match cached_arch {
             Some((cached_id, ok)) if cached_id == arch_idx => ok,
@@ -382,7 +382,7 @@ fn gather_index_batched(
                 }
             }
         }
-        row_buf.push(loc.row);
+        row_buf.push(loc.row());
     }
 
     // Flush final batch.

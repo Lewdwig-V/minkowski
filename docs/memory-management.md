@@ -26,7 +26,7 @@ The pool is one window with two opposing frontiers. The bottom frontier grows up
 
 ### What the budget covers
 
-The pool budget covers **component storage and per-entity bookkeeping**. Plan for roughly 40 bytes of pool per entity for the bookkeeping (more while vectors carry doubling slack), on top of its component bytes. It is not a TigerBeetle-style whole-process limit: the structures in the right-hand column use the system heap.
+The pool budget covers **component storage and per-entity bookkeeping**. Plan for roughly 24 bytes of pool per entity for the bookkeeping (4 B generation, 4 B free-list slot, 8 B location, 8 B archetype entity-list slot) (more while vectors carry doubling slack), on top of its component bytes. It is not a TigerBeetle-style whole-process limit: the structures in the right-hand column use the system heap.
 
 | Inside the world's pool budget | Outside it |
 |---|---|
