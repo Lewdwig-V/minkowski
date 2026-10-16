@@ -6,7 +6,7 @@ use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
 use crate::sync::Arc;
 
-use crate::pool::{SlabPool, default_pool};
+use crate::pool::{SlabPool, shared_scratch_pool};
 use crate::tick::Tick;
 use crate::world::{EntityLocation, World, get_pair_mut};
 
@@ -80,20 +80,25 @@ const ARENA_ALIGN: usize = 16;
 ///
 /// Backing memory is allocated with alignment 16 to satisfy alignment
 /// requirements of any component type stored within.
+///
+/// The arena binds to a pool lazily, on its first allocation. An empty
+/// changeset (most reverse changesets, the one `Tx::take_changeset` leaves
+/// behind, a transaction that wrote nothing) therefore costs nothing to build.
 pub(crate) struct Arena {
     data: NonNull<u8>,
     len: usize,
     capacity: usize,
-    pool: Arc<SlabPool>,
+    /// `None` until the first allocation; `Some` whenever `capacity > 0`.
+    pool: Option<Arc<SlabPool>>,
 }
 
 impl Arena {
-    pub fn new(pool: Arc<SlabPool>) -> Self {
+    pub fn new() -> Self {
         Self {
             data: NonNull::dangling(),
             len: 0,
             capacity: 0,
-            pool,
+            pool: None,
         }
     }
 
@@ -146,13 +151,15 @@ impl Arena {
         // preserve alignment > max_align_t (typically 16 bytes). SlabPool::grow
         // keeps the original alignment (class-aligned blocks, unit-aligned
         // runs) — same reasoning as BlobVec::grow.
+        let pool = self.pool.get_or_insert_with(shared_scratch_pool);
         let new_data = if self.capacity > 0 {
             let old_layout = Layout::from_size_align(self.capacity, ARENA_ALIGN).unwrap();
-            // SAFETY: self.data was allocated from self.pool with old_layout;
+            // SAFETY: self.data was allocated from this pool (bound on the
+            // first allocation and never rebound) with old_layout;
             // self.len <= self.capacity live bytes. self.data is replaced below.
-            unsafe { self.pool.grow(self.data, old_layout, new_layout, self.len) }
+            unsafe { pool.grow(self.data, old_layout, new_layout, self.len) }
         } else {
-            self.pool.allocate(new_layout)
+            pool.allocate(new_layout)
         }
         .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout));
         self.data = new_data;
@@ -171,10 +178,14 @@ impl Drop for Arena {
         if self.capacity > 0 {
             let layout =
                 Layout::from_size_align(self.capacity, ARENA_ALIGN).expect("invalid arena layout");
+            let pool = self
+                .pool
+                .as_ref()
+                .expect("arena with capacity is bound to a pool");
             // SAFETY: self.data was returned by a prior call to pool.allocate
             // with this layout, and will not be used after this call.
             unsafe {
-                self.pool.deallocate(self.data, layout);
+                pool.deallocate(self.data, layout);
             }
         }
     }
@@ -293,29 +304,26 @@ pub struct EnumChangeSet {
 }
 
 impl EnumChangeSet {
+    /// Create an empty changeset. Allocates nothing: the component-byte arena
+    /// binds to the process-wide scratch pool on its first write.
     pub fn new() -> Self {
-        Self::new_in(default_pool())
+        Self {
+            mutations: Vec::new(),
+            arena: Arena::new(),
+            drop_entries: Vec::new(),
+            archetype_batches: Vec::new(),
+        }
     }
 
     /// Create a changeset pre-allocated for `mutations` mutations, each up to
     /// `bytes_per_mutation` bytes of component data. Avoids reallocation during
     /// recording when the mutation count is known ahead of time.
     pub fn with_capacity(mutations: usize, bytes_per_mutation: usize) -> Self {
-        let pool = default_pool();
-        let mut arena = Arena::new(pool.clone());
+        let mut arena = Arena::new();
         arena.reserve(mutations * bytes_per_mutation);
         Self {
             mutations: Vec::with_capacity(mutations),
             arena,
-            drop_entries: Vec::new(),
-            archetype_batches: Vec::new(),
-        }
-    }
-
-    pub(crate) fn new_in(pool: Arc<SlabPool>) -> Self {
-        Self {
-            mutations: Vec::new(),
-            arena: Arena::new(pool),
             drop_entries: Vec::new(),
             archetype_batches: Vec::new(),
         }
@@ -1352,7 +1360,7 @@ mod tests {
 
     #[test]
     fn arena_alloc_and_read_back() {
-        let mut arena = Arena::new(default_pool());
+        let mut arena = Arena::new();
         let value: u32 = 42;
         let layout = Layout::new::<u32>();
         let offset = arena.alloc(&value as *const u32 as *const u8, layout);
@@ -1362,7 +1370,7 @@ mod tests {
 
     #[test]
     fn arena_alignment() {
-        let mut arena = Arena::new(default_pool());
+        let mut arena = Arena::new();
         let byte: u8 = 0xFF;
         let _ = arena.alloc(&byte as *const u8, Layout::new::<u8>());
 
@@ -1372,8 +1380,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_changeset_binds_no_pool() {
+        // Building a changeset (every Tx, every commit's take_changeset, every
+        // WAL record) must not create a pool until it stores component bytes.
+        let cs = EnumChangeSet::new();
+        assert!(cs.arena.pool.is_none());
+        let mut arena = Arena::new();
+        arena.alloc(std::ptr::null(), Layout::new::<()>());
+        assert!(arena.pool.is_none(), "ZST writes need no backing memory");
+        drop(EnumChangeSet::default());
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn changesets_share_one_scratch_pool() {
+        let value: u32 = 7;
+        let mut a = Arena::new();
+        let mut b = Arena::new();
+        a.alloc(&value as *const u32 as *const u8, Layout::new::<u32>());
+        b.alloc(&value as *const u32 as *const u8, Layout::new::<u32>());
+        assert!(Arc::ptr_eq(
+            a.pool.as_ref().unwrap(),
+            b.pool.as_ref().unwrap()
+        ));
+        // with_capacity binds on its up-front reserve, to the same pool.
+        let c = EnumChangeSet::with_capacity(4, 16);
+        assert!(Arc::ptr_eq(
+            a.pool.as_ref().unwrap(),
+            c.arena.pool.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
     fn arena_zst() {
-        let mut arena = Arena::new(default_pool());
+        let mut arena = Arena::new();
         let layout = Layout::new::<()>();
         let offset = arena.alloc(std::ptr::null(), layout);
         assert_eq!(offset, 0);

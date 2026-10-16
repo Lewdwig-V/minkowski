@@ -1,14 +1,36 @@
 use crate::entity::Entity;
 use crate::world::EntityLocation;
 
-/// Pool-aware reusable entity buffer for allocation-free query execution.
+/// Reusable entity buffer for allocation-free query execution.
 ///
 /// Used by join/gather plans instead of per-node `Vec<Entity>` allocation.
 /// Call [`clear`](ScratchBuffer::clear) between uses to reset length while
 /// preserving the backing allocation.
+///
+/// Lives on the system heap, not the `SlabPool`: the pool budget covers
+/// component storage only (see `docs/memory-management.md`). Growth past
+/// the pre-allocated capacity is driven by result size.
 pub(super) struct ScratchBuffer {
     pub(super) entities: Vec<Entity>,
+    /// Per-partition buckets for [`partitioned_intersection`], kept across
+    /// executions so a repeated join reuses their capacity instead of
+    /// allocating up to `MAX_PARTITIONS` vectors per call.
+    ///
+    /// Retained capacity is re-bounded at the start of every call (see
+    /// `BUCKET_SLACK`), so it stays linear in the current call's build side
+    /// even when one plan runs joins with different partition counts.
+    ///
+    /// [`partitioned_intersection`]: ScratchBuffer::partitioned_intersection
+    buckets: Vec<Vec<u64>>,
 }
+
+/// A reused bucket keeps its capacity only while it is within this factor of
+/// the current call's expected per-bucket share (plus `BUCKET_SLACK_MIN`
+/// entries). Beyond that it is shrunk before use. The slack is wide enough
+/// that a repeated join of the same shape (bucket sizes near the expected
+/// share, capacity up to 2x after doubling) never reallocates.
+const BUCKET_SLACK: usize = 4;
+const BUCKET_SLACK_MIN: usize = 16;
 
 /// Maximum pre-allocation cap: 64K entities.
 pub(super) const SCRATCH_MAX_CAP: usize = 64 * 1024;
@@ -18,6 +40,7 @@ impl ScratchBuffer {
     pub(super) fn new(estimated_capacity: usize) -> Self {
         Self {
             entities: Vec::with_capacity(estimated_capacity.min(SCRATCH_MAX_CAP)),
+            buckets: Vec::new(),
         }
     }
 
@@ -29,6 +52,12 @@ impl ScratchBuffer {
     /// Reset length to 0, preserving the backing allocation.
     pub(super) fn clear(&mut self) {
         self.entities.clear();
+    }
+
+    /// Total capacity, in entries, retained by the partition buckets.
+    #[cfg(test)]
+    pub(super) fn retained_bucket_capacity(&self) -> usize {
+        self.buckets.iter().map(Vec::capacity).sum()
     }
 
     /// Number of entities currently in the buffer.
@@ -109,14 +138,27 @@ impl ScratchBuffer {
             return self.sorted_intersection(left_len);
         }
 
-        // Bucket left and right entities by partition.
-        let mut left_buckets: Vec<Vec<u64>> = vec![Vec::new(); partitions];
+        // Bucket left entities by partition, reusing bucket capacity from
+        // earlier executions. Bound what is reused: drop buckets this call
+        // does not need, and shrink any bucket far above its expected share,
+        // so capacity retained across calls with different partition counts
+        // stays linear in this call's build side (not N log P).
+        self.buckets.truncate(partitions);
+        self.buckets.resize_with(partitions, Vec::new);
+        let keep = left_len.div_ceil(partitions) * BUCKET_SLACK + BUCKET_SLACK_MIN;
+        let left_buckets = &mut self.buckets[..];
+        for bucket in left_buckets.iter_mut() {
+            bucket.clear();
+            if bucket.capacity() > keep {
+                bucket.shrink_to(keep);
+            }
+        }
         for &e in &self.entities[..left_len] {
             let bits = e.to_bits();
             left_buckets[(bits % partitions as u64) as usize].push(bits);
         }
         // Sort each left bucket for binary search.
-        for bucket in &mut left_buckets {
+        for bucket in left_buckets.iter_mut() {
             bucket.sort_unstable();
         }
 

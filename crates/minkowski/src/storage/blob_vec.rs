@@ -64,9 +64,10 @@ impl Drop for PoolScratch {
 }
 
 // Placeholder so `PoolScratch::zst()` needs no pool handle; ZST scratches are
-// never deallocated (ptr is None).
+// never deallocated (ptr is None). Shared, so it no longer maps a whole pool
+// per zero-sized scratch.
 fn default_pool_shim() -> Arc<SlabPool> {
-    crate::pool::default_pool()
+    crate::pool::shared_scratch_pool()
 }
 
 /// A removed value evacuated to scratch, awaiting destruction. Produced by

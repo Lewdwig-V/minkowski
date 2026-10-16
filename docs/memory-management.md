@@ -24,7 +24,22 @@ match world.try_spawn((pos, vel)) {
 
 The pool is one window with two opposing frontiers. The bottom frontier grows upward and carves 64 KiB chunks on demand for five slab size classes (64 B – 64 KiB). The top frontier grows downward and serves anything larger as runs of 1 MiB units, so one column can grow to any size the budget allows. Nothing is reserved per size class up front: `PoolExhausted` means the frontiers have met (or every carved block of the needed class is in use), not that one fixed partition ran out. Large runs grow in place when free units border them, which avoids the transient 2× footprint of copy-on-grow. All worlds use the mmap-backed `SlabPool`: `World::new()` creates a 256 MiB demand-paged pool that touches no pages until the first allocation, while `WorldBuilder::memory_budget()` creates a pre-faulted pool with a specific budget and optional hugepage support. Exhaustion is deterministic for single-threaded use of a pool. When several threads share one, thread-local caches and lock order can move the exact point where `PoolExhausted` fires. `flush_pool_caches()` does not make that exact across threads: it returns only the calling thread's cached blocks immediately, and other threads (idle Rayon workers included) return theirs on their next pool operation or at thread exit. A budget-sensitive check is therefore exact only once every other thread has touched the pool, or exited, since the flush. See [the design doc](plans/two-frontier-pool.md) for the layout and measured utilization.
 
-The budget covers component columns and per-entity bookkeeping: entity generations, the allocator free list, the entity location table, archetype entity lists, and sparse-set dense entity lists. Plan for roughly 40 bytes of pool per entity (more while vectors carry doubling slack) on top of its component bytes. Sparse page tables (16 KiB per 4096 entity indices touched), archetype and component metadata, secondary indexes, query-planner scratch, and changeset buffers use the global heap. `try_spawn` and `try_insert` reserve every pool slot they need before mutating, so `Err(PoolExhausted)` leaves the world unchanged, and `despawn` never allocates. See [the design doc](plans/pool-entity-bookkeeping.md).
+### What the budget covers
+
+The pool budget covers **component storage and per-entity bookkeeping**. Plan for roughly 40 bytes of pool per entity for the bookkeeping (more while vectors carry doubling slack), on top of its component bytes. It is not a TigerBeetle-style whole-process limit: the structures in the right-hand column use the system heap.
+
+| Inside the world's pool budget | Outside it |
+|---|---|
+| Dense component columns (`BlobVec`) | `PagedSparseSet` page directory (16 KiB per 4096 entity indices touched), component registry, query cache (system heap) |
+| Sparse component values (`PagedSparseSet` dense storage) and their dense entity lists | `EnumChangeSet` component bytes (the changeset `Arena`): `EnumChangeSet::new()` / `with_capacity()`, including the changeset inside every transaction, allocate from a separate scratch pool that no world's budget covers |
+| Entity bookkeeping: generations, free list, `entity_locations`, per-archetype entity lists | `EnumChangeSet` mutation records and drop entries (system heap) |
+| | Per-column dirty-page bitsets (system heap) |
+| | Query planner scratch (grows with join/result size), user-owned indexes (`BTreeIndex`, `HashIndex`, spatial) (system heap) |
+| | WAL and LSM buffers, and the pool's own side table (system heap) |
+
+`try_spawn` and `try_insert` reserve every pool slot they need, bookkeeping included, before mutating, so `Err(PoolExhausted)` leaves the world unchanged, and `despawn` never allocates. See [the design doc](plans/pool-entity-bookkeeping.md).
+
+Query scratch scales with result size: a plan pre-sizes it (capped at 64K entities) and reuses it across executions, but it can grow past that for large joins. Indexes scale with indexed entities. `PoolExhausted` therefore bounds the world's entities and components, not process RSS, and recording a large changeset never raises it. Size the process limit (container memory, `RLIMIT_AS`) with headroom for the heap side.
 
 ## Blob Offloading
 
@@ -60,11 +75,11 @@ world.spawn((data, Expiry::after(5)));
 registry.run(&mut world, retention_id, ());
 ```
 
-Together, these four features let a Minkowski deployment run indefinitely within a fixed memory envelope: the pool caps total RAM, blob offloading keeps large assets external, retention prevents unbounded entity growth, and LSM compaction bounds disk-space amplification to ≤ 2×.
+Together, these four features let a Minkowski deployment run indefinitely within a bounded memory footprint: the pool caps component storage and entity bookkeeping (see [What the budget covers](#what-the-budget-covers)), blob offloading keeps large assets external, retention prevents unbounded entity growth, and LSM compaction bounds disk-space amplification to ≤ 2×.
 
 ## LSM Disk-Space Management
 
-The `minkowski-lsm` crate adds a fourth dimension to memory management: **incremental disk persistence with bounded space amplification**. Where the pool caps in-memory RAM, blob offloading keeps large assets external, and retention prevents unbounded entity growth, LSM compaction prevents unbounded disk usage.
+The `minkowski-lsm` crate adds a fourth dimension to memory management: **incremental disk persistence with bounded space amplification**. Where the pool caps in-memory component storage, blob offloading keeps large assets external, and retention prevents unbounded entity growth, LSM compaction prevents unbounded disk usage.
 
 ### Dirty-Page Tracking
 

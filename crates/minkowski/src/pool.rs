@@ -64,6 +64,27 @@ pub(crate) fn try_default_pool(hugepages: HugePages) -> Result<Arc<SlabPool>, Po
     SlabPool::new(DEFAULT_POOL_BUDGET, hugepages, false).map(Arc::new)
 }
 
+/// Process-wide pool for allocations that belong to no world: standalone
+/// changeset arenas (`EnumChangeSet::new()`, WAL decode, transaction write
+/// buffers) and zero-sized scratch placeholders.
+///
+/// Created on first use and shared for the life of the process, so building a
+/// changeset no longer maps a fresh 256 MiB pool (and zero-fills its 4 MiB side
+/// table) every time. Like the per-changeset pools it replaces, it is not part
+/// of any world's budget. Pages it touches stay resident for the process
+/// (demand-paged, never handed back), bounded by its 256 MiB size.
+#[cfg(not(loom))]
+pub(crate) fn shared_scratch_pool() -> Arc<SlabPool> {
+    static POOL: std::sync::OnceLock<Arc<SlabPool>> = std::sync::OnceLock::new();
+    Arc::clone(POOL.get_or_init(default_pool))
+}
+
+/// Loom objects cannot live in statics; each call gets a fresh pool.
+#[cfg(loom)]
+pub(crate) fn shared_scratch_pool() -> Arc<SlabPool> {
+    default_pool()
+}
+
 /// Create the default mmap-backed pool (256 MiB, demand-paged, no hugepages).
 ///
 /// Panics if the mmap allocation fails. Prefer [`try_default_pool`] when the
@@ -2123,10 +2144,15 @@ mod tests {
         // and slab blocks against the same frontiers. Each grower checks its
         // own bytes after every grow; a failed grow must leave them intact.
         let pool = Arc::new(SlabPool::new(32 * LARGE_UNIT, HugePages::Off, false).unwrap());
-        std::thread::scope(|s| {
+        // std::thread::spawn + join, not thread::scope: scope returns when the
+        // closures finish, before the workers' thread-local TCache destructors
+        // run, so cached blocks could still be outstanding at the used() == 0
+        // check below. join waits for full thread exit.
+        let mut handles = Vec::new();
+        {
             for t in 0..4u8 {
                 let pool = Arc::clone(&pool);
-                s.spawn(move || {
+                handles.push(std::thread::spawn(move || {
                     for round in 0..20 {
                         let mut layout = Layout::from_size_align(LARGE_UNIT, 64).unwrap();
                         let Ok(mut ptr) = pool.allocate(layout) else {
@@ -2147,11 +2173,11 @@ mod tests {
                         }
                         unsafe { pool.deallocate(ptr, layout) };
                     }
-                });
+                }));
             }
             for _ in 0..4 {
                 let pool = Arc::clone(&pool);
-                s.spawn(move || {
+                handles.push(std::thread::spawn(move || {
                     let large = Layout::from_size_align(LARGE_UNIT + 1, 64).unwrap();
                     let small = Layout::from_size_align(4000, 64).unwrap();
                     for _ in 0..50 {
@@ -2166,9 +2192,12 @@ mod tests {
                             }
                         }
                     }
-                });
+                }));
             }
-        });
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
         pool.flush_caches();
         pool.flush_current_thread_cache();
         assert_eq!(pool.used(), 0);
