@@ -3,7 +3,7 @@ use std::alloc::Layout;
 use crate::entity::Entity;
 use crate::sync::Arc;
 
-use crate::pool::SlabPool;
+use crate::pool::{PoolExhausted, SlabPool};
 use crate::storage::blob_vec::BlobVec;
 use crate::storage::pool_vec::PoolVec;
 
@@ -119,6 +119,30 @@ impl PagedSparseSet {
         }
     }
 
+    /// Like [`insert`](Self::insert), returning `Err(PoolExhausted)` instead
+    /// of aborting when the pool cannot hold the value. On `Err` the set is
+    /// unchanged and the caller still owns the value at `ptr`.
+    ///
+    /// # Safety
+    /// Same contract as [`insert`](Self::insert).
+    pub unsafe fn try_insert(
+        &mut self,
+        entity: Entity,
+        ptr: *const u8,
+    ) -> Result<(), PoolExhausted> {
+        if let Some(dense) = self.dense_index(entity) {
+            // SAFETY: as in insert's overwrite path. On Err nothing was written.
+            return unsafe { self.dense_values.replace_protected(dense, ptr) };
+        }
+        // New entry: reserve both pool-backed vectors, then the plain insert
+        // cannot allocate in the pool (pages are heap-allocated).
+        self.dense_entities.try_reserve(1)?;
+        self.dense_values.try_reserve(1)?;
+        // SAFETY: forwarded caller contract.
+        unsafe { self.insert(entity, ptr) };
+        Ok(())
+    }
+
     /// Removes the entity's value, dropping it. Returns `true` if the entity
     /// was present.
     pub fn remove(&mut self, entity: Entity) -> bool {
@@ -228,6 +252,44 @@ impl SparseStorage {
         unsafe {
             set.insert(entity, &mut *value as *mut T as *const u8);
         }
+    }
+
+    /// Like [`insert`](Self::insert), returning `Err(PoolExhausted)` instead
+    /// of aborting. On `Err` the storage is unchanged and `value` is dropped.
+    pub fn try_insert<T: Component>(
+        &mut self,
+        comp_id: ComponentId,
+        entity: Entity,
+        value: T,
+    ) -> Result<(), PoolExhausted> {
+        let mut value = ManuallyDrop::new(value);
+        let ptr = &mut *value as *mut T as *const u8;
+        // SAFETY (both arms): value is a valid T matching the set's layout; on
+        // Ok ownership moved into the set, on Err nothing was written and we
+        // drop it below.
+        let result = if let Some(set) = self.storages.get_mut(&comp_id) {
+            unsafe { set.try_insert(entity, ptr) }
+        } else {
+            // First value for this component: build the set off to the side
+            // and publish it only on success, so Err leaves no empty set
+            // behind (a failed set drops here, returning any page it took).
+            let drop_fn = if std::mem::needs_drop::<T>() {
+                Some(drop_ptr::<T> as unsafe fn(*mut u8))
+            } else {
+                None
+            };
+            let mut set = PagedSparseSet::new(Layout::new::<T>(), drop_fn, self.pool.clone());
+            let r = unsafe { set.try_insert(entity, ptr) };
+            if r.is_ok() {
+                self.storages.insert(comp_id, set);
+            }
+            r
+        };
+        if result.is_err() {
+            // SAFETY: the set did not take ownership.
+            unsafe { ManuallyDrop::drop(&mut value) };
+        }
+        result
     }
 
     pub fn get<T: Component>(&self, comp_id: ComponentId, entity: Entity) -> Option<&T> {

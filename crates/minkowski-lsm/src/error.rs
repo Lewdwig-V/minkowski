@@ -17,6 +17,8 @@ pub enum LsmError {
         /// Checksum computed over the actual bytes.
         actual: u32,
     },
+    /// The recovered state does not fit the target world's memory pool.
+    PoolExhausted(minkowski::PoolExhausted),
 }
 
 impl std::fmt::Display for LsmError {
@@ -32,6 +34,7 @@ impl std::fmt::Display for LsmError {
                 f,
                 "CRC mismatch at offset {offset}: expected {expected:#010x}, got {actual:#010x}"
             ),
+            Self::PoolExhausted(e) => write!(f, "recovery does not fit the world's pool: {e}"),
         }
     }
 }
@@ -40,6 +43,7 @@ impl std::error::Error for LsmError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::PoolExhausted(e) => Some(e),
             Self::Format(_) | Self::Crc { .. } => None,
         }
     }
@@ -48,5 +52,11 @@ impl std::error::Error for LsmError {
 impl From<io::Error> for LsmError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<minkowski::PoolExhausted> for LsmError {
+    fn from(e: minkowski::PoolExhausted) -> Self {
+        Self::PoolExhausted(e)
     }
 }

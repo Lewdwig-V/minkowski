@@ -30,15 +30,27 @@ impl FreeList {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_slice(pool: Arc<SlabPool>, slots: &[u32]) -> Self {
         let mut list = Self::new(Arc::clone(&pool));
         list.slots = PoolVec::from_slice(pool, slots);
         list
     }
 
+    /// Replace the contents with `slots` (no tombstones, no lookup index).
+    /// Does not allocate in the pool when `try_reserve_total(slots.len())`
+    /// succeeded beforehand.
+    pub(crate) fn assign(&mut self, slots: &[u32]) {
+        self.slots.truncate(0);
+        self.slots.extend_from_slice(slots);
+        self.positions = None;
+        self.holes = 0;
+        self.snapshot.take();
+    }
+
     /// Ensure capacity for `total` slots without allocating later.
     /// On `Err` nothing changed.
-    fn try_reserve_total(&mut self, total: usize) -> Result<(), PoolExhausted> {
+    pub(crate) fn try_reserve_total(&mut self, total: usize) -> Result<(), PoolExhausted> {
         self.slots
             .try_reserve(total.saturating_sub(self.slots.len()))
     }

@@ -67,6 +67,8 @@ pub enum CodecError {
         receiver_size: usize,
         receiver_align: usize,
     },
+    #[error("component does not fit the world's memory pool: {0}")]
+    PoolExhausted(minkowski::PoolExhausted),
     #[error("unknown component name in schema: '{0}'")]
     UnknownComponentName(String),
     #[error(
@@ -536,8 +538,9 @@ impl CodecRegistry {
             aligned.extend_from_slice(data);
             let value: T = rkyv::from_bytes::<T, rancor::Error>(&aligned)
                 .map_err(|e| CodecError::Deserialize(e.to_string()))?;
-            world.insert_sparse::<T>(entity, value);
-            Ok(())
+            world
+                .try_insert_sparse::<T>(entity, value)
+                .map_err(CodecError::PoolExhausted)
         };
 
         let drop_fn: unsafe fn(*mut u8) = |ptr| {

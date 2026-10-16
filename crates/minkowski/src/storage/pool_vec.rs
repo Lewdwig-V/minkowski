@@ -44,6 +44,7 @@ impl<T: Copy> PoolVec<T> {
     }
 
     /// Vector holding a copy of `items`. Aborts if the pool is exhausted.
+    #[cfg(test)]
     pub(crate) fn from_slice(pool: Arc<SlabPool>, items: &[T]) -> Self {
         let mut v = Self::new(pool);
         v.extend_from_slice(items);
