@@ -30,8 +30,8 @@ The pool budget covers **component storage and per-entity bookkeeping**. Plan fo
 
 | Inside the world's pool budget | Outside it |
 |---|---|
-| Dense component columns (`BlobVec`) | `PagedSparseSet` page directory (16 KiB per 4096 entity indices touched), component registry, query cache (system heap) |
-| Sparse component values (`PagedSparseSet` dense storage) and their dense entity lists | `EnumChangeSet` component bytes (the changeset `Arena`): `EnumChangeSet::new()` / `with_capacity()`, including the changeset inside every transaction, allocate from a separate scratch pool that no world's budget covers |
+| Dense component columns (`BlobVec`) | `PagedSparseSet` page directory (8 B per 1024 entity indices), component registry, query cache (system heap) |
+| Sparse components: values, dense entity lists, and sparse pages (4 KiB per 1024 entity indices touched, per sparse component) | `EnumChangeSet` component bytes (the changeset `Arena`): `EnumChangeSet::new()` / `with_capacity()`, including the changeset inside every transaction, allocate from a separate scratch pool that no world's budget covers |
 | Entity bookkeeping: generations, free list, `entity_locations`, per-archetype entity lists | `EnumChangeSet` mutation records and drop entries (system heap) |
 | | Per-column dirty-page bitsets (system heap) |
 | | Query planner scratch (grows with join/result size), user-owned indexes (`BTreeIndex`, `HashIndex`, spatial) (system heap) |
