@@ -2123,10 +2123,15 @@ mod tests {
         // and slab blocks against the same frontiers. Each grower checks its
         // own bytes after every grow; a failed grow must leave them intact.
         let pool = Arc::new(SlabPool::new(32 * LARGE_UNIT, HugePages::Off, false).unwrap());
-        std::thread::scope(|s| {
+        // std::thread::spawn + join, not thread::scope: scope returns when the
+        // closures finish, before the workers' thread-local TCache destructors
+        // run, so cached blocks could still be outstanding at the used() == 0
+        // check below. join waits for full thread exit.
+        let mut handles = Vec::new();
+        {
             for t in 0..4u8 {
                 let pool = Arc::clone(&pool);
-                s.spawn(move || {
+                handles.push(std::thread::spawn(move || {
                     for round in 0..20 {
                         let mut layout = Layout::from_size_align(LARGE_UNIT, 64).unwrap();
                         let Ok(mut ptr) = pool.allocate(layout) else {
@@ -2147,11 +2152,11 @@ mod tests {
                         }
                         unsafe { pool.deallocate(ptr, layout) };
                     }
-                });
+                }));
             }
             for _ in 0..4 {
                 let pool = Arc::clone(&pool);
-                s.spawn(move || {
+                handles.push(std::thread::spawn(move || {
                     let large = Layout::from_size_align(LARGE_UNIT + 1, 64).unwrap();
                     let small = Layout::from_size_align(4000, 64).unwrap();
                     for _ in 0..50 {
@@ -2166,9 +2171,12 @@ mod tests {
                             }
                         }
                     }
-                });
+                }));
             }
-        });
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
         pool.flush_caches();
         pool.flush_current_thread_cache();
         assert_eq!(pool.used(), 0);
