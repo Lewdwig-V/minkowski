@@ -1411,7 +1411,7 @@ fn open_batch_for_entity(
     comp_id: crate::component::ComponentId,
 ) {
     let loc = world.entity_locations[entity.index() as usize].unwrap();
-    let arch_idx = loc.archetype_id.0;
+    let arch_idx = loc.archetype_id().0;
     let arch = &world.archetypes.archetypes[arch_idx];
     let mut mutable = fixedbitset::FixedBitSet::with_capacity(comp_id + 1);
     mutable.insert(comp_id);
@@ -1463,12 +1463,12 @@ fn writer_query_ref_t_passthrough() {
     let mut world = World::new();
     let e = world.spawn((Pos(7.0),));
     let loc = world.entity_locations[e.index() as usize].unwrap();
-    let archetype = &world.archetypes.archetypes[loc.archetype_id.0];
+    let archetype = &world.archetypes.archetypes[loc.archetype_id().0];
 
     let fetch = <&Pos as WriterQuery>::init_writer_fetch(archetype, &world.components);
     let mut cs = EnumChangeSet::new();
     let item = unsafe {
-        <&Pos as WriterQuery>::fetch_writer(&fetch, loc.row, e, &mut cs as *mut EnumChangeSet)
+        <&Pos as WriterQuery>::fetch_writer(&fetch, loc.row(), e, &mut cs as *mut EnumChangeSet)
     };
     assert_eq!(item.0, 7.0);
 }
@@ -1478,14 +1478,14 @@ fn writer_query_mut_t_becomes_writable_ref() {
     let mut world = World::new();
     let e = world.spawn((Pos(5.0),));
     let loc = world.entity_locations[e.index() as usize].unwrap();
-    let archetype = &world.archetypes.archetypes[loc.archetype_id.0];
+    let archetype = &world.archetypes.archetypes[loc.archetype_id().0];
 
     let fetch = <&mut Pos as WriterQuery>::init_writer_fetch(archetype, &world.components);
     let mut cs = EnumChangeSet::new();
     let pos_id = world.components.id::<Pos>().unwrap();
     open_batch_for_entity(&mut cs, &world, e, pos_id);
     let mut item = unsafe {
-        <&mut Pos as WriterQuery>::fetch_writer(&fetch, loc.row, e, &mut cs as *mut EnumChangeSet)
+        <&mut Pos as WriterQuery>::fetch_writer(&fetch, loc.row(), e, &mut cs as *mut EnumChangeSet)
     };
     assert_eq!(item.get().0, 5.0);
     item.set(Pos(55.0));
@@ -1501,7 +1501,7 @@ fn writer_query_tuple_fetch() {
     let mut world = World::new();
     let e = world.spawn((Pos(3.0), Vel(4.0)));
     let loc = world.entity_locations[e.index() as usize].unwrap();
-    let archetype = &world.archetypes.archetypes[loc.archetype_id.0];
+    let archetype = &world.archetypes.archetypes[loc.archetype_id().0];
 
     let fetch = <(&Vel, &mut Pos) as WriterQuery>::init_writer_fetch(archetype, &world.components);
     let mut cs = EnumChangeSet::new();
@@ -1510,7 +1510,7 @@ fn writer_query_tuple_fetch() {
     let (vel_ref, mut pos_wr) = unsafe {
         <(&Vel, &mut Pos) as WriterQuery>::fetch_writer(
             &fetch,
-            loc.row,
+            loc.row(),
             e,
             &mut cs as *mut EnumChangeSet,
         )

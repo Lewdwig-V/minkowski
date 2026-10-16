@@ -115,10 +115,80 @@ pub(crate) fn get_pair_mut(
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct EntityLocation {
-    pub archetype_id: ArchetypeId,
-    pub row: usize,
+pub(crate) use location::EntityLocation;
+
+mod location {
+    use super::ArchetypeId;
+    use std::num::NonZeroU32;
+
+    /// Where a placed entity lives: archetype + row. Packed into two `u32`s
+    /// (archetype stored as id + 1 in a `NonZeroU32`) so the niche keeps
+    /// `Option<EntityLocation>` at 8 bytes per entity index instead of 24.
+    /// Rows fit: an archetype never holds more than `u32::MAX` entities because
+    /// entity indices are `u32`. Archetype ids are bounded at creation
+    /// (`Archetypes::get_or_create`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct EntityLocation {
+        archetype: NonZeroU32,
+        row: u32,
+    }
+
+    const _: () = assert!(size_of::<Option<EntityLocation>>() == 8);
+
+    impl EntityLocation {
+        #[inline]
+        pub(crate) fn new(archetype_id: ArchetypeId, row: usize) -> Self {
+            let archetype = u32::try_from(archetype_id.0)
+                .ok()
+                .and_then(|id| NonZeroU32::new(id.wrapping_add(1)))
+                .expect("archetype id exceeds u32::MAX - 1");
+            let row = u32::try_from(row).expect("archetype row exceeds u32::MAX");
+            Self { archetype, row }
+        }
+
+        #[inline]
+        pub(crate) fn archetype_id(self) -> ArchetypeId {
+            ArchetypeId((self.archetype.get() - 1) as usize)
+        }
+
+        #[inline]
+        pub(crate) fn row(self) -> usize {
+            self.row as usize
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn round_trips_edge_values() {
+            let max = (u32::MAX - 1) as usize;
+            for (arch, row) in [
+                (0, 0),
+                (0, u32::MAX as usize),
+                (1, 7),
+                (max, 0),
+                (max, 12_345),
+            ] {
+                let loc = EntityLocation::new(ArchetypeId(arch), row);
+                assert_eq!(loc.archetype_id(), ArchetypeId(arch));
+                assert_eq!(loc.row(), row);
+            }
+        }
+
+        #[test]
+        #[should_panic(expected = "archetype id exceeds")]
+        fn rejects_archetype_id_past_u32() {
+            let _ = EntityLocation::new(ArchetypeId(u32::MAX as usize), 0);
+        }
+
+        #[test]
+        #[should_panic(expected = "row exceeds")]
+        fn rejects_row_past_u32() {
+            let _ = EntityLocation::new(ArchetypeId(0), u32::MAX as usize + 1);
+        }
+    }
 }
 
 pub(crate) struct QueryCacheEntry {
@@ -443,10 +513,7 @@ impl World {
         archetype.entities.push(entity);
         archetype.debug_assert_consistent();
 
-        self.entity_locations[index] = Some(EntityLocation {
-            archetype_id: arch_id,
-            row,
-        });
+        self.entity_locations[index] = Some(EntityLocation::new(arch_id, row));
         entity
     }
 
@@ -511,10 +578,7 @@ impl World {
         archetype.entities.push(entity);
         archetype.debug_assert_consistent();
 
-        self.entity_locations[index] = Some(EntityLocation {
-            archetype_id: arch_id,
-            row,
-        });
+        self.entity_locations[index] = Some(EntityLocation::new(arch_id, row));
         Ok(entity)
     }
 
@@ -569,10 +633,7 @@ impl World {
             let row = archetype.entities.len();
             archetype.entities.push(entity);
 
-            self.entity_locations[index] = Some(EntityLocation {
-                archetype_id: arch_id,
-                row,
-            });
+            self.entity_locations[index] = Some(EntityLocation::new(arch_id, row));
             spawned.push(entity);
         }
 
@@ -594,8 +655,8 @@ impl World {
             return false;
         };
 
-        let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
-        let row = location.row;
+        let archetype = &mut self.archetypes.archetypes[location.archetype_id().0];
+        let row = location.row();
         debug_assert!(
             row < archetype.len(),
             "stale EntityLocation: row {} >= archetype len {}",
@@ -638,10 +699,8 @@ impl World {
         // Update the swapped entity's location
         if row < archetype.entities.len() {
             let swapped = archetype.entities[row];
-            self.entity_locations[swapped.index() as usize] = Some(EntityLocation {
-                archetype_id: location.archetype_id,
-                row,
-            });
+            self.entity_locations[swapped.index() as usize] =
+                Some(EntityLocation::new(location.archetype_id(), row));
         }
 
         archetype.debug_assert_consistent();
@@ -684,9 +743,9 @@ impl World {
                 continue;
             };
             by_archetype
-                .entry(location.archetype_id.0)
+                .entry(location.archetype_id().0)
                 .or_default()
-                .push((location.row, entity));
+                .push((location.row(), entity));
             to_dealloc.push(entity);
         }
 
@@ -727,10 +786,8 @@ impl World {
                     }
                     let moved_entity = archetype.entities[last];
                     archetype.entities[row] = moved_entity;
-                    self.entity_locations[moved_entity.index() as usize] = Some(EntityLocation {
-                        archetype_id: ArchetypeId(arch_idx),
-                        row,
-                    });
+                    self.entity_locations[moved_entity.index() as usize] =
+                        Some(EntityLocation::new(ArchetypeId(arch_idx), row));
                 }
                 archetype.entities.truncate(last);
                 for col in &mut archetype.columns {
@@ -799,7 +856,7 @@ impl World {
         if self.components.is_sparse(comp_id) {
             return self.sparse.contains(comp_id, entity);
         }
-        let archetype = &self.archetypes.archetypes[location.archetype_id.0];
+        let archetype = &self.archetypes.archetypes[location.archetype_id().0];
         archetype.component_ids.contains(comp_id)
     }
 
@@ -814,10 +871,10 @@ impl World {
             return self.sparse.get::<T>(comp_id, entity);
         }
 
-        let archetype = &self.archetypes.archetypes[location.archetype_id.0];
+        let archetype = &self.archetypes.archetypes[location.archetype_id().0];
         let col_idx = archetype.column_index(comp_id)?;
         unsafe {
-            let ptr = archetype.columns[col_idx].get_ptr(location.row) as *const T;
+            let ptr = archetype.columns[col_idx].get_ptr(location.row()) as *const T;
             Some(&*ptr)
         }
     }
@@ -834,10 +891,10 @@ impl World {
             return None;
         }
         let location = self.entity_locations[entity.index() as usize]?;
-        let archetype = &self.archetypes.archetypes[location.archetype_id.0];
+        let archetype = &self.archetypes.archetypes[location.archetype_id().0];
         let col_idx = archetype.column_index(comp_id)?;
         unsafe {
-            let ptr = archetype.columns[col_idx].get_ptr(location.row) as *const T;
+            let ptr = archetype.columns[col_idx].get_ptr(location.row()) as *const T;
             Some(&*ptr)
         }
     }
@@ -855,16 +912,16 @@ impl World {
         }
 
         let tick = self.next_tick();
-        let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
+        let archetype = &mut self.archetypes.archetypes[location.archetype_id().0];
         debug_assert!(
-            location.row < archetype.len(),
+            location.row() < archetype.len(),
             "stale EntityLocation: row {} >= archetype len {}",
-            location.row,
+            location.row(),
             archetype.len()
         );
         let col_idx = archetype.column_index(comp_id)?;
         unsafe {
-            let ptr = archetype.columns[col_idx].get_ptr_mut(location.row, tick) as *mut T;
+            let ptr = archetype.columns[col_idx].get_ptr_mut(location.row(), tick) as *mut T;
             Some(&mut *ptr)
         }
     }
@@ -905,9 +962,9 @@ impl World {
             }
             if let Some(location) = self.entity_locations[entity.index() as usize] {
                 by_arch
-                    .entry(location.archetype_id.0)
+                    .entry(location.archetype_id().0)
                     .or_default()
-                    .push((i, location.row));
+                    .push((i, location.row()));
             }
         }
 
@@ -998,9 +1055,9 @@ impl World {
             }
             if let Some(location) = self.entity_locations[entity.index() as usize] {
                 by_arch
-                    .entry(location.archetype_id.0)
+                    .entry(location.archetype_id().0)
                     .or_default()
-                    .push((i, location.row));
+                    .push((i, location.row()));
             }
         }
 
@@ -1289,14 +1346,14 @@ impl World {
             return Err(DeadEntity { entity });
         };
         debug_assert!(
-            location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
+            location.row() < self.archetypes.archetypes[location.archetype_id().0].len(),
             "stale EntityLocation: row {} >= archetype len {}",
-            location.row,
-            self.archetypes.archetypes[location.archetype_id.0].len()
+            location.row(),
+            self.archetypes.archetypes[location.archetype_id().0].len()
         );
         let new_ids = B::component_ids(&mut self.components);
 
-        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
+        let src_arch = &self.archetypes.archetypes[location.archetype_id().0];
         let all_existing = new_ids
             .iter()
             .all(|&id| src_arch.component_ids.contains(id));
@@ -1304,8 +1361,8 @@ impl World {
         if all_existing {
             // All bundle components already exist — overwrite in-place
             let tick = self.next_tick();
-            let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
-            let row = location.row;
+            let arch = &mut self.archetypes.archetypes[location.archetype_id().0];
+            let row = location.row();
             unsafe {
                 // Preflight scratch for every overwritten droppable column so
                 // pool exhaustion surfaces as Err(PoolExhausted) BEFORE any
@@ -1350,8 +1407,8 @@ impl World {
             }
         }
         target_ids.sort_unstable();
-        let src_arch_id = location.archetype_id;
-        let src_row = location.row;
+        let src_arch_id = location.archetype_id();
+        let src_row = location.row();
 
         let target_arch_id =
             self.archetypes
@@ -1452,16 +1509,11 @@ impl World {
         // Update swapped entity's location in source
         if src_row < src_arch.entities.len() {
             let swapped = src_arch.entities[src_row];
-            self.entity_locations[swapped.index() as usize] = Some(EntityLocation {
-                archetype_id: src_arch_id,
-                row: src_row,
-            });
+            self.entity_locations[swapped.index() as usize] =
+                Some(EntityLocation::new(src_arch_id, src_row));
         }
 
-        self.entity_locations[index] = Some(EntityLocation {
-            archetype_id: target_arch_id,
-            row: target_row,
-        });
+        self.entity_locations[index] = Some(EntityLocation::new(target_arch_id, target_row));
 
         // Verify column/entity invariant after migration.
         src_arch.debug_assert_consistent();
@@ -1488,22 +1540,22 @@ impl World {
             return Err(InsertError::Unplaced(entity));
         };
         debug_assert!(
-            location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
+            location.row() < self.archetypes.archetypes[location.archetype_id().0].len(),
             "stale EntityLocation: row {} >= archetype len {}",
-            location.row,
-            self.archetypes.archetypes[location.archetype_id.0].len()
+            location.row(),
+            self.archetypes.archetypes[location.archetype_id().0].len()
         );
         let new_ids = B::component_ids(&mut self.components);
 
-        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
+        let src_arch = &self.archetypes.archetypes[location.archetype_id().0];
         let all_existing = new_ids
             .iter()
             .all(|&id| src_arch.component_ids.contains(id));
 
         if all_existing {
             // All bundle components already exist — overwrite in-place (no allocation)
-            let arch = &mut self.archetypes.archetypes[location.archetype_id.0];
-            let row = location.row;
+            let arch = &mut self.archetypes.archetypes[location.archetype_id().0];
+            let row = location.row();
             unsafe {
                 // Preflight scratch for every overwritten droppable column so
                 // pool exhaustion surfaces as Err(PoolExhausted) BEFORE any
@@ -1547,8 +1599,8 @@ impl World {
             }
         }
         target_ids.sort_unstable();
-        let src_arch_id = location.archetype_id;
-        let src_row = location.row;
+        let src_arch_id = location.archetype_id();
+        let src_row = location.row();
 
         let target_arch_id =
             self.archetypes
@@ -1655,16 +1707,11 @@ impl World {
 
         if src_row < src_arch.entities.len() {
             let swapped = src_arch.entities[src_row];
-            self.entity_locations[swapped.index() as usize] = Some(EntityLocation {
-                archetype_id: src_arch_id,
-                row: src_row,
-            });
+            self.entity_locations[swapped.index() as usize] =
+                Some(EntityLocation::new(src_arch_id, src_row));
         }
 
-        self.entity_locations[index] = Some(EntityLocation {
-            archetype_id: target_arch_id,
-            row: target_row,
-        });
+        self.entity_locations[index] = Some(EntityLocation::new(target_arch_id, target_row));
 
         src_arch.debug_assert_consistent();
         target_arch.debug_assert_consistent();
@@ -1679,14 +1726,14 @@ impl World {
         let index = entity.index() as usize;
         let location = self.entity_locations[index]?;
         debug_assert!(
-            location.row < self.archetypes.archetypes[location.archetype_id.0].len(),
+            location.row() < self.archetypes.archetypes[location.archetype_id().0].len(),
             "stale EntityLocation: row {} >= archetype len {}",
-            location.row,
-            self.archetypes.archetypes[location.archetype_id.0].len()
+            location.row(),
+            self.archetypes.archetypes[location.archetype_id().0].len()
         );
         let comp_id = self.components.id::<T>()?;
 
-        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
+        let src_arch = &self.archetypes.archetypes[location.archetype_id().0];
         if !src_arch.component_ids.contains(comp_id) {
             return None;
         }
@@ -1694,7 +1741,7 @@ impl World {
         // Read the component value before migration
         let removed = unsafe {
             let col_idx = src_arch.column_index(comp_id).unwrap();
-            let ptr = src_arch.columns[col_idx].get_ptr(location.row) as *const T;
+            let ptr = src_arch.columns[col_idx].get_ptr(location.row()) as *const T;
             std::ptr::read(ptr)
         };
 
@@ -1705,8 +1752,8 @@ impl World {
             .copied()
             .filter(|&id| id != comp_id)
             .collect();
-        let src_arch_id = location.archetype_id;
-        let src_row = location.row;
+        let src_arch_id = location.archetype_id();
+        let src_row = location.row();
 
         if target_ids.is_empty() {
             // Entity has no components left — move to empty archetype
@@ -1727,10 +1774,8 @@ impl World {
             arch.entities.swap_remove(src_row);
             if src_row < arch.entities.len() {
                 let swapped = arch.entities[src_row];
-                self.entity_locations[swapped.index() as usize] = Some(EntityLocation {
-                    archetype_id: src_arch_id,
-                    row: src_row,
-                });
+                self.entity_locations[swapped.index() as usize] =
+                    Some(EntityLocation::new(src_arch_id, src_row));
             }
             arch.debug_assert_consistent();
             let empty_arch_id = self
@@ -1738,10 +1783,10 @@ impl World {
                 .get_or_create(&[], &self.components, &self.pool);
             let empty_arch = &mut self.archetypes.archetypes[empty_arch_id.0];
             empty_arch.entities.push(entity);
-            self.entity_locations[index] = Some(EntityLocation {
-                archetype_id: empty_arch_id,
-                row: empty_arch.entities.len() - 1,
-            });
+            self.entity_locations[index] = Some(EntityLocation::new(
+                empty_arch_id,
+                empty_arch.entities.len() - 1,
+            ));
             return Some(removed);
         }
 
@@ -1777,16 +1822,11 @@ impl World {
 
         if src_row < src_arch.entities.len() {
             let swapped = src_arch.entities[src_row];
-            self.entity_locations[swapped.index() as usize] = Some(EntityLocation {
-                archetype_id: src_arch_id,
-                row: src_row,
-            });
+            self.entity_locations[swapped.index() as usize] =
+                Some(EntityLocation::new(src_arch_id, src_row));
         }
 
-        self.entity_locations[index] = Some(EntityLocation {
-            archetype_id: target_arch_id,
-            row: target_row,
-        });
+        self.entity_locations[index] = Some(EntityLocation::new(target_arch_id, target_row));
 
         // Verify column/entity invariant after migration.
         src_arch.debug_assert_consistent();
@@ -1807,7 +1847,7 @@ impl World {
             return None;
         }
         let location = self.entity_locations[entity.index() as usize]?;
-        let archetype = &self.archetypes.archetypes[location.archetype_id.0];
+        let archetype = &self.archetypes.archetypes[location.archetype_id().0];
 
         let components: Vec<_> = archetype
             .sorted_ids
@@ -1815,7 +1855,7 @@ impl World {
             .map(|&comp_id| {
                 let col_idx = archetype.column_index(comp_id).unwrap();
                 let info = self.components.info(comp_id);
-                let ptr = unsafe { archetype.columns[col_idx].get_ptr(location.row) };
+                let ptr = unsafe { archetype.columns[col_idx].get_ptr(location.row()) };
                 (comp_id, ptr as *const u8, info.layout)
             })
             .collect();
@@ -2698,7 +2738,7 @@ mod tests {
         let _ = world.get_mut::<Pos>(e);
 
         let loc = world.entity_locations[e.index() as usize].unwrap();
-        let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+        let arch = &world.archetypes.archetypes[loc.archetype_id().0];
         let comp_id = world.components.id::<Pos>().unwrap();
         let col_idx = arch.column_index(comp_id).unwrap();
         // get_mut should advance the tick beyond spawn's tick
@@ -3318,7 +3358,7 @@ mod tests {
         let _results = world.get_batch_mut::<Health>(&[e]);
 
         let loc = world.entity_locations[e.index() as usize].unwrap();
-        let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+        let arch = &world.archetypes.archetypes[loc.archetype_id().0];
         let comp_id = world.components.id::<Health>().unwrap();
         let col_idx = arch.column_index(comp_id).unwrap();
         assert!(arch.columns[col_idx].changed_tick.is_newer_than(spawn_tick));
