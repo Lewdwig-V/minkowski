@@ -5511,13 +5511,13 @@ fn scratch_sort_by_archetype_groups_entities() {
     let loc1 = world.entity_locations[sorted[1].index() as usize].unwrap();
     let loc2 = world.entity_locations[sorted[2].index() as usize].unwrap();
     let loc3 = world.entity_locations[sorted[3].index() as usize].unwrap();
-    assert_eq!(loc0.archetype_id, loc1.archetype_id);
-    assert_eq!(loc2.archetype_id, loc3.archetype_id);
-    assert_ne!(loc0.archetype_id, loc2.archetype_id);
+    assert_eq!(loc0.archetype_id(), loc1.archetype_id());
+    assert_eq!(loc2.archetype_id(), loc3.archetype_id());
+    assert_ne!(loc0.archetype_id(), loc2.archetype_id());
 
     // Within each archetype group, rows should be sorted ascending.
-    assert!(loc0.row < loc1.row);
-    assert!(loc2.row < loc3.row);
+    assert!(loc0.row() < loc1.row());
+    assert!(loc2.row() < loc3.row());
 }
 
 #[test]

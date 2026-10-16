@@ -136,6 +136,12 @@ impl Archetypes {
         if let Some(&id) = self.by_components.get(sorted_ids) {
             return id;
         }
+        // EntityLocation packs the id as a NonZeroU32 (id + 1). Unreachable in
+        // practice: each archetype carries ~1.5 KiB of heap metadata.
+        assert!(
+            self.archetypes.len() < u32::MAX as usize,
+            "archetype count exceeds u32::MAX - 1"
+        );
         let id = ArchetypeId(self.archetypes.len());
         let archetype = Archetype::new(id, sorted_ids, registry, pool);
         self.archetypes.push(archetype);

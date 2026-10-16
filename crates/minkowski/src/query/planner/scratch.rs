@@ -190,7 +190,7 @@ impl ScratchBuffer {
         self.entities.sort_unstable_by_key(|e| {
             let loc = entity_locations[e.index() as usize]
                 .expect("entity in scratch buffer has no location");
-            ((loc.archetype_id.0 as u64) << 32) | (loc.row as u64)
+            ((loc.archetype_id().0 as u64) << 32) | (loc.row() as u64)
         });
     }
 }

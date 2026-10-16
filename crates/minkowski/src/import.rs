@@ -263,10 +263,7 @@ impl World {
             if idx >= self.entity_locations.len() {
                 self.entity_locations.resize(idx + 1, None);
             }
-            self.entity_locations[idx] = Some(EntityLocation {
-                archetype_id: arch_id,
-                row: base_row + i,
-            });
+            self.entity_locations[idx] = Some(EntityLocation::new(arch_id, base_row + i));
         }
         Ok(())
     }
