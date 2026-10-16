@@ -51,15 +51,6 @@ impl<T: Copy> PoolVec<T> {
         v
     }
 
-    /// Vector holding a copy of `items`, returning `Err` instead of
-    /// aborting. On `Err` nothing is left allocated.
-    pub(crate) fn try_from_slice(pool: Arc<SlabPool>, items: &[T]) -> Result<Self, PoolExhausted> {
-        let mut v = Self::new(pool);
-        v.try_reserve(items.len())?;
-        v.extend_from_slice(items); // capacity reserved: no allocation
-        Ok(v)
-    }
-
     pub(crate) fn capacity(&self) -> usize {
         self.cap
     }

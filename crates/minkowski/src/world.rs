@@ -1,6 +1,5 @@
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
-use crate::entity::FreeList;
 use crate::entity::{Entity, EntityAllocator};
 use crate::storage::pool_vec::PoolVec;
 
@@ -2230,20 +2229,24 @@ impl World {
         free_list: &[u32],
     ) -> Result<(), PoolExhausted> {
         self.drain_orphans();
-        // Build everything fallibly first, then commit with no further
-        // allocation (all-or-nothing).
-        let new_generations = PoolVec::try_from_slice(self.pool.clone(), generations)?;
-        let new_free_list =
-            FreeList::try_from_slice(self.pool.clone(), free_list, generations.len())?;
-        self.entity_locations.try_reserve(
-            generations
-                .len()
-                .saturating_sub(self.entity_locations.len()),
-        )?;
+        // Phase 1: grow the existing buffers' capacity in place (fallible;
+        // only spare capacity changes, so Err leaves the world unchanged).
+        // Reusing the buffers avoids holding old and new arrays at once.
+        let generations_len = generations.len();
+        self.entities
+            .generations
+            .try_reserve(generations_len.saturating_sub(self.entities.generations.len()))?;
+        self.entities
+            .free_list
+            .try_reserve_total(free_list.len().max(generations_len))?;
+        self.entity_locations
+            .try_reserve(generations_len.saturating_sub(self.entity_locations.len()))?;
 
-        self.entities.generations = new_generations;
-        self.entities.free_list = new_free_list;
-        debug_assert!(self.entities.free_list.capacity() >= self.entities.generations.len());
+        // Phase 2: commit. Capacity is reserved, so nothing below allocates.
+        self.entities.generations.truncate(0);
+        self.entities.generations.extend_from_slice(generations);
+        self.entities.free_list.assign(free_list);
+        debug_assert!(self.entities.free_list.capacity() >= generations_len);
         // Sync the atomic counter so reserve() doesn't hand out already-used indices.
         self.entities.sync_reserved();
         self.entity_locations.resize(generations.len(), None); // reserved above
@@ -2280,8 +2283,13 @@ impl World {
         value: T,
     ) -> Result<(), PoolExhausted> {
         self.drain_orphans();
-        let comp_id = self.components.register_sparse::<T>();
-        self.sparse.try_insert(comp_id, entity, value)
+        // Register the type id now (as try_spawn does), but mark it sparse
+        // only once the value is stored: an Err must not reroute get/has for
+        // T through an empty sparse set.
+        let comp_id = self.components.register::<T>();
+        self.sparse.try_insert(comp_id, entity, value)?;
+        self.components.mark_sparse(comp_id);
+        Ok(())
     }
 }
 
@@ -4292,6 +4300,42 @@ mod tests {
         world.try_restore_allocator_state(&[3, 0], &[1]).unwrap();
         assert_eq!(world.entities.generations.len(), 2);
         assert!(world.entities.free_list.capacity() >= 2);
+    }
+
+    /// Allocate from every size class until each refuses (test-only hog).
+    fn exhaust_pool(world: &World) {
+        for size in [1 << 20, 65_536, 16_384, 4096, 1024, 256, 64] {
+            let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+            while world.pool.allocate(layout).is_ok() {}
+        }
+    }
+
+    #[test]
+    fn try_restore_allocator_state_reuses_buffers_when_pool_is_full() {
+        // Codex P1 on #291: restoring a same-size state into a full pool must
+        // not need a second copy of the allocator arrays.
+        let (mut world, _) = exhausted_world(512 << 10, |w, n| w.try_spawn((n,)).is_ok());
+        let generations = world.entities.generations.to_vec();
+        let free_list = world.entities.free_list.as_slice().to_vec();
+        exhaust_pool(&world);
+        world
+            .try_restore_allocator_state(&generations, &free_list)
+            .expect("same-size restore fits in the existing buffers");
+        assert_eq!(&world.entities.generations[..], &generations[..]);
+    }
+
+    #[test]
+    fn failed_first_sparse_insert_does_not_mark_component_sparse() {
+        // Codex P2 on #291: Err must not leave T routed through an empty set.
+        #[derive(Clone, Copy)]
+        struct Late(#[expect(dead_code, reason = "payload size only")] [u64; 64]);
+        let (mut world, _) = exhausted_world(512 << 10, |w, n| w.try_spawn((n,)).is_ok());
+        let e = world.query::<(Entity,)>().next().map(|(e,)| e).unwrap();
+        exhaust_pool(&world);
+        assert!(world.try_insert_sparse(e, Late([0; 64])).is_err());
+        let id = world.component_id::<Late>().expect("type id is registered");
+        assert!(!world.components.is_sparse(id));
+        assert_eq!(world.sparse_component_ids().len(), 0);
     }
 
     #[test]

@@ -37,23 +37,20 @@ impl FreeList {
         list
     }
 
-    /// Copy `slots` into a pool-backed list with capacity for at least
-    /// `min_capacity` slots (invariant B3), returning `Err` instead of
-    /// aborting.
-    pub(crate) fn try_from_slice(
-        pool: Arc<SlabPool>,
-        slots: &[u32],
-        min_capacity: usize,
-    ) -> Result<Self, PoolExhausted> {
-        let mut list = Self::new(Arc::clone(&pool));
-        list.slots = PoolVec::try_from_slice(pool, slots)?;
-        list.try_reserve_total(min_capacity)?;
-        Ok(list)
+    /// Replace the contents with `slots` (no tombstones, no lookup index).
+    /// Does not allocate in the pool when `try_reserve_total(slots.len())`
+    /// succeeded beforehand.
+    pub(crate) fn assign(&mut self, slots: &[u32]) {
+        self.slots.truncate(0);
+        self.slots.extend_from_slice(slots);
+        self.positions = None;
+        self.holes = 0;
+        self.snapshot.take();
     }
 
     /// Ensure capacity for `total` slots without allocating later.
     /// On `Err` nothing changed.
-    fn try_reserve_total(&mut self, total: usize) -> Result<(), PoolExhausted> {
+    pub(crate) fn try_reserve_total(&mut self, total: usize) -> Result<(), PoolExhausted> {
         self.slots
             .try_reserve(total.saturating_sub(self.slots.len()))
     }
