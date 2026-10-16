@@ -714,7 +714,7 @@ impl QueryPlanResult {
         while run_start < entities.len() {
             let loc = world.entity_locations[entities[run_start].index() as usize]
                 .expect("sorted entity has no location");
-            let arch_id = loc.archetype_id;
+            let arch_id = loc.archetype_id();
             let archetype = &world.archetypes.archetypes[arch_id.0];
 
             // Validate Q's required components are present in this archetype.
@@ -732,7 +732,7 @@ impl QueryPlanResult {
             while run_end < entities.len() {
                 let next_loc = world.entity_locations[entities[run_end].index() as usize]
                     .expect("sorted entity has no location");
-                if next_loc.archetype_id != arch_id {
+                if next_loc.archetype_id() != arch_id {
                     break;
                 }
                 run_end += 1;
@@ -742,7 +742,7 @@ impl QueryPlanResult {
             for &entity in &entities[run_start..run_end] {
                 let row = world.entity_locations[entity.index() as usize]
                     .expect("sorted entity has no location")
-                    .row;
+                    .row();
                 debug_assert!(
                     row < archetype.len(),
                     "row {row} >= archetype len {}",
@@ -908,7 +908,7 @@ impl QueryPlanResult {
         while run_start < entities.len() {
             let loc = world.entity_locations[entities[run_start].index() as usize]
                 .expect("sorted entity has no location");
-            let arch_id = loc.archetype_id;
+            let arch_id = loc.archetype_id();
             let archetype = &world.archetypes.archetypes[arch_id.0];
 
             // Validate Q's required components.
@@ -926,7 +926,7 @@ impl QueryPlanResult {
             while run_end < entities.len() {
                 let next_loc = world.entity_locations[entities[run_end].index() as usize]
                     .expect("sorted entity has no location");
-                if next_loc.archetype_id != arch_id {
+                if next_loc.archetype_id() != arch_id {
                     break;
                 }
                 run_end += 1;
@@ -937,7 +937,7 @@ impl QueryPlanResult {
             for &entity in &entities[run_start..run_end] {
                 let row = world.entity_locations[entity.index() as usize]
                     .expect("sorted entity has no location")
-                    .row;
+                    .row();
                 debug_assert!(row < archetype.len());
                 row_indices.push(row);
             }

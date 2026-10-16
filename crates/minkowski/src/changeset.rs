@@ -913,7 +913,7 @@ impl EnumChangeSet {
                     return Err(map_err(ApplyError::Unplaced(*entity)));
                 };
                 let key_matches = batch.as_ref().is_some_and(|b| {
-                    b.arch_idx == location.archetype_id.0 && b.comp_id == *component_id
+                    b.arch_idx == location.archetype_id().0 && b.comp_id == *component_id
                 });
                 if key_matches {
                     debug_assert_eq!(
@@ -922,16 +922,16 @@ impl EnumChangeSet {
                         "batch layout mismatch for same ComponentId"
                     );
                     let src = self.arena.get(*offset);
-                    batch.as_mut().unwrap().entries.push((location.row, src));
+                    batch.as_mut().unwrap().entries.push((location.row(), src));
                     continue;
                 }
-                let arch = &world.archetypes.archetypes[location.archetype_id.0];
+                let arch = &world.archetypes.archetypes[location.archetype_id().0];
 
                 if arch.component_ids.contains(*component_id) {
                     // New batch — archetype has component, resolve column once.
                     let col_idx = arch.column_index(*component_id).unwrap();
                     let new_batch = InsertBatch {
-                        arch_idx: location.archetype_id.0,
+                        arch_idx: location.archetype_id().0,
                         comp_id: *component_id,
                         col_idx,
                         layout: *layout,
@@ -940,7 +940,7 @@ impl EnumChangeSet {
                     flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
                     batch = Some(new_batch);
                     let src = self.arena.get(*offset);
-                    batch.as_mut().unwrap().entries.push((location.row, src));
+                    batch.as_mut().unwrap().entries.push((location.row(), src));
                     continue;
                 }
 
@@ -998,10 +998,7 @@ impl EnumChangeSet {
                     archetype.entities.push(*entity);
                     archetype.debug_assert_consistent();
 
-                    world.entity_locations[index] = Some(EntityLocation {
-                        archetype_id: arch_id,
-                        row,
-                    });
+                    world.entity_locations[index] = Some(EntityLocation::new(arch_id, row));
                 }
 
                 Mutation::Despawn { entity } => {
@@ -1152,29 +1149,29 @@ fn changeset_insert_raw(
         return Err(ApplyError::Unplaced(entity));
     };
 
-    let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
+    let src_arch = &world.archetypes.archetypes[location.archetype_id().0];
 
     if src_arch.component_ids.contains(comp_id) {
         // Entity already has this component — overwrite in-place.
         let col_idx = src_arch.column_index(comp_id).unwrap();
 
         // Overwrite with new data (write path — marks column changed).
-        let src_arch = &mut world.archetypes.archetypes[location.archetype_id.0];
+        let src_arch = &mut world.archetypes.archetypes[location.archetype_id().0];
         // Panic-safe overwrite (#180) — new value committed before drop.
         // SAFETY: replacement is protected; row in bounds per pre-check above.
         unsafe {
             src_arch.columns[col_idx]
-                .replace_protected(location.row, data_ptr)
+                .replace_protected(location.row(), data_ptr)
                 .expect("pool exhausted during changeset apply");
         }
     } else {
         // Archetype migration: source components + new component.
-        let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
+        let src_arch = &world.archetypes.archetypes[location.archetype_id().0];
         let mut target_ids = src_arch.sorted_ids.clone();
         target_ids.push(comp_id);
         target_ids.sort_unstable();
-        let src_arch_id = location.archetype_id;
-        let src_row = location.row;
+        let src_arch_id = location.archetype_id();
+        let src_row = location.row();
 
         let target_arch_id =
             world
@@ -1217,20 +1214,15 @@ fn changeset_insert_raw(
         // Update swapped entity's location in source.
         if src_row < src_arch.entities.len() {
             let swapped = src_arch.entities[src_row];
-            world.entity_locations[swapped.index() as usize] = Some(EntityLocation {
-                archetype_id: src_arch_id,
-                row: src_row,
-            });
+            world.entity_locations[swapped.index() as usize] =
+                Some(EntityLocation::new(src_arch_id, src_row));
         }
 
         // Verify column/entity invariant after migration.
         src_arch.debug_assert_consistent();
         target_arch.debug_assert_consistent();
 
-        world.entity_locations[index] = Some(EntityLocation {
-            archetype_id: target_arch_id,
-            row: target_row,
-        });
+        world.entity_locations[index] = Some(EntityLocation::new(target_arch_id, target_row));
     }
 
     Ok(())
@@ -1252,7 +1244,7 @@ fn changeset_remove_raw(
         // Alive but unplaced (alloc_entity without spawn).
         return Err(ApplyError::Unplaced(entity));
     };
-    let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
+    let src_arch = &world.archetypes.archetypes[location.archetype_id().0];
 
     if !src_arch.component_ids.contains(comp_id) {
         return Ok(()); // Component not present — nothing to do.
@@ -1265,8 +1257,8 @@ fn changeset_remove_raw(
         .copied()
         .filter(|&id| id != comp_id)
         .collect();
-    let src_arch_id = location.archetype_id;
-    let src_row = location.row;
+    let src_arch_id = location.archetype_id();
+    let src_row = location.row();
 
     if target_ids.is_empty() {
         // Entity has no components left — move to empty archetype.
@@ -1280,10 +1272,8 @@ fn changeset_remove_raw(
         arch.entities.swap_remove(src_row);
         if src_row < arch.entities.len() {
             let swapped = arch.entities[src_row];
-            world.entity_locations[swapped.index() as usize] = Some(EntityLocation {
-                archetype_id: src_arch_id,
-                row: src_row,
-            });
+            world.entity_locations[swapped.index() as usize] =
+                Some(EntityLocation::new(src_arch_id, src_row));
         }
         arch.debug_assert_consistent();
         let empty_arch_id = world
@@ -1291,10 +1281,10 @@ fn changeset_remove_raw(
             .get_or_create(&[], &world.components, &world.pool);
         let empty_arch = &mut world.archetypes.archetypes[empty_arch_id.0];
         empty_arch.entities.push(entity);
-        world.entity_locations[index] = Some(EntityLocation {
-            archetype_id: empty_arch_id,
-            row: empty_arch.entities.len() - 1,
-        });
+        world.entity_locations[index] = Some(EntityLocation::new(
+            empty_arch_id,
+            empty_arch.entities.len() - 1,
+        ));
         return Ok(());
     }
 
@@ -1336,20 +1326,15 @@ fn changeset_remove_raw(
 
     if src_row < src_arch.entities.len() {
         let swapped = src_arch.entities[src_row];
-        world.entity_locations[swapped.index() as usize] = Some(EntityLocation {
-            archetype_id: src_arch_id,
-            row: src_row,
-        });
+        world.entity_locations[swapped.index() as usize] =
+            Some(EntityLocation::new(src_arch_id, src_row));
     }
 
     // Verify column/entity invariant after migration.
     src_arch.debug_assert_consistent();
     target_arch.debug_assert_consistent();
 
-    world.entity_locations[index] = Some(EntityLocation {
-        archetype_id: target_arch_id,
-        row: target_row,
-    });
+    world.entity_locations[index] = Some(EntityLocation::new(target_arch_id, target_row));
 
     Ok(())
 }
@@ -2295,7 +2280,7 @@ mod tests {
     /// Helper: look up an entity's (arch_idx, row) from the world.
     fn entity_location(world: &World, entity: Entity) -> (usize, usize) {
         let loc = world.entity_locations[entity.index() as usize].unwrap();
-        (loc.archetype_id.0, loc.row)
+        (loc.archetype_id().0, loc.row())
     }
 
     /// Helper: look up the column index for a component within an archetype.
