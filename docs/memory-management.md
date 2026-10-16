@@ -26,19 +26,20 @@ The pool is one window with two opposing frontiers. The bottom frontier grows up
 
 ### What the budget covers
 
-The pool budget applies to **component storage only**. That's a design decision, not an oversight: component columns are expected to dominate memory, so a TigerBeetle-style whole-process limit was judged unnecessary.
+The pool budget covers **component storage and per-entity bookkeeping**. Plan for roughly 40 bytes of pool per entity for the bookkeeping (more while vectors carry doubling slack), on top of its component bytes. It is not a TigerBeetle-style whole-process limit: the structures in the right-hand column use the system heap.
 
 | Inside the world's pool budget | Outside it |
 |---|---|
-| Dense component columns (`BlobVec`) | Entity bookkeeping: generations, free list, `entity_locations`, per-archetype entity lists (system heap) |
-| Sparse component values (`PagedSparseSet` dense storage) | `PagedSparseSet` page directory, component registry, query cache (system heap) |
-| | `EnumChangeSet` component bytes (the changeset `Arena`): `EnumChangeSet::new()` / `with_capacity()`, including the changeset inside every transaction, allocate from a separate scratch pool that no world's budget covers |
-| | `EnumChangeSet` mutation records and drop entries (system heap) |
+| Dense component columns (`BlobVec`) | `PagedSparseSet` page directory (16 KiB per 4096 entity indices touched), component registry, query cache (system heap) |
+| Sparse component values (`PagedSparseSet` dense storage) and their dense entity lists | `EnumChangeSet` component bytes (the changeset `Arena`): `EnumChangeSet::new()` / `with_capacity()`, including the changeset inside every transaction, allocate from a separate scratch pool that no world's budget covers |
+| Entity bookkeeping: generations, free list, `entity_locations`, per-archetype entity lists | `EnumChangeSet` mutation records and drop entries (system heap) |
 | | Per-column dirty-page bitsets (system heap) |
 | | Query planner scratch (grows with join/result size), user-owned indexes (`BTreeIndex`, `HashIndex`, spatial) (system heap) |
 | | WAL and LSM buffers, and the pool's own side table (system heap) |
 
-Most heap-side structures scale with entity count rather than component bytes. Query scratch scales with result size: a plan pre-sizes it (capped at 64K entities) and reuses it across executions, but it can grow past that for large joins. `PoolExhausted` therefore bounds the world's component columns, not process RSS, and recording a large changeset never raises it. Size the process limit (container memory, `RLIMIT_AS`) with headroom for the heap side.
+`try_spawn` and `try_insert` reserve every pool slot they need, bookkeeping included, before mutating, so `Err(PoolExhausted)` leaves the world unchanged, and `despawn` never allocates. See [the design doc](plans/pool-entity-bookkeeping.md).
+
+Query scratch scales with result size: a plan pre-sizes it (capped at 64K entities) and reuses it across executions, but it can grow past that for large joins. Indexes scale with indexed entities. `PoolExhausted` therefore bounds the world's entities and components, not process RSS, and recording a large changeset never raises it. Size the process limit (container memory, `RLIMIT_AS`) with headroom for the heap side.
 
 ## Blob Offloading
 
@@ -74,7 +75,7 @@ world.spawn((data, Expiry::after(5)));
 registry.run(&mut world, retention_id, ());
 ```
 
-Together, these four features let a Minkowski deployment run indefinitely within a bounded memory footprint: the pool caps component storage (see [What the budget covers](#what-the-budget-covers)), blob offloading keeps large assets external, retention prevents unbounded entity growth, and LSM compaction bounds disk-space amplification to ≤ 2×.
+Together, these four features let a Minkowski deployment run indefinitely within a bounded memory footprint: the pool caps component storage and entity bookkeeping (see [What the budget covers](#what-the-budget-covers)), blob offloading keeps large assets external, retention prevents unbounded entity growth, and LSM compaction bounds disk-space amplification to ≤ 2×.
 
 ## LSM Disk-Space Management
 
