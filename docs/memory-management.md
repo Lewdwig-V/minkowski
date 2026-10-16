@@ -24,6 +24,22 @@ match world.try_spawn((pos, vel)) {
 
 The pool is one window with two opposing frontiers. The bottom frontier grows upward and carves 64 KiB chunks on demand for five slab size classes (64 B – 64 KiB). The top frontier grows downward and serves anything larger as runs of 1 MiB units, so one column can grow to any size the budget allows. Nothing is reserved per size class up front: `PoolExhausted` means the frontiers have met (or every carved block of the needed class is in use), not that one fixed partition ran out. Large runs grow in place when free units border them, which avoids the transient 2× footprint of copy-on-grow. All worlds use the mmap-backed `SlabPool`: `World::new()` creates a 256 MiB demand-paged pool that touches no pages until the first allocation, while `WorldBuilder::memory_budget()` creates a pre-faulted pool with a specific budget and optional hugepage support. Exhaustion is deterministic for single-threaded use of a pool. When several threads share one, thread-local caches and lock order can move the exact point where `PoolExhausted` fires. `flush_pool_caches()` does not make that exact across threads: it returns only the calling thread's cached blocks immediately, and other threads (idle Rayon workers included) return theirs on their next pool operation or at thread exit. A budget-sensitive check is therefore exact only once every other thread has touched the pool, or exited, since the flush. See [the design doc](plans/two-frontier-pool.md) for the layout and measured utilization.
 
+### What the budget covers
+
+The pool budget applies to **component storage only**. That's a design decision, not an oversight: component columns are expected to dominate memory, so a TigerBeetle-style whole-process limit was judged unnecessary.
+
+| Inside the world's pool budget | Outside it |
+|---|---|
+| Dense component columns (`BlobVec`) | Entity bookkeeping: generations, free list, `entity_locations`, per-archetype entity lists (system heap) |
+| Sparse component values (`PagedSparseSet` dense storage) | `PagedSparseSet` page directory, component registry, query cache (system heap) |
+| | `EnumChangeSet` component bytes (the changeset `Arena`): `EnumChangeSet::new()` / `with_capacity()`, including the changeset inside every transaction, allocate from a separate scratch pool that no world's budget covers |
+| | `EnumChangeSet` mutation records and drop entries (system heap) |
+| | Per-column dirty-page bitsets (system heap) |
+| | Query planner scratch (grows with join/result size), user-owned indexes (`BTreeIndex`, `HashIndex`, spatial) (system heap) |
+| | WAL and LSM buffers, and the pool's own side table (system heap) |
+
+Most heap-side structures scale with entity count rather than component bytes. Query scratch scales with result size: a plan pre-sizes it (capped at 64K entities) and reuses it across executions, but it can grow past that for large joins. `PoolExhausted` therefore bounds the world's component columns, not process RSS, and recording a large changeset never raises it. Size the process limit (container memory, `RLIMIT_AS`) with headroom for the heap side.
+
 ## Blob Offloading
 
 Large per-entity assets (images, meshes, audio) shouldn't live in column storage. `BlobRef` is a lightweight component that stores an external key (S3 path, URL, content hash). The `BlobStore` trait provides a cleanup hook — after despawning entities, collect orphaned refs and let your store delete the external data.
@@ -58,11 +74,11 @@ world.spawn((data, Expiry::after(5)));
 registry.run(&mut world, retention_id, ());
 ```
 
-Together, these four features let a Minkowski deployment run indefinitely within a fixed memory envelope: the pool caps total RAM, blob offloading keeps large assets external, retention prevents unbounded entity growth, and LSM compaction bounds disk-space amplification to ≤ 2×.
+Together, these four features let a Minkowski deployment run indefinitely within a bounded memory footprint: the pool caps component storage (see [What the budget covers](#what-the-budget-covers)), blob offloading keeps large assets external, retention prevents unbounded entity growth, and LSM compaction bounds disk-space amplification to ≤ 2×.
 
 ## LSM Disk-Space Management
 
-The `minkowski-lsm` crate adds a fourth dimension to memory management: **incremental disk persistence with bounded space amplification**. Where the pool caps in-memory RAM, blob offloading keeps large assets external, and retention prevents unbounded entity growth, LSM compaction prevents unbounded disk usage.
+The `minkowski-lsm` crate adds a fourth dimension to memory management: **incremental disk persistence with bounded space amplification**. Where the pool caps in-memory component storage, blob offloading keeps large assets external, and retention prevents unbounded entity growth, LSM compaction prevents unbounded disk usage.
 
 ### Dirty-Page Tracking
 

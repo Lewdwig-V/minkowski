@@ -2327,6 +2327,89 @@ fn scratch_buffer_partitioned_intersection() {
     assert_eq!(bits, expected);
 }
 
+/// Run one partitioned intersection on a cleared buffer and return the
+/// sorted matching entity indices.
+fn partitioned_matches(
+    buf: &mut ScratchBuffer,
+    left: &[u32],
+    right: &[u32],
+    partitions: usize,
+) -> Vec<u32> {
+    buf.clear();
+    for &idx in left {
+        buf.push(Entity::new(idx, 0));
+    }
+    let left_len = buf.len();
+    for &idx in right {
+        buf.push(Entity::new(idx, 0));
+    }
+    let mut out: Vec<u32> = buf
+        .partitioned_intersection(left_len, partitions)
+        .iter()
+        .map(|e| e.index())
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+#[test]
+fn scratch_buffer_partitioned_intersection_reuses_buckets_without_stale_entries() {
+    // The bucket vectors persist across calls. A later call must not see
+    // entities bucketed by an earlier one, whether it uses more, fewer, or
+    // the same number of partitions.
+    let mut buf = ScratchBuffer::new(32);
+    assert_eq!(
+        partitioned_matches(&mut buf, &[1, 2, 3, 4, 5, 6, 7, 8], &[2, 4, 9], 4),
+        [2, 4]
+    );
+    // Same partitions, disjoint data: stale 2/4 must not match.
+    assert_eq!(
+        partitioned_matches(&mut buf, &[10, 11, 12, 13], &[2, 4, 11], 4),
+        [11]
+    );
+    // Fewer partitions than the previous call.
+    assert_eq!(
+        partitioned_matches(&mut buf, &[20, 21, 22], &[10, 21, 22], 2),
+        [21, 22]
+    );
+    // More partitions than any previous call (grows the bucket list).
+    let left: Vec<u32> = (100..140).collect();
+    assert_eq!(
+        partitioned_matches(&mut buf, &left, &[20, 101, 139, 200], 8),
+        [101, 139]
+    );
+    // Back down to fewer: buckets 3..8 still hold capacity but must be ignored.
+    assert_eq!(
+        partitioned_matches(&mut buf, &[50, 51, 52], &[101, 51], 3),
+        [51]
+    );
+}
+
+#[test]
+fn scratch_buffer_partition_bucket_retention_is_bounded() {
+    // Joins with different partition counts on one plan must not accumulate
+    // each bucket's peak capacity under every earlier modulus.
+    let mut buf = ScratchBuffer::new(0);
+    let big: Vec<u32> = (0..20_000).collect();
+    for partitions in 2..=16 {
+        partitioned_matches(&mut buf, &big, &[1], partitions);
+        // Bounded by a constant multiple of this call's build side.
+        assert!(
+            buf.retained_bucket_capacity() <= 6 * big.len() + 16 * partitions,
+            "p={partitions}: retained {}",
+            buf.retained_bucket_capacity()
+        );
+    }
+    // A much smaller join afterwards gives the excess back.
+    let small: Vec<u32> = (0..100).collect();
+    partitioned_matches(&mut buf, &small, &[1], 4);
+    assert!(
+        buf.retained_bucket_capacity() <= 6 * small.len() + 16 * 4,
+        "after small join: retained {}",
+        buf.retained_bucket_capacity()
+    );
+}
+
 #[test]
 fn scratch_buffer_partitioned_intersection_no_overlap() {
     let mut buf = ScratchBuffer::new(10);
