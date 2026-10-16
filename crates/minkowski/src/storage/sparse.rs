@@ -1,4 +1,5 @@
 use std::alloc::Layout;
+use std::ptr::NonNull;
 
 use crate::entity::Entity;
 use crate::sync::Arc;
@@ -7,10 +8,15 @@ use crate::pool::{PoolExhausted, SlabPool};
 use crate::storage::blob_vec::BlobVec;
 use crate::storage::pool_vec::PoolVec;
 
+/// A sparse page: dense indices for `PAGE_SIZE` consecutive entity indices.
+type Page = [u32; PAGE_SIZE];
+
 /// Entries per sparse page. 1024 × `u32` = 4 KiB, exactly the pool's 4 KiB
 /// slab class (a 16 KiB page would round up to the 64 KiB class, 4× waste).
 const PAGE_SIZE: usize = 1024;
 const EMPTY: u32 = u32::MAX;
+
+const _: () = assert!(size_of::<Option<NonNull<Page>>>() == size_of::<usize>());
 
 /// A paged sparse set mapping `Entity` → dense index, backed by `BlobVec`
 /// for type-erased value storage. Pages are lazily allocated.
@@ -31,7 +37,10 @@ pub(crate) struct PagedSparseSet {
     // PERF: Two pointer chases per lookup (directory → page → slot).
     // Inherent to paged design — flat array would be 16 GiB for u32 index space.
     // Prefer archetype-stored components for hot-path queries.
-    pages: Vec<Option<PoolVec<u32>>>,
+    /// Page handles: one pointer each (`Option<NonNull<_>>` uses the niche),
+    /// so the heap directory costs 8 B per 1024 indices. Pages are pool
+    /// blocks owned by this set and freed in `Drop`.
+    pages: Vec<Option<NonNull<Page>>>,
     dense_entities: PoolVec<Entity>,
     pub(crate) dense_values: BlobVec,
     pool: Arc<SlabPool>,
@@ -109,7 +118,7 @@ impl PagedSparseSet {
             if let Err(e) = self.try_ensure_page(page_idx) {
                 std::alloc::handle_alloc_error(e.requested);
             }
-            self.pages[page_idx].as_mut().expect("page ensured above")[slot] = dense;
+            self.page_mut(page_idx).expect("page ensured above")[slot] = dense;
 
             self.dense_entities.push(entity);
             // SAFETY: `ptr` points to a valid value matching this set's layout
@@ -167,13 +176,28 @@ impl PagedSparseSet {
         if self.pages.get(page_idx).is_some_and(Option::is_some) {
             return Ok(());
         }
-        let mut page = PoolVec::new(Arc::clone(&self.pool));
-        page.try_resize(PAGE_SIZE, EMPTY)?;
+        let page: NonNull<Page> = self.pool.allocate(Layout::new::<Page>())?.cast();
+        // SAFETY: freshly allocated block of Page's size and alignment; every
+        // byte 0xFF makes every u32 slot EMPTY (u32::MAX).
+        unsafe { page.cast::<u8>().write_bytes(0xFF, size_of::<Page>()) };
         if page_idx >= self.pages.len() {
             self.pages.resize_with(page_idx + 1, || None);
         }
         self.pages[page_idx] = Some(page);
         Ok(())
+    }
+
+    fn page(&self, page_idx: usize) -> Option<&Page> {
+        let page = (*self.pages.get(page_idx)?)?;
+        // SAFETY: page handles are live pool blocks owned by this set,
+        // initialized on allocation; &self gives shared access.
+        Some(unsafe { page.as_ref() })
+    }
+
+    fn page_mut(&mut self, page_idx: usize) -> Option<&mut Page> {
+        let mut page = (*self.pages.get(page_idx)?)?;
+        // SAFETY: as in page(); &mut self gives exclusive access.
+        Some(unsafe { page.as_mut() })
     }
 
     /// Resolves an entity to its dense index, validating generation.
@@ -182,7 +206,7 @@ impl PagedSparseSet {
         let page_idx = idx / PAGE_SIZE;
         let slot = idx % PAGE_SIZE;
 
-        let page = self.pages.get(page_idx)?.as_ref()?;
+        let page = self.page(page_idx)?;
         let dense = page[slot];
         if dense == EMPTY {
             return None;
@@ -207,7 +231,7 @@ impl PagedSparseSet {
         let slot = idx % PAGE_SIZE;
 
         // Clear the sparse entry for the removed entity.
-        self.pages[page_idx].as_mut().unwrap()[slot] = EMPTY;
+        self.page_mut(page_idx).expect("entity's page exists")[slot] = EMPTY;
 
         let last = self.dense_entities.len() - 1;
 
@@ -219,7 +243,8 @@ impl PagedSparseSet {
             let sw_slot = sw_idx % PAGE_SIZE;
 
             // Update the swapped entity's sparse entry to point to the new dense index.
-            self.pages[sw_page_idx].as_mut().unwrap()[sw_slot] = dense as u32;
+            self.page_mut(sw_page_idx)
+                .expect("swapped entity's page exists")[sw_slot] = dense as u32;
         }
 
         // Remove from dense arrays.
@@ -229,6 +254,22 @@ impl PagedSparseSet {
         true
     }
 }
+
+impl Drop for PagedSparseSet {
+    fn drop(&mut self) {
+        for page in self.pages.iter().flatten() {
+            // SAFETY: each handle is a live block allocated from self.pool with
+            // Page's layout and is not used after this point.
+            unsafe { self.pool.deallocate(page.cast(), Layout::new::<Page>()) };
+        }
+    }
+}
+
+// SAFETY: the set exclusively owns its page blocks (like Box<Page>) and only
+// mutates them through &mut self; every other field is Send + Sync.
+unsafe impl Send for PagedSparseSet {}
+// SAFETY: &PagedSparseSet only reads pages; see Send.
+unsafe impl Sync for PagedSparseSet {}
 
 // ── SparseStorage: typed wrapper around PagedSparseSet ───────────────
 
