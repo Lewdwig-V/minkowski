@@ -7,7 +7,9 @@ use crate::pool::{PoolExhausted, SlabPool};
 use crate::storage::blob_vec::BlobVec;
 use crate::storage::pool_vec::PoolVec;
 
-const PAGE_SIZE: usize = 4096;
+/// Entries per sparse page. 1024 × `u32` = 4 KiB, exactly the pool's 4 KiB
+/// slab class (a 16 KiB page would round up to the 64 KiB class, 4× waste).
+const PAGE_SIZE: usize = 1024;
 const EMPTY: u32 = u32::MAX;
 
 /// A paged sparse set mapping `Entity` → dense index, backed by `BlobVec`
@@ -17,23 +19,22 @@ const EMPTY: u32 = u32::MAX;
 /// [`PAGE_SIZE`]. Each page entry stores a dense index (`u32`) or [`EMPTY`].
 /// Generation is validated against `dense_entities` to reject stale handles.
 ///
-/// # Pool threading status
+/// # Pool backing
 ///
-/// The dense `BlobVec` and `dense_entities` live in the world's pool (threaded
-/// via `new()`), so per-value storage counts against the memory budget. Both
-/// grow through aborting paths, matching `insert`'s infallible contract.
-///
-/// `pages: Vec<Option<Box<[u32; PAGE_SIZE]>>>` stays on the heap for now:
-/// each page is 16 KiB, allocated lazily (one per 4096 entity indices
-/// touched). Moving pages into the pool is phase 2 of
-/// `docs/plans/pool-entity-bookkeeping.md`.
+/// Everything per entry lives in the world's pool, so sparse storage counts
+/// against the memory budget: the dense `BlobVec`, `dense_entities`, and the
+/// 4 KiB sparse pages (one per 1024 entity indices touched). Only the page
+/// directory (`pages`, 8 bytes per 1024 indices) stays on the heap. `insert`
+/// aborts on exhaustion like other infallible paths; `try_insert` reserves
+/// the page and both dense vectors first and returns `Err` instead.
 pub(crate) struct PagedSparseSet {
-    // PERF: Two pointer chases per lookup (Vec data → Box page → array slot).
+    // PERF: Two pointer chases per lookup (directory → page → slot).
     // Inherent to paged design — flat array would be 16 GiB for u32 index space.
     // Prefer archetype-stored components for hot-path queries.
-    pages: Vec<Option<Box<[u32; PAGE_SIZE]>>>,
+    pages: Vec<Option<PoolVec<u32>>>,
     dense_entities: PoolVec<Entity>,
     pub(crate) dense_values: BlobVec,
+    pool: Arc<SlabPool>,
 }
 
 impl PagedSparseSet {
@@ -46,7 +47,8 @@ impl PagedSparseSet {
         Self {
             pages: Vec::new(),
             dense_entities: PoolVec::new(Arc::clone(&pool)),
-            dense_values: BlobVec::new(item_layout, drop_fn, 0, pool),
+            dense_values: BlobVec::new(item_layout, drop_fn, 0, Arc::clone(&pool)),
+            pool,
         }
     }
 
@@ -104,13 +106,10 @@ impl PagedSparseSet {
             let page_idx = idx / PAGE_SIZE;
             let slot = idx % PAGE_SIZE;
 
-            // Grow pages vec if needed
-            if page_idx >= self.pages.len() {
-                self.pages.resize_with(page_idx + 1, || None);
+            if let Err(e) = self.try_ensure_page(page_idx) {
+                std::alloc::handle_alloc_error(e.requested);
             }
-            // Allocate page if needed
-            let page = self.pages[page_idx].get_or_insert_with(|| Box::new([EMPTY; PAGE_SIZE]));
-            page[slot] = dense;
+            self.pages[page_idx].as_mut().expect("page ensured above")[slot] = dense;
 
             self.dense_entities.push(entity);
             // SAFETY: `ptr` points to a valid value matching this set's layout
@@ -134,8 +133,11 @@ impl PagedSparseSet {
             // SAFETY: as in insert's overwrite path. On Err nothing was written.
             return unsafe { self.dense_values.replace_protected(dense, ptr) };
         }
-        // New entry: reserve both pool-backed vectors, then the plain insert
-        // cannot allocate in the pool (pages are heap-allocated).
+        // New entry: ensure the sparse page and reserve both dense vectors,
+        // then the plain insert cannot allocate in the pool. A page created
+        // here on a later Err holds only EMPTY slots (spare capacity, no
+        // observable entry).
+        self.try_ensure_page(entity.index() as usize / PAGE_SIZE)?;
         self.dense_entities.try_reserve(1)?;
         self.dense_values.try_reserve(1)?;
         // SAFETY: forwarded caller contract.
@@ -158,6 +160,21 @@ impl PagedSparseSet {
     }
 
     // ── internals ───────────────────────────────────────────
+
+    /// Make sure page `page_idx` exists, allocating it (all `EMPTY`) from the
+    /// pool. On `Err` no page was added. The directory grows on the heap.
+    fn try_ensure_page(&mut self, page_idx: usize) -> Result<(), PoolExhausted> {
+        if self.pages.get(page_idx).is_some_and(Option::is_some) {
+            return Ok(());
+        }
+        let mut page = PoolVec::new(Arc::clone(&self.pool));
+        page.try_resize(PAGE_SIZE, EMPTY)?;
+        if page_idx >= self.pages.len() {
+            self.pages.resize_with(page_idx + 1, || None);
+        }
+        self.pages[page_idx] = Some(page);
+        Ok(())
+    }
 
     /// Resolves an entity to its dense index, validating generation.
     fn dense_index(&self, entity: Entity) -> Option<usize> {
@@ -388,6 +405,54 @@ mod tests {
     use super::*;
     use crate::pool::default_pool;
     use std::alloc::Layout;
+
+    #[test]
+    fn sparse_pages_live_in_the_pool() {
+        let pool = Arc::new(SlabPool::new(1 << 20, crate::pool::HugePages::Off, false).unwrap());
+        let mut set = PagedSparseSet::new(Layout::new::<u64>(), None, Arc::clone(&pool));
+        let v = 5u64;
+        unsafe { set.insert(Entity::new(0, 0), &v as *const u64 as *const u8) };
+        // Pre-size the dense vectors so only the new page touches the pool.
+        set.dense_entities.reserve(8);
+        set.dense_values.reserve(8);
+        pool.flush_caches();
+        let before = pool.used();
+        // A second page costs exactly one 4 KiB slab block (no class waste).
+        unsafe {
+            set.insert(
+                Entity::new(PAGE_SIZE as u32, 0),
+                &v as *const u64 as *const u8,
+            );
+        }
+        pool.flush_caches();
+        assert_eq!(pool.used() - before, PAGE_SIZE * 4);
+        drop(set);
+        pool.flush_caches();
+        assert_eq!(pool.used(), 0, "pages are returned on drop");
+    }
+
+    #[test]
+    fn try_insert_fails_on_page_allocation_and_leaves_set_unchanged() {
+        let pool = Arc::new(SlabPool::new(1 << 20, crate::pool::HugePages::Off, false).unwrap());
+        let mut set = PagedSparseSet::new(Layout::new::<u64>(), None, Arc::clone(&pool));
+        let v = 9u64;
+        unsafe { set.try_insert(Entity::new(1, 0), &v as *const u64 as *const u8) }.unwrap();
+        // Dense vectors have room; only a new page would need the pool.
+        set.dense_entities.reserve(8);
+        set.dense_values.reserve(8);
+        for size in [1 << 20, 65_536, 16_384, 4096, 1024, 256, 64] {
+            let layout = Layout::from_size_align(size, 8).unwrap();
+            while pool.allocate(layout).is_ok() {}
+        }
+        let far = Entity::new(3 * PAGE_SIZE as u32, 0);
+        let r = unsafe { set.try_insert(far, &v as *const u64 as *const u8) };
+        assert!(r.is_err(), "the page cannot be allocated");
+        assert_eq!(set.len(), 1);
+        assert!(!set.contains(far));
+        // Same page as an existing entry: no page needed, succeeds.
+        unsafe { set.try_insert(Entity::new(2, 0), &v as *const u64 as *const u8) }.unwrap();
+        assert_eq!(set.len(), 2);
+    }
 
     /// Creates a `PagedSparseSet` for the given type `T`.
     fn make_set<T: 'static>() -> PagedSparseSet {
