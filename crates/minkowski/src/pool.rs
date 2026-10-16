@@ -15,7 +15,7 @@ use std::sync::atomic::AtomicU64;
 use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
 
 /// Error returned when the memory pool is exhausted.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolExhausted {
     pub requested: Layout,
 }

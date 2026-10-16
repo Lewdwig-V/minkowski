@@ -30,10 +30,25 @@ impl FreeList {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_slice(pool: Arc<SlabPool>, slots: &[u32]) -> Self {
         let mut list = Self::new(Arc::clone(&pool));
         list.slots = PoolVec::from_slice(pool, slots);
         list
+    }
+
+    /// Copy `slots` into a pool-backed list with capacity for at least
+    /// `min_capacity` slots (invariant B3), returning `Err` instead of
+    /// aborting.
+    pub(crate) fn try_from_slice(
+        pool: Arc<SlabPool>,
+        slots: &[u32],
+        min_capacity: usize,
+    ) -> Result<Self, PoolExhausted> {
+        let mut list = Self::new(Arc::clone(&pool));
+        list.slots = PoolVec::try_from_slice(pool, slots)?;
+        list.try_reserve_total(min_capacity)?;
+        Ok(list)
     }
 
     /// Ensure capacity for `total` slots without allocating later.

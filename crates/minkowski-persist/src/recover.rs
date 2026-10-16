@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use minkowski::World;
+use minkowski::{World, WorldBuilder};
 use minkowski_lsm::codec::CodecRegistry;
 use minkowski_lsm::error::LsmError;
 use minkowski_lsm::recovery::LsmRecovery;
@@ -21,15 +21,34 @@ pub enum RecoverError {
 /// Recover a [`World`] from on-disk LSM state and replay the WAL tail.
 ///
 /// If no LSM manifest exists yet, returns an empty world and replays the WAL
-/// from sequence 0.
+/// from sequence 0. Uses the default pool; see [`recover_world_with_builder`]
+/// to recover into a configured memory budget.
 pub fn recover_world(
     lsm_dir: &Path,
     manifest_log_path: &Path,
     wal: &mut Wal,
     codecs: &CodecRegistry,
 ) -> Result<World, RecoverError> {
+    recover_world_with_builder(World::builder(), lsm_dir, manifest_log_path, wal, codecs)
+}
+
+/// Like [`recover_world`], recovering into a world built from `builder`.
+///
+/// Loading the LSM baseline into the builder's pool is fallible: if it does
+/// not fit, this returns `RecoverError::Lsm(LsmError::PoolExhausted(_))`.
+/// Replaying the WAL tail still uses the infallible changeset apply path, so
+/// a budget too small for the tail aborts the process like any other
+/// infallible spawn; leave headroom above the baseline.
+pub fn recover_world_with_builder(
+    builder: WorldBuilder,
+    lsm_dir: &Path,
+    manifest_log_path: &Path,
+    wal: &mut Wal,
+    codecs: &CodecRegistry,
+) -> Result<World, RecoverError> {
     if manifest_log_path.exists() {
-        let (result, _, _) = LsmRecovery::recover::<4>(lsm_dir, manifest_log_path, codecs)?;
+        let (result, _, _) =
+            LsmRecovery::recover_with_builder::<4>(builder, lsm_dir, manifest_log_path, codecs)?;
         let mut world = result.world;
         for id in codecs.registered_ids() {
             codecs.register_one(id, &mut world);
@@ -50,7 +69,7 @@ pub fn recover_world(
         // No LSM baseline yet (crash before first flush). Register components
         // before replaying — otherwise spawn replay records ComponentIds into an
         // empty registry and EnumChangeSet::apply panics resolving their layouts.
-        let mut world = World::new();
+        let mut world = builder.build().map_err(LsmError::from)?;
         for id in codecs.registered_ids() {
             codecs.register_one(id, &mut world);
         }

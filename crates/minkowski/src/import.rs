@@ -30,6 +30,7 @@ use std::fmt;
 
 use crate::component::ComponentId;
 use crate::entity::Entity;
+use crate::pool::PoolExhausted;
 use crate::storage::archetype::ArchetypeId;
 use crate::world::{EntityLocation, World};
 
@@ -54,6 +55,15 @@ pub enum ImportError {
     AlreadyPlaced(Entity),
     /// An imported entity is not alive (generation mismatch / freed slot).
     DeadEntity(Entity),
+    /// The world's pool cannot hold the page (columns, the archetype's entity
+    /// list, or the entity location table). Nothing was imported.
+    PoolExhausted(PoolExhausted),
+}
+
+impl From<PoolExhausted> for ImportError {
+    fn from(e: PoolExhausted) -> Self {
+        ImportError::PoolExhausted(e)
+    }
 }
 
 impl fmt::Display for ImportError {
@@ -93,6 +103,7 @@ impl fmt::Display for ImportError {
                     "entity {e:?} is not alive — restore allocator state before importing"
                 )
             }
+            ImportError::PoolExhausted(e) => write!(f, "import page does not fit: {e}"),
         }
     }
 }
@@ -194,6 +205,12 @@ impl World {
 
     /// Append a validated page of committed rows into the target archetype.
     ///
+    /// All-or-nothing: entity validation and every pool reservation (columns,
+    /// the archetype's entity list, the entity location table) happen before
+    /// any byte is copied, so on `Err` (including
+    /// [`ImportError::PoolExhausted`]) no row was imported and the caller
+    /// still owns the column values.
+    ///
     /// # Safety
     /// Each column slice must be the native (in-memory) byte image of
     /// `entities.len()` consecutive values of the corresponding component type,
@@ -239,6 +256,26 @@ impl World {
         }
 
         let count = page.entities.len();
+
+        // Reserve every pool slot the copy below needs, so pool exhaustion
+        // surfaces as Err before anything is written (all-or-nothing, like the
+        // validation above). Each step only grows spare capacity.
+        {
+            let archetype = &mut self.archetypes.archetypes[arch_id.0];
+            for col in &mut archetype.columns {
+                col.try_reserve(count)?;
+            }
+            archetype.entities.try_reserve(count)?;
+            let needed = page
+                .entities
+                .iter()
+                .map(|e| e.index() as usize + 1)
+                .max()
+                .unwrap_or(0);
+            self.entity_locations
+                .try_reserve(needed.saturating_sub(self.entity_locations.len()))?;
+        }
+
         let base_row = {
             let archetype = &mut self.archetypes.archetypes[arch_id.0];
             let base_row = archetype.entities.len();
@@ -316,6 +353,55 @@ mod tests {
         assert_eq!(dst.get::<A>(e2).copied(), Some(A(3)));
         assert_eq!(dst.get::<B>(e2).copied(), Some(B(30)));
         assert_eq!(dst.query::<(&A,)>().count(), 3);
+    }
+
+    #[test]
+    fn import_page_pool_exhaustion_imports_nothing() {
+        // 256 B rows in 8 KiB pages: the column climbs the slab classes until
+        // the 256 KiB pool (shared with bookkeeping) cannot grow it.
+        #[derive(Clone, Copy)]
+        struct Big(#[expect(dead_code, reason = "payload size only")] [u8; 256]);
+        let mut dst = World::builder()
+            .memory_budget(256 * 1024)
+            .hugepages(crate::HugePages::Off)
+            .build()
+            .unwrap();
+        let big = dst.register_component::<Big>();
+        let n = 1024u32;
+        dst.restore_allocator_state(vec![0; n as usize], Vec::new());
+        let target = dst.import_target(&[big]).unwrap();
+        // Pre-size the entity list and location table so the column is the
+        // only thing that can exhaust the pool (pins the column preflight).
+        dst.archetypes.archetypes[target.arch_id.0]
+            .entities
+            .reserve(n as usize);
+        dst.entity_locations.reserve(n as usize);
+        let bytes = vec![7u8; 256 * 32];
+
+        let mut imported = 0u32;
+        let mut failed = false;
+        for chunk in 0..n / 32 {
+            let entities: Vec<Entity> = (chunk * 32..chunk * 32 + 32)
+                .map(|i| Entity::new(i, 0))
+                .collect();
+            let cols: [&[u8]; 1] = [&bytes];
+            let page = target.page(&entities, &cols).unwrap();
+            let locations_before = dst.entity_locations.len();
+            match unsafe { dst.import_page(&page) } {
+                Ok(()) => imported += 32,
+                Err(ImportError::PoolExhausted(_)) => {
+                    // All-or-nothing: no row, no placement, no growth of len.
+                    assert_eq!(dst.query::<(&Big,)>().count(), imported as usize);
+                    assert!(entities.iter().all(|&e| !dst.is_placed(e)));
+                    assert_eq!(dst.entity_locations.len(), locations_before);
+                    failed = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected {e}"),
+            }
+        }
+        assert!(failed, "256 KiB pool should not hold {n} x 256 B rows");
+        assert!(imported > 0);
     }
 
     #[test]

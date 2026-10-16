@@ -4,7 +4,7 @@ use std::alloc::Layout;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use minkowski::{ComponentId, Entity, World};
+use minkowski::{ComponentId, Entity, World, WorldBuilder};
 
 use crate::allocator_meta;
 use crate::codec::CodecRegistry;
@@ -182,8 +182,27 @@ struct StoredSparse {
 }
 
 impl LsmRecovery {
-    /// Recover world state from on-disk LSM artifacts.
+    /// Recover world state from on-disk LSM artifacts into a world with the
+    /// default pool (`World::builder()`). See
+    /// [`recover_with_builder`](Self::recover_with_builder) to recover into a
+    /// configured memory budget.
     pub fn recover<const N: usize>(
+        lsm_dir: &Path,
+        manifest_log_path: &Path,
+        codecs: &CodecRegistry,
+    ) -> Result<(RecoveryResult, LsmManifest<N>, ManifestLog), LsmError> {
+        Self::recover_with_builder(World::builder(), lsm_dir, manifest_log_path, codecs)
+    }
+
+    /// Recover world state into a world built from `builder` (memory budget,
+    /// hugepages, memory locking).
+    ///
+    /// Returns [`LsmError::PoolExhausted`] if the recovered state does not fit
+    /// the builder's pool: the allocator state, every imported page and the
+    /// sparse baseline are reserved before they are written, so exhaustion is
+    /// an error, never an abort. The partially built world is dropped.
+    pub fn recover_with_builder<const N: usize>(
+        builder: WorldBuilder,
         lsm_dir: &Path,
         manifest_log_path: &Path,
         codecs: &CodecRegistry,
@@ -353,6 +372,7 @@ impl LsmRecovery {
             "recovery: pages present but no component layouts were resolved"
         );
         let mut world = materialize_world(
+            builder,
             pages,
             allocator.as_ref(),
             &component_layouts,
@@ -677,13 +697,14 @@ fn resolve_signature(
 }
 
 fn materialize_world(
+    builder: WorldBuilder,
     pages: BTreeMap<PageKey, StoredPage>,
     allocator: Option<&StoredAllocator>,
     component_layouts: &BTreeMap<String, (usize, usize)>,
     component_kinds: &BTreeMap<String, crate::schema::StorageKind>,
     codecs: &CodecRegistry,
 ) -> Result<World, LsmError> {
-    let mut world = World::new();
+    let mut world = builder.build()?;
     for id in codecs.registered_ids() {
         codecs.register_one(id, &mut world);
     }
@@ -730,7 +751,7 @@ fn materialize_world(
     // Allocator-first: import_page checks `is_alive`, so generations must be set
     // before any entity is placed.
     let (generations, free_list) = build_allocator_state(&by_sig, allocator);
-    world.restore_allocator_state(generations, free_list);
+    world.try_restore_allocator_state(&generations, &free_list)?;
 
     // Archetype processing order: newest state image first. Runs are merged
     // per page key, so an archetype migration (remove a component from the
@@ -1013,8 +1034,10 @@ fn materialize_world(
             // infallible — so an `Err` means zero columns were transferred, and
             // dropping the still-armed guards frees each heap value exactly once
             // (no double free with a partially-populated archetype).
-            unsafe { world.import_page(&import_page) }
-                .map_err(|e| LsmError::Format(format!("import_page failed for {sig:?}: {e}")))
+            unsafe { world.import_page(&import_page) }.map_err(|e| match e {
+                minkowski::ImportError::PoolExhausted(e) => LsmError::PoolExhausted(e),
+                e => LsmError::Format(format!("import_page failed for {sig:?}: {e}")),
+            })
             // col_refs + import_page dropped at block end, releasing the borrow
         };
         import_result?; // on Err, col_slices (armed) drops here → heap values freed
@@ -1058,7 +1081,10 @@ fn apply_sparse(
             }
             codecs
                 .insert_sparse_raw(comp_id, world, entity, value)
-                .map_err(|e| LsmError::Format(format!("sparse restore failed for {name}: {e}")))?;
+                .map_err(|e| match e {
+                    crate::codec::CodecError::PoolExhausted(e) => LsmError::PoolExhausted(e),
+                    e => LsmError::Format(format!("sparse restore failed for {name}: {e}")),
+                })?;
         }
     }
     Ok(())
@@ -1121,6 +1147,78 @@ mod tests {
         assert_eq!(recovered.get::<ZComp>(both).copied(), Some(ZComp(20)));
         assert_eq!(recovered.get::<ZComp>(zonly).copied(), Some(ZComp(99)));
         assert_eq!(recovered.get::<AComp>(zonly), None);
+    }
+
+    /// Recovery into a configured budget: a budget that fits recovers with
+    /// that pool; one that does not returns `LsmError::PoolExhausted` (never
+    /// aborts). Covers dense pages and the sparse baseline.
+    #[test]
+    fn recover_with_builder_respects_memory_budget() {
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Wide([u64; 32]); // 256 B
+        #[derive(Clone, Copy, PartialEq, Debug, Archive, Serialize, Deserialize)]
+        #[repr(C)]
+        struct Tag(u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Wide>("wide", &mut world).unwrap();
+        codecs.register_as::<Tag>("tag", &mut world).unwrap();
+        // ~2.5 MiB of component bytes: more than the small budget can hold.
+        let entities: Vec<Entity> = (0..10_000u64)
+            .map(|i| world.spawn((Wide([i; 32]),)))
+            .collect();
+        for &e in entities.iter().step_by(10) {
+            world.insert_sparse(e, Tag(e.index()));
+        }
+
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(1u64)).unwrap(),
+            &mut manifest,
+            &mut log,
+            &lsm_dir,
+            &codecs,
+        )
+        .unwrap()
+        .expect("flush");
+        drop(log);
+
+        // Too small: Err, not an abort.
+        let small = World::builder()
+            .memory_budget(1 << 20)
+            .hugepages(minkowski::HugePages::Off);
+        let err = LsmRecovery::recover_with_builder::<4>(small, &lsm_dir, &log_path, &codecs)
+            .err()
+            .expect("1 MiB budget cannot hold the baseline");
+        assert!(matches!(err, LsmError::PoolExhausted(_)), "got {err}");
+
+        // Large enough: recovers into exactly that pool.
+        let budget = 32 << 20;
+        let fits = World::builder()
+            .memory_budget(budget)
+            .hugepages(minkowski::HugePages::Off);
+        let (result, _, _) =
+            LsmRecovery::recover_with_builder::<4>(fits, &lsm_dir, &log_path, &codecs).unwrap();
+        let recovered = result.world;
+        assert_eq!(recovered.stats().pool_capacity, budget);
+        for &e in &entities {
+            assert_eq!(
+                recovered.get::<Wide>(e).map(|w| w.0[0]),
+                Some(u64::from(e.index()))
+            );
+        }
+        assert_eq!(
+            recovered.get::<Tag>(entities[10]).copied(),
+            Some(Tag(entities[10].index()))
+        );
     }
 
     /// Codex P2 (round 3) regression: a codec registered at a NON-CONTIGUOUS id

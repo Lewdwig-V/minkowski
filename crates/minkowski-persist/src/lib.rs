@@ -19,7 +19,7 @@ pub use fingerprint::world_fingerprint;
 pub use index::{IndexPersistError, PersistentIndex, load_btree_index, load_hash_index};
 pub use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 pub use record::*;
-pub use recover::{RecoverError, recover_world};
+pub use recover::{RecoverError, recover_world, recover_world_with_builder};
 pub use replicated::{Replicated, RetentionPlan, SessionError, SessionFetch};
 pub use replication::{Follower, FollowerError, ReplicationError, apply_batch};
 pub use transport::{

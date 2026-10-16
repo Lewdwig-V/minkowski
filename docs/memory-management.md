@@ -41,6 +41,8 @@ The pool budget covers **component storage and per-entity bookkeeping**. Plan fo
 
 Query scratch scales with result size: a plan pre-sizes it (capped at 64K entities) and reuses it across executions, but it can grow past that for large joins. Indexes scale with indexed entities. `PoolExhausted` therefore bounds the world's entities and components, not process RSS, and recording a large changeset never raises it. Size the process limit (container memory, `RLIMIT_AS`) with headroom for the heap side.
 
+To recover a persisted world into a specific budget, pass a `WorldBuilder` to `recover_world_with_builder` (or `LsmRecovery::recover_with_builder`). If the LSM baseline does not fit, recovery returns `LsmError::PoolExhausted` rather than aborting; the WAL tail is replayed through the infallible apply path, so size the budget with headroom above the baseline.
+
 ## Blob Offloading
 
 Large per-entity assets (images, meshes, audio) shouldn't live in column storage. `BlobRef` is a lightweight component that stores an external key (S3 path, URL, content hash). The `BlobStore` trait provides a cleanup hook — after despawning entities, collect orphaned refs and let your store delete the external data.

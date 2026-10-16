@@ -2209,20 +2209,45 @@ impl World {
         )
     }
 
-    /// Restore entity allocator state from a snapshot.
+    /// Restore entity allocator state from a snapshot. Aborts if the pool
+    /// cannot hold it; see [`try_restore_allocator_state`](Self::try_restore_allocator_state).
     #[expect(
         clippy::needless_pass_by_value,
         reason = "public API kept stable; contents are copied into the pool"
     )]
     pub fn restore_allocator_state(&mut self, generations: Vec<u32>, free_list: Vec<u32>) {
+        if let Err(e) = self.try_restore_allocator_state(&generations, &free_list) {
+            std::alloc::handle_alloc_error(e.requested);
+        }
+    }
+
+    /// Restore entity allocator state from a snapshot, returning
+    /// `Err(PoolExhausted)` if the world's pool cannot hold the generations,
+    /// free list and entity location table. On `Err` the world is unchanged.
+    pub fn try_restore_allocator_state(
+        &mut self,
+        generations: &[u32],
+        free_list: &[u32],
+    ) -> Result<(), PoolExhausted> {
         self.drain_orphans();
-        self.entities.generations = PoolVec::from_slice(self.pool.clone(), &generations);
-        self.entities.free_list = FreeList::from_slice(self.pool.clone(), &free_list);
-        self.entities.ensure_free_capacity();
+        // Build everything fallibly first, then commit with no further
+        // allocation (all-or-nothing).
+        let new_generations = PoolVec::try_from_slice(self.pool.clone(), generations)?;
+        let new_free_list =
+            FreeList::try_from_slice(self.pool.clone(), free_list, generations.len())?;
+        self.entity_locations.try_reserve(
+            generations
+                .len()
+                .saturating_sub(self.entity_locations.len()),
+        )?;
+
+        self.entities.generations = new_generations;
+        self.entities.free_list = new_free_list;
+        debug_assert!(self.entities.free_list.capacity() >= self.entities.generations.len());
         // Sync the atomic counter so reserve() doesn't hand out already-used indices.
         self.entities.sync_reserved();
-        self.entity_locations
-            .resize(self.entities.generations.len(), None);
+        self.entity_locations.resize(generations.len(), None); // reserved above
+        Ok(())
     }
 
     /// Which ComponentIds have sparse storage.
@@ -2244,6 +2269,19 @@ impl World {
         self.drain_orphans();
         let comp_id = self.components.register_sparse::<T>();
         self.sparse.insert(comp_id, entity, value);
+    }
+
+    /// Like [`insert_sparse`](Self::insert_sparse), returning
+    /// `Err(PoolExhausted)` if the world's pool cannot hold the value. On
+    /// `Err` the sparse storage is unchanged and `value` is dropped.
+    pub fn try_insert_sparse<T: Component>(
+        &mut self,
+        entity: Entity,
+        value: T,
+    ) -> Result<(), PoolExhausted> {
+        self.drain_orphans();
+        let comp_id = self.components.register_sparse::<T>();
+        self.sparse.try_insert(comp_id, entity, value)
     }
 }
 
@@ -4230,6 +4268,62 @@ mod tests {
             ),
             caps
         );
+    }
+
+    #[test]
+    fn try_restore_allocator_state_exhaustion_leaves_world_unchanged() {
+        let mut world = World::builder()
+            .memory_budget(256 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        let e = world.spawn((7u32,));
+        // 1M generations need 4 MiB: cannot fit.
+        let generations = vec![0u32; 1 << 20];
+        assert!(
+            world
+                .try_restore_allocator_state(&generations, &[])
+                .is_err()
+        );
+        assert_eq!(world.entities.generations.len(), 1);
+        assert_eq!(world.entity_locations.len(), 1);
+        assert_eq!(world.get::<u32>(e), Some(&7));
+        // A state that fits is applied.
+        world.try_restore_allocator_state(&[3, 0], &[1]).unwrap();
+        assert_eq!(world.entities.generations.len(), 2);
+        assert!(world.entities.free_list.capacity() >= 2);
+    }
+
+    #[test]
+    fn try_insert_sparse_exhaustion_drops_value_once() {
+        use std::sync::Arc as Rc; // Components must be Send + Sync.
+        #[derive(Clone)]
+        #[expect(dead_code, reason = "drop counter and payload size only")]
+        struct Counted(Rc<()>, [u64; 8]);
+        let mut world = World::builder()
+            .memory_budget(256 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        let token = Rc::new(());
+        let mut inserted = 0usize;
+        loop {
+            let e = world.alloc_entity();
+            let before = Rc::strong_count(&token);
+            match world.try_insert_sparse(e, Counted(Rc::clone(&token), [0; 8])) {
+                Ok(()) => inserted += 1,
+                Err(_) => {
+                    // The rejected value was dropped exactly once.
+                    assert_eq!(Rc::strong_count(&token), before);
+                    break;
+                }
+            }
+            assert!(inserted < 1_000_000, "pool never ran out");
+        }
+        assert!(inserted > 0);
+        assert_eq!(Rc::strong_count(&token), inserted + 1);
+        drop(world);
+        assert_eq!(Rc::strong_count(&token), 1);
     }
 
     // ── insert / try_insert dead entity tests ──────────────────────

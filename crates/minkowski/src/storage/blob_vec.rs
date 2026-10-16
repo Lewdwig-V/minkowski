@@ -197,14 +197,23 @@ impl BlobVec {
 
     /// Ensures the column has capacity for at least `additional` more elements.
     /// If the column already has enough spare capacity, this is a no-op.
+    /// Aborts via `handle_alloc_error` if the pool is exhausted.
     pub(crate) fn reserve(&mut self, additional: usize) {
-        let required = self.len + additional;
+        if let Err(e) = self.try_reserve(additional) {
+            std::alloc::handle_alloc_error(e.requested);
+        }
+    }
+
+    /// Like [`reserve`](Self::reserve), returning `Err(PoolExhausted)`
+    /// instead of aborting. On `Err` the column is unchanged.
+    pub(crate) fn try_reserve(&mut self, additional: usize) -> Result<(), PoolExhausted> {
+        let required = self.len.checked_add(additional).expect("capacity overflow");
         if required <= self.capacity {
-            return;
+            return Ok(());
         }
         let size = self.item_layout.size();
         if size == 0 {
-            return;
+            return Ok(());
         }
         // Grow to at least the required capacity, doubling as needed.
         let mut new_capacity = if self.capacity == 0 { 4 } else { self.capacity };
@@ -217,11 +226,9 @@ impl BlobVec {
         )
         .expect("invalid layout");
 
-        let new_data = self
-            .grow_allocation(new_layout)
-            .unwrap_or_else(|_| std::alloc::handle_alloc_error(new_layout));
-        self.data = new_data;
+        self.data = self.grow_allocation(new_layout)?;
         self.capacity = new_capacity;
+        Ok(())
     }
 
     /// Pushes a value by copying `item_layout.size()` bytes from `ptr`.
