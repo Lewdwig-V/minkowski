@@ -279,19 +279,29 @@ impl SparseStorage {
         entity: Entity,
         value: T,
     ) -> Result<(), PoolExhausted> {
-        let pool = self.pool.clone();
-        let set = self.storages.entry(comp_id).or_insert_with(|| {
+        let mut value = ManuallyDrop::new(value);
+        let ptr = &mut *value as *mut T as *const u8;
+        // SAFETY (both arms): value is a valid T matching the set's layout; on
+        // Ok ownership moved into the set, on Err nothing was written and we
+        // drop it below.
+        let result = if let Some(set) = self.storages.get_mut(&comp_id) {
+            unsafe { set.try_insert(entity, ptr) }
+        } else {
+            // First value for this component: build the set off to the side
+            // and publish it only on success, so Err leaves no empty set
+            // behind (a failed set drops here, returning any page it took).
             let drop_fn = if std::mem::needs_drop::<T>() {
                 Some(drop_ptr::<T> as unsafe fn(*mut u8))
             } else {
                 None
             };
-            PagedSparseSet::new(Layout::new::<T>(), drop_fn, pool)
-        });
-        let mut value = ManuallyDrop::new(value);
-        // SAFETY: value is a valid T matching the set's layout; on Ok ownership
-        // moved into the set, on Err nothing was written and we drop it below.
-        let result = unsafe { set.try_insert(entity, &mut *value as *mut T as *const u8) };
+            let mut set = PagedSparseSet::new(Layout::new::<T>(), drop_fn, self.pool.clone());
+            let r = unsafe { set.try_insert(entity, ptr) };
+            if r.is_ok() {
+                self.storages.insert(comp_id, set);
+            }
+            r
+        };
         if result.is_err() {
             // SAFETY: the set did not take ownership.
             unsafe { ManuallyDrop::drop(&mut value) };
