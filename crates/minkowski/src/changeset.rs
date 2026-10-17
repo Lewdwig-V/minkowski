@@ -869,8 +869,7 @@ impl EnumChangeSet {
                     unsafe {
                         let src = self.arena.get(entry.arena_offset);
                         // Panic-safe overwrite (#180) — new value committed before drop.
-                        col.replace_protected(entry.row, src)
-                            .expect("pool exhausted during changeset apply");
+                        col.replace_protected(entry.row, src);
                     }
                     col.mark_row_dirty(entry.row);
                 }
@@ -1094,8 +1093,7 @@ fn flush_insert_batch(
         unsafe {
             let src2 = src;
             // Panic-safe overwrite (#180) — new value committed before drop.
-            col.replace_protected(row, src2)
-                .expect("pool exhausted during changeset apply");
+            col.replace_protected(row, src2);
         }
         col.mark_row_dirty(row);
     }
@@ -1160,9 +1158,7 @@ fn changeset_insert_raw(
         // Panic-safe overwrite (#180) — new value committed before drop.
         // SAFETY: replacement is protected; row in bounds per pre-check above.
         unsafe {
-            src_arch.columns[col_idx]
-                .replace_protected(location.row(), data_ptr)
-                .expect("pool exhausted during changeset apply");
+            src_arch.columns[col_idx].replace_protected(location.row(), data_ptr);
         }
     } else {
         // Archetype migration: source components + new component.

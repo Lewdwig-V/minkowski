@@ -73,7 +73,7 @@ Structures moved to `PoolVec`:
 
 ### Invariant Matrix
 
-Invariant **B1**: every structure in the table above is allocated from the world's pool. Invariant **B2**: no path reports success or failure inconsistently. A fallible path that returns `Err` has changed no state, and an infallible path aborts only where its column push would already abort. Invariant **B3**: `despawn` never allocates.
+Invariant **B1**: every structure in the table above is allocated from the world's pool. Invariant **B2**: no path reports success or failure inconsistently. A fallible path that returns `Err` has changed no state, and an infallible path aborts only where its column push would already abort. Invariant **B3**: `despawn` never allocates. (As shipped in #286 this held for the free list but not for droppable components, whose panic-safe removal took a pool scratch block; resident per-column scratch slots closed that gap, see `fallible-changeset-apply.md`.)
 
 | Consumer \ structure | generations | free list | entity_locations | archetype entities | sparse dense_entities |
 |---|---|---|---|---|---|

@@ -119,8 +119,8 @@ With reservation done in `try_commit`, the post-commit `apply(...).expect(...)` 
 
 ## Implementation Plan
 
-1. Correct the false "despawn never allocates" claims in docs: only components without `Drop`, until step 2 lands.
-2. Resident scratch slot in `BlobVec` (overwrite and extract paths); A4 and A5 tests.
+1. ~~Correct the false "despawn never allocates" claims~~ — superseded: step 2 makes the claim true, and the docs record the gap instead.
+2. Resident scratch slot in `BlobVec` (overwrite and extract paths); A4 and A5 tests. **Done (first PR).**
 3. `EnumChangeSet::try_reserve` with simulation; A1, A2 and A6 tests.
 4. `apply` / `apply_replay` call `try_reserve` first; `ApplyError::PoolExhausted`.
 5. `TransactError::PoolExhausted`; reserve in `Optimistic` / `Pessimistic` `try_commit` and before the WAL append in `Durable`; A3 test.

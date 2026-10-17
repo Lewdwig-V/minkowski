@@ -99,9 +99,7 @@ impl PagedSparseSet {
             // SAFETY: `dense` is a valid index; `ptr` is valid per caller
             // contract and does not alias our BlobVec.
             unsafe {
-                self.dense_values
-                    .replace_protected(dense, ptr)
-                    .expect("pool exhausted during sparse overwrite");
+                self.dense_values.replace_protected(dense, ptr);
             }
         } else {
             // New entry
@@ -139,8 +137,10 @@ impl PagedSparseSet {
         ptr: *const u8,
     ) -> Result<(), PoolExhausted> {
         if let Some(dense) = self.dense_index(entity) {
-            // SAFETY: as in insert's overwrite path. On Err nothing was written.
-            return unsafe { self.dense_values.replace_protected(dense, ptr) };
+            // SAFETY: as in insert's overwrite path. Overwrites never allocate
+            // (resident scratch slot).
+            unsafe { self.dense_values.replace_protected(dense, ptr) };
+            return Ok(());
         }
         // New entry: ensure the sparse page and reserve both dense vectors,
         // then the plain insert cannot allocate in the pool. A page created
