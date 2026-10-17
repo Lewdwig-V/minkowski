@@ -18,65 +18,26 @@ pub(crate) struct BlobVec {
     pub(crate) changed_tick: Tick,
     pub(crate) dirty_pages: DirtyPageTracker,
     pool: Arc<SlabPool>,
+    /// Resident scratch slot (one item, pool-backed) for columns whose
+    /// component has a destructor: overwrites and despawn extraction move the
+    /// old value here before dropping it (#180 panic safety), so neither path
+    /// allocates. Allocated with the column's first buffer, freed in `Drop`.
+    /// Invariant: `len > 0 && needs_scratch()` implies `Some`.
+    scratch: Option<NonNull<u8>>,
 }
 
 // Safety: BlobVec stores Component data which requires Send + Sync.
 unsafe impl Send for BlobVec {}
 unsafe impl Sync for BlobVec {}
 
-/// RAII scratch slot carved from the component pool. Lets callers reserve
-/// overwrite capacity up front (multi-component overwrites preflight all
-/// demand before mutating anything) and guarantees the slot returns to the
-/// pool on every exit path, including a panicking component `Drop`.
-pub(crate) struct PoolScratch {
-    pool: Arc<SlabPool>,
-    ptr: Option<NonNull<u8>>,
-    layout: Layout,
-}
-
-impl PoolScratch {
-    fn zst() -> Self {
-        Self {
-            pool: default_pool_shim(),
-            ptr: None,
-            layout: Layout::new::<()>(),
-        }
-    }
-
-    fn as_ptr(&mut self) -> *mut u8 {
-        match self.ptr {
-            Some(p) => p.as_ptr(),
-            None => std::ptr::null_mut(), // ZST: never dereferenced
-        }
-    }
-
-    fn take_ptr(&mut self) -> Option<NonNull<u8>> {
-        self.ptr.take()
-    }
-}
-
-impl Drop for PoolScratch {
-    fn drop(&mut self) {
-        if let Some(ptr) = self.ptr.take() {
-            unsafe { self.pool.deallocate(ptr, self.layout) };
-        }
-    }
-}
-
-// Placeholder so `PoolScratch::zst()` needs no pool handle; ZST scratches are
-// never deallocated (ptr is None). Shared, so it no longer maps a whole pool
-// per zero-sized scratch.
-fn default_pool_shim() -> Arc<SlabPool> {
-    crate::pool::shared_scratch_pool()
-}
-
-/// A removed value evacuated to scratch, awaiting destruction. Produced by
-/// [`BlobVec::begin_extract_swap`] and consumed by
-/// [`BlobVec::commit_extracted_swap`] + [`ExtractedSlot::drop_value`].
+/// A removed value evacuated to its column's resident scratch slot,
+/// awaiting destruction. Produced by [`BlobVec::begin_extract_swap`] and
+/// consumed by [`BlobVec::commit_extracted_swap`] +
+/// [`ExtractedSlot::drop_value`]. It borrows the slot by raw pointer: the
+/// caller must drop the value before the next overwrite or extraction on the
+/// same column, and before the column is dropped.
 pub(crate) struct ExtractedSlot {
-    pool: Arc<SlabPool>,
     ptr: Option<NonNull<u8>>,
-    layout: Layout,
     drop_fn: Option<unsafe fn(*mut u8)>,
 }
 
@@ -85,17 +46,10 @@ impl ExtractedSlot {
     /// already committed all structural state so the unwind sees a consistent
     /// world (leaked component internals are the accepted worst case).
     pub(crate) fn drop_value(&mut self) {
-        if let (Some(drop_fn), Some(ptr)) = (self.drop_fn, self.ptr) {
-            // SAFETY: ptr holds the only moved-out copy of the value.
+        if let (Some(drop_fn), Some(ptr)) = (self.drop_fn, self.ptr.take()) {
+            // SAFETY: ptr holds the only moved-out copy of the value; take()
+            // makes a second call a no-op.
             unsafe { drop_fn(ptr.as_ptr()) };
-        }
-    }
-}
-
-impl Drop for ExtractedSlot {
-    fn drop(&mut self) {
-        if let Some(ptr) = self.ptr.take() {
-            unsafe { self.pool.deallocate(ptr, self.layout) };
         }
     }
 }
@@ -108,6 +62,33 @@ impl BlobVec {
     /// Compute the allocation alignment for a BlobVec column.
     fn alloc_align(item: &Layout) -> usize {
         item.align().max(Self::MIN_COLUMN_ALIGN)
+    }
+
+    /// Whether this column keeps a resident scratch slot.
+    fn needs_scratch(&self) -> bool {
+        self.drop_fn.is_some() && self.item_layout.size() > 0
+    }
+
+    fn scratch_layout(&self) -> Layout {
+        Layout::from_size_align(self.item_layout.size(), self.item_layout.align())
+            .expect("valid layout from component layout")
+    }
+
+    /// Allocate the resident scratch slot if this column needs one and has
+    /// none. On Err nothing changed.
+    fn try_ensure_scratch(&mut self) -> Result<(), PoolExhausted> {
+        if self.scratch.is_none() && self.needs_scratch() {
+            self.scratch = Some(self.pool.allocate(self.scratch_layout())?);
+        }
+        Ok(())
+    }
+
+    /// The resident scratch slot. Only called for droppable, non-ZST columns
+    /// with `len > 0`, where the slot exists by invariant.
+    fn scratch_ptr(&self) -> *mut u8 {
+        self.scratch
+            .expect("droppable column with rows has a resident scratch slot")
+            .as_ptr()
     }
 
     /// Mark this column as changed at the given tick.
@@ -164,7 +145,7 @@ impl BlobVec {
                 .unwrap_or_else(|_| std::alloc::handle_alloc_error(layout));
             (data, capacity)
         };
-        Self {
+        let mut bv = Self {
             item_layout,
             drop_fn,
             data,
@@ -173,7 +154,14 @@ impl BlobVec {
             changed_tick: Tick::default(),
             dirty_pages: DirtyPageTracker::new(),
             pool,
+            scratch: None,
+        };
+        if capacity > 0
+            && let Err(e) = bv.try_ensure_scratch()
+        {
+            std::alloc::handle_alloc_error(e.requested);
         }
+        bv
     }
 
     #[inline]
@@ -340,35 +328,25 @@ impl BlobVec {
     /// on `Err(PoolExhausted)` the column is untouched. Pair with
     /// [`commit_extracted_swap`](Self::commit_extracted_swap) (structural
     /// removal) and [`ExtractedSlot::drop_value`] (destruction).
-    pub(crate) fn begin_extract_swap(
-        &mut self,
-        row: usize,
-    ) -> Result<ExtractedSlot, PoolExhausted> {
+    pub(crate) fn begin_extract_swap(&mut self, row: usize) -> ExtractedSlot {
         debug_assert!(row < self.len);
-        let size = self.item_layout.size();
-        if self.drop_fn.is_none() || size == 0 {
+        if !self.needs_scratch() {
             // POD / ZST: nothing to evacuate; destructor-free path.
-            return Ok(ExtractedSlot {
-                pool: self.pool.clone(),
+            return ExtractedSlot {
                 ptr: None,
-                layout: Layout::new::<()>(),
                 drop_fn: None,
-            });
+            };
         }
-        let mut scratch = self.alloc_scratch()?;
+        let scratch = self.scratch_ptr();
+        // SAFETY: row < len; the slot is sized for one item and holds no live
+        // value (callers drop each extracted value before the next extract).
         unsafe {
-            std::ptr::copy_nonoverlapping(self.ptr_at(row), scratch.as_ptr(), size);
+            std::ptr::copy_nonoverlapping(self.ptr_at(row), scratch, self.item_layout.size());
         }
-        let ptr = scratch
-            .take_ptr()
-            .expect("non-ZST scratch always has a pointer");
-        Ok(ExtractedSlot {
-            pool: self.pool.clone(),
-            ptr: Some(ptr),
-            layout: Layout::from_size_align(size, self.item_layout.align())
-                .expect("valid layout from component layout"),
+        ExtractedSlot {
+            ptr: NonNull::new(scratch),
             drop_fn: self.drop_fn,
-        })
+        }
     }
 
     /// Phase B: structurally remove `row` (tail copy + shrink). Infallible.
@@ -443,88 +421,37 @@ impl BlobVec {
     }
 
     /// Overwrite the value at `row` with the bytes at `src`, dropping the old
-    /// value. Panic-safe ordering for droppable types:
+    /// value. Never allocates. Panic-safe ordering for droppable types:
     ///
-    /// 1. Steal the OLD value's bytes into a pool-allocated scratch slot,
+    /// 1. Move the OLD value's bytes into the column's resident scratch slot,
     /// 2. write the NEW value into the live slot (structural commit),
-    /// 3. run `drop_fn` on the stolen bytes and release the scratch.
+    /// 3. run `drop_fn` on the moved-out bytes.
     ///
     /// If the component's `Drop` panics, the live slot holds the new (valid)
-    /// value and the leaked worst case is half-dropped scratch bytes — never
-    /// freed bytes readable through `get`/query.
-    ///
-    /// Returns `Err(PoolExhausted)` if the scratch slot cannot be allocated;
-    /// on error the column is UNCHANGED.
+    /// value and the leaked worst case is a half-dropped value in the scratch
+    /// slot, whose bytes are never read again — never freed bytes readable
+    /// through `get`/query.
     ///
     /// # Safety
     /// `row` must be in bounds. `src` must point to a valid initialized value
     /// of this BlobVec's layout; caller must not double-drop the source value.
-    pub(crate) unsafe fn replace_protected(
-        &mut self,
-        row: usize,
-        src: *const u8,
-    ) -> Result<(), PoolExhausted> {
-        let scratch = self.alloc_scratch()?;
-        // SAFETY: row < len per debug_assert; src valid per caller contract;
-        // scratch came from this column's pool sized for this layout.
-        unsafe { self.replace_protected_with(row, src, scratch) };
-        Ok(())
-    }
-
-    /// Allocate a pool-backed scratch slot for [`replace_protected_with`].
-    /// Used by callers that must reserve overwrite capacity for several
-    /// components up front so a multi-component overwrite either fully
-    /// commits or leaves state untouched.
-    pub(crate) fn alloc_scratch(&self) -> Result<PoolScratch, PoolExhausted> {
-        let size = self.item_layout.size();
-        if size == 0 {
-            return Ok(PoolScratch::zst());
-        }
-        let layout = Layout::from_size_align(size, self.item_layout.align())
-            .expect("valid layout from component layout");
-        let ptr = self.pool.allocate(layout)?;
-        Ok(PoolScratch {
-            pool: self.pool.clone(),
-            ptr: Some(ptr),
-            layout,
-        })
-    }
-
-    /// Overwrite the value at `row` with the bytes at `src`, dropping the old
-    /// value into `scratch`. Infallible — allocation happened earlier via
-    /// [`alloc_scratch`], which lets multi-component overwrites preflight all
-    /// scratch demand before mutating anything.
-    ///
-    /// Panic-safe ordering: steal old bytes → commit new bytes → drop stolen.
-    /// If the component's `Drop` panics, the live slot holds the new (valid)
-    /// value; worst case is half-dropped scratch bytes.
-    ///
-    /// # Safety
-    /// `row` must be in bounds. `src` must point to a valid initialized value
-    /// of this BlobVec's layout; caller must not double-drop the source value.
-    /// The scratch must come from this column's pool (`alloc_scratch`) and be
-    /// sized for this layout.
-    pub(crate) unsafe fn replace_protected_with(
-        &mut self,
-        row: usize,
-        src: *const u8,
-        mut scratch: PoolScratch,
-    ) {
+    /// No [`ExtractedSlot`] from this column may still hold an undropped value.
+    pub(crate) unsafe fn replace_protected(&mut self, row: usize, src: *const u8) {
         debug_assert!(row < self.len);
         let size = self.item_layout.size();
         let dst = self.ptr_at(row);
-        if self.drop_fn.is_none() || size == 0 {
+        if !self.needs_scratch() {
             unsafe { std::ptr::copy_nonoverlapping(src, dst, size) };
             return;
         }
+        let scratch = self.scratch_ptr();
         unsafe {
-            std::ptr::copy_nonoverlapping(dst, scratch.as_ptr(), size);
+            std::ptr::copy_nonoverlapping(dst, scratch, size);
             std::ptr::copy_nonoverlapping(src, dst, size);
             // SAFETY: scratch holds the only moved-out copy of the old value;
             // drop_fn matches this column's component type.
-            (self.drop_fn.unwrap_unchecked())(scratch.as_ptr());
+            (self.drop_fn.unwrap_unchecked())(scratch);
         }
-        // Scratch deallocation happens in PoolScratch::drop.
     }
 
     /// Copy element from `src_row` to `dst_row` without dropping either.
@@ -630,6 +557,10 @@ impl BlobVec {
     /// which can widen a large run in place instead of copying. On `Err`
     /// the current allocation is untouched.
     fn grow_allocation(&mut self, new_layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
+        // Every growth path comes through here, so the resident scratch slot
+        // exists before the first row does. A slot allocated ahead of a
+        // failed data growth is kept (spare capacity, no observable change).
+        self.try_ensure_scratch()?;
         let size = self.item_layout.size();
         if self.capacity == 0 {
             return self.pool.allocate(new_layout);
@@ -665,6 +596,11 @@ impl Drop for BlobVec {
                 self.pool.deallocate(self.data, layout);
             }
         }
+        if let Some(scratch) = self.scratch.take() {
+            // SAFETY: allocated from self.pool with scratch_layout(); no
+            // ExtractedSlot outlives the column.
+            unsafe { self.pool.deallocate(scratch, self.scratch_layout()) };
+        }
     }
 }
 
@@ -697,6 +633,32 @@ mod tests {
             None
         };
         BlobVec::new(Layout::new::<T>(), drop_fn, 0, default_pool())
+    }
+
+    #[test]
+    fn resident_scratch_only_for_droppable_columns() {
+        let pool = crate::sync::Arc::new(
+            SlabPool::new(1 << 20, crate::pool::HugePages::Off, false).unwrap(),
+        );
+        let mut pod = BlobVec::new(Layout::new::<u64>(), None, 0, pool.clone());
+        unsafe { push_val(&mut pod, 7u64) };
+        assert!(pod.scratch.is_none());
+
+        let drop_fn = Some(crate::component::drop_ptr::<String> as unsafe fn(*mut u8));
+        let mut owned = BlobVec::new(Layout::new::<String>(), drop_fn, 0, pool.clone());
+        assert!(owned.scratch.is_none(), "no slot before the first row");
+        unsafe { push_val(&mut owned, String::from("a")) };
+        assert!(owned.scratch.is_some());
+        pool.flush_caches();
+        let before = pool.used();
+        let mut replacement = std::mem::ManuallyDrop::new(String::from("b"));
+        unsafe { owned.replace_protected(0, &mut *replacement as *mut String as *const u8) };
+        pool.flush_caches();
+        assert_eq!(pool.used(), before, "overwrite allocates nothing");
+        drop(owned);
+        drop(pod);
+        pool.flush_caches();
+        assert_eq!(pool.used(), 0, "slot returned on drop");
     }
 
     // ── tests ───────────────────────────────────────────────

@@ -37,7 +37,7 @@ The pool budget covers **component storage and per-entity bookkeeping**. Plan fo
 | | Query planner scratch (grows with join/result size), user-owned indexes (`BTreeIndex`, `HashIndex`, spatial) (system heap) |
 | | WAL and LSM buffers, and the pool's own side table (system heap) |
 
-`try_spawn` and `try_insert` reserve every pool slot they need, bookkeeping included, before mutating, so `Err(PoolExhausted)` leaves the world unchanged, and `despawn` never allocates. See [the design doc](plans/pool-entity-bookkeeping.md).
+`try_spawn` and `try_insert` reserve every pool slot they need, bookkeeping included, before mutating, so `Err(PoolExhausted)` leaves the world unchanged. `despawn` and in-place overwrites never allocate: each column whose component has a destructor keeps one resident scratch slot for panic-safe drops. See [the design doc](plans/pool-entity-bookkeeping.md).
 
 Query scratch scales with result size: a plan pre-sizes it (capped at 64K entities) and reuses it across executions, but it can grow past that for large joins. Indexes scale with indexed entities. `PoolExhausted` therefore bounds the world's entities and components, not process RSS, and recording a large changeset never raises it. Size the process limit (container memory, `RLIMIT_AS`) with headroom for the heap side.
 

@@ -679,12 +679,9 @@ impl World {
         let mut extracted: Vec<crate::storage::blob_vec::ExtractedSlot> =
             Vec::with_capacity(archetype.columns.len());
         for col in &mut archetype.columns {
-            // Pool exhaustion during despawn is a hard operational failure
-            // (despawn has no error channel); abort loudly with state intact.
-            match col.begin_extract_swap(row) {
-                Ok(slot) => extracted.push(slot),
-                Err(e) => panic!("pool exhausted during despawn: {e}"),
-            }
+            // Never allocates: the value moves into the column's resident
+            // scratch slot.
+            extracted.push(col.begin_extract_swap(row));
         }
 
         for col in &mut archetype.columns {
@@ -771,10 +768,7 @@ impl World {
                 let mut extracted: Vec<crate::storage::blob_vec::ExtractedSlot> =
                     Vec::with_capacity(archetype.columns.len());
                 for col in &mut archetype.columns {
-                    match col.begin_extract_swap(row) {
-                        Ok(slot) => extracted.push(slot),
-                        Err(e) => panic!("pool exhausted during despawn_batch: {e}"),
-                    }
+                    extracted.push(col.begin_extract_swap(row));
                 }
 
                 if row < last {
@@ -1363,34 +1357,14 @@ impl World {
             let arch = &mut self.archetypes.archetypes[location.archetype_id().0];
             let row = location.row();
             unsafe {
-                // Preflight scratch for every overwritten droppable column so
-                // pool exhaustion surfaces as Err(PoolExhausted) BEFORE any
-                // column is touched (try_insert's unchanged-state contract).
-                let mut scratches: Vec<crate::storage::blob_vec::PoolScratch> =
-                    Vec::with_capacity(new_ids.len());
-                for &id in &new_ids {
-                    if self.components.info(id).drop_fn.is_some() {
-                        let col_idx = arch.column_index(id).unwrap();
-                        scratches.push(
-                            arch.columns[col_idx]
-                                .alloc_scratch()
-                                .expect("pool exhausted during component overwrite"),
-                        );
-                    }
-                }
-                let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
                     let col = &mut arch.columns[col_idx];
-                    // Panic-safe overwrite (#180) — scratch was preflighted.
-                    // SAFETY: row in bounds; ptr valid; scratch sized for layout.
-                    match scratch_iter.next() {
-                        Some(scratch) => col.replace_protected_with(row, ptr, scratch),
-                        None => col
-                            .replace_protected(row, ptr)
-                            .expect("pool exhausted during component overwrite"),
-                    }
-                    // replace_protected* don't touch ticks — mark the write.
+                    // Panic-safe overwrite (#180) through the column's resident
+                    // scratch slot: never allocates.
+                    // SAFETY: row in bounds; ptr valid for the column's layout.
+                    col.replace_protected(row, ptr);
+                    // replace_protected doesn't touch ticks — mark the write.
                     col.mark_changed(tick);
                     col.dirty_pages.mark_row(row);
                 });
@@ -1420,33 +1394,14 @@ impl World {
         if src_arch_id == target_arch_id {
             let arch = &mut self.archetypes.archetypes[src_arch_id.0];
             unsafe {
-                // Preflight scratch for every overwritten droppable column so
-                // pool exhaustion surfaces BEFORE any column is touched.
-                let mut scratches: Vec<crate::storage::blob_vec::PoolScratch> =
-                    Vec::with_capacity(new_ids.len());
-                for &id in &new_ids {
-                    if self.components.info(id).drop_fn.is_some() {
-                        let col_idx = arch.column_index(id).unwrap();
-                        scratches.push(
-                            arch.columns[col_idx]
-                                .alloc_scratch()
-                                .expect("pool exhausted during component overwrite"),
-                        );
-                    }
-                }
-                let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
                     let col = &mut arch.columns[col_idx];
-                    // Panic-safe overwrite (#180) — scratch was preflighted.
-                    // SAFETY: row in bounds; ptr valid; scratch sized for layout.
-                    match scratch_iter.next() {
-                        Some(scratch) => col.replace_protected_with(src_row, ptr, scratch),
-                        None => col
-                            .replace_protected(src_row, ptr)
-                            .expect("pool exhausted during component overwrite"),
-                    }
-                    // replace_protected* don't touch ticks — mark the write.
+                    // Panic-safe overwrite (#180) through the column's resident
+                    // scratch slot: never allocates.
+                    // SAFETY: row in bounds; ptr valid for the column's layout.
+                    col.replace_protected(src_row, ptr);
+                    // replace_protected doesn't touch ticks — mark the write.
                     col.mark_changed(tick);
                     col.dirty_pages.mark_row(src_row);
                 });
@@ -1552,37 +1507,20 @@ impl World {
             .all(|&id| src_arch.component_ids.contains(id));
 
         if all_existing {
-            // All bundle components already exist — overwrite in-place (no allocation)
+            // All bundle components already exist — overwrite in place. Never
+            // allocates (resident scratch), so nothing can fail from here.
+            let tick = self.next_tick();
             let arch = &mut self.archetypes.archetypes[location.archetype_id().0];
             let row = location.row();
             unsafe {
-                // Preflight scratch for every overwritten droppable column so
-                // pool exhaustion surfaces as Err(PoolExhausted) BEFORE any
-                // column is touched (try_insert's unchanged-state contract).
-                let mut scratches: Vec<crate::storage::blob_vec::PoolScratch> =
-                    Vec::with_capacity(new_ids.len());
-                for &id in &new_ids {
-                    if self.components.info(id).drop_fn.is_some() {
-                        let col_idx = arch.column_index(id).unwrap();
-                        scratches.push(arch.columns[col_idx].alloc_scratch()?);
-                    }
-                }
-                // Advance the tick only once every fallible step has passed,
-                // so Err leaves the world's tick unchanged too.
-                let tick = self.current_tick.advance();
-                let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
                     let col = &mut arch.columns[col_idx];
-                    // Panic-safe overwrite (#180) — scratch was preflighted.
-                    // SAFETY: row in bounds; ptr valid; scratch sized for layout.
-                    match scratch_iter.next() {
-                        Some(scratch) => col.replace_protected_with(row, ptr, scratch),
-                        None => col
-                            .replace_protected(row, ptr)
-                            .expect("pool exhausted during component overwrite"),
-                    }
-                    // replace_protected* don't touch ticks — mark the write.
+                    // Panic-safe overwrite (#180) through the column's resident
+                    // scratch slot: never allocates.
+                    // SAFETY: row in bounds; ptr valid for the column's layout.
+                    col.replace_protected(row, ptr);
+                    // replace_protected doesn't touch ticks — mark the write.
                     col.mark_changed(tick);
                     col.dirty_pages.mark_row(row);
                 });
@@ -1607,34 +1545,17 @@ impl World {
 
         // Defensive: same archetype → overwrite in-place
         if src_arch_id == target_arch_id {
+            let tick = self.next_tick();
             let arch = &mut self.archetypes.archetypes[src_arch_id.0];
             unsafe {
-                // Preflight scratch for every overwritten droppable column so
-                // pool exhaustion surfaces BEFORE any column is touched.
-                let mut scratches: Vec<crate::storage::blob_vec::PoolScratch> =
-                    Vec::with_capacity(new_ids.len());
-                for &id in &new_ids {
-                    if self.components.info(id).drop_fn.is_some() {
-                        let col_idx = arch.column_index(id).unwrap();
-                        scratches.push(arch.columns[col_idx].alloc_scratch()?);
-                    }
-                }
-                // Advance the tick only once every fallible step has passed,
-                // so Err leaves the world's tick unchanged too.
-                let tick = self.current_tick.advance();
-                let mut scratch_iter = scratches.into_iter();
                 bundle.put(&self.components, &mut |comp_id, ptr, _layout| {
                     let col_idx = arch.column_index(comp_id).unwrap();
                     let col = &mut arch.columns[col_idx];
-                    // Panic-safe overwrite (#180) — scratch was preflighted.
-                    // SAFETY: row in bounds; ptr valid; scratch sized for layout.
-                    match scratch_iter.next() {
-                        Some(scratch) => col.replace_protected_with(src_row, ptr, scratch),
-                        None => col
-                            .replace_protected(src_row, ptr)
-                            .expect("pool exhausted during component overwrite"),
-                    }
-                    // replace_protected* don't touch ticks — mark the write.
+                    // Panic-safe overwrite (#180) through the column's resident
+                    // scratch slot: never allocates.
+                    // SAFETY: row in bounds; ptr valid for the column's layout.
+                    col.replace_protected(src_row, ptr);
+                    // replace_protected doesn't touch ticks — mark the write.
                     col.mark_changed(tick);
                     col.dirty_pages.mark_row(src_row);
                 });
@@ -4340,6 +4261,91 @@ mod tests {
         world.try_restore_allocator_state(&[3, 0], &[1]).unwrap();
         assert_eq!(world.entities.generations.len(), 2);
         assert!(world.entities.free_list.capacity() >= 2);
+    }
+
+    /// Droppable component with a live-instance counter (Send + Sync).
+    #[derive(Clone)]
+    #[expect(dead_code, reason = "drop counter and payload size only")]
+    struct Owned(std::sync::Arc<()>, [u64; 4]);
+
+    #[test]
+    fn despawn_droppable_with_exhausted_pool() {
+        // #294 / A4: despawn moves droppable values into the column's resident
+        // scratch slot, so it never allocates, even with every class exhausted.
+        let token = std::sync::Arc::new(());
+        let mut world = World::builder()
+            .memory_budget(512 << 10)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        let entities: Vec<Entity> = (0..200u32)
+            .map(|i| world.spawn((i, Owned(token.clone(), [0; 4]))))
+            .collect();
+        exhaust_pool(&world);
+        let (head, tail) = entities.split_at(100);
+        for &e in head {
+            assert!(world.despawn(e));
+        }
+        assert_eq!(world.despawn_batch(tail), 100);
+        assert_eq!(
+            std::sync::Arc::strong_count(&token),
+            1,
+            "each value dropped once"
+        );
+    }
+
+    #[test]
+    fn overwrite_droppable_with_exhausted_pool() {
+        // #294 / A4: insert, try_insert and changeset overwrites never allocate.
+        let token = std::sync::Arc::new(());
+        let mut world = World::builder()
+            .memory_budget(512 << 10)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        let e = world.spawn((1u32, Owned(token.clone(), [0; 4])));
+        exhaust_pool(&world);
+        world.insert(e, (Owned(token.clone(), [1; 4]),)).unwrap();
+        world
+            .try_insert(e, (Owned(token.clone(), [2; 4]),))
+            .unwrap();
+        let mut cs = crate::changeset::EnumChangeSet::new();
+        cs.insert::<Owned>(&mut world, e, Owned(token.clone(), [3; 4]));
+        cs.apply(&mut world).unwrap();
+        // One live value in the world plus our handle.
+        assert_eq!(std::sync::Arc::strong_count(&token), 2);
+        drop(world);
+        assert_eq!(std::sync::Arc::strong_count(&token), 1);
+    }
+
+    #[test]
+    fn resident_scratch_survives_panicking_drop() {
+        // #294 / A5: after a destructor panics mid-overwrite, the slot is
+        // reused by the next overwrite and despawn without corruption.
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static PANIC_ON_DROP: AtomicBool = AtomicBool::new(false);
+        struct Bomb(u32);
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                assert!(!PANIC_ON_DROP.load(Ordering::SeqCst), "bomb {}", self.0);
+            }
+        }
+        let mut world = World::new();
+        let e = world.spawn((Bomb(1),));
+        let other = world.spawn((Bomb(2),));
+        PANIC_ON_DROP.store(true, Ordering::SeqCst);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            world.insert(e, (Bomb(3),)).unwrap();
+        }));
+        assert!(r.is_err());
+        PANIC_ON_DROP.store(false, Ordering::SeqCst);
+        // The new value was committed before the old one's drop panicked.
+        assert_eq!(world.get::<Bomb>(e).map(|b| b.0), Some(3));
+        world.insert(e, (Bomb(4),)).unwrap();
+        assert_eq!(world.get::<Bomb>(e).map(|b| b.0), Some(4));
+        assert!(world.despawn(other));
+        assert_eq!(world.get::<Bomb>(e).map(|b| b.0), Some(4));
     }
 
     /// Allocate from every size class until each refuses (test-only hog).
