@@ -4425,6 +4425,45 @@ mod tests {
     }
 
     #[test]
+    fn invalid_mutation_reports_validation_error_not_pool_exhaustion() {
+        // Codex P2 on #296: growth after the first invalid mutation is
+        // unreachable, so the reservation stops there and apply reports the
+        // validation error (or PartialApply after a valid prefix).
+        use crate::changeset::{ApplyError, EnumChangeSet};
+        for with_prefix in [false, true] {
+            let mut world = World::builder()
+                .memory_budget(1 << 20)
+                .hugepages(HugePages::Off)
+                .build()
+                .unwrap();
+            let placed: Vec<Entity> = (0..100u32).map(|i| world.spawn((i,))).collect();
+            let dead = world.spawn((0u32,));
+            world.despawn(dead);
+            let unplaced: Vec<Entity> = (0..2000).map(|_| world.alloc_entity()).collect();
+
+            let mut cs = EnumChangeSet::new();
+            if with_prefix {
+                cs.record_despawn(placed[0]);
+            }
+            cs.insert::<f64>(&mut world, dead, 1.0); // DeadEntity at apply
+            for &e in &unplaced {
+                cs.spawn_bundle(&mut world, e, ([0u64; 64],)).unwrap(); // ~1 MiB, unreachable
+            }
+            exhaust_pool(&world);
+            let err = cs.apply(&mut world).unwrap_err();
+            if with_prefix {
+                assert!(
+                    matches!(&err, ApplyError::PartialApply { failed_index: 1, source, .. }
+                        if **source == ApplyError::DeadEntity(dead)),
+                    "{err:?}"
+                );
+            } else {
+                assert_eq!(err, ApplyError::DeadEntity(dead));
+            }
+        }
+    }
+
+    #[test]
     fn reserved_changeset_applies_with_exhausted_pool() {
         // #294 / A2: once try_reserve succeeds, apply allocates nothing in the
         // pool: every growth path below runs with every size class exhausted.

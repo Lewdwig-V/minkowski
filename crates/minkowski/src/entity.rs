@@ -133,6 +133,23 @@ impl FreeList {
         None
     }
 
+    /// Whether `index` is a free slot. Builds the lazy lookup index, as
+    /// `remove` does.
+    fn contains(&mut self, index: u32) -> bool {
+        if self.slots.last() == Some(&index) {
+            return true;
+        }
+        self.positions
+            .get_or_insert_with(|| {
+                self.slots
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &i)| (i, pos))
+                    .collect()
+            })
+            .contains_key(&index)
+    }
+
     fn remove(&mut self, index: u32) -> bool {
         if self.slots.last() == Some(&index) {
             self.pop();
@@ -376,6 +393,27 @@ impl EntityAllocator {
 
     /// Claim an unplaced entity from a committed log in its original slot.
     /// The caller checks placement before calling this method.
+    /// Whether [`adopt`](Self::adopt) would accept `entity` in the current
+    /// state, without changing anything observable. Mirrors `adopt` exactly,
+    /// including indices that `materialize_reserved` would add (generation 0,
+    /// not free).
+    pub(crate) fn would_adopt(&mut self, entity: Entity) -> bool {
+        if entity.index() == u32::MAX {
+            return false;
+        }
+        let index = entity.index() as usize;
+        let generation = match self.generations.get(index) {
+            Some(&generation) => generation,
+            None if index < self.reserved_bound() => 0, // materialized live, not free
+            None => return true,                        // fresh slot past the end
+        };
+        if generation > entity.generation() {
+            return false;
+        }
+        (index < self.generations.len() && self.free_list.contains(entity.index()))
+            || generation == entity.generation()
+    }
+
     pub(crate) fn adopt(&mut self, entity: Entity) -> bool {
         // Keep the reservation counter representable after adopting the slot.
         if entity.index() == u32::MAX {

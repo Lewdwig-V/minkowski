@@ -84,6 +84,12 @@ impl<S: Transact> Transact for Durable<S> {
         // Shared by building-block commits and all closure entry points.
         // The WAL serializer requires ordinary mutations, not fast-lane batches.
         forward.drain_fast_lane_to_mutations();
+        // WAL chokepoint (#294): never log a changeset the world cannot hold.
+        // The built-in strategies already reserved; this also covers custom
+        // `Transact` implementations and mutations added after delegating.
+        forward
+            .try_reserve(world)
+            .map_err(TransactError::PoolExhausted)?;
         self.wal
             .lock()
             .append(&forward, &self.codecs, world.current_tick())
@@ -268,6 +274,64 @@ mod tests {
         );
         assert_eq!(durable.wal_seq(), 0, "nothing logged");
         assert!(world.query::<(&Health,)>().next().is_none());
+    }
+
+    /// Codex P1 on #296: a custom strategy can hand Durable an unreserved
+    /// changeset (here: mutations appended after delegating to Optimistic).
+    /// Durable reserves at its own WAL chokepoint, so it still logs nothing.
+    #[test]
+    fn durable_reserves_custom_strategy_changesets_before_wal() {
+        struct AppendsAfterCommit {
+            inner: Optimistic,
+            entities: Vec<minkowski::Entity>,
+        }
+        impl Transact for AppendsAfterCommit {
+            fn begin(&self, world: &mut World, access: &Access) -> Result<Tx<'_>, WorldMismatch> {
+                self.inner.begin(world, access)
+            }
+            fn try_commit(
+                &self,
+                tx: &mut Tx<'_>,
+                world: &mut World,
+            ) -> Result<EnumChangeSet, TransactError> {
+                let mut forward = self.inner.try_commit(tx, world)?;
+                for &e in &self.entities {
+                    forward.insert(world, e, Health(1)); // never reserved
+                }
+                Ok(forward)
+            }
+            fn max_retries(&self) -> usize {
+                1
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+        let mut world = World::builder()
+            .memory_budget(512 << 10)
+            .hugepages(minkowski::HugePages::Off)
+            .build()
+            .unwrap();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
+        let mut entities = Vec::new();
+        while let Ok(e) = world.try_spawn((Pos { x: 0.0, y: 0.0 },)) {
+            entities.push(e);
+        }
+        let wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
+        let strategy = AppendsAfterCommit {
+            inner: Optimistic::new(&world),
+            entities,
+        };
+        let durable = Durable::new(strategy, wal, codecs);
+        let access = Access::of::<(&mut Health,)>(&mut world);
+        let result = durable.transact(&mut world, &access, |_tx, _world| {});
+        assert!(
+            matches!(result, Err(TransactError::PoolExhausted(_))),
+            "{result:?}"
+        );
+        assert_eq!(durable.wal_seq(), 0, "nothing logged");
     }
 
     struct CountingHandler {

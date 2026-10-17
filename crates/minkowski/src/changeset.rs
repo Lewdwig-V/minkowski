@@ -803,7 +803,8 @@ impl EnumChangeSet {
         // Reserve all pool growth before the tick and every mutation, so pool
         // exhaustion leaves the world unchanged (A1) and the loop below never
         // allocates in the pool (A2).
-        self.try_reserve(world).map_err(ApplyError::PoolExhausted)?;
+        self.try_reserve_inner(world, adopt_entities)
+            .map_err(ApplyError::PoolExhausted)?;
         let tick = world.next_tick();
 
         let result = self.apply_mutations(world, tick, adopt_entities);
@@ -1088,6 +1089,19 @@ struct SparseSim {
 
 impl EnumChangeSet {
     /// Reserve every pool slot [`apply`](Self::apply) will need for this
+    /// changeset, so a later `apply` on the same world cannot run out of pool
+    /// (and returns no [`ApplyError::PoolExhausted`]) as long as the world is
+    /// not mutated in between. On `Err` the world is observably unchanged.
+    ///
+    /// `apply` reserves on its own; call this first when something must
+    /// happen between the decision and the apply that cannot be undone, such
+    /// as writing the changeset to a WAL (`Durable` does) or committing a
+    /// custom [`Transact`](crate::Transact) strategy.
+    pub fn try_reserve(&self, world: &mut World) -> Result<(), PoolExhausted> {
+        self.try_reserve_inner(world, false)
+    }
+
+    /// Reserve every pool slot [`apply`](Self::apply) will need for this
     /// changeset (design: `docs/plans/fallible-changeset-apply.md`, part 2).
     ///
     /// Walks the mutations in order without touching data, tracking each
@@ -1096,11 +1110,18 @@ impl EnumChangeSet {
     /// would), each touched entity's simulated location, entity bookkeeping
     /// and sparse growth. Overwrites need nothing: they use resident scratch.
     ///
-    /// On `Err` only spare capacity grew (and empty archetypes or sparse sets
-    /// may have been created, as `try_spawn` does), so the world is
-    /// observably unchanged. A mutation that would fail validation is
-    /// simulated as a no-op; apply stops there anyway.
-    pub(crate) fn try_reserve(&self, world: &mut World) -> Result<(), PoolExhausted> {
+    /// On `Err` only spare capacity grew (and empty archetypes may have been
+    /// created, as `try_spawn` does), so the world is observably unchanged.
+    /// The simulation stops at the first mutation apply would reject (dead,
+    /// unplaced or already-placed entity, or a refused replay adopt), so it
+    /// never reserves work apply cannot reach, and a changeset with an invalid
+    /// mutation still reports `DeadEntity` / `Unplaced` / `PartialApply`
+    /// rather than `PoolExhausted` caused by unreachable growth.
+    pub(crate) fn try_reserve_inner(
+        &self,
+        world: &mut World,
+        adopt: bool,
+    ) -> Result<(), PoolExhausted> {
         if self.mutations.is_empty() {
             return Ok(()); // fast-lane batches only overwrite
         }
@@ -1139,11 +1160,36 @@ impl EnumChangeSet {
                 .map(EntityLocation::archetype_id)
         }
 
+        // Liveness as apply sees it at this point: spawned in this changeset
+        // counts as alive (unplaced is fine for sparse), despawned as dead.
+        fn alive(
+            world: &World,
+            moved: &HashMap<Entity, Option<ArchetypeId>>,
+            entity: Entity,
+        ) -> bool {
+            match moved.get(&entity) {
+                Some(loc) => loc.is_some(),
+                None => world.is_alive(entity),
+            }
+        }
+        // Replay: slots claimed by earlier spawns in this changeset.
+        let mut adopted: HashMap<usize, u32> = HashMap::new();
+
         for mutation in &self.mutations {
             match mutation {
                 Mutation::Spawn { entity, components } => {
                     if locate(world, &moved, *entity).is_some() {
-                        continue; // AlreadyPlaced at apply time
+                        break; // AlreadyPlaced: apply stops here
+                    }
+                    if adopt {
+                        let index = entity.index() as usize;
+                        let claimed = adopted.get(&index).copied();
+                        if claimed.is_some_and(|g| g != entity.generation())
+                            || (claimed.is_none() && !world.entities.would_adopt(*entity))
+                        {
+                            break; // adopt fails (DeadEntity): apply stops here
+                        }
+                        adopted.insert(index, entity.generation());
                     }
                     let mut ids: Vec<ComponentId> =
                         components.iter().map(|&(id, _, _)| id).collect();
@@ -1158,10 +1204,12 @@ impl EnumChangeSet {
                     max_index = Some(max_index.map_or(index, |m| m.max(index)));
                 }
                 Mutation::Despawn { entity } => {
-                    if let Some(arch) = locate(world, &moved, *entity) {
-                        bump(&mut arch_growth, arch.0, -1);
-                        moved.insert(*entity, None);
-                    }
+                    // Dead or unplaced: despawn returns false, apply stops.
+                    let Some(arch) = locate(world, &moved, *entity) else {
+                        break;
+                    };
+                    bump(&mut arch_growth, arch.0, -1);
+                    moved.insert(*entity, None);
                 }
                 Mutation::Insert {
                     entity,
@@ -1169,7 +1217,7 @@ impl EnumChangeSet {
                     ..
                 } => {
                     let Some(src) = locate(world, &moved, *entity) else {
-                        continue;
+                        break; // DeadEntity / Unplaced: apply stops here
                     };
                     let src_arch = &world.archetypes.archetypes[src.0];
                     if src_arch.component_ids.contains(*component_id) {
@@ -1191,7 +1239,7 @@ impl EnumChangeSet {
                     component_id,
                 } => {
                     let Some(src) = locate(world, &moved, *entity) else {
-                        continue;
+                        break; // DeadEntity / Unplaced: apply stops here
                     };
                     let src_arch = &world.archetypes.archetypes[src.0];
                     if !src_arch.component_ids.contains(*component_id) {
@@ -1217,8 +1265,8 @@ impl EnumChangeSet {
                     layout,
                     ..
                 } => {
-                    if locate(world, &moved, *entity).is_none() && !world.is_alive(*entity) {
-                        continue;
+                    if !alive(world, &moved, *entity) {
+                        break; // DeadEntity: apply stops here
                     }
                     let sim = sparse.entry(*component_id).or_insert_with(|| SparseSim {
                         layout: *layout,
@@ -1247,6 +1295,9 @@ impl EnumChangeSet {
                     entity,
                     component_id,
                 } => {
+                    if !alive(world, &moved, *entity) {
+                        break; // DeadEntity: apply stops here
+                    }
                     if let Some(sim) = sparse.get_mut(component_id) {
                         let present = *sim
                             .presence
