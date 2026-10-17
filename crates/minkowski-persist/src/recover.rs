@@ -34,11 +34,11 @@ pub fn recover_world(
 
 /// Like [`recover_world`], recovering into a world built from `builder`.
 ///
-/// Loading the LSM baseline into the builder's pool is fallible: if it does
-/// not fit, this returns `RecoverError::Lsm(LsmError::PoolExhausted(_))`.
-/// Replaying the WAL tail still uses the infallible changeset apply path, so
-/// a budget too small for the tail aborts the process like any other
-/// infallible spawn; leave headroom above the baseline.
+/// Recovery never aborts on pool exhaustion. If the LSM baseline does not
+/// fit, this returns `RecoverError::Lsm(LsmError::PoolExhausted(_))`; if a WAL
+/// tail record does not fit, replay reserves its growth before applying it and
+/// returns `RecoverError::Wal(WalError::Apply(ApplyError::PoolExhausted(_)))`.
+/// Either way the partially recovered world is dropped.
 pub fn recover_world_with_builder(
     builder: WorldBuilder,
     lsm_dir: &Path,
@@ -135,6 +135,58 @@ mod tests {
         assert_eq!(recovered.query::<(&Pos,)>().count(), 1);
         assert_eq!(recovered.query::<(&Health,)>().count(), 1);
         assert_eq!(recovered.query::<(&Health,)>().next().unwrap().0.0, 42);
+    }
+
+    /// #294: a WAL tail that does not fit the target budget fails recovery
+    /// with ApplyError::PoolExhausted (via WalError::Apply) instead of
+    /// aborting the process, and a budget that fits recovers it.
+    #[test]
+    fn recover_world_with_builder_reports_wal_tail_exhaustion() {
+        #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+        struct Wide([u64; 64]); // 512 B
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsm_dir = dir.path().join("lsm");
+        let log_path = lsm_dir.join("manifest.log");
+        let wal_dir = dir.path().join("test.wal");
+        std::fs::create_dir_all(&lsm_dir).unwrap();
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Wide>(&mut world).unwrap();
+        let mut wal = Wal::create(&wal_dir, &codecs, crate::wal::WalConfig::default()).unwrap();
+        // ~2 MiB of rows in one WAL record: no LSM baseline, so it is all tail.
+        let mut cs = minkowski::EnumChangeSet::new();
+        for i in 0..4000u64 {
+            let e = world.alloc_entity();
+            cs.spawn_bundle(&mut world, e, (Wide([i; 64]),)).unwrap();
+        }
+        wal.append(&cs, &codecs, world.current_tick()).unwrap();
+        cs.apply(&mut world).unwrap();
+        drop(wal);
+
+        let small = World::builder()
+            .memory_budget(1 << 20)
+            .hugepages(minkowski::HugePages::Off);
+        let mut wal = Wal::open(&wal_dir, &codecs, crate::wal::WalConfig::default()).unwrap();
+        let err = recover_world_with_builder(small, &lsm_dir, &log_path, &mut wal, &codecs)
+            .err()
+            .expect("1 MiB cannot hold a 2 MiB tail");
+        assert!(
+            matches!(
+                err,
+                RecoverError::Wal(WalError::Apply(minkowski::ApplyError::PoolExhausted(_)))
+            ),
+            "got {err}"
+        );
+
+        let fits = World::builder()
+            .memory_budget(16 << 20)
+            .hugepages(minkowski::HugePages::Off);
+        let mut wal = Wal::open(&wal_dir, &codecs, crate::wal::WalConfig::default()).unwrap();
+        let mut recovered =
+            recover_world_with_builder(fits, &lsm_dir, &log_path, &mut wal, &codecs).unwrap();
+        assert_eq!(recovered.query::<(&Wide,)>().count(), 4000);
     }
 
     /// (e) Sparse component in LSM baseline + sparse mutation appended to WAL

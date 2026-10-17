@@ -4348,6 +4348,268 @@ mod tests {
         assert_eq!(world.get::<Bomb>(e).map(|b| b.0), Some(4));
     }
 
+    /// State a failed `apply` must not change. Archetypes created by the
+    /// reservation (empty, heap-only, as `try_spawn` does) are excluded; the
+    /// pre-existing archetypes' lengths are compared.
+    fn apply_snapshot(
+        world: &World,
+        archetypes: usize,
+    ) -> (u64, usize, usize, usize, Vec<usize>, Vec<ComponentId>) {
+        (
+            world.current_tick(),
+            world.entity_count(),
+            world.entities.generations.len(),
+            world.entity_locations.len(),
+            world.archetypes.archetypes[..archetypes]
+                .iter()
+                .map(Archetype::len)
+                .collect(),
+            world.sparse_component_ids(),
+        )
+    }
+
+    #[test]
+    fn apply_pool_exhaustion_leaves_world_unchanged() {
+        // #294 / A1: spawn, migration and sparse changesets that cannot fit
+        // return ApplyError::PoolExhausted before any mutation.
+        type Build = fn(&mut World, &[Entity], &[Entity]) -> crate::changeset::EnumChangeSet;
+        let cases: [(&str, Build); 3] = [
+            ("spawn", |w, _, unplaced| {
+                let mut cs = crate::changeset::EnumChangeSet::new();
+                for (i, &e) in unplaced.iter().enumerate() {
+                    cs.spawn_bundle(w, e, (i as f64, [0u64; 8])).unwrap();
+                }
+                cs
+            }),
+            ("migrate", |w, placed, _| {
+                let mut cs = crate::changeset::EnumChangeSet::new();
+                for &e in placed {
+                    cs.insert::<f64>(w, e, 1.0);
+                }
+                cs
+            }),
+            ("sparse", |w, placed, _| {
+                let mut cs = crate::changeset::EnumChangeSet::new();
+                for &e in placed {
+                    cs.insert_sparse::<u64>(w, e, 7);
+                }
+                cs
+            }),
+        ];
+        for (name, build) in cases {
+            let mut world = World::builder()
+                .memory_budget(1 << 20)
+                .hugepages(HugePages::Off)
+                .build()
+                .unwrap();
+            let placed: Vec<Entity> = (0..1000u32).map(|i| world.spawn((i,))).collect();
+            let unplaced: Vec<Entity> = (0..1000).map(|_| world.alloc_entity()).collect();
+            let cs = build(&mut world, &placed, &unplaced);
+            exhaust_pool(&world);
+            let archetypes = world.archetypes.archetypes.len();
+            let before = apply_snapshot(&world, archetypes);
+            let err = cs.apply(&mut world).expect_err(name);
+            assert!(
+                matches!(err, crate::changeset::ApplyError::PoolExhausted(_)),
+                "{name}: got {err}"
+            );
+            assert_eq!(apply_snapshot(&world, archetypes), before, "{name}");
+            let mut sum = 0u64;
+            world
+                .query::<(&u32,)>()
+                .for_each(|(v,)| sum += u64::from(*v));
+            assert_eq!(sum, (0..1000u64).sum::<u64>(), "{name}: values intact");
+            assert!(world.query::<(&f64,)>().next().is_none(), "{name}");
+            assert!(unplaced.iter().all(|&e| !world.is_placed(e)), "{name}");
+        }
+    }
+
+    #[test]
+    fn invalid_mutation_reports_validation_error_not_pool_exhaustion() {
+        // Codex P2 on #296: growth after the first invalid mutation is
+        // unreachable, so the reservation stops there and apply reports the
+        // validation error (or PartialApply after a valid prefix).
+        use crate::changeset::{ApplyError, EnumChangeSet};
+        for with_prefix in [false, true] {
+            let mut world = World::builder()
+                .memory_budget(1 << 20)
+                .hugepages(HugePages::Off)
+                .build()
+                .unwrap();
+            let placed: Vec<Entity> = (0..100u32).map(|i| world.spawn((i,))).collect();
+            let dead = world.spawn((0u32,));
+            world.despawn(dead);
+            let unplaced: Vec<Entity> = (0..2000).map(|_| world.alloc_entity()).collect();
+
+            let mut cs = EnumChangeSet::new();
+            if with_prefix {
+                cs.record_despawn(placed[0]);
+            }
+            cs.insert::<f64>(&mut world, dead, 1.0); // DeadEntity at apply
+            for &e in &unplaced {
+                cs.spawn_bundle(&mut world, e, ([0u64; 64],)).unwrap(); // ~1 MiB, unreachable
+            }
+            exhaust_pool(&world);
+            let err = cs.apply(&mut world).unwrap_err();
+            if with_prefix {
+                assert!(
+                    matches!(&err, ApplyError::PartialApply { failed_index: 1, source, .. }
+                        if **source == ApplyError::DeadEntity(dead)),
+                    "{err:?}"
+                );
+            } else {
+                assert_eq!(err, ApplyError::DeadEntity(dead));
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_changeset_applies_with_exhausted_pool() {
+        // #294 / A2: once try_reserve succeeds, apply allocates nothing in the
+        // pool: every growth path below runs with every size class exhausted.
+        let token = std::sync::Arc::new(());
+        let mut world = World::builder()
+            .memory_budget(4 << 20)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        let a = world.spawn((1u32, Owned(token.clone(), [0; 4])));
+        let b = world.spawn((2u32,));
+        let c = world.spawn((3u32, 3.0f64));
+        let d = world.spawn((4u32,));
+        world.insert_sparse(d, 40u64);
+
+        let mut cs = crate::changeset::EnumChangeSet::new();
+        let spawned: Vec<Entity> = (0..300u32)
+            .map(|i| {
+                let e = world.entities.reserve();
+                cs.spawn_bundle(&mut world, e, (i, Owned(token.clone(), [0; 4])))
+                    .unwrap();
+                e
+            })
+            .collect();
+        cs.insert::<f64>(&mut world, spawned[0], 0.5); // migrate a fresh spawn
+        cs.insert::<i8>(&mut world, spawned[0], -1); // ... twice
+        cs.insert::<Owned>(&mut world, a, Owned(token.clone(), [1; 4])); // droppable overwrite
+        cs.insert::<f64>(&mut world, b, 2.0); // migrate
+        cs.remove::<f64>(&mut world, c); // migrate back
+        cs.remove::<u32>(&mut world, d); // to the empty archetype
+        cs.record_despawn(spawned[1]);
+        cs.insert_sparse::<u64>(&mut world, b, 20); // new sparse entry
+        cs.insert_sparse::<u64>(&mut world, d, 41); // sparse overwrite
+        cs.insert_sparse::<u64>(&mut world, spawned[2], 22); // sparse on a fresh spawn
+        for &e in &spawned[10..110] {
+            cs.insert_sparse::<u64>(&mut world, e, 1); // dense growth past capacity
+        }
+        cs.remove_sparse::<u64>(&mut world, d);
+
+        cs.try_reserve(&mut world).unwrap();
+        exhaust_pool(&world);
+        cs.apply(&mut world).unwrap();
+
+        assert_eq!(world.get::<f64>(spawned[0]), Some(&0.5));
+        assert_eq!(world.get::<i8>(spawned[0]), Some(&-1));
+        assert!(!world.is_alive(spawned[1]));
+        assert_eq!(world.get::<f64>(b), Some(&2.0));
+        assert!(world.get::<f64>(c).is_none());
+        assert!(world.get::<u32>(d).is_none());
+        assert_eq!(world.get::<u64>(b), Some(&20));
+        assert_eq!(world.get::<u64>(spawned[2]), Some(&22));
+        assert!(world.get::<u64>(d).is_none());
+        // a + 299 live spawns hold Owned values; the despawned one was dropped.
+        assert_eq!(std::sync::Arc::strong_count(&token), 1 + 1 + 299);
+    }
+
+    #[test]
+    fn reserved_replay_applies_with_exhausted_pool() {
+        // #294 / A2 for replay: adopt grows generations, the free list (B3)
+        // and the location table to a far index, and a sparse value there
+        // needs a brand-new page; all reserved before the pool is exhausted.
+        let mut world = World::builder()
+            .memory_budget(4 << 20)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+        world.spawn((0u32,));
+        let far = Entity::new(3000, 0);
+        let mut cs = crate::changeset::EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, far, (7u32,)).unwrap();
+        cs.insert_sparse::<u64>(&mut world, far, 70);
+        cs.try_reserve(&mut world).unwrap();
+        exhaust_pool(&world);
+        cs.apply_replay(&mut world).unwrap();
+        assert_eq!(world.get::<u32>(far), Some(&7));
+        assert_eq!(world.get::<u64>(far), Some(&70));
+        assert!(world.entities.generations.len() > 3000);
+    }
+
+    #[test]
+    fn reservation_matches_sequential_growth() {
+        // #294 / A6: reserving the peak up front never ends above the column and
+        // entity-list capacity that spawning one by one reaches.
+        let n = 10_000u32;
+        let mut reserved = World::new();
+        let mut cs = crate::changeset::EnumChangeSet::new();
+        for i in 0..n {
+            let e = reserved.entities.reserve();
+            cs.spawn_bundle(&mut reserved, e, (i, u64::from(i)))
+                .unwrap();
+        }
+        cs.apply(&mut reserved).unwrap();
+        let mut sequential = World::new();
+        for i in 0..n {
+            sequential.spawn((i, u64::from(i)));
+        }
+        let caps = |w: &World| {
+            let arch = w
+                .archetypes
+                .archetypes
+                .iter()
+                .find(|a| a.len() == n as usize)
+                .unwrap();
+            (
+                arch.columns
+                    .iter()
+                    .map(crate::storage::blob_vec::BlobVec::capacity)
+                    .collect::<Vec<_>>(),
+                arch.entities.capacity(),
+            )
+        };
+        // Never more than sequential growth (PoolVec reserves exactly what is
+        // asked when that exceeds doubling, so it can be smaller).
+        let (r_cols, r_entities) = caps(&reserved);
+        let (s_cols, s_entities) = caps(&sequential);
+        assert!(
+            r_cols.iter().zip(&s_cols).all(|(r, s)| r <= s),
+            "{r_cols:?} vs {s_cols:?}"
+        );
+        assert!(r_entities <= s_entities, "{r_entities} vs {s_entities}");
+    }
+
+    #[test]
+    fn optimistic_commit_reports_pool_exhaustion() {
+        // #294 / A3 (in-core half): commit reserves before returning, so a
+        // transaction whose writes cannot fit fails cleanly and applies
+        // nothing. (Tx::spawn allocates its entity eagerly, like World::spawn,
+        // so the growth here comes from migrations that only happen at apply.)
+        use crate::access::Access;
+        use crate::transaction::{Optimistic, Transact, TransactError};
+        let (mut world, n) = exhausted_world(512 << 10, |w, n| w.try_spawn((n,)).is_ok());
+        let entities: Vec<Entity> = world.query::<(Entity,)>().map(|(e,)| e).collect();
+        let strategy = Optimistic::new(&world);
+        let access = Access::of::<(&mut f64,)>(&mut world);
+        let tick = world.current_tick();
+        let result = strategy.transact(&mut world, &access, |tx, world| {
+            for &e in &entities {
+                tx.write::<f64>(world, e, 1.0);
+            }
+        });
+        assert!(matches!(result, Err(TransactError::PoolExhausted(_))));
+        assert_eq!(world.entity_count(), n as usize);
+        assert!(world.query::<(&f64,)>().next().is_none());
+        assert!(world.current_tick() >= tick);
+    }
+
     /// Allocate from every size class until each refuses (test-only hog).
     fn exhaust_pool(world: &World) {
         for size in [1 << 20, 65_536, 16_384, 4096, 1024, 256, 64] {
