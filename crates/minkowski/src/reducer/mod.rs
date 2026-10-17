@@ -68,6 +68,9 @@ pub enum ReducerError {
     /// The transaction strategy was used with a different World than it
     /// was created from.
     WorldMismatch(WorldMismatch),
+    /// The world's pool cannot hold the reducer's writes (from
+    /// [`TransactError::PoolExhausted`]). The world is unchanged.
+    PoolExhausted(crate::pool::PoolExhausted),
 }
 
 impl fmt::Display for ReducerError {
@@ -100,6 +103,7 @@ impl fmt::Display for ReducerError {
                 )
             }
             ReducerError::WorldMismatch(w) => write!(f, "{w}"),
+            ReducerError::PoolExhausted(e) => write!(f, "{e}"),
         }
     }
 }
@@ -109,6 +113,7 @@ impl std::error::Error for ReducerError {
         match self {
             ReducerError::TransactionConflict(c) => Some(c),
             ReducerError::WorldMismatch(w) => Some(w),
+            ReducerError::PoolExhausted(e) => Some(e),
             _ => None,
         }
     }
@@ -119,6 +124,7 @@ impl From<TransactError> for ReducerError {
         match e {
             TransactError::Conflict(c) => ReducerError::TransactionConflict(c),
             TransactError::WorldMismatch(w) => ReducerError::WorldMismatch(w),
+            TransactError::PoolExhausted(e) => ReducerError::PoolExhausted(e),
         }
     }
 }

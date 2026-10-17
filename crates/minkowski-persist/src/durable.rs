@@ -147,7 +147,9 @@ impl<S: Transact> Transact for Durable<S> {
                 Err(TransactError::Conflict(conflict)) => {
                     last_conflict = Some(conflict);
                 }
-                Err(e @ TransactError::WorldMismatch(_)) => return Err(e),
+                Err(e @ (TransactError::WorldMismatch(_) | TransactError::PoolExhausted(_))) => {
+                    return Err(e);
+                }
             }
         }
         Err(TransactError::Conflict(last_conflict.unwrap_or_else(
@@ -227,6 +229,45 @@ mod tests {
             .unwrap();
 
         assert_eq!(durable.wal_seq(), 1);
+    }
+
+    #[test]
+    fn durable_commit_pool_exhausted_writes_no_wal_record() {
+        // #294 / A3: the inner strategy reserves the commit's pool growth
+        // before Durable appends to the WAL, so a transaction that cannot fit
+        // returns PoolExhausted and logs nothing (the WAL never runs ahead of
+        // the world).
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        let mut world = World::builder()
+            .memory_budget(512 << 10)
+            .hugepages(minkowski::HugePages::Off)
+            .build()
+            .unwrap();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
+        let mut entities = Vec::new();
+        while let Ok(e) = world.try_spawn((Pos { x: 0.0, y: 0.0 },)) {
+            entities.push(e);
+        }
+
+        let wal = Wal::create(&wal_path, &codecs, WalConfig::default()).unwrap();
+        let durable = Durable::new(Optimistic::new(&world), wal, codecs);
+        let access = Access::of::<(&mut Health,)>(&mut world);
+        let result = durable.transact(&mut world, &access, |tx, world| {
+            for &e in &entities {
+                tx.write::<Health>(world, e, Health(1)); // migrates every entity
+            }
+        });
+
+        assert!(
+            matches!(result, Err(TransactError::PoolExhausted(_))),
+            "{result:?}"
+        );
+        assert_eq!(durable.wal_seq(), 0, "nothing logged");
+        assert!(world.query::<(&Health,)>().next().is_none());
     }
 
     struct CountingHandler {

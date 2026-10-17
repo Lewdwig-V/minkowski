@@ -81,11 +81,11 @@ With reservation done in `try_commit`, the post-commit `apply(...).expect(...)` 
 | Invariant | Holds by | Tested by (new) |
 |---|---|---|
 | **A1** `apply` returning `ApplyError::PoolExhausted` left the world unchanged (no entity, row, location, sparse entry or tick change) | reservation precedes the tick and every mutation | `apply_pool_exhaustion_leaves_world_unchanged` (spawn / migrate / sparse variants, every size class exhausted) |
-| **A2** after `try_reserve` succeeds, the mutation loop never allocates in the pool | simulation covers every growth site in the table above | debug-build allocation counter on the pool (`used()` unchanged across the loop, except changeset arena pool) |
-| **A3** a transaction never writes a WAL record it cannot apply | `Durable::try_commit` reserves before `append` | `durable_commit_pool_exhausted_writes_no_wal_record` |
+| **A2** after `try_reserve` succeeds, the mutation loop never allocates in the pool | simulation covers every growth site in the table above | `reserved_changeset_applies_with_exhausted_pool`, `reserved_replay_applies_with_exhausted_pool` (reserve, exhaust every size class, then apply; each reservation step is mutation-checked) |
+| **A3** a transaction never writes a WAL record it cannot apply | strategies' `try_commit` reserve; `Durable` calls it before `append` | `durable_commit_pool_exhausted_writes_no_wal_record`, `optimistic_commit_reports_pool_exhaustion` |
 | **A4** overwrites and despawn never allocate (B3 for all component types) | resident scratch | `despawn_droppable_with_exhausted_pool`, `overwrite_droppable_with_exhausted_pool` |
 | **A5** a panicking `Drop` during overwrite or despawn leaves a consistent column (#180) | slot reuse keeps the structural commit before the drop | existing #180 tests, re-run against resident slots |
-| **A6** reservation never needs more pool than sequential apply would have grown | peak-length reservation, doubling identical to `reserve` | `reservation_matches_sequential_growth` (compare `used()` after apply with and without reservation on an unbounded pool) |
+| **A6** reservation never needs more pool than sequential apply would have grown | peak-length reservation; `PoolVec` reserves exactly when that exceeds doubling | `reservation_matches_sequential_growth` (capacity after a reserved apply ≤ one-by-one spawning) |
 
 ### Convention Sheet
 
@@ -114,17 +114,17 @@ With reservation done in `try_commit`, the post-commit `apply(...).expect(...)` 
 
 ## Risks
 
-- **Simulation drift:** a new growth site added to `apply` without a matching simulation entry silently breaks A2. Mitigation: the debug allocation counter (A2) turns any drift into a test failure, and the plan adds a fuzz target, `fuzz_changeset_apply_budget`, that drives random changesets against a small budget.
+- **Simulation drift:** a new growth site added to `apply` without a matching simulation entry silently breaks A2. Mitigation: the reserve-exhaust-apply tests (A2) abort on any unreserved growth, and `fuzz_changeset_budget` drives random changesets against a small budget with a shadow model (run with `-max_len=8192` so batches reach the limit).
 - **Breaking `TransactError`:** downstream exhaustive matches need a new arm. Noted in the CHANGELOG.
 
 ## Implementation Plan
 
 1. ~~Correct the false "despawn never allocates" claims~~ — superseded: step 2 makes the claim true, and the docs record the gap instead.
 2. Resident scratch slot in `BlobVec` (overwrite and extract paths); A4 and A5 tests. **Done (first PR).**
-3. `EnumChangeSet::try_reserve` with simulation; A1, A2 and A6 tests.
-4. `apply` / `apply_replay` call `try_reserve` first; `ApplyError::PoolExhausted`.
-5. `TransactError::PoolExhausted`; reserve in `Optimistic` / `Pessimistic` `try_commit` and before the WAL append in `Durable`; A3 test.
-6. Docs: `memory-management.md`, the `recover_world_with_builder` caveat, CHANGELOG; close #294.
+3. `EnumChangeSet::try_reserve` with simulation; A1, A2 and A6 tests. **Done (second PR).**
+4. `apply` / `apply_replay` call `try_reserve` first; `ApplyError::PoolExhausted`. **Done.**
+5. `TransactError::PoolExhausted` (and `ReducerError::PoolExhausted`); reserve in `Optimistic` / `Pessimistic` `try_commit`, which `Durable` calls before its WAL append; A3 test. **Done.**
+6. Docs: `memory-management.md`, the `recover_world_with_builder` caveat, CHANGELOG; close #294. **Done.**
 7. Gates: fmt and clippy (1.97, 1.99), workspace tests, loom, TSan, Miri on `blob_vec` and `changeset`, the new fuzz target plus `fuzz_world_ops` 60 s, benchmarks against main.
 
 Steps 1–2 can ship as their own PR (they fix a real despawn panic independently); steps 3–6 as a second.

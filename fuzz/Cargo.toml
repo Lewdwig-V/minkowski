@@ -40,3 +40,8 @@ doc = false
 name = "fuzz_pool_columns"
 path = "fuzz_targets/fuzz_pool_columns.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_changeset_budget"
+path = "fuzz_targets/fuzz_changeset_budget.rs"
+doc = false

@@ -315,6 +315,20 @@ impl EntityAllocator {
     /// for B3). On `Ok`, the next `alloc()` does not allocate, and the
     /// returned bound exceeds the index it will return. On `Err` nothing
     /// observable changed (only spare capacity may have grown).
+    /// One past the highest index handed out by `reserve()` (or `alloc()`).
+    pub(crate) fn reserved_bound(&self) -> usize {
+        self.next_reserved.load(Ordering::Relaxed) as usize
+    }
+
+    /// Reserve generation and free-list capacity (B3) for `total` slots, so
+    /// growing to `total` (materialize, alloc, adopt) cannot allocate. On
+    /// Err only spare capacity grew.
+    pub(crate) fn try_reserve_slots(&mut self, total: usize) -> Result<(), PoolExhausted> {
+        self.generations
+            .try_reserve(total.saturating_sub(self.generations.len()))?;
+        self.free_list.try_reserve_total(total)
+    }
+
     pub(crate) fn try_prepare_alloc(&mut self) -> Result<usize, PoolExhausted> {
         let reserved = self.next_reserved.load(Ordering::Relaxed) as usize;
         let mut target = self.generations.len().max(reserved);

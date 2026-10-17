@@ -46,6 +46,11 @@ pub(crate) struct PagedSparseSet {
     pool: Arc<SlabPool>,
 }
 
+/// Index of the sparse page holding `entity`'s slot.
+pub(crate) fn sparse_page_of(entity: Entity) -> usize {
+    entity.index() as usize / PAGE_SIZE
+}
+
 impl PagedSparseSet {
     /// Creates a new empty `PagedSparseSet` for components with the given layout.
     pub fn new(
@@ -172,6 +177,25 @@ impl PagedSparseSet {
 
     /// Make sure page `page_idx` exists, allocating it (all `EMPTY`) from the
     /// pool. On `Err` no page was added. The directory grows on the heap.
+    pub(crate) fn has_page(&self, page_idx: usize) -> bool {
+        self.pages.get(page_idx).is_some_and(Option::is_some)
+    }
+
+    /// Reserve room for `additional` new entries and ensure each page in
+    /// `pages` exists, so that many inserts cannot allocate. On Err only
+    /// spare capacity (or empty pages) was added.
+    pub(crate) fn try_reserve(
+        &mut self,
+        additional: usize,
+        pages: &[usize],
+    ) -> Result<(), PoolExhausted> {
+        for &page in pages {
+            self.try_ensure_page(page)?;
+        }
+        self.dense_entities.try_reserve(additional)?;
+        self.dense_values.try_reserve(additional)
+    }
+
     fn try_ensure_page(&mut self, page_idx: usize) -> Result<(), PoolExhausted> {
         if self.pages.get(page_idx).is_some_and(Option::is_some) {
             return Ok(());
@@ -434,6 +458,34 @@ impl SparseStorage {
 
     /// Raw remove: removes and drops the sparse component. Returns `true`
     /// if the entity had the component.
+    /// Whether `comp_id`'s set already has page `page_idx`.
+    pub(crate) fn has_page(&self, comp_id: ComponentId, page_idx: usize) -> bool {
+        self.storages
+            .get(&comp_id)
+            .is_some_and(|set| set.has_page(page_idx))
+    }
+
+    /// Reserve `additional` new entries and the given pages for `comp_id`.
+    /// A set that does not exist yet is built off to the side and published
+    /// only on success, so Err leaves no empty set behind (only spare
+    /// capacity was added to an existing one).
+    pub(crate) fn try_reserve_raw(
+        &mut self,
+        comp_id: ComponentId,
+        layout: Layout,
+        drop_fn: Option<unsafe fn(*mut u8)>,
+        additional: usize,
+        pages: &[usize],
+    ) -> Result<(), PoolExhausted> {
+        if let Some(set) = self.storages.get_mut(&comp_id) {
+            return set.try_reserve(additional, pages);
+        }
+        let mut set = PagedSparseSet::new(layout, drop_fn, self.pool.clone());
+        set.try_reserve(additional, pages)?;
+        self.storages.insert(comp_id, set);
+        Ok(())
+    }
+
     pub fn remove_raw(&mut self, comp_id: ComponentId, entity: Entity) -> bool {
         match self.storages.get_mut(&comp_id) {
             Some(set) => set.remove(entity),
