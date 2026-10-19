@@ -1,5 +1,27 @@
 # Returning Fully-Free Slab Chunks (#280)
 
+**Status: implemented on branch `claude/slab-chunk-release`, shelved.** The design works at the allocator level:
+- R1–R6 have tests, and each fails with its mechanism removed;
+- the R2 and R3 loom models pass;
+- `add_remove/*` and `simple_insert/*` are within noise.
+
+But it shows **no measurable gain on `World` workloads**. Through the `World` API, pool memory is almost never freed:
+- `despawn` and component removal keep column capacity, and columns never shrink;
+- sparse pages and entity bookkeeping are never freed;
+- the only frees are old buffers released by doubling growth, which are small and spread across shared chunks.
+
+The `pool_fragmentation` scenarios, plus a fill / despawn-all / refill churn, give identical numbers on `main` and the branch:
+
+| Scenario | Result (main = branch) |
+|---|---|
+| small columns | 93.5% |
+| one big column | 56.2% |
+| mixed | 88.4% / 97.2% |
+| uniform | 95.3% |
+| churn, 8 B → 256 B | phase 2 at 96.9% |
+
+Revisit when a feature frees pool memory: column shrink-to-fit, archetype cleanup, or sparse page release.
+
 ## Problem
 
 The bottom frontier carves 64 KiB chunks for one slab class at a time, and a carved chunk then belongs to that class forever (`Frontier::carve_chunk`, `pool.rs:473`; `SlabPoolInner::carve`, `pool.rs:837`). Freed blocks go back onto their class's free list (`slab_deallocate`, `pool.rs:1060`), and nothing ever hands a chunk back to the frontier.
