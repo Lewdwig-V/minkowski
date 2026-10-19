@@ -4134,6 +4134,18 @@ mod tests {
         )
     }
 
+    /// `Err` leaves bookkeeping unchanged, except that the target archetype
+    /// may have been created empty (the fallible-path convention).
+    fn assert_bookkeeping_unchanged(
+        world: &World,
+        before: &(u64, usize, usize, usize, usize, Vec<usize>),
+    ) {
+        let mut after = bookkeeping_snapshot(world);
+        let new_archetypes = after.5.split_off(before.5.len());
+        assert!(new_archetypes.iter().all(|&len| len == 0), "{new_archetypes:?}");
+        assert_eq!(&after, before);
+    }
+
     fn exhausted_world(budget: usize, spawn: impl Fn(&mut World, u32) -> bool) -> (World, u32) {
         let mut world = World::builder()
             .memory_budget(budget)
@@ -4167,7 +4179,7 @@ mod tests {
                 for i in 0..3 {
                     assert!(!spawn(&mut world, n + i));
                 }
-                assert_eq!(bookkeeping_snapshot(&world), before);
+                assert_bookkeeping_unchanged(&world, &before);
                 let mut sum = 0u64;
                 world
                     .query::<(&u32,)>()
@@ -4191,7 +4203,7 @@ mod tests {
                 let before = bookkeeping_snapshot(&world);
                 let value = *world.get::<u32>(e).unwrap();
                 if world.try_insert(e, (1.5f64,)).is_err() {
-                    assert_eq!(bookkeeping_snapshot(&world), before);
+                    assert_bookkeeping_unchanged(&world, &before);
                     assert_eq!(*world.get::<u32>(e).unwrap(), value);
                     assert!(world.get::<f64>(e).is_none());
                     failures += 1;
@@ -4592,21 +4604,25 @@ mod tests {
         // transaction whose writes cannot fit fails cleanly and applies
         // nothing. (Tx::spawn allocates its entity eagerly, like World::spawn,
         // so the growth here comes from migrations that only happen at apply.)
+        // 512 B per migrated entity: several times the whole budget, so no
+        // amount of reclaimed free space can make it fit.
         use crate::access::Access;
         use crate::transaction::{Optimistic, Transact, TransactError};
+        type Big = [u64; 64];
         let (mut world, n) = exhausted_world(512 << 10, |w, n| w.try_spawn((n,)).is_ok());
         let entities: Vec<Entity> = world.query::<(Entity,)>().map(|(e,)| e).collect();
+        assert!(entities.len() * size_of::<Big>() > 2 * (512 << 10));
         let strategy = Optimistic::new(&world);
-        let access = Access::of::<(&mut f64,)>(&mut world);
+        let access = Access::of::<(&mut Big,)>(&mut world);
         let tick = world.current_tick();
         let result = strategy.transact(&mut world, &access, |tx, world| {
             for &e in &entities {
-                tx.write::<f64>(world, e, 1.0);
+                tx.write::<Big>(world, e, [1; 64]);
             }
         });
         assert!(matches!(result, Err(TransactError::PoolExhausted(_))));
         assert_eq!(world.entity_count(), n as usize);
-        assert!(world.query::<(&f64,)>().next().is_none());
+        assert!(world.query::<(&Big,)>().next().is_none());
         assert!(world.current_tick() >= tick);
     }
 

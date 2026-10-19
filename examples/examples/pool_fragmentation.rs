@@ -8,6 +8,11 @@
 //!   - `final`:      pool utilization once every archetype has failed
 //!   - `entities`:   total entities placed
 //!
+//! A churn section fills the pool with one mix of archetypes, despawns
+//! everything, then fills it with another. It shows how much of the budget
+//! the second phase gets back once the first phase's size classes are idle
+//! (fully-free slab chunks return to the shared frontier on exhaustion, #280).
+//!
 //! A final section measures resident memory (RSS) right after `World::new()`
 //! for the default demand-paged pool, which shows how much of the pool the
 //! allocator touches before the application allocates anything. The
@@ -15,7 +20,7 @@
 //!
 //! Run: cargo run -p minkowski-examples --example pool_fragmentation --release
 
-use minkowski::{HugePages, World};
+use minkowski::{Entity, HugePages, World};
 
 const BUDGET: usize = 64 * 1024 * 1024;
 
@@ -112,6 +117,54 @@ fn report(name: &str, o: &Outcome) {
     );
 }
 
+/// Spawn round-robin into `archetypes` until every one has failed once.
+/// Returns the entities placed.
+fn fill(world: &mut World, archetypes: &[usize]) -> u64 {
+    let mut alive = vec![true; archetypes.len()];
+    let mut entities = 0u64;
+    while alive.iter().any(|a| *a) {
+        for (slot, &arch) in archetypes.iter().enumerate() {
+            if alive[slot] {
+                if spawn_into(world, arch) {
+                    entities += 1;
+                } else {
+                    alive[slot] = false;
+                }
+            }
+        }
+    }
+    entities
+}
+
+fn utilization(world: &mut World) -> f64 {
+    world.flush_pool_caches();
+    let s = world.stats();
+    s.pool_used as f64 / s.pool_capacity as f64
+}
+
+/// Phase 1 fills the pool through `first`, everything is despawned, then
+/// phase 2 fills it through `second`.
+fn churn(name: &str, first: &[usize], second: &[usize]) {
+    let mut world = World::builder()
+        .memory_budget(BUDGET)
+        .hugepages(HugePages::Off)
+        .build()
+        .expect("failed to allocate memory pool");
+    let n1 = fill(&mut world, first);
+    let u1 = utilization(&mut world);
+    let all: Vec<Entity> = world.query::<(Entity,)>().map(|(e,)| e).collect();
+    for e in all {
+        world.despawn(e);
+    }
+    let n2 = fill(&mut world, second);
+    let u2 = utilization(&mut world);
+    println!(
+        "{name:<28} phase 1 {:>5.1}% ({n1:>8} ent)   phase 2 {:>5.1}% ({n2:>8} ent)",
+        u1 * 100.0,
+        u2 * 100.0
+    );
+}
+
 /// Resident set size from `/proc/self/status` (`VmRSS`, in kB — independent
 /// of the system page size).
 #[cfg(target_os = "linux")]
@@ -150,6 +203,12 @@ fn main() {
 
     // All 64 archetypes with equal weight.
     report("uniform (64 arch)", &run(&mixed, |_| 1));
+
+    println!("\n--- Churn: fill, despawn all, fill with another mix ---");
+    let tiny: Vec<usize> = (0..16).collect(); // 8 B payloads
+    let wide: Vec<usize> = (48..64).collect(); // 256 B payloads
+    churn("8 B rows, then 256 B rows", &tiny, &wide);
+    churn("256 B rows, then 8 B rows", &wide, &tiny);
 
     // Indicative only: RSS depends on the kernel, THP settings, and the
     // process's own allocations (e.g. the pool's side table).

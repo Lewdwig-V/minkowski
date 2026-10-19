@@ -440,7 +440,9 @@ fn large_units_for(layout: Layout) -> usize {
 ///
 /// Invariants (all hold whenever the lock is released):
 /// - `lo` is a multiple of `CHUNK_SIZE`; `[0, lo)` is carved into slab
-///   chunks and never returns to the frontier.
+///   chunks, except chunks marked in `free_chunks`, which a reclaim released
+///   (#280). The chunk just below `lo` is never marked: releasing it lowers
+///   `lo` instead.
 /// - `hi <= units.len()`; units `[hi, units.len())` form the top region.
 ///   `lo <= hi * LARGE_UNIT` whenever `hi < units.len()`.
 /// - `hi == units.len()` or `units[hi] != UNIT_FREE`: the lowest unit of
@@ -457,9 +459,58 @@ struct Frontier {
     lo: usize,
     hi: usize,
     units: Box<[u32]>,
+    /// Released chunks below `lo`, one bit per chunk (bit `i` covers window
+    /// offsets `[i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)`).
+    free_chunks: Box<[u64]>,
+    /// Number of bits set in `free_chunks`.
+    free_chunk_count: usize,
+    /// Reclaim scratch: free blocks counted per chunk. All zero between
+    /// reclaims.
+    counts: Box<[u16]>,
+    /// `used_bytes` after the last reclaim that released nothing; reclaim is
+    /// skipped until it drops below this (`usize::MAX`: no such reclaim).
+    futile_used: usize,
 }
 
 impl Frontier {
+    fn new(total: usize) -> Self {
+        let n_units = total / LARGE_UNIT;
+        let n_chunks = total / CHUNK_SIZE;
+        Self {
+            lo: 0,
+            hi: n_units,
+            units: vec![UNIT_FREE; n_units].into_boxed_slice(),
+            free_chunks: vec![0; n_chunks.div_ceil(64)].into_boxed_slice(),
+            free_chunk_count: 0,
+            counts: vec![0; n_chunks].into_boxed_slice(),
+            futile_used: usize::MAX,
+        }
+    }
+
+    fn chunk_is_free(&self, chunk: usize) -> bool {
+        self.free_chunks[chunk / 64] & (1 << (chunk % 64)) != 0
+    }
+
+    /// Give a chunk back (#280). Lowers `lo` over every released chunk at
+    /// the top of the bottom region, so large runs can reach that space;
+    /// otherwise the chunk waits in `free_chunks` for the next carve.
+    fn release_chunk(&mut self, chunk: usize) {
+        // assert! not debug_assert!: marking a live or uncarved chunk free
+        // would let two owners carve it.
+        assert!(
+            (chunk + 1) * CHUNK_SIZE <= self.lo && !self.chunk_is_free(chunk),
+            "SlabPool: release of chunk {chunk} which is not carved"
+        );
+        self.free_chunks[chunk / 64] |= 1 << (chunk % 64);
+        self.free_chunk_count += 1;
+        while self.lo > 0 && self.chunk_is_free(self.lo / CHUNK_SIZE - 1) {
+            let top = self.lo / CHUNK_SIZE - 1;
+            self.free_chunks[top / 64] &= !(1 << (top % 64));
+            self.free_chunk_count -= 1;
+            self.lo -= CHUNK_SIZE;
+        }
+    }
+
     /// Upper bound (exclusive, window offset) for the bottom frontier.
     fn bottom_limit(&self, total: usize) -> usize {
         if self.hi == self.units.len() {
@@ -469,8 +520,22 @@ impl Frontier {
         }
     }
 
-    /// Carve one chunk off the bottom frontier. Returns its window offset.
+    /// Carve one chunk: the lowest released chunk if there is one (keeps the
+    /// bottom region dense so `lo` can retreat), else off the bottom
+    /// frontier. Returns its window offset.
     fn carve_chunk(&mut self, total: usize) -> Option<usize> {
+        if self.free_chunk_count > 0 {
+            let (word, bits) = self
+                .free_chunks
+                .iter()
+                .enumerate()
+                .find(|(_, w)| **w != 0)
+                .expect("free_chunk_count > 0 means a bit is set");
+            let chunk = word * 64 + bits.trailing_zeros() as usize;
+            self.free_chunks[word] &= !(1 << (chunk % 64));
+            self.free_chunk_count -= 1;
+            return Some(chunk * CHUNK_SIZE);
+        }
         let start = self.lo;
         if start + CHUNK_SIZE > self.bottom_limit(total) {
             return None;
@@ -693,12 +758,7 @@ impl SlabPoolInner {
 
         // All free lists start empty: blocks are threaded lazily, one chunk
         // at a time, so a demand-paged pool touches no pages up front.
-        let n_units = total / LARGE_UNIT;
-        let frontier = Frontier {
-            lo: 0,
-            hi: n_units,
-            units: vec![UNIT_FREE; n_units].into_boxed_slice(),
-        };
+        let frontier = Frontier::new(total);
 
         Ok(Self {
             _region: region,
@@ -837,6 +897,12 @@ impl SlabPoolInner {
     fn carve(&self, class: usize) -> Option<*mut u8> {
         debug_assert!(class < NUM_SLAB_CLASSES);
         let offset = self.frontier.lock().carve_chunk(self.total)?;
+        Some(self.thread_chunk(class, offset))
+    }
+
+    /// Thread the chunk at window `offset`, just taken from the frontier,
+    /// onto `class`'s free list; returns its first block to the caller.
+    fn thread_chunk(&self, class: usize, offset: usize) -> *mut u8 {
         let block_size = SIZE_CLASSES[class];
         let count = CHUNK_SIZE / block_size;
         // SAFETY: carve_chunk returned [offset, offset + CHUNK_SIZE) inside
@@ -871,7 +937,126 @@ impl SlabPoolInner {
                 );
             }
         }
-        Some(chunk)
+        chunk
+    }
+
+    /// Release every slab chunk whose blocks are all on its class free list
+    /// back to the frontier (#280): steal each list, count its blocks per
+    /// chunk, release the full chunks, re-push the rest. Returns whether
+    /// anything was released.
+    ///
+    /// Runs under the frontier lock (`f`), which serializes reclaims; every
+    /// allocation failure path re-pops after taking that lock, so a pop that
+    /// raced a steal sees the re-pushed blocks (no spurious failure).
+    /// Blocks pushed concurrently land on the emptied list and are left
+    /// alone; blocks in thread caches count as allocated, so their chunks
+    /// are never released.
+    fn reclaim_locked(&self, f: &mut Frontier) -> bool {
+        let used = self.used_bytes.load(Ordering::Relaxed);
+        if used >= f.futile_used {
+            // Nothing was freed globally since a reclaim found nothing.
+            return false;
+        }
+        let mut chains = [std::ptr::null_mut::<u8>(); NUM_SLAB_CLASSES];
+        for (class, chain) in chains.iter_mut().enumerate() {
+            // Steal the whole list: one CAS to empty makes the chain ours.
+            *chain = loop {
+                let head = load_head(&self.heads[class]);
+                if head.is_empty() {
+                    break std::ptr::null_mut();
+                }
+                if cas_head(&self.heads[class], head, head.with_next(std::ptr::null_mut())) {
+                    break self.block_ptr(head.ptr() as u64);
+                }
+                std::hint::spin_loop();
+            };
+            self.for_each_in_chain(*chain, |block| {
+                f.counts[(block as usize - self.base as usize) / CHUNK_SIZE] += 1;
+            });
+        }
+        let mut released = false;
+        for (class, &chain) in chains.iter().enumerate() {
+            let per_chunk = u16::try_from(CHUNK_SIZE / SIZE_CLASSES[class])
+                .expect("at most 1024 blocks per chunk");
+            // Re-link the survivors in place, releasing full chunks.
+            let mut first = std::ptr::null_mut::<u8>();
+            let mut last = std::ptr::null_mut::<u8>();
+            self.for_each_in_chain(chain, |block| {
+                let chunk = (block as usize - self.base as usize) / CHUNK_SIZE;
+                match f.counts[chunk] {
+                    0 => {} // already released
+                    n if n == per_chunk => {
+                        f.counts[chunk] = 0;
+                        f.release_chunk(chunk);
+                        released = true;
+                    }
+                    _ => {
+                        if last.is_null() {
+                            first = block;
+                        } else {
+                            // SAFETY: `last` is a stolen block (owned), a
+                            // slab block of >= 64 bytes, 8-aligned.
+                            unsafe {
+                                (*(last as *const StdAtomicU64))
+                                    .store(block as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        last = block;
+                    }
+                }
+            });
+            if !last.is_null() {
+                // SAFETY: every block in first..=last was stolen (owned) and
+                // is free, so its side table entry is UNALLOCATED.
+                unsafe { self.push_chain(class, first, last) };
+            }
+        }
+        // Survivors' chunks still hold their counts; clear them.
+        f.counts.fill(0);
+        f.futile_used = if released { usize::MAX } else { used };
+        released
+    }
+
+    /// Visit each block of an owned (stolen) free-list chain. The next
+    /// pointer is read before `visit` runs, so `visit` may relink the block.
+    fn for_each_in_chain(&self, mut block: *mut u8, mut visit: impl FnMut(*mut u8)) {
+        while !block.is_null() {
+            // SAFETY: `block` is in an owned chain of slab blocks (>= 64
+            // bytes, 8-aligned), so its first 8 bytes hold the next pointer.
+            let next = unsafe {
+                (*(block as *const StdAtomicU64)).load(std::sync::atomic::Ordering::Acquire)
+            };
+            visit(block);
+            block = if next == 0 {
+                std::ptr::null_mut()
+            } else {
+                self.block_ptr(next)
+            };
+        }
+    }
+
+    /// Slow path for `slab_allocate` once the free list and a fresh carve
+    /// both came up empty: under the frontier lock, re-pop (a racing
+    /// reclaim may have re-pushed blocks), carve, then reclaim and carve
+    /// once more.
+    fn slab_allocate_slow(&self, class: usize) -> Option<*mut u8> {
+        let mut f = self.frontier.lock();
+        if let Some(block) = self.pop_free(class) {
+            return Some(block);
+        }
+        if let Some(offset) = f.carve_chunk(self.total) {
+            drop(f);
+            return Some(self.thread_chunk(class, offset));
+        }
+        if !self.reclaim_locked(&mut f) {
+            return None;
+        }
+        if let Some(block) = self.pop_free(class) {
+            return Some(block);
+        }
+        let offset = f.carve_chunk(self.total)?;
+        drop(f);
+        Some(self.thread_chunk(class, offset))
     }
 
     /// Allocate from a slab class: its free list, then a fresh chunk from
@@ -884,6 +1069,7 @@ impl SlabPoolInner {
         let block = self
             .pop_free(class)
             .or_else(|| self.carve(class))
+            .or_else(|| self.slab_allocate_slow(class))
             .ok_or(PoolExhausted { requested: layout })?;
 
         // SAFETY: block was popped (CAS won) or carved by this thread.
@@ -902,6 +1088,11 @@ impl SlabPoolInner {
         let mut frontier = self.frontier.lock();
         let start = frontier
             .take_run(k)
+            .or_else(|| {
+                self.reclaim_locked(&mut frontier)
+                    .then(|| frontier.take_run(k))
+                    .flatten()
+            })
             .ok_or(PoolExhausted { requested: layout })?;
         // SAFETY: take_run returned units [start, start + k), inside the
         // window and exclusively owned while the run is recorded.
@@ -958,7 +1149,11 @@ impl SlabPoolInner {
         let k_new = large_units_for(new);
         let mut frontier = self.frontier.lock();
         let k_old = frontier.units[start] as usize;
-        let new_start = frontier.grow_run(start, k_new)?;
+        let new_start = match frontier.grow_run(start, k_new) {
+            Some(s) => s,
+            None if self.reclaim_locked(&mut frontier) => frontier.grow_run(start, k_new)?,
+            None => return None,
+        };
         let k_new = k_new.max(k_old);
         // SAFETY: new_start is a unit inside the window.
         let new_block = unsafe { self.base.add(new_start * LARGE_UNIT) };
@@ -1355,7 +1550,12 @@ impl SlabPool {
         // least LARGE_UNIT bytes, and they must return to the shared top
         // frontier promptly so the bottom frontier can reclaim the space.
         if class == LARGE_CLASS {
-            return self.inner.large_allocate(layout);
+            return self.inner.large_allocate(layout).or_else(|_| {
+                // As for slab refills: return this thread's cached blocks so
+                // the reclaim can release their chunks, then retry once.
+                self.flush_own_cache();
+                self.inner.large_allocate(layout)
+            });
         }
 
         #[cfg(not(loom))]
@@ -1389,8 +1589,14 @@ impl SlabPool {
                     return Ok(NonNull::new(ptr).unwrap());
                 }
 
-                // L1 miss: refill from global pool.
-                cache.refill(&self.inner, class, layout)
+                // L1 miss: refill from global pool. If even that fails, this
+                // thread's own cached blocks may be what pins their chunks:
+                // return them and retry once, so the reclaim can release
+                // those chunks (#280). global_allocate never touches TCACHE.
+                cache.refill(&self.inner, class, layout).or_else(|_| {
+                    cache.flush_all(&self.inner);
+                    self.inner.global_allocate(layout)
+                })
             })
         }
 
@@ -1513,6 +1719,23 @@ impl SlabPool {
 
     pub(crate) fn used(&self) -> usize {
         self.inner.used_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Return the calling thread's cached blocks for this pool, without
+    /// bumping the epoch for other threads. No-op under loom (no cache).
+    #[allow(clippy::unused_self)]
+    fn flush_own_cache(&self) {
+        #[cfg(not(loom))]
+        TCACHE.with(|cell| {
+            // SAFETY: same no-reentrancy argument as allocate/deallocate:
+            // not called from inside a TCACHE.with closure.
+            let slot = unsafe { &mut *cell.get() };
+            if let Some(cache) = slot.as_mut()
+                && cache.is_for(&self.inner)
+            {
+                cache.flush_all(&self.inner);
+            }
+        });
     }
 
     pub(crate) fn flush_caches(&self) {
@@ -1970,11 +2193,10 @@ mod tests {
     }
 
     #[test]
-    fn slab_pool_one_class_can_exhaust_the_frontier() {
-        // No per-class reservation: class 1 alone takes every chunk, and
-        // class 0 then fails — even after class 1 frees everything, because
-        // carved chunks stay with their class (see the design doc's
-        // "return fully-free chunks" follow-up).
+    fn class_shift_reclaims_free_chunks() {
+        // #280 / R5: class 1 fills the pool and frees everything; class 0
+        // then gets the whole budget back (on main, chunks stayed with
+        // class 1 and class 0 failed).
         let pool = SlabPool::new(512 * 1024, HugePages::Off, false).unwrap();
         let layout_small = Layout::from_size_align(32, 8).unwrap(); // class 0
         let layout_medium = Layout::from_size_align(200, 8).unwrap(); // class 1
@@ -1984,17 +2206,181 @@ mod tests {
             ptrs1.push(ptr);
         }
         assert_eq!(ptrs1.len(), 512 * 1024 / SIZE_CLASSES[1]);
-        assert!(pool.allocate(layout_small).is_err());
-
         for ptr in ptrs1 {
             unsafe { pool.deallocate(ptr, layout_medium) };
         }
+        let mut ptrs0 = Vec::new();
+        while let Ok(ptr) = pool.allocate(layout_small) {
+            ptrs0.push(ptr);
+        }
+        assert_eq!(ptrs0.len(), 512 * 1024 / SIZE_CLASSES[0]);
+        for ptr in ptrs0 {
+            unsafe { pool.deallocate(ptr, layout_small) };
+        }
         pool.flush_current_thread_cache();
         assert_eq!(pool.used(), 0);
-        assert!(
-            pool.allocate(layout_small).is_err(),
-            "chunks stay with class 1"
-        );
+    }
+
+    /// Window chunk index of a pool block.
+    fn chunk_of(pool: &SlabPool, ptr: NonNull<u8>) -> usize {
+        (ptr.as_ptr() as usize - pool.inner.base as usize) / CHUNK_SIZE
+    }
+
+    #[test]
+    fn reclaim_skips_chunk_with_live_block() {
+        // #280 / R1: one live block keeps its chunk with its class.
+        let pool = SlabPool::new(512 * 1024, HugePages::Off, false).unwrap();
+        let medium = Layout::from_size_align(200, 8).unwrap();
+        let small = Layout::from_size_align(32, 8).unwrap();
+        let mut ptrs = Vec::new();
+        while let Ok(ptr) = pool.allocate(medium) {
+            ptrs.push(ptr);
+        }
+        let live = ptrs.pop().unwrap();
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, medium) };
+        }
+        let mut got = Vec::new();
+        while let Ok(ptr) = pool.allocate(small) {
+            assert_ne!(chunk_of(&pool, ptr), chunk_of(&pool, live));
+            got.push(ptr);
+        }
+        assert_eq!(got.len(), 7 * CHUNK_SIZE / SIZE_CLASSES[0]);
+        // The live block's chunk still serves its class.
+        let again = pool.allocate(medium).unwrap();
+        assert_eq!(chunk_of(&pool, again), chunk_of(&pool, live));
+    }
+
+    #[test]
+    fn reclaim_skips_chunk_with_cached_block() {
+        // #280 / R1: a block in another live thread's cache counts as
+        // allocated, so its chunk is not released.
+        let pool = Arc::new(SlabPool::new(512 * 1024, HugePages::Off, false).unwrap());
+        let medium = Layout::from_size_align(200, 8).unwrap();
+        let small = Layout::from_size_align(32, 8).unwrap();
+        let mut ptrs = Vec::new();
+        while let Ok(ptr) = pool.allocate(medium) {
+            ptrs.push(ptr);
+        }
+        let cached = ptrs.pop().unwrap();
+        let cached_chunk = chunk_of(&pool, cached);
+        let (freed_tx, freed_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let pool = Arc::clone(&pool);
+            let addr = cached.as_ptr() as usize;
+            std::thread::spawn(move || {
+                let ptr = NonNull::new(addr as *mut u8).unwrap();
+                // SAFETY: ownership of the block moved to this thread.
+                unsafe { pool.deallocate(ptr, medium) }; // lands in this thread's cache
+                freed_tx.send(()).unwrap();
+                exit_rx.recv().unwrap();
+            })
+        };
+        freed_rx.recv().unwrap();
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, medium) };
+        }
+        let mut got = Vec::new();
+        while let Ok(ptr) = pool.allocate(small) {
+            assert_ne!(chunk_of(&pool, ptr), cached_chunk);
+            got.push(ptr);
+        }
+        assert_eq!(got.len(), 7 * CHUNK_SIZE / SIZE_CLASSES[0]);
+        exit_tx.send(()).unwrap();
+        worker.join().unwrap();
+        for ptr in got {
+            unsafe { pool.deallocate(ptr, small) };
+        }
+        pool.flush_current_thread_cache();
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn reclaim_preserves_free_blocks() {
+        // #280 / R2: a reclaim releases only full chunks and re-pushes every
+        // other free block exactly once.
+        let pool = SlabPool::new(512 * 1024, HugePages::Off, false).unwrap();
+        let medium = Layout::from_size_align(200, 8).unwrap();
+        let small = Layout::from_size_align(32, 8).unwrap();
+        let mut ptrs = Vec::new();
+        while let Ok(ptr) = pool.allocate(medium) {
+            ptrs.push(ptr);
+        }
+        let first_chunk = chunk_of(&pool, ptrs[0]);
+        let (whole, rest): (Vec<_>, Vec<_>) =
+            ptrs.into_iter().partition(|&p| chunk_of(&pool, p) == first_chunk);
+        let (freed_rest, kept): (Vec<_>, Vec<_>) =
+            rest.into_iter().enumerate().partition(|(i, _)| i % 2 == 0);
+        let freed: std::collections::HashSet<usize> =
+            freed_rest.iter().map(|(_, p)| p.as_ptr() as usize).collect();
+        for p in whole.iter().chain(freed_rest.iter().map(|(_, p)| p)) {
+            unsafe { pool.deallocate(*p, medium) };
+        }
+        pool.flush_current_thread_cache();
+        // Triggers a reclaim: only `first_chunk` is fully free.
+        let s = pool.allocate(small).unwrap();
+        assert_eq!(chunk_of(&pool, s), first_chunk);
+        let mut again = std::collections::HashSet::new();
+        while let Ok(ptr) = pool.allocate(medium) {
+            assert!(again.insert(ptr.as_ptr() as usize), "duplicate block");
+        }
+        assert_eq!(again, freed, "every half-freed block comes back exactly once");
+        drop(kept);
+    }
+
+    #[test]
+    fn reclaim_lets_large_run_reuse_slab_space() {
+        // #280 / R6: slab chunks freed at the top of the bottom region lower
+        // `lo`, so a large run can take the whole budget afterwards.
+        let pool = SlabPool::new(4 * LARGE_UNIT, HugePages::Off, false).unwrap();
+        let slab = Layout::from_size_align(4096, 8).unwrap();
+        let mut ptrs = Vec::new();
+        while let Ok(ptr) = pool.allocate(slab) {
+            ptrs.push(ptr);
+        }
+        assert_eq!(ptrs.len(), 4 * LARGE_UNIT / 4096);
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, slab) };
+        }
+        let large = Layout::from_size_align(4 * LARGE_UNIT, 8).unwrap();
+        let run = pool.allocate(large).expect("the whole window is free again");
+        unsafe { pool.deallocate(run, large) };
+        assert_eq!(pool.inner.frontier_bytes(), (0, 0));
+    }
+
+    #[test]
+    fn release_chunk_lowers_lo_and_carve_prefers_released() {
+        // #280 / R4.
+        let mut f = Frontier::new(8 * CHUNK_SIZE);
+        let total = 8 * CHUNK_SIZE;
+        for i in 0..4 {
+            assert_eq!(f.carve_chunk(total), Some(i * CHUNK_SIZE));
+        }
+        f.release_chunk(1);
+        assert_eq!((f.lo, f.free_chunk_count), (4 * CHUNK_SIZE, 1));
+        f.release_chunk(2);
+        assert_eq!((f.lo, f.free_chunk_count), (4 * CHUNK_SIZE, 2));
+        // Releasing the top chunk lowers lo over 3, 2 and 1.
+        f.release_chunk(3);
+        assert_eq!((f.lo, f.free_chunk_count), (CHUNK_SIZE, 0));
+        f.release_chunk(0);
+        assert_eq!((f.lo, f.free_chunk_count), (0, 0));
+        for i in 0..3 {
+            assert_eq!(f.carve_chunk(total), Some(i * CHUNK_SIZE));
+        }
+        f.release_chunk(1);
+        // The released interior chunk is carved before lo advances.
+        assert_eq!(f.carve_chunk(total), Some(CHUNK_SIZE));
+        assert_eq!(f.carve_chunk(total), Some(3 * CHUNK_SIZE));
+    }
+
+    #[test]
+    #[should_panic(expected = "which is not carved")]
+    fn release_chunk_rejects_uncarved_chunk() {
+        let mut f = Frontier::new(8 * CHUNK_SIZE);
+        f.carve_chunk(8 * CHUNK_SIZE);
+        f.release_chunk(1);
     }
 
     #[test]
@@ -2955,6 +3341,59 @@ mod loom_tests {
     use super::*;
     use loom::thread;
     use std::alloc::Layout;
+
+    /// Run a reclaim the way the failure paths do: under the frontier lock.
+    fn reclaim(pool: &SlabPool) -> bool {
+        let mut f = pool.inner.frontier.lock();
+        pool.inner.reclaim_locked(&mut f)
+    }
+
+    #[test]
+    fn loom_pop_during_reclaim_never_spuriously_fails() {
+        // #280 / R3: one chunk, one live block, the rest free. A reclaim
+        // steals the list (releasing nothing) while another thread pops; the
+        // pop must still succeed via the slow-path re-pop under the lock.
+        loom::model(|| {
+            let pool = Arc::new(SlabPool::new(CHUNK_SIZE, HugePages::Off, false).unwrap());
+            let layout = Layout::from_size_align(4096, 8).unwrap();
+            let live = pool.allocate(layout).unwrap().as_ptr() as usize;
+
+            let p1 = pool.clone();
+            let t1 = thread::spawn(move || p1.allocate(layout).map(|p| p.as_ptr() as usize));
+            let p2 = pool.clone();
+            let t2 = thread::spawn(move || reclaim(&p2));
+
+            let got = t1.join().unwrap().expect("a free block existed throughout");
+            assert!(!t2.join().unwrap(), "a live block pins the only chunk");
+            assert_ne!(got, live);
+        });
+    }
+
+    #[test]
+    fn loom_reclaim_races_push() {
+        // #280 / R2: a free racing a reclaim is never lost. Once every block
+        // is free, the chunk can be released whole, which needs all 16.
+        loom::model(|| {
+            let pool = Arc::new(SlabPool::new(CHUNK_SIZE, HugePages::Off, false).unwrap());
+            let layout = Layout::from_size_align(4096, 8).unwrap();
+            let a = pool.allocate(layout).unwrap().as_ptr() as usize;
+            let b = pool.allocate(layout).unwrap();
+
+            let p1 = pool.clone();
+            let t1 = thread::spawn(move || unsafe {
+                p1.deallocate(NonNull::new(a as *mut u8).unwrap(), layout);
+            });
+            let p2 = pool.clone();
+            let t2 = thread::spawn(move || reclaim(&p2));
+            t1.join().unwrap();
+            assert!(!t2.join().unwrap(), "b is still live");
+
+            unsafe { pool.deallocate(b, layout) };
+            assert_eq!(pool.used(), 0);
+            let whole = Layout::from_size_align(CHUNK_SIZE, 8).unwrap();
+            assert!(pool.allocate(whole).is_ok(), "all 16 blocks came back");
+        });
+    }
 
     #[test]
     fn loom_concurrent_pop_no_duplicates() {
