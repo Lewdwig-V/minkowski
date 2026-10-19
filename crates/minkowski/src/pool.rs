@@ -13,6 +13,8 @@ use std::sync::atomic::AtomicU64 as StdAtomicU64;
 use std::sync::atomic::AtomicU64;
 
 use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
+#[cfg(not(loom))]
+use std::sync::Weak;
 
 /// Error returned when the memory pool is exhausted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1147,18 +1149,49 @@ impl TCacheBin {
     }
 }
 
+/// A thread's cache of free slab blocks for one pool. Not built under loom,
+/// which bypasses the cache (and whose `Arc` has no `Weak`).
+///
+/// Holds its pool weakly: only owners of live allocations keep a pool
+/// mapped, so a dropped world releases its window even while idle threads
+/// still cache its blocks (#293). Cached blocks are dereferenced only
+/// through a strong reference, either the caller's `&SlabPoolInner` (whose
+/// address matches `pool`) or a successful `upgrade`; a cache whose pool is
+/// gone discards its bins without touching them.
+#[cfg(not(loom))]
 struct TCache {
     bins: [TCacheBin; NUM_SLAB_CLASSES],
     local_epoch: u64,
-    pool: Arc<SlabPoolInner>,
+    pool: Weak<SlabPoolInner>,
 }
 
+#[cfg(not(loom))]
 impl TCache {
-    fn new(pool: Arc<SlabPoolInner>) -> Self {
+    fn new(pool: &Arc<SlabPoolInner>) -> Self {
         Self {
             bins: [const { TCacheBin::empty() }; NUM_SLAB_CLASSES],
             local_epoch: pool.epoch.load(std::sync::atomic::Ordering::Acquire),
-            pool,
+            pool: Arc::downgrade(pool),
+        }
+    }
+
+    /// Whether this cache belongs to `pool`. Address identity cannot
+    /// mistake a new pool for a dead one: the `Weak` keeps the dead pool's
+    /// `ArcInner` allocated, so its address is not reused.
+    #[inline]
+    fn is_for(&self, pool: &Arc<SlabPoolInner>) -> bool {
+        std::ptr::eq(self.pool.as_ptr(), Arc::as_ptr(pool))
+    }
+
+    /// Return every cached block to the pool if it is still alive; if it is
+    /// gone, forget them (its window is unmapped and nothing owns them).
+    fn release(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            self.flush_all(&pool);
+        } else {
+            for bin in &mut self.bins {
+                bin.count = 0;
+            }
         }
     }
 
@@ -1168,21 +1201,27 @@ impl TCache {
     ///
     /// Extras never carve: a thread cache must not pull fresh memory off the
     /// shared frontier that other classes (or large runs) could have used.
-    fn refill(&mut self, class: usize, layout: Layout) -> Result<NonNull<u8>, PoolExhausted> {
+    ///
+    /// `pool` is the cache's own pool (`is_for(pool)`).
+    fn refill(
+        &mut self,
+        pool: &SlabPoolInner,
+        class: usize,
+        layout: Layout,
+    ) -> Result<NonNull<u8>, PoolExhausted> {
         debug_assert!(class < NUM_SLAB_CLASSES);
-        let first = self.pool.global_allocate(layout)?;
+        let first = pool.global_allocate(layout)?;
         for _ in 1..TCACHE_REFILL {
-            let Some(block) = self.pool.pop_free(class) else {
+            let Some(block) = pool.pop_free(class) else {
                 break;
             };
             // CAS in pop_free won — this thread owns the block.
             // SAFETY: pop_free's CAS won, so this thread owns `block`.
             unsafe {
-                self.pool
-                    .record_allocation(block, class, SIZE_CLASSES[class]);
+                pool.record_allocation(block, class, SIZE_CLASSES[class]);
             }
             if self.bins[class].is_full() {
-                self.spill(class);
+                self.spill(pool, class);
             }
             self.bins[class].push(block);
         }
@@ -1190,12 +1229,13 @@ impl TCache {
     }
 
     /// Flush all bins back to the global pool (epoch mismatch).
-    fn flush_all(&mut self) {
+    /// `pool` is the cache's own pool.
+    fn flush_all(&mut self, pool: &SlabPoolInner) {
         for class in 0..NUM_SLAB_CLASSES {
             let bin = &mut self.bins[class];
             for i in 0..bin.count {
                 unsafe {
-                    self.pool.global_deallocate_to_class(class, bin.stack[i]);
+                    pool.global_deallocate_to_class(class, bin.stack[i]);
                 }
             }
             bin.count = 0;
@@ -1203,12 +1243,13 @@ impl TCache {
     }
 
     /// Spill TCACHE_SPILL blocks from the bottom of a bin back to global.
-    fn spill(&mut self, class: usize) {
+    /// `pool` is the cache's own pool.
+    fn spill(&mut self, pool: &SlabPoolInner, class: usize) {
         let bin = &mut self.bins[class];
         let spill_count = TCACHE_SPILL.min(bin.count);
         for i in 0..spill_count {
             unsafe {
-                self.pool.global_deallocate_to_class(class, bin.stack[i]);
+                pool.global_deallocate_to_class(class, bin.stack[i]);
             }
         }
         // Compact: shift remaining blocks down.
@@ -1220,19 +1261,13 @@ impl TCache {
     }
 }
 
+#[cfg(not(loom))]
 impl Drop for TCache {
     fn drop(&mut self) {
-        for class in 0..NUM_SLAB_CLASSES {
-            let bin = &mut self.bins[class];
-            for i in 0..bin.count {
-                // SAFETY: blocks are valid pointers from global_allocate.
-                // global_deallocate_to_class does NOT touch TCACHE (no reentrancy).
-                unsafe {
-                    self.pool.global_deallocate_to_class(class, bin.stack[i]);
-                }
-            }
-            bin.count = 0;
-        }
+        // global_deallocate_to_class does NOT touch TCACHE, and neither does
+        // SlabPoolInner::drop if the upgraded Arc turns out to be the last
+        // (munmap plus a system-heap free): no reentrancy.
+        self.release();
     }
 }
 
@@ -1291,8 +1326,10 @@ impl SlabPool {
         TCACHE.with(|cell| {
             // SAFETY: same no-reentrancy argument as allocate/deallocate.
             let cache = unsafe { &mut *cell.get() };
-            if let Some(c) = cache.as_mut() {
-                c.flush_all();
+            if let Some(c) = cache.as_mut()
+                && c.is_for(&self.inner)
+            {
+                c.flush_all(&self.inner);
             }
         });
     }
@@ -1331,18 +1368,19 @@ impl SlabPool {
 
                 // If the TCache belongs to a different pool, flush and replace.
                 if let Some(existing) = slot.as_ref()
-                    && !Arc::ptr_eq(&existing.pool, &self.inner)
+                    && !existing.is_for(&self.inner)
                 {
-                    // Drop the old TCache (flushes blocks to old pool).
+                    // Drop the old TCache (flushes blocks to the old pool if
+                    // it is still alive, discards them otherwise).
                     *slot = None;
                 }
 
-                let cache = slot.get_or_insert_with(|| TCache::new(Arc::clone(&self.inner)));
+                let cache = slot.get_or_insert_with(|| TCache::new(&self.inner));
 
                 // Epoch check — lazy flush if stale.
                 let global_epoch = self.inner.epoch.load(std::sync::atomic::Ordering::Acquire);
                 if cache.local_epoch != global_epoch {
-                    cache.flush_all();
+                    cache.flush_all(&self.inner);
                     cache.local_epoch = global_epoch;
                 }
 
@@ -1352,7 +1390,7 @@ impl SlabPool {
                 }
 
                 // L1 miss: refill from global pool.
-                cache.refill(class, layout)
+                cache.refill(&self.inner, class, layout)
             })
         }
 
@@ -1386,24 +1424,24 @@ impl SlabPool {
 
                 // If the TCache belongs to a different pool, flush and replace.
                 if let Some(existing) = slot.as_ref()
-                    && !Arc::ptr_eq(&existing.pool, &self.inner)
+                    && !existing.is_for(&self.inner)
                 {
                     *slot = None;
                 }
 
-                let cache = slot.get_or_insert_with(|| TCache::new(Arc::clone(&self.inner)));
+                let cache = slot.get_or_insert_with(|| TCache::new(&self.inner));
 
                 // Epoch check — lazy flush if stale (must check on BOTH
                 // allocate and deallocate per spec).
                 let global_epoch = self.inner.epoch.load(std::sync::atomic::Ordering::Acquire);
                 if cache.local_epoch != global_epoch {
-                    cache.flush_all();
+                    cache.flush_all(&self.inner);
                     cache.local_epoch = global_epoch;
                 }
 
                 // Spill BEFORE pushing if full to avoid overflow.
                 if cache.bins[actual_class].is_full() {
-                    cache.spill(actual_class);
+                    cache.spill(&self.inner, actual_class);
                 }
 
                 cache.bins[actual_class].push(ptr.as_ptr());
@@ -1483,9 +1521,9 @@ impl SlabPool {
         TCACHE.with(|cell| {
             let slot = unsafe { &mut *cell.get() };
             if let Some(cache) = slot.as_mut()
-                && Arc::ptr_eq(&cache.pool, &self.inner)
+                && cache.is_for(&self.inner)
             {
-                cache.flush_all();
+                cache.flush_all(&self.inner);
             }
         });
         // Lazily flush other threads via epoch bump.
@@ -1682,6 +1720,86 @@ mod tests {
 
         // After threads exit, their TCache destructors flush all blocks.
         assert_eq!(pool.used(), 0);
+    }
+
+    // ── #293: thread caches hold their pool weakly ──────────────────
+
+    /// W2: an idle thread that still caches a pool's blocks does not keep
+    /// the pool mapped once the last allocation owner drops it. W3 (exit
+    /// path): that thread's cache then exits without touching the window.
+    #[cfg(not(loom))]
+    #[test]
+    fn dropped_pool_released_while_other_thread_caches_blocks() {
+        let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap());
+        let inner = Arc::downgrade(&pool.inner);
+        let layout = Layout::from_size_align(64, 64).unwrap();
+        let (cached_tx, cached_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+
+        let worker = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let ptr = pool.allocate(layout).unwrap();
+                // SAFETY: ptr was just allocated from this pool.
+                unsafe { pool.deallocate(ptr, layout) };
+                // The freed block now sits in this thread's cache.
+                drop(pool);
+                cached_tx.send(()).unwrap();
+                // Stay alive and idle until the pool has been dropped.
+                exit_rx.recv().unwrap();
+            })
+        };
+
+        cached_rx.recv().unwrap();
+        drop(pool);
+        assert!(
+            inner.upgrade().is_none(),
+            "an idle thread's cache kept the dropped pool alive"
+        );
+        exit_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    /// W3 (replacement path): a cache whose pool is gone is discarded,
+    /// not flushed into the unmapped window, when the thread next uses
+    /// another pool. Miri reports any write into the freed region.
+    #[cfg(not(loom))]
+    #[test]
+    fn cache_replacement_after_pool_drop_discards_cache() {
+        let layout = Layout::from_size_align(64, 64).unwrap();
+        let first = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
+        let first_inner = Arc::downgrade(&first.inner);
+        let ptr = first.allocate(layout).unwrap();
+        // SAFETY: ptr was just allocated from `first`.
+        unsafe { first.deallocate(ptr, layout) };
+        drop(first);
+        assert!(first_inner.upgrade().is_none());
+
+        let second = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
+        let ptr = second.allocate(layout).unwrap();
+        // SAFETY: ptr was just allocated from `second`.
+        unsafe { second.deallocate(ptr, layout) };
+        second.flush_current_thread_cache();
+        assert_eq!(second.used(), 0);
+    }
+
+    /// W4: replacing a cache whose pool is still alive returns its blocks.
+    #[cfg(not(loom))]
+    #[test]
+    fn cache_replacement_flushes_to_live_pool() {
+        let layout = Layout::from_size_align(64, 64).unwrap();
+        let first = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
+        let ptr = first.allocate(layout).unwrap();
+        // SAFETY: ptr was just allocated from `first`.
+        unsafe { first.deallocate(ptr, layout) };
+        assert!(first.used() > 0, "the freed block should be cached");
+
+        let second = SlabPool::new(4 * 1024 * 1024, HugePages::Off, false).unwrap();
+        let ptr = second.allocate(layout).unwrap();
+        assert_eq!(first.used(), 0, "replacing the cache must flush it");
+        // SAFETY: ptr was just allocated from `second`.
+        unsafe { second.deallocate(ptr, layout) };
+        second.flush_current_thread_cache();
     }
 
     #[test]
