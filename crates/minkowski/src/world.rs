@@ -4189,10 +4189,19 @@ mod tests {
         // budgets migrate every entity; sweep until several fail at
         // different points.
         let mut failures = 0;
-        // Under Miri, fewer budgets: filling a pool spawn by spawn is slow there.
-        let max_chunks = if cfg!(miri) { 9 } else { 16 };
-        for budget in (4..=max_chunks).map(|chunks| chunks * 65_536) {
-            let (mut world, n) = exhausted_world(budget, |w, n| w.try_spawn((n,)).is_ok());
+        // Under Miri, 64 B-wide rows and fewer budgets: filling a pool with
+        // 4 B rows takes 10-20K spawns per budget, too slow there. Wide rows
+        // fill these budgets with 512 entities each, and both fail.
+        let (chunks, min_failures) = if cfg!(miri) { (5..=6, 2) } else { (4..=16, 3) };
+        for budget in chunks.map(|chunks| chunks * 65_536) {
+            let (mut world, n) = exhausted_world(budget, |w, n| {
+                if cfg!(miri) {
+                    w.try_spawn((n, [0u8; 64]))
+                } else {
+                    w.try_spawn((n,))
+                }
+                .is_ok()
+            });
             let entities: Vec<Entity> = world.query::<(Entity,)>().map(|(e,)| e).collect();
             assert_eq!(entities.len(), n as usize);
             for &e in &entities {
@@ -4213,7 +4222,7 @@ mod tests {
             assert_eq!(sum, (0..u64::from(n)).sum::<u64>());
         }
         assert!(
-            failures >= 3,
+            failures >= min_failures,
             "only {failures} budgets ran out during inserts"
         );
     }
@@ -4561,7 +4570,7 @@ mod tests {
     fn reservation_matches_sequential_growth() {
         // #294 / A6: reserving the peak up front never ends above the column and
         // entity-list capacity that spawning one by one reaches.
-        let n = if cfg!(miri) { 1_000u32 } else { 10_000 };
+        let n = if cfg!(miri) { 300u32 } else { 10_000 };
         let mut reserved = World::new();
         let mut cs = crate::changeset::EnumChangeSet::new();
         for i in 0..n {
