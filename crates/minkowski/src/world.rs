@@ -4153,7 +4153,13 @@ mod tests {
         // Vary budget and row width so exhaustion lands on different
         // preflight steps (column, entity list, generations, free list,
         // entity_locations).
-        for budget in [256 << 10, 320 << 10, 384 << 10, 512 << 10, 1 << 20] {
+        // Under Miri, two budgets: filling a pool spawn by spawn is slow there.
+        let budgets: &[usize] = if cfg!(miri) {
+            &[256 << 10, 320 << 10]
+        } else {
+            &[256 << 10, 320 << 10, 384 << 10, 512 << 10, 1 << 20]
+        };
+        for &budget in budgets {
             for wide in [false, true] {
                 let spawn = |w: &mut World, n: u32| {
                     if wide {
@@ -4183,7 +4189,9 @@ mod tests {
         // budgets migrate every entity; sweep until several fail at
         // different points.
         let mut failures = 0;
-        for budget in (4..=16).map(|chunks| chunks * 65_536) {
+        // Under Miri, fewer budgets: filling a pool spawn by spawn is slow there.
+        let max_chunks = if cfg!(miri) { 9 } else { 16 };
+        for budget in (4..=max_chunks).map(|chunks| chunks * 65_536) {
             let (mut world, n) = exhausted_world(budget, |w, n| w.try_spawn((n,)).is_ok());
             let entities: Vec<Entity> = world.query::<(Entity,)>().map(|(e,)| e).collect();
             assert_eq!(entities.len(), n as usize);
@@ -4402,8 +4410,11 @@ mod tests {
                 .hugepages(HugePages::Off)
                 .build()
                 .unwrap();
-            let placed: Vec<Entity> = (0..1000u32).map(|i| world.spawn((i,))).collect();
-            let unplaced: Vec<Entity> = (0..1000).map(|_| world.alloc_entity()).collect();
+            // The pool is exhausted before apply, so any growth fails; Miri
+            // needs only a few entities to show it.
+            let n: u32 = if cfg!(miri) { 100 } else { 1000 };
+            let placed: Vec<Entity> = (0..n).map(|i| world.spawn((i,))).collect();
+            let unplaced: Vec<Entity> = (0..n).map(|_| world.alloc_entity()).collect();
             let cs = build(&mut world, &placed, &unplaced);
             exhaust_pool(&world);
             let archetypes = world.archetypes.archetypes.len();
@@ -4418,7 +4429,7 @@ mod tests {
             world
                 .query::<(&u32,)>()
                 .for_each(|(v,)| sum += u64::from(*v));
-            assert_eq!(sum, (0..1000u64).sum::<u64>(), "{name}: values intact");
+            assert_eq!(sum, (0..u64::from(n)).sum::<u64>(), "{name}: values intact");
             assert!(world.query::<(&f64,)>().next().is_none(), "{name}");
             assert!(unplaced.iter().all(|&e| !world.is_placed(e)), "{name}");
         }
@@ -4439,7 +4450,10 @@ mod tests {
             let placed: Vec<Entity> = (0..100u32).map(|i| world.spawn((i,))).collect();
             let dead = world.spawn((0u32,));
             world.despawn(dead);
-            let unplaced: Vec<Entity> = (0..2000).map(|_| world.alloc_entity()).collect();
+            // The pool is exhausted before apply, so reserving even one of
+            // these spawns would fail; Miri uses a few, natively ~1 MiB.
+            let spawns = if cfg!(miri) { 20 } else { 2000 };
+            let unplaced: Vec<Entity> = (0..spawns).map(|_| world.alloc_entity()).collect();
 
             let mut cs = EnumChangeSet::new();
             if with_prefix {
@@ -4447,7 +4461,7 @@ mod tests {
             }
             cs.insert::<f64>(&mut world, dead, 1.0); // DeadEntity at apply
             for &e in &unplaced {
-                cs.spawn_bundle(&mut world, e, ([0u64; 64],)).unwrap(); // ~1 MiB, unreachable
+                cs.spawn_bundle(&mut world, e, ([0u64; 64],)).unwrap(); // unreachable
             }
             exhaust_pool(&world);
             let err = cs.apply(&mut world).unwrap_err();
@@ -4547,7 +4561,7 @@ mod tests {
     fn reservation_matches_sequential_growth() {
         // #294 / A6: reserving the peak up front never ends above the column and
         // entity-list capacity that spawning one by one reaches.
-        let n = 10_000u32;
+        let n = if cfg!(miri) { 1_000u32 } else { 10_000 };
         let mut reserved = World::new();
         let mut cs = crate::changeset::EnumChangeSet::new();
         for i in 0..n {

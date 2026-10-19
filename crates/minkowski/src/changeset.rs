@@ -2427,7 +2427,8 @@ mod tests {
         // 10K overwrites on the same (archetype, component) should be batched
         // and all values must be correct after apply.
         let mut world = World::new();
-        let entities: Vec<Entity> = (0..10_000)
+        let n = if cfg!(miri) { 1_000 } else { 10_000 };
+        let entities: Vec<Entity> = (0..n)
             .map(|i| {
                 world.spawn((Pos {
                     x: i as f32,

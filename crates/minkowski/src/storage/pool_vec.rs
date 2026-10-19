@@ -268,12 +268,13 @@ mod tests {
     fn grows_past_one_mebibyte_through_pool_grow() {
         let p = pool(8 << 20);
         let mut v = PoolVec::new(Arc::clone(&p));
-        let n = (2 << 20) / 8 + 1; // > 2 MiB of u64
+        // 256 B elements keep the push count low enough for Miri.
+        let n = (2 << 20) / 256 + 1; // > 2 MiB
         for i in 0..n as u64 {
-            v.push(i);
+            v.push([i; 32]);
         }
-        assert!(v.iter().enumerate().all(|(i, &x)| x == i as u64));
-        assert!(p.used() >= n * 8);
+        assert!(v.iter().enumerate().all(|(i, x)| *x == [i as u64; 32]));
+        assert!(p.used() >= n * 256);
         drop(v);
         p.flush_caches();
         assert_eq!(p.used(), 0, "drop returns the buffer");
