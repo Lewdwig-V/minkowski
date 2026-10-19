@@ -256,8 +256,8 @@ addressed by the chunk-return follow-up instead.
 - Return fully-free slab chunks to the bottom frontier (alternative 4): the
   real fix for capacity stranded in one class after a workload shift
   (`slab_pool_one_class_can_exhaust_the_frontier` pins today's behavior).
-- With prefault on, the up-to-1 MiB of mapping slack around the window is
-  also faulted in. Pre-fault only the window, or `munmap` the slack.
+- ~~With prefault on, the up-to-1 MiB of mapping slack around the window is
+  also faulted in.~~ Done (#281): only the window is pre-faulted.
 - Expose `lo` / `hi` in `WorldStats` so operators can see how close the
   frontiers are.
 - Optionally `madvise(MADV_DONTNEED)` large runs freed in demand-paged pools.

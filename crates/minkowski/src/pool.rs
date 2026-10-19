@@ -119,39 +119,38 @@ pub(crate) fn try_mlockall() -> bool {
 
 /// Memory region backed by an anonymous mmap with optional hugepage support.
 ///
-/// Uses `memmap2` for cross-platform mmap. Pages are demand-paged by the OS;
-/// the first access to each page triggers a soft fault.
+/// Uses `memmap2` for cross-platform mmap. The mapping itself is never
+/// pre-faulted: the pool maps a little more than its budget to find an
+/// aligned window, and only that window is pre-faulted, by
+/// [`prefault_window`] (#281).
 struct MmapRegion {
     mmap: memmap2::MmapMut,
+    /// Backed by 2 MiB hugepages (`HugePages::Try` succeeded, or `Require`).
+    huge: bool,
 }
 
 impl MmapRegion {
-    /// Create the mmap region.
+    /// Create the mmap region, demand-paged.
     ///
-    /// When `prefault` is true, pages are pre-faulted into physical RAM
-    /// via a three-step fallback chain (MAP_POPULATE → mlock → manual
-    /// touch). When false, pages are demand-paged by the OS — the first
-    /// access to each page triggers a soft fault.
+    /// With `HugePages::Try` / `Require`, maps 2 MiB hugepages first. A
+    /// private hugetlb mapping reserves its pages at mmap time, so a pool
+    /// the system cannot back fails here; `Try` then falls back to regular
+    /// pages.
     ///
     /// Miri only supports `mmap` with `MAP_PRIVATE|MAP_ANONYMOUS` — no
-    /// `MAP_POPULATE`, `MAP_HUGETLB`, `mlock`, or `write_volatile` page
-    /// touch. Under `cfg(miri)` we use plain `map_anon()` and skip
-    /// pre-faulting entirely (there's no real VM subsystem to fault into).
+    /// `MAP_HUGETLB`. Under `cfg(miri)` we use plain `map_anon()`.
     #[cfg(not(miri))]
-    fn new(size: usize, hugepages: HugePages, prefault: bool) -> Result<Self, PoolExhausted> {
+    fn new(size: usize, hugepages: HugePages) -> Result<Self, PoolExhausted> {
         use memmap2::MmapOptions;
         let layout = Layout::from_size_align(size, 1).expect("valid layout");
 
-        // Try hugepages first if requested.
         if matches!(hugepages, HugePages::Try | HugePages::Require) {
-            let result = MmapOptions::new()
+            match MmapOptions::new()
                 .len(size)
-                .populate() // MAP_POPULATE — pre-fault with hugepages
                 .huge(Some(21)) // 2 MiB hugepages (2^21)
-                .map_anon();
-
-            match result {
-                Ok(mmap) => return Ok(Self { mmap }),
+                .map_anon()
+            {
+                Ok(mmap) => return Ok(Self { mmap, huge: true }),
                 Err(_) if matches!(hugepages, HugePages::Try) => {
                     // Fall through to regular pages.
                 }
@@ -159,80 +158,67 @@ impl MmapRegion {
             }
         }
 
-        if !prefault {
-            // Lazy mode: demand-paged, no pre-faulting. The OS backs
-            // pages with physical RAM on first access (soft fault).
-            let mmap = MmapOptions::new()
-                .len(size)
-                .map_anon()
-                .map_err(|_| PoolExhausted { requested: layout })?;
-            return Ok(Self { mmap });
-        }
-
-        // Regular pages — pre-fault via fallback chain.
-        // Pre-faulting is NOT optional for bounded pools: we must know
-        // at startup whether the system can back the mapping with
-        // physical RAM. Three paths, tried in order of preference:
-        //
-        // 1. MAP_POPULATE — kernel pre-faults pages at mmap time.
-        //    Fastest on native Linux, but can hang/fail on WSL2 or
-        //    older kernels.
-        //
-        // 2. mlock — forces pages into physical RAM after mmap.
-        //    Works on most systems but requires sufficient RLIMIT_MEMLOCK.
-        //
-        // 3. Manual touch sweep — write one byte per page (4 KB stride).
-        //    Always works, no privilege requirements. Slowest but guaranteed.
-
-        // Try MAP_POPULATE first. Track whether it succeeded so we can
-        // skip redundant mlock/touch when it did.
-        let (mut mmap, populated) = MmapOptions::new()
+        let mmap = MmapOptions::new()
             .len(size)
-            .populate()
             .map_anon()
-            .map(|m| (m, true))
-            .or_else(|_| MmapOptions::new().len(size).map_anon().map(|m| (m, false)))
             .map_err(|_| PoolExhausted { requested: layout })?;
-
-        // If MAP_POPULATE succeeded, pages are already faulted. If it
-        // didn't (we fell through to the plain mmap), we need to force
-        // pages into RAM via mlock or manual touch.
-        if !populated && mmap.lock().is_err() {
-            // mlock failed (insufficient RLIMIT_MEMLOCK or platform
-            // doesn't support it) — manual touch sweep as final fallback.
-            Self::prefault_manual(&mut mmap);
-        }
-
-        Ok(Self { mmap })
+        Ok(Self { mmap, huge: false })
     }
 
     /// Miri-compatible path: plain `MAP_PRIVATE|MAP_ANONYMOUS` only.
     #[cfg(miri)]
-    fn new(size: usize, _hugepages: HugePages, _prefault: bool) -> Result<Self, PoolExhausted> {
+    fn new(size: usize, _hugepages: HugePages) -> Result<Self, PoolExhausted> {
         use memmap2::MmapOptions;
         let layout = Layout::from_size_align(size, 1).expect("valid layout");
         let mmap = MmapOptions::new()
             .len(size)
             .map_anon()
             .map_err(|_| PoolExhausted { requested: layout })?;
-        Ok(Self { mmap })
-    }
-
-    /// Write one byte per page to force the kernel to back the mapping
-    /// with physical memory. This is the last-resort pre-fault path.
-    #[cfg(not(miri))]
-    fn prefault_manual(mmap: &mut memmap2::MmapMut) {
-        const PAGE_SIZE: usize = 4096;
-        let ptr = mmap.as_mut_ptr();
-        let len = mmap.len();
-        for offset in (0..len).step_by(PAGE_SIZE) {
-            // Safety: offset < len, and len == mmap size.
-            unsafe { ptr.add(offset).write_volatile(0) };
-        }
+        Ok(Self { mmap, huge: false })
     }
 
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.mmap.as_mut_ptr()
+    }
+}
+
+/// Fault `[start, start + len)` into physical RAM, leaving the rest of the
+/// mapping untouched.
+///
+/// Pre-faulting is NOT optional for bounded pools: we must know at startup
+/// whether the system can back the window with physical RAM. Three paths,
+/// tried in order of preference:
+///
+/// 1. `madvise(MADV_POPULATE_WRITE)` (Linux 5.14+): one syscall, like
+///    `MAP_POPULATE` but limited to the range.
+/// 2. `mlock` on the range: forces its pages into RAM (and keeps them
+///    there); needs sufficient `RLIMIT_MEMLOCK`.
+/// 3. Manual touch sweep: write one byte per page. Always works, no
+///    privilege requirements. Slowest but guaranteed.
+///
+/// No pre-faulting under Miri: there is no real VM subsystem to fault into.
+///
+/// # Safety
+/// `[start, start + len)` lies inside one live, writable mapping, `start`
+/// is aligned to `page`, and nothing else accesses the range concurrently.
+#[cfg(not(miri))]
+unsafe fn prefault_window(start: *mut u8, len: usize, page: usize) {
+    debug_assert!((start as usize).is_multiple_of(page));
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: caller contract; madvise only faults pages in.
+        let r = unsafe { libc::madvise(start.cast(), len, libc::MADV_POPULATE_WRITE) };
+        if r == 0 {
+            return;
+        }
+    }
+    // SAFETY: caller contract; mlock only faults and pins pages.
+    if unsafe { libc::mlock(start.cast_const().cast(), len) } == 0 {
+        return;
+    }
+    for offset in (0..len).step_by(page) {
+        // SAFETY: offset < len, inside the range (caller contract).
+        unsafe { start.add(offset).write_volatile(0) };
     }
 }
 
@@ -672,7 +658,7 @@ impl SlabPoolInner {
         } else {
             oversize.next_multiple_of(HUGE_PAGE_SIZE)
         };
-        let mut region = MmapRegion::new(oversize, hugepages, prefault)?;
+        let mut region = MmapRegion::new(oversize, hugepages)?;
 
         // Cache the window pointer now. After this point we never
         // re-borrow the MmapMut — calling `as_ptr()` would create a
@@ -684,6 +670,44 @@ impl SlabPoolInner {
         // bytes, so [raw + pad, raw + pad + budget) is inside the mapping.
         let base = unsafe { raw.add(pad) };
         let total = budget;
+
+        // Pre-fault the window only, never the alignment slack around it
+        // (#281). Hugepage pools are always pre-faulted, as before.
+        #[cfg(not(miri))]
+        if prefault || region.huge {
+            let page = if region.huge { HUGE_PAGE_SIZE } else { 4096 };
+            // With transparent hugepages set to `always`, faulting the window
+            // could map a 2 MiB THP that spans into the slack. Opt the slack
+            // out (best effort; it only splits the VMA).
+            #[cfg(target_os = "linux")]
+            if !region.huge {
+                let window_end = total.next_multiple_of(page) + pad;
+                // SAFETY: both ranges are page-aligned and inside the
+                // mapping; MADV_NOHUGEPAGE changes no contents.
+                unsafe {
+                    if pad > 0 {
+                        libc::madvise(raw.cast(), pad, libc::MADV_NOHUGEPAGE);
+                    }
+                    if oversize > window_end {
+                        libc::madvise(
+                            raw.add(window_end).cast(),
+                            oversize - window_end,
+                            libc::MADV_NOHUGEPAGE,
+                        );
+                    }
+                }
+            }
+            // SAFETY: base is page-aligned (WINDOW_ALIGN-aligned, and a
+            // hugepage mapping is 2 MiB-aligned, so pad == 0 there), and
+            // [base, base + total.next_multiple_of(page)) stays inside the
+            // mapping: regular pages round up by < 4096 <= the remaining
+            // slack (pad is a multiple of 4096 below WINDOW_ALIGN), and a
+            // hugepage mapping is a multiple of 2 MiB with pad == 0. Nothing
+            // else can reach the window yet.
+            unsafe { prefault_window(base, total.next_multiple_of(page), page) };
+        }
+        #[cfg(miri)]
+        let _ = prefault;
 
         // Allocate side table as raw pointer (see struct doc for rationale).
         // Box::into_raw transfers ownership; Drop reconstructs via Box::from_raw.
@@ -1720,6 +1744,45 @@ mod tests {
 
         // After threads exit, their TCache destructors flush all blocks.
         assert_eq!(pool.used(), 0);
+    }
+
+    /// #281: a pre-faulted pool faults in its window, never the alignment
+    /// slack mapped around it.
+    #[cfg(all(target_os = "linux", not(miri), not(loom)))]
+    #[test]
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "reads the mapping bounds of the keep-alive `_region` field"
+    )]
+    fn prefault_touches_only_the_window() {
+        fn resident(start: usize, len: usize) -> usize {
+            if len == 0 {
+                return 0;
+            }
+            let page = 4096;
+            let aligned = start - start % page;
+            let len = start + len - aligned;
+            let mut vec = vec![0u8; len.div_ceil(page)];
+            // SAFETY: the range lies inside a live mapping (the pool's).
+            let r = unsafe { libc::mincore(aligned as *mut _, len, vec.as_mut_ptr()) };
+            assert_eq!(r, 0, "mincore failed");
+            vec.iter().filter(|&&b| b & 1 != 0).count() * page
+        }
+        let budget = 8 * LARGE_UNIT + 12_345;
+        let pool = SlabPool::new(budget, HugePages::Off, true).unwrap();
+        let map_start = pool.inner._region.mmap.as_ptr() as usize;
+        let map_len = pool.inner._region.mmap.len();
+        let base = pool.inner.base as usize;
+        let window_end = base + budget.next_multiple_of(4096);
+        let head = resident(map_start, base - map_start);
+        let tail = resident(window_end, map_start + map_len - window_end);
+        let window = resident(base, budget);
+        assert_eq!(
+            window,
+            budget.next_multiple_of(4096),
+            "window is pre-faulted"
+        );
+        assert_eq!(head + tail, 0, "slack around the window is not");
     }
 
     // ── #293: thread caches hold their pool weakly ──────────────────
