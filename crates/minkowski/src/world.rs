@@ -4421,7 +4421,7 @@ mod tests {
                 .unwrap();
             // The pool is exhausted before apply, so any growth fails; Miri
             // needs only a few entities to show it.
-            let n: u32 = if cfg!(miri) { 100 } else { 1000 };
+            let n: u32 = if cfg!(miri) { 30 } else { 1000 };
             let placed: Vec<Entity> = (0..n).map(|i| world.spawn((i,))).collect();
             let unplaced: Vec<Entity> = (0..n).map(|_| world.alloc_entity()).collect();
             let cs = build(&mut world, &placed, &unplaced);

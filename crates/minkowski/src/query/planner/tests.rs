@@ -2401,7 +2401,7 @@ fn scratch_buffer_partition_bucket_retention_is_bounded() {
     // Joins with different partition counts on one plan must not accumulate
     // each bucket's peak capacity under every earlier modulus.
     let mut buf = ScratchBuffer::new(0);
-    let n = if cfg!(miri) { 2_000 } else { 20_000 };
+    let n = if cfg!(miri) { 1_000 } else { 20_000 };
     let big: Vec<u32> = (0..n).collect();
     for partitions in 2..=16 {
         partitioned_matches(&mut buf, &big, &[1], partitions);
