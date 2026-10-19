@@ -6,9 +6,12 @@ use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
 use crate::sync::Arc;
 
-use crate::pool::{SlabPool, shared_scratch_pool};
+use crate::pool::{PoolExhausted, SlabPool, shared_scratch_pool};
+use crate::storage::archetype::ArchetypeId;
+use crate::storage::sparse::sparse_page_of;
 use crate::tick::Tick;
 use crate::world::{EntityLocation, World, get_pair_mut};
+use std::collections::HashMap;
 
 /// Error returned by [`EnumChangeSet::apply`] when a mutation targets
 /// an invalid entity.
@@ -38,6 +41,9 @@ pub enum ApplyError {
     /// The variant is `#[non_exhaustive]` so it can only be constructed by
     /// the engine, which guarantees `source` is never itself a
     /// `PartialApply`.
+    /// The world's pool cannot hold this changeset's growth. Reported
+    /// before any mutation is applied: the world is unchanged.
+    PoolExhausted(PoolExhausted),
     #[non_exhaustive]
     PartialApply {
         /// Position of the failing mutation in the changeset's sequential
@@ -54,6 +60,7 @@ impl std::fmt::Display for ApplyError {
             Self::DeadEntity(e) => write!(f, "entity {e:?} is not alive"),
             Self::Unplaced(e) => write!(f, "entity {e:?} is alive but not placed in an archetype"),
             Self::AlreadyPlaced(e) => write!(f, "entity {e:?} is already placed"),
+            Self::PoolExhausted(e) => write!(f, "changeset does not fit the world's pool: {e}"),
             Self::PartialApply {
                 failed_index,
                 source,
@@ -68,6 +75,7 @@ impl std::error::Error for ApplyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PartialApply { source, .. } => Some(&**source),
+            Self::PoolExhausted(e) => Some(e),
             Self::DeadEntity(_) | Self::Unplaced(_) | Self::AlreadyPlaced(_) => None,
         }
     }
@@ -792,6 +800,11 @@ impl EnumChangeSet {
     }
 
     fn apply_inner(mut self, world: &mut World, adopt_entities: bool) -> Result<(), ApplyError> {
+        // Reserve all pool growth before the tick and every mutation, so pool
+        // exhaustion leaves the world unchanged (A1) and the loop below never
+        // allocates in the pool (A2).
+        self.try_reserve_inner(world, adopt_entities)
+            .map_err(ApplyError::PoolExhausted)?;
         let tick = world.next_tick();
 
         let result = self.apply_mutations(world, tick, adopt_entities);
@@ -1060,6 +1073,288 @@ impl EnumChangeSet {
         // Flush any remaining batch.
         flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
 
+        Ok(())
+    }
+}
+
+/// Simulated sparse-set growth for one component during [`EnumChangeSet::try_reserve`].
+struct SparseSim {
+    layout: Layout,
+    /// Entities whose presence the simulation has decided (true = present).
+    presence: HashMap<Entity, bool>,
+    len: isize,
+    peak: isize,
+    new_pages: Vec<usize>,
+}
+
+impl EnumChangeSet {
+    /// Reserve every pool slot [`apply`](Self::apply) will need for this
+    /// changeset, so a later `apply` on the same world cannot run out of pool
+    /// (and returns no [`ApplyError::PoolExhausted`]) as long as the world is
+    /// not mutated in between. On `Err` the world is observably unchanged.
+    ///
+    /// `apply` reserves on its own; call this first when something must
+    /// happen between the decision and the apply that cannot be undone, such
+    /// as writing the changeset to a WAL (`Durable` does) or committing a
+    /// custom [`Transact`](crate::Transact) strategy.
+    pub fn try_reserve(&self, world: &mut World) -> Result<(), PoolExhausted> {
+        self.try_reserve_inner(world, false)
+    }
+
+    /// Reserve every pool slot [`apply`](Self::apply) will need for this
+    /// changeset (design: `docs/plans/fallible-changeset-apply.md`, part 2).
+    ///
+    /// Walks the mutations in order without touching data, tracking each
+    /// archetype's simulated row count (columns never shrink mid-apply, so
+    /// reserving the peak up front needs no more pool than sequential growth
+    /// would), each touched entity's simulated location, entity bookkeeping
+    /// and sparse growth. Overwrites need nothing: they use resident scratch.
+    ///
+    /// On `Err` only spare capacity grew (and empty archetypes may have been
+    /// created, as `try_spawn` does), so the world is observably unchanged.
+    /// The simulation stops at the first mutation apply would reject (dead,
+    /// unplaced or already-placed entity, or a refused replay adopt), so it
+    /// never reserves work apply cannot reach, and a changeset with an invalid
+    /// mutation still reports `DeadEntity` / `Unplaced` / `PartialApply`
+    /// rather than `PoolExhausted` caused by unreachable growth.
+    pub(crate) fn try_reserve_inner(
+        &self,
+        world: &mut World,
+        adopt: bool,
+    ) -> Result<(), PoolExhausted> {
+        if self.mutations.is_empty() {
+            return Ok(()); // fast-lane batches only overwrite
+        }
+        // (current delta, peak delta) per archetype index.
+        let mut arch_growth: HashMap<usize, (isize, isize)> = HashMap::new();
+        // Simulated location of entities spawned, despawned or migrated so far.
+        let mut moved: HashMap<Entity, Option<ArchetypeId>> = HashMap::new();
+        let mut sparse: HashMap<ComponentId, SparseSim> = HashMap::new();
+        let mut max_index: Option<usize> = None;
+
+        fn bump(growth: &mut HashMap<usize, (isize, isize)>, arch: usize, by: isize) {
+            let entry = growth.entry(arch).or_insert((0, 0));
+            entry.0 += by;
+            entry.1 = entry.1.max(entry.0);
+        }
+        // Where `entity` lives at this point of the simulated sequence.
+        // Entities spawned earlier in this changeset are not yet alive in the
+        // world (reserved indices materialize during apply), so the
+        // simulation's own map wins.
+        fn locate(
+            world: &World,
+            moved: &HashMap<Entity, Option<ArchetypeId>>,
+            entity: Entity,
+        ) -> Option<ArchetypeId> {
+            if let Some(&loc) = moved.get(&entity) {
+                return loc;
+            }
+            if !world.is_alive(entity) {
+                return None;
+            }
+            world
+                .entity_locations
+                .get(entity.index() as usize)
+                .copied()
+                .flatten()
+                .map(EntityLocation::archetype_id)
+        }
+
+        // Liveness as apply sees it at this point: spawned in this changeset
+        // counts as alive (unplaced is fine for sparse), despawned as dead.
+        fn alive(
+            world: &World,
+            moved: &HashMap<Entity, Option<ArchetypeId>>,
+            entity: Entity,
+        ) -> bool {
+            match moved.get(&entity) {
+                Some(loc) => loc.is_some(),
+                None => world.is_alive(entity),
+            }
+        }
+        // Replay: slots claimed by earlier spawns in this changeset.
+        let mut adopted: HashMap<usize, u32> = HashMap::new();
+
+        for mutation in &self.mutations {
+            match mutation {
+                Mutation::Spawn { entity, components } => {
+                    if locate(world, &moved, *entity).is_some() {
+                        break; // AlreadyPlaced: apply stops here
+                    }
+                    if adopt {
+                        let index = entity.index() as usize;
+                        let claimed = adopted.get(&index).copied();
+                        if claimed.is_some_and(|g| g != entity.generation())
+                            || (claimed.is_none() && !world.entities.would_adopt(*entity))
+                        {
+                            break; // adopt fails (DeadEntity): apply stops here
+                        }
+                        adopted.insert(index, entity.generation());
+                    }
+                    let mut ids: Vec<ComponentId> =
+                        components.iter().map(|&(id, _, _)| id).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    let arch = world
+                        .archetypes
+                        .get_or_create(&ids, &world.components, &world.pool);
+                    bump(&mut arch_growth, arch.0, 1);
+                    moved.insert(*entity, Some(arch));
+                    let index = entity.index() as usize;
+                    max_index = Some(max_index.map_or(index, |m| m.max(index)));
+                }
+                Mutation::Despawn { entity } => {
+                    // Dead or unplaced: despawn returns false, apply stops.
+                    let Some(arch) = locate(world, &moved, *entity) else {
+                        break;
+                    };
+                    bump(&mut arch_growth, arch.0, -1);
+                    moved.insert(*entity, None);
+                }
+                Mutation::Insert {
+                    entity,
+                    component_id,
+                    ..
+                } => {
+                    let Some(src) = locate(world, &moved, *entity) else {
+                        break; // DeadEntity / Unplaced: apply stops here
+                    };
+                    let src_arch = &world.archetypes.archetypes[src.0];
+                    if src_arch.component_ids.contains(*component_id) {
+                        continue; // overwrite: resident scratch, no growth
+                    }
+                    let mut ids = src_arch.sorted_ids.clone();
+                    ids.push(*component_id);
+                    ids.sort_unstable();
+                    let target =
+                        world
+                            .archetypes
+                            .get_or_create(&ids, &world.components, &world.pool);
+                    bump(&mut arch_growth, src.0, -1);
+                    bump(&mut arch_growth, target.0, 1);
+                    moved.insert(*entity, Some(target));
+                }
+                Mutation::Remove {
+                    entity,
+                    component_id,
+                } => {
+                    let Some(src) = locate(world, &moved, *entity) else {
+                        break; // DeadEntity / Unplaced: apply stops here
+                    };
+                    let src_arch = &world.archetypes.archetypes[src.0];
+                    if !src_arch.component_ids.contains(*component_id) {
+                        continue;
+                    }
+                    let ids: Vec<ComponentId> = src_arch
+                        .sorted_ids
+                        .iter()
+                        .copied()
+                        .filter(|&id| id != *component_id)
+                        .collect();
+                    let target =
+                        world
+                            .archetypes
+                            .get_or_create(&ids, &world.components, &world.pool);
+                    bump(&mut arch_growth, src.0, -1);
+                    bump(&mut arch_growth, target.0, 1);
+                    moved.insert(*entity, Some(target));
+                }
+                Mutation::SparseInsert {
+                    entity,
+                    component_id,
+                    layout,
+                    ..
+                } => {
+                    if !alive(world, &moved, *entity) {
+                        break; // DeadEntity: apply stops here
+                    }
+                    let sim = sparse.entry(*component_id).or_insert_with(|| SparseSim {
+                        layout: *layout,
+                        presence: HashMap::new(),
+                        len: 0,
+                        peak: 0,
+                        new_pages: Vec::new(),
+                    });
+                    let present = *sim
+                        .presence
+                        .entry(*entity)
+                        .or_insert_with(|| world.sparse.contains(*component_id, *entity));
+                    if !present {
+                        sim.presence.insert(*entity, true);
+                        sim.len += 1;
+                        sim.peak = sim.peak.max(sim.len);
+                        let page = sparse_page_of(*entity);
+                        if !world.sparse.has_page(*component_id, page)
+                            && !sim.new_pages.contains(&page)
+                        {
+                            sim.new_pages.push(page);
+                        }
+                    }
+                }
+                Mutation::SparseRemove {
+                    entity,
+                    component_id,
+                } => {
+                    if !alive(world, &moved, *entity) {
+                        break; // DeadEntity: apply stops here
+                    }
+                    if let Some(sim) = sparse.get_mut(component_id) {
+                        let present = *sim
+                            .presence
+                            .entry(*entity)
+                            .or_insert_with(|| world.sparse.contains(*component_id, *entity));
+                        if present {
+                            sim.presence.insert(*entity, false);
+                            sim.len -= 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Archetype rows: every column and the entity list, up to the peak.
+        for (&arch, &(_, peak)) in &arch_growth {
+            if peak <= 0 {
+                continue;
+            }
+            let additional = peak as usize;
+            let archetype = &mut world.archetypes.archetypes[arch];
+            for col in &mut archetype.columns {
+                col.try_reserve(additional)?;
+            }
+            archetype.entities.try_reserve(additional)?;
+        }
+
+        // Entity bookkeeping: materialize_reserved and (on replay) adopt grow
+        // generations and the free list (B3) to cover every index, and spawns
+        // grow the location table to the highest spawned index.
+        let mut slots = world
+            .entities
+            .generations
+            .len()
+            .max(world.entities.reserved_bound());
+        if let Some(index) = max_index {
+            slots = slots.max(index + 1);
+        }
+        world.entities.try_reserve_slots(slots)?;
+        world
+            .entity_locations
+            .try_reserve(slots.saturating_sub(world.entity_locations.len()))?;
+
+        // Sparse sets: peak new entries plus any new pages.
+        for (&comp_id, sim) in &sparse {
+            if sim.peak <= 0 && sim.new_pages.is_empty() {
+                continue;
+            }
+            let drop_fn = world.components.info(comp_id).drop_fn;
+            world.sparse.try_reserve_raw(
+                comp_id,
+                sim.layout,
+                drop_fn,
+                sim.peak.max(0) as usize,
+                &sim.new_pages,
+            )?;
+        }
         Ok(())
     }
 }

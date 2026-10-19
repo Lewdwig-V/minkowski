@@ -65,6 +65,7 @@ use crate::changeset::EnumChangeSet;
 use crate::component::Component;
 use crate::entity::Entity;
 use crate::lock_table::{ColumnLockSet, ColumnLockTable};
+use crate::pool::PoolExhausted;
 use crate::query::fetch::{ReadOnlyWorldQuery, WorldQuery};
 use crate::query::iter::QueryIter;
 use crate::world::{World, WorldId};
@@ -162,6 +163,10 @@ pub enum TransactError {
     Conflict(Conflict),
     /// The strategy was used with a different World than it was created from.
     WorldMismatch(WorldMismatch),
+    /// The world's pool cannot hold the transaction's writes. Detected at
+    /// commit, before anything is applied or logged: the world is unchanged
+    /// and the transaction's buffered values are dropped. Not retried.
+    PoolExhausted(PoolExhausted),
 }
 
 impl std::fmt::Display for TransactError {
@@ -169,6 +174,7 @@ impl std::fmt::Display for TransactError {
         match self {
             TransactError::Conflict(c) => write!(f, "{c}"),
             TransactError::WorldMismatch(w) => write!(f, "{w}"),
+            TransactError::PoolExhausted(e) => write!(f, "{e}"),
         }
     }
 }
@@ -178,6 +184,7 @@ impl std::error::Error for TransactError {
         match self {
             TransactError::Conflict(c) => Some(c),
             TransactError::WorldMismatch(w) => Some(w),
+            TransactError::PoolExhausted(e) => Some(e),
         }
     }
 }
@@ -747,7 +754,9 @@ pub trait Transact {
                     last_conflict = Some(conflict);
                     drop(tx);
                 }
-                Err(e @ TransactError::WorldMismatch(_)) => return Err(e),
+                Err(e @ (TransactError::WorldMismatch(_) | TransactError::PoolExhausted(_))) => {
+                    return Err(e);
+                }
             }
         }
         Err(TransactError::Conflict(last_conflict.unwrap_or_else(
@@ -823,7 +832,13 @@ impl Transact for Optimistic {
             }
             .into());
         }
-        Ok(tx.take_changeset())
+        let changeset = tx.take_changeset();
+        // Reserve before returning: the caller (and Durable's WAL append)
+        // treats Ok as "will apply", so the pool must already hold it.
+        changeset
+            .try_reserve(world)
+            .map_err(TransactError::PoolExhausted)?;
+        Ok(changeset)
     }
 
     fn max_retries(&self) -> usize {
@@ -863,7 +878,9 @@ impl Transact for Pessimistic {
                     drop(tx);
                     backoff(attempt);
                 }
-                Err(e @ TransactError::WorldMismatch(_)) => return Err(e),
+                Err(e @ (TransactError::WorldMismatch(_) | TransactError::PoolExhausted(_))) => {
+                    return Err(e);
+                }
             }
         }
         Err(TransactError::Conflict(last_conflict.unwrap_or_else(
@@ -909,6 +926,10 @@ impl Transact for Pessimistic {
         if let Some(locks) = locks {
             let changeset = tx.take_changeset();
             self.lock_table.lock().release(locks);
+            // Reserve before returning (see Optimistic::try_commit).
+            changeset
+                .try_reserve(world)
+                .map_err(TransactError::PoolExhausted)?;
             Ok(changeset)
         } else {
             Err(Conflict {
