@@ -8,7 +8,7 @@
 #
 # Exclusions (defined in .config/nextest.toml [profile.default-miri]):
 #   - par_for_each: rayon thread pool unsupported by Miri (covered by TSan)
-#   - concurrent/contention pool tests: too slow under Miri (covered by TSan + Loom)
+#   - the four slowest multi-threaded pool tests: too slow under Miri (covered by TSan + Loom)
 
 set -euo pipefail
 
