@@ -103,7 +103,15 @@ The WAL and snapshots are properly integrated, not bolted on separately:
 
 ## Stage 2.5: SlabPool as the Only Allocator
 
-**Status: Complete.** The goal as framed was "all *component storage* is slab-backed, not all storage." `BlobVec` requires a `SharedPool` at construction, archetype column creation routes through it, sparse `dense_values` is also a pool-backed `BlobVec`, and `default_pool()` is `SlabPool` — so every component byte lives on the slab. What remains on the general-purpose allocator is indexing and bookkeeping (`PagedSparseSet::pages` directory, `EntityAllocator` generation/free Vecs, component-registry `HashMap`, `DirtyPageTracker` bitsets, scratch buffers) — metadata never read as component data. Stage 3's note about a "separate I/O path" holds and is compatible: LSM reads pages *through* the slab, not around it.
+**Status: Complete, and since extended.** The goal as framed was "all *component storage* is slab-backed". `BlobVec` takes an `Arc<SlabPool>` at construction, archetype columns and sparse `dense_values` are pool-backed `BlobVec`s, and every `World` carries a `SlabPool` (`World::new()` uses a 256 MiB demand-paged default). Later work moved more into the pool:
+
+- **Everything that scales with entity count:** generations, the free list, the location table, archetype entity lists, sparse dense entity lists (#286), and sparse pages (#292).
+- **Fallible growth:** `try_spawn`, `try_insert`, `try_insert_sparse`, `import_page`, changeset apply and transaction commit return `PoolExhausted` with the world unchanged (#286, #291, #294). Plain `spawn` / `insert` still abort on exhaustion.
+- **Release on drop:** a dropped world releases its mapping immediately (#293).
+
+What remains on the system heap scales with archetype count, indexes or query results, not with entities: the sparse page directory, the component registry, `DirtyPageTracker` bitsets, query planner scratch, user indexes, and changeset mutation records. See [`docs/memory-management.md`](docs/memory-management.md#what-the-budget-covers). Stage 3's note about a "separate I/O path" holds and is compatible: LSM reads pages *through* the slab, not around it.
+
+The rest of this section is the original plan, kept for the record.
 
 **Goal**: Eliminate `SystemAllocator` — all BlobVec columns must be mmap-backed
 via `SlabPool`. This is a hard prerequisite for every subsequent stage.
@@ -120,7 +128,7 @@ Every stage from 3 onwards assumes mmap-backed, page-aligned memory:
 | 6 (Storage/Compute) | Demand-paged working set maps directly onto mmap pages |
 | 7 (Diagonal) | Object storage sorted runs are page-aligned for zero-copy load |
 
-Today, `WorldBuilder` defaults to `SystemAllocator` unless `memory_budget()` is
+Before this stage, `WorldBuilder` defaulted to `SystemAllocator` unless `memory_budget()` was
 called. This means most worlds in tests, examples, and user code use `malloc`'d
 memory. The `SlabPool` path is opt-in, not default.
 
@@ -968,14 +976,14 @@ An ECS engine at Stage 7 has properties that a general-purpose database does not
                                                separate)
 ```
 
-**Stage 2.5 (SlabPool-only) is the immediate next step.** It's a prerequisite
-for Stage 3 — LSM dirty-page tracking requires mmap-backed, page-aligned
-columns. This is a breaking change that removes `SystemAllocator`, so do it
-first while the user base is small.
+**Stages 1 through 3 are done.** Stage 2.5 (SlabPool-only) shipped in v1.4.0
+(#155) and Stage 3 (LSM) in v1.3.0. Stage 3 was the critical path: it unblocks
+Stage 4 (efficient state transfer for new replicas) and is the foundation for
+Stage 6 (object storage as LSM backing store).
 
-**Stage 3 (LSM) is the critical path.** It blocks Stage 4 (efficient state
-transfer for new replicas) and is the foundation for Stage 6 (object storage
-as LSM backing store).
+**Stage 4 is next.** The 4.0 substrate is underway
+(`docs/rsm-substrate-design.md`), and Stage 3.75 can proceed in parallel once
+the substrate lands.
 
 **Stages 4 and 5 can partially overlap.** The consensus protocol (Stage 4) can
 be developed and tested with a single shard. Sharding (Stage 5) adds the
