@@ -49,6 +49,9 @@ fn add_remove(c: &mut Criterion) {
                 for &e in &entities {
                     world.remove::<Velocity>(e);
                 }
+                // Returned so criterion drops it outside the timed region:
+                // tearing down a pre-faulted pool (munmap) is not add/remove.
+                world
             },
             BatchSize::SmallInput,
         );
@@ -75,6 +78,9 @@ fn add_remove(c: &mut Criterion) {
                 for &e in &entities {
                     world.remove::<Velocity>(e);
                 }
+                // Returned so criterion drops it outside the timed region:
+                // tearing down a pre-faulted pool (munmap) is not add/remove.
+                world
             },
             BatchSize::SmallInput,
         );
