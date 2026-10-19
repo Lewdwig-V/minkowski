@@ -182,6 +182,19 @@ impl MmapRegion {
     }
 }
 
+/// The system's base page size (4 KiB on x86-64, 16 or 64 KiB on some
+/// arm64 and ppc64 kernels). Range advice and pre-faulting must use it, or
+/// unaligned `madvise` ranges fail with `EINVAL`.
+#[cfg(not(miri))]
+fn base_page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page)
+        .ok()
+        .filter(|p| p.is_power_of_two())
+        .unwrap_or(4096)
+}
+
 /// Fault `[start, start + len)` into physical RAM, leaving the rest of the
 /// mapping untouched.
 ///
@@ -675,7 +688,11 @@ impl SlabPoolInner {
         // (#281). Hugepage pools are always pre-faulted, as before.
         #[cfg(not(miri))]
         if prefault || region.huge {
-            let page = if region.huge { HUGE_PAGE_SIZE } else { 4096 };
+            let page = if region.huge {
+                HUGE_PAGE_SIZE
+            } else {
+                base_page_size()
+            };
             // With transparent hugepages set to `always`, faulting the window
             // could map a 2 MiB THP that spans into the slack. Opt the slack
             // out (best effort; it only splits the VMA).
@@ -700,8 +717,9 @@ impl SlabPoolInner {
             // SAFETY: base is page-aligned (WINDOW_ALIGN-aligned, and a
             // hugepage mapping is 2 MiB-aligned, so pad == 0 there), and
             // [base, base + total.next_multiple_of(page)) stays inside the
-            // mapping: regular pages round up by < 4096 <= the remaining
-            // slack (pad is a multiple of 4096 below WINDOW_ALIGN), and a
+            // mapping: regular pages round up by < page <= the remaining
+            // slack (the mapping is page-aligned, so pad is a multiple of
+            // page below WINDOW_ALIGN), and a
             // hugepage mapping is a multiple of 2 MiB with pad == 0. Nothing
             // else can reach the window yet.
             unsafe { prefault_window(base, total.next_multiple_of(page), page) };
@@ -1759,7 +1777,7 @@ mod tests {
             if len == 0 {
                 return 0;
             }
-            let page = 4096;
+            let page = base_page_size();
             let aligned = start - start % page;
             let len = start + len - aligned;
             let mut vec = vec![0u8; len.div_ceil(page)];
@@ -1773,13 +1791,14 @@ mod tests {
         let map_start = pool.inner._region.mmap.as_ptr() as usize;
         let map_len = pool.inner._region.mmap.len();
         let base = pool.inner.base as usize;
-        let window_end = base + budget.next_multiple_of(4096);
+        let page = base_page_size();
+        let window_end = base + budget.next_multiple_of(page);
         let head = resident(map_start, base - map_start);
         let tail = resident(window_end, map_start + map_len - window_end);
         let window = resident(base, budget);
         assert_eq!(
             window,
-            budget.next_multiple_of(4096),
+            budget.next_multiple_of(page),
             "window is pre-faulted"
         );
         assert_eq!(head + tail, 0, "slack around the window is not");
