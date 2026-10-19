@@ -2256,6 +2256,50 @@ mod tests {
         assert_eq!(pool.used(), 0);
     }
 
+    /// Miri-sized version of `slab_pool_concurrent_grow_and_large_churn`:
+    /// threads contend the frontier lock with large allocate / grow / free
+    /// and slab carves, few enough rounds to run in the Miri subset. At this
+    /// size threads park on the lock: with `parking_lot` under Miri it
+    /// reproduced #300's futex error.
+    #[test]
+    fn slab_pool_concurrent_frontier_lock_small() {
+        let pool = Arc::new(SlabPool::new(8 * LARGE_UNIT, HugePages::Off, false).unwrap());
+        let handles: Vec<_> = (0..4u8)
+            .map(|t| {
+                let pool = Arc::clone(&pool);
+                std::thread::spawn(move || {
+                    for round in 0..8u8 {
+                        let mut layout = Layout::from_size_align(LARGE_UNIT, 64).unwrap();
+                        let small = Layout::from_size_align(4000, 64).unwrap();
+                        let sm = pool.allocate(small).ok();
+                        if let Ok(mut ptr) = pool.allocate(layout) {
+                            let tag = t.wrapping_mul(31).wrapping_add(round);
+                            unsafe { std::ptr::write_bytes(ptr.as_ptr(), tag, 64) };
+                            let next = Layout::from_size_align(2 * LARGE_UNIT, 64).unwrap();
+                            // Err leaves the original run intact (checked below).
+                            if let Ok(p) = unsafe { pool.grow(ptr, layout, next, 64) } {
+                                ptr = p;
+                                layout = next;
+                            }
+                            for i in 0..64 {
+                                assert_eq!(unsafe { ptr.as_ptr().add(i).read() }, tag);
+                            }
+                            unsafe { pool.deallocate(ptr, layout) };
+                        }
+                        if let Some(p) = sm {
+                            unsafe { pool.deallocate(p, small) };
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        pool.flush_current_thread_cache();
+        assert_eq!(pool.used(), 0);
+    }
+
     #[test]
     fn slab_pool_concurrent_grow_and_large_churn() {
         // Growers widen/shift runs while churners allocate and free large

@@ -57,7 +57,7 @@ cargo +nightly fuzz run fuzz_wal_replay -- -max_total_time=60 -max_len=65536    
 cargo +nightly fuzz run fuzz_pool_columns -- -max_total_time=60   # fuzz: two-frontier pool via World (3 MiB budget, large runs, grow, collision; shadow-model value checks)
 ```
 
-Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows. Runs the full test suite via nextest (parallel execution). Exclusions defined in `.config/nextest.toml` (`[profile.default-miri]`, auto-activated under Miri): `par_for_each` (rayon unsupported by Miri, covered by TSan), concurrent/contention pool tests (too slow, covered by TSan + Loom). To list selected tests: `cargo nextest list -p minkowski --lib --profile default-miri`.
+Miri flags: `-Zmiri-tree-borrows` because crossbeam-epoch (rayon dep) violates Stacked Borrows. Runs the full test suite via nextest (parallel execution). Exclusions defined in `.config/nextest.toml` (`[profile.default-miri]`, auto-activated under Miri): `par_for_each` (rayon unsupported by Miri, covered by TSan), the four slowest multi-threaded pool tests (too slow, covered by TSan + Loom; the faster concurrent tests do run, using `crate::sync`'s std `Mutex` under Miri, #300). To list selected tests: `cargo nextest list -p minkowski --lib --profile default-miri`.
 
 Pre-commit hooks run `cargo fmt` and `cargo clippy -D warnings` on commit, `cargo test` on push.
 

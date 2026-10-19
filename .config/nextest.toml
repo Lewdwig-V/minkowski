@@ -3,7 +3,10 @@
 # Miri profile: activated automatically when MIRI_SYSROOT is set.
 # Runs the full test suite minus Miri-incompatible tests:
 #   - par_for_each: rayon thread pool unsupported by Miri (covered by TSan)
-#   - concurrent/contention pool tests: too slow under Miri (covered by TSan + Loom)
+#   - the four slowest multi-threaded pool tests (each 38–160 s under Miri;
+#     covered by TSan + Loom). The other concurrent/contention tests run, plus
+#     `slab_pool_concurrent_frontier_lock_small`, which contends the frontier
+#     lock. They need crate::sync's std Mutex under Miri (#300).
 [profile.default-miri]
-default-filter = "all() - test(/par_for_each/) - test(/concurrent|contention/)"
+default-filter = "all() - test(/par_for_each/) - test(/slab_pool_concurrent_(allocate_no_duplicates|frontier_collision_no_overlap|grow_and_large_churn)$|tcache_concurrent_no_duplicates$/)"
 slow-timeout = { period = "60s", terminate-after = 2 }
