@@ -1201,21 +1201,32 @@ fn hash_join_partitioned() {
 #[test]
 fn partitioned_join_plan_node_has_multiple_partitions() {
     // Enough entities to trigger partitions > 1 (default L2 = 256 KiB,
-    // avg_component_bytes = 16 → 16K entities per partition).
+    // avg_component_bytes = 16 → 16K entities per partition). Spawning 40K
+    // entities is slow under Miri, which states the row counts instead.
+    let n = if cfg!(miri) { 100 } else { 20_000 };
     let mut world = World::new();
-    for i in 0..20_000 {
+    for i in 0..n {
         world.spawn((Score(i),));
     }
-    for i in 0..20_000 {
+    for i in 0..n {
         world.spawn((Team(i),));
     }
 
     let planner = QueryPlanner::new(&world);
     // Use Left join — inner joins are eliminated at build time.
-    let plan = planner
-        .scan::<(&Score,)>()
-        .join::<(&Team,)>(JoinKind::Left)
-        .build();
+    let plan = if cfg!(miri) {
+        planner
+            .scan_with_estimate::<(&Score,)>(20_000)
+            .join::<(&Team,)>(JoinKind::Left)
+            .with_right_estimate(20_000)
+            .unwrap()
+            .build()
+    } else {
+        planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Left)
+            .build()
+    };
 
     match plan.root() {
         PlanNode::HashJoin { partitions, .. } => {
@@ -2390,7 +2401,8 @@ fn scratch_buffer_partition_bucket_retention_is_bounded() {
     // Joins with different partition counts on one plan must not accumulate
     // each bucket's peak capacity under every earlier modulus.
     let mut buf = ScratchBuffer::new(0);
-    let big: Vec<u32> = (0..20_000).collect();
+    let n = if cfg!(miri) { 1_000 } else { 20_000 };
+    let big: Vec<u32> = (0..n).collect();
     for partitions in 2..=16 {
         partitioned_matches(&mut buf, &big, &[1], partitions);
         // Bounded by a constant multiple of this call's build side.

@@ -462,7 +462,9 @@ mod tests {
         let mut free = FreeList::from_slice(Arc::clone(&pool), &expected);
         let mut next = 64;
         let mut seed = 42u64;
-        for step in 0..2048 {
+        // Each step compares the whole list, so Miri runs fewer steps.
+        let steps = if cfg!(miri) { 256 } else { 2048 };
+        for step in 0..steps {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             match (seed >> 32) % 4 {
                 0 | 1 => {
@@ -681,7 +683,11 @@ mod tests {
 
     #[test]
     fn failed_prepare_alloc_changes_nothing() {
-        let mut alloc = EntityAllocator::new(small_pool());
+        // Under Miri, a smaller pool: allocating until it is full is slow there.
+        let chunks = if cfg!(miri) { 4 } else { 8 };
+        let pool =
+            Arc::new(SlabPool::new(chunks * 65_536, crate::pool::HugePages::Off, false).unwrap());
+        let mut alloc = EntityAllocator::new(pool);
         // An outstanding reservation makes prepare also cover
         // materialize_reserved's growth.
         let reserved = alloc.reserve();
@@ -716,7 +722,8 @@ mod tests {
     fn dealloc_never_allocates_with_exhausted_pool() {
         let pool = small_pool();
         let mut alloc = EntityAllocator::new(Arc::clone(&pool));
-        let mut live: Vec<Entity> = (0..2000).map(|_| alloc.alloc()).collect();
+        let n = if cfg!(miri) { 300 } else { 2000 };
+        let mut live: Vec<Entity> = (0..n).map(|_| alloc.alloc()).collect();
         // Free every third entity, then adopt some of them back from the
         // middle of the free list so it carries tombstones (holes).
         let mut freed = Vec::new();
