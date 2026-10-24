@@ -15,4 +15,4 @@ crate-type = ["cdylib"]
 minkowski = { path = "../minkowski" }
 pyo3 = { version = "0.29", features = ["extension-module"] }
 pyo3-arrow = "0.19"
-arrow = { version = "59", default-features = false }
+arrow = { version = "60", default-features = false }
